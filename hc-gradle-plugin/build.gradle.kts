@@ -1,14 +1,8 @@
+import org.gradle.api.publish.PublishingExtension
+import org.gradle.api.publish.maven.MavenPublication
+
 plugins {
     `java-gradle-plugin`
-    // Explicit, not just `java-gradle-plugin`'s own transitive application -- JitPack probes
-    // for a `publishToMavenLocal` task with a preliminary `./gradlew tasks --all` before
-    // deciding whether to inject its own default publication for the "java" component. That
-    // probe apparently runs before `java-gradle-plugin`'s own lazy `maven-publish` application
-    // is visible to it, so it always concluded one was missing and injected a second, redundant
-    // publication alongside the real "pluginMaven" one -- both targeting the identical
-    // group:artifact:version, hence Gradle's own "will overwrite each other" warning. Applying
-    // it explicitly up front is what should make the task visible to that early probe.
-    `maven-publish`
     kotlin("jvm") version "1.9.24"
 }
 
@@ -28,6 +22,41 @@ gradlePlugin {
         create("hotChocolate") {
             id = "hc"
             implementationClass = "hc.gradle.HotChocolatePlugin"
+        }
+    }
+}
+
+// `java-gradle-plugin` auto-creates a "pluginMaven" publication for the real implementation
+// jar, defaulting its artifactId to this project's own name ("hc-gradle-plugin"). JitPack
+// separately auto-injects its own default publication for this project's "java" component --
+// verified two ways it actually behaves, not just documented behavior: (1) when JitPack's own
+// early `./gradlew tasks --all` probe fails to see `publishToMavenLocal` already available
+// (which happens because `java-gradle-plugin`'s `maven-publish` application isn't visible to
+// that probe), it falls back to a path that both injects that extra publication AND correctly
+// packages every module for serving; (2) making the task visible earlier (by applying
+// `maven-publish` explicitly) skips that fallback entirely -- no more duplicate-publication
+// warning, but JitPack's *other* code path then only serves the root project's own artifacts,
+// silently dropping this module. So the fallback path is the one that actually works end-to-end
+// and is worth keeping; what's fixed here instead is the actual coordinate collision it causes:
+// giving "pluginMaven" a distinct artifactId means it and JitPack's same-named injected
+// publication no longer share a GAV, so there's nothing left to "overwrite each other" even
+// though both still get created. The plugin marker artifact (what `id("hc")` resolves through)
+// is wired to follow "pluginMaven" automatically, so this doesn't change anything for consumers.
+// `configure<PublishingExtension>`, not the sugared `publishing { }` block: `maven-publish`
+// isn't declared in this file's own `plugins { }` block (only applied transitively by
+// `java-gradle-plugin`), so the Kotlin DSL has no typed accessor generated for it at script
+// compile time -- this is the same configuration, just reached through the untyped extension API.
+// `pluginManager.withPlugin("maven-publish")`, not `afterEvaluate`: `java-gradle-plugin` applies
+// `maven-publish` conditionally, only once something actually needs it (a real `publish*` task
+// in the requested task graph) -- confirmed directly, since even `afterEvaluate` here still
+// fails with "Extension of type 'PublishingExtension' does not exist" on a plain `./gradlew
+// build`. `withPlugin` is the idiomatic way to react to a plugin regardless of exactly when
+// (or whether) it ends up applied: it fires immediately if already present, or later at the
+// moment it actually is, instead of guessing at a specific lifecycle phase.
+pluginManager.withPlugin("maven-publish") {
+    configure<PublishingExtension> {
+        publications.named<MavenPublication>("pluginMaven") {
+            artifactId = "hc-gradle-plugin-impl"
         }
     }
 }
