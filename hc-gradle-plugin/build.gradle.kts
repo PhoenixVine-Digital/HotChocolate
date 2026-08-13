@@ -1,6 +1,3 @@
-import org.gradle.api.publish.PublishingExtension
-import org.gradle.api.publish.maven.MavenPublication
-
 plugins {
     `java-gradle-plugin`
     kotlin("jvm") version "1.9.24"
@@ -26,40 +23,25 @@ gradlePlugin {
     }
 }
 
-// `java-gradle-plugin` auto-creates a "pluginMaven" publication for the real implementation
-// jar, defaulting its artifactId to this project's own name ("hc-gradle-plugin"). JitPack
-// separately auto-injects its own default publication for this project's "java" component --
-// verified two ways it actually behaves, not just documented behavior: (1) when JitPack's own
-// early `./gradlew tasks --all` probe fails to see `publishToMavenLocal` already available
-// (which happens because `java-gradle-plugin`'s `maven-publish` application isn't visible to
-// that probe), it falls back to a path that both injects that extra publication AND correctly
-// packages every module for serving; (2) making the task visible earlier (by applying
-// `maven-publish` explicitly) skips that fallback entirely -- no more duplicate-publication
-// warning, but JitPack's *other* code path then only serves the root project's own artifacts,
-// silently dropping this module. So the fallback path is the one that actually works end-to-end
-// and is worth keeping; what's fixed here instead is the actual coordinate collision it causes:
-// giving "pluginMaven" a distinct artifactId means it and JitPack's same-named injected
-// publication no longer share a GAV, so there's nothing left to "overwrite each other" even
-// though both still get created. The plugin marker artifact (what `id("hc")` resolves through)
-// is wired to follow "pluginMaven" automatically, so this doesn't change anything for consumers.
-// `configure<PublishingExtension>`, not the sugared `publishing { }` block: `maven-publish`
-// isn't declared in this file's own `plugins { }` block (only applied transitively by
-// `java-gradle-plugin`), so the Kotlin DSL has no typed accessor generated for it at script
-// compile time -- this is the same configuration, just reached through the untyped extension API.
-// `pluginManager.withPlugin("maven-publish")`, not `afterEvaluate`: `java-gradle-plugin` applies
-// `maven-publish` conditionally, only once something actually needs it (a real `publish*` task
-// in the requested task graph) -- confirmed directly, since even `afterEvaluate` here still
-// fails with "Extension of type 'PublishingExtension' does not exist" on a plain `./gradlew
-// build`. `withPlugin` is the idiomatic way to react to a plugin regardless of exactly when
-// (or whether) it ends up applied: it fires immediately if already present, or later at the
-// moment it actually is, instead of guessing at a specific lifecycle phase.
-pluginManager.withPlugin("maven-publish") {
-    configure<PublishingExtension> {
-        publications.named<MavenPublication>("pluginMaven") {
-            artifactId = "hc-gradle-plugin-impl"
-        }
-    }
-}
+// Deliberately NOT trying to silence Gradle's "Multiple publications ... will overwrite each
+// other" warning here (java-gradle-plugin's own "pluginMaven" publication vs. one JitPack
+// injects for the same coordinates) -- two different fix attempts were tried and reverted after
+// real JitPack builds (not just local ones) showed each one traded the cosmetic warning for an
+// actual regression:
+//   1. Applying `maven-publish` explicitly (so JitPack's own early probe sees
+//      `publishToMavenLocal` already exists) does silence the warning, but that probe result is
+//      also what triggers the *fallback* codepath in JitPack's own build script that correctly
+//      packages every module for serving -- skip the fallback and it silently serves only the
+//      root project's artifacts, dropping this module's jar/pom entirely from what's published.
+//   2. Keeping the fallback active and instead giving "pluginMaven" a distinct artifactId (via
+//      `pluginManager.withPlugin("maven-publish") { ... }`, to dodge the actual coordinate
+//      collision) fails outright on JitPack specifically: whatever applies `maven-publish` in
+//      that fallback path isn't `java-gradle-plugin`'s own internal application, so
+//      "pluginMaven" doesn't exist yet when the hook fires -- "Publication with name
+//      'pluginMaven' not found", a hard build failure, strictly worse than the warning.
+// The warning is real but non-fatal (the build still succeeds, both modules still get
+// correctly served under it -- verified via an actual JitPack build.log). Leaving it alone is
+// the working state; both silencing attempts are documented here so they aren't retried blind.
 
 kotlin {
     jvmToolchain(17)
