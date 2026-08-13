@@ -8,6 +8,12 @@ JVM/JDK interop, static typing) but give the compiler enough discipline about
 ownership that memory bugs and accidental aliasing get caught before runtime,
 the way Rust does.
 
+**License**: [Business Source License 1.1](LICENSE) — source-available now,
+free for effectively all use (including compiling and distributing your own
+programs written in it) except offering Hot Chocolate itself as a competing
+commercial product or service; converts automatically to Apache 2.0 on
+2029-08-13.
+
 ## Status: phase 1 (this repo)
 
 - Hand-written lexer/parser (`src/main/kotlin/hc/lexer`, `hc/parser`)
