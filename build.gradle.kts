@@ -3,8 +3,13 @@ plugins {
     application
 }
 
-group = "hc"
-version = "0.1.0"
+// JitPack builds with `-Pgroup=com.github.<org> -Pversion=<tag>` so consumers can depend on
+// `com.github.<org>:HotChocolate:<tag>` -- reading those properties (falling back to plain
+// local-dev defaults when they're absent) is what makes the coordinates JitPack's own page
+// advertises actually match what gets published, instead of silently publishing under the
+// hardcoded local group/version and leaving every copy-pasted dependency line broken.
+group = (findProperty("group") as String?) ?: "hc"
+version = (findProperty("version") as String?) ?: "0.1.0"
 
 repositories {
     mavenCentral()
