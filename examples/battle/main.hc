@@ -1,0 +1,76 @@
+// A small dungeon crawl exercising most of the language at once: structs + inherent impls
+// (Player), a sealed interface with dynamic dispatch and match-by-concrete-type (Enemy,
+// taunt -- see enemies.hc), the self-hosted `Registry<T>` prelude (the enemy roster), real
+// Java interop (java.util.Random) for damage rolls, and `read_line()` for the player's name
+// -- spread across a multi-file directory compiled as one program (see enemies.hc /
+// player.hc). `./gradlew playBattle` runs this with stdin wired up.
+
+extern class Random = "java.util.Random" {
+    fn new() -> Self;
+    fn nextInt(self, bound: Int) -> Int;
+}
+
+fn rollDamage(rng: &Random, base: Int) -> Int {
+    return base + rng.nextInt(3);
+}
+
+fn fightEnemy(player: &mut Player, enemy: &dyn Enemy, rng: &Random) {
+    print("A wild enemy appears:");
+    print(enemy.name());
+    print(taunt(&enemy));
+    var enemyHp = enemy.maxHp();
+
+    while enemyHp > 0 {
+        let dmgToEnemy = rollDamage(&rng, player.attack);
+        enemyHp = enemyHp - dmgToEnemy;
+        print("You hit for:");
+        print(dmgToEnemy);
+
+        if enemyHp > 0 {
+            let dmgToPlayer = rollDamage(&rng, enemy.attackPower());
+            player.takeDamage(dmgToPlayer);
+            print("It hits back for:");
+            print(dmgToPlayer);
+            if !player.isAlive() {
+                print("You were defeated...");
+                return;
+            }
+            player.healIfPossible();
+        }
+    }
+    print("Enemy defeated!");
+}
+
+fn main() {
+    print("What's your name, adventurer?");
+    let name = read_line();
+    print("Good luck, " + name + ".");
+
+    var player = Player { name: name, hp: 40, maxHp: 40, attack: 6, potions: 2 };
+    let rng = Random::new();
+
+    let first: &dyn Enemy = &Goblin { };
+    var roster = registry_new("goblin", &first);
+    let second: &dyn Enemy = &Orc { };
+    roster.register("orc", &second);
+    let third: &dyn Enemy = &Slime { };
+    roster.register("slime", &third);
+
+    let order = ["goblin", "orc", "slime"];
+    for key in order {
+        if player.isAlive() {
+            let found = roster.get(key);
+            match found {
+                Some { value } => { fightEnemy(&mut player, &value, &rng); }
+                None => { }
+            }
+        }
+    }
+
+    if player.isAlive() {
+        print("You survived the dungeon!");
+        print(player.hp);
+    } else {
+        print("Game over.");
+    }
+}

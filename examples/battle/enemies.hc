@@ -1,0 +1,36 @@
+sealed interface Enemy {
+    fn name(&self) -> String;
+    fn maxHp(&self) -> Int;
+    fn attackPower(&self) -> Int;
+}
+
+struct Goblin { }
+impl Enemy for Goblin {
+    fn name(&self) -> String { return "Goblin"; }
+    fn maxHp(&self) -> Int { return 20; }
+    fn attackPower(&self) -> Int { return 4; }
+}
+
+struct Orc { }
+impl Enemy for Orc {
+    fn name(&self) -> String { return "Orc"; }
+    fn maxHp(&self) -> Int { return 35; }
+    fn attackPower(&self) -> Int { return 7; }
+}
+
+struct Slime { }
+impl Enemy for Slime {
+    fn name(&self) -> String { return "Slime"; }
+    fn maxHp(&self) -> Int { return 12; }
+    fn attackPower(&self) -> Int { return 2; }
+}
+
+// `sealed` lets `match` dispatch by concrete type (instanceof chain), exhaustiveness-checked
+// against every implementer declared anywhere in this compiled directory -- see player.hc/main.hc.
+fn taunt(e: &dyn Enemy) -> String {
+    match e {
+        Goblin { } => { return "the goblin snickers."; }
+        Orc { } => { return "the orc grunts menacingly."; }
+        Slime { } => { return "the slime jiggles quietly."; }
+    }
+}
