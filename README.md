@@ -1308,11 +1308,54 @@ actual right-sized version of that want.
 
 **Known limitation**: `compilerHome` still points at a locally-built
 install distribution (`./gradlew installDist`), not a published
-artifact — there's no Maven Central (or any repository) publishing
-story yet, so every consuming project needs a local HotChocolate
-checkout built once. Fine for this repo's own current use (a sibling
-checkout), not yet a "add one line, no local setup" experience for an
-arbitrary outside project.
+artifact, so *using the plugin* still needs a local HotChocolate
+checkout built once — `includeBuild`, not a version string, is how a
+consuming project's `settings.gradle` resolves the plugin itself. Fine
+for this repo's own current use (a sibling checkout), not yet a "add one
+line, no local setup" experience for an arbitrary outside project.
+
+### Published on JitPack
+
+The raw compiler jar (and the plugin's own jar, separately) *are* now
+real, versioned, remotely-resolvable Maven artifacts — no local checkout
+needed for these specifically:
+
+```kotlin
+dependencies {
+    implementation("com.github.P-H-O-E-N-I-X-PackForge:HotChocolate:v0.1.5")
+}
+```
+
+built on demand by JitPack from any pushed tag (`git tag vX.Y.Z && git
+push origin vX.Y.Z`, then JitPack builds it the first time someone
+requests it). Verified via a real `build.log` run, not just configured —
+including catching and fixing a real bug before calling it done: the
+root `build.gradle.kts` used to hardcode `group = "hc"` / `version =
+"0.1.0"`, silently ignoring the `-Pgroup`/`-Pversion` JitPack passes in,
+so the first tag actually published under the wrong coordinates despite
+JitPack's own page advertising the right ones. Fixed by reading those
+properties with local-dev fallbacks (`(findProperty("group") as
+String?) ?: "hc"`), confirmed against a second real build.
+
+**Known, accepted limitation**: Gradle's own "Multiple publications ...
+will overwrite each other" warning shows up during the `hc-gradle-plugin`
+module's publish step (`java-gradle-plugin`'s auto-created `pluginMaven`
+publication collides in coordinates with one JitPack separately injects
+for the same "java" component). It's real but non-fatal — the build
+still succeeds and both modules still get correctly served under it,
+confirmed via `build.log`. Two different fixes were tried and reverted
+after real JitPack builds (not just local ones) showed each traded the
+warning for something worse: applying `maven-publish` explicitly
+silences it but silently drops this module from what gets served at all
+(the early-detection "failure" that produces the warning turns out to
+also be what triggers the JitPack codepath that packages every module
+correctly); giving `pluginMaven` a distinct artifactId to dodge the
+actual collision while keeping that codepath active fails outright
+("Publication with name 'pluginMaven' not found") since whatever applies
+`maven-publish` in that fallback isn't `java-gradle-plugin`'s own
+internal application. Left alone, documented, not worth a third blind
+attempt at outguessing JitPack's own undocumented internal packaging
+heuristics for a cosmetic, non-fatal warning.
 
 ## Try it
 
