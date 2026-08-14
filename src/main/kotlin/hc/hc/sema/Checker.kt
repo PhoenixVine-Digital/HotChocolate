@@ -28,7 +28,7 @@ private class RawInterface(val extends: List<String>, val ownMethods: Map<String
 // A `pub static NAME: Type = initExpr;` -- see StaticDecl's doc. `init` is the already
 // type-checked initializer expression, evaluated once at class-load time (codegen emits it
 // into its owning module's holder-class `<clinit>`).
-class StaticInfo(val name: String, val ty: Ty, val init: Expr, val moduleName: String?, val visible: Boolean)
+class StaticInfo(val name: String, val ty: Ty, val init: Expr, val moduleName: String?, val visible: Boolean, val sourceUnit: String? = null)
 
 // `mutable` governs reassigning the whole variable (`x = ...`, needs `var`).
 // `canMutateFields` governs mutating through it (`x.field = ...`): true for `var` owned
@@ -104,6 +104,17 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     )
 
     fun check() {
+        // Extern class *names* must be registered before anything else calls `resolveType` --
+        // struct fields, interface method signatures (including `extern interface`'s own, which
+        // may reference an `extern class` type, e.g. `fn get(&self) -> JObject;`), enum variant
+        // fields, all resolve types before the extern-registration block below used to run. Only
+        // the name needs to exist this early (an empty method table is fine here -- real
+        // signatures are resolved further down, after interfaces, in the same place this used to
+        // live); `resolveType` only needs to know a `JavaExtern` name is valid at all.
+        for (ext in program.externs) {
+            if (externClasses.containsKey(ext.name)) { errors += "Duplicate extern class '${ext.name}'"; continue }
+            externClasses[ext.name] = ExternClassInfo(ext.name, ext.binaryName, emptyList(), lazy = ext.lazyAll, isInterface = ext.isInterface)
+        }
         for (s in program.structs) {
             if (s.typeParams.isNotEmpty()) {
                 if (genericStructTemplates.containsKey(s.name)) errors += "Duplicate struct '${s.name}'"
@@ -189,14 +200,10 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             interfaces[i.name] = info
         }
 
-        // Extern class registration: first register all names so they are available in resolveType,
-        // then resolve method signatures -- from the hand-written signature list (explicit form),
-        // from reflection against `--classpath` (`use { ... }`, eager), or left empty pending
-        // on-demand reflection later (bare/lazy form) -- see the comment on ExternClassDecl.
-        for (ext in program.externs) {
-            if (externClasses.containsKey(ext.name)) { errors += "Duplicate extern class '${ext.name}'"; continue }
-            externClasses[ext.name] = ExternClassInfo(ext.name, ext.binaryName, emptyList(), lazy = ext.lazyAll)
-        }
+        // Extern class method/field resolution -- names are already registered (see the top of
+        // `check()`); this fills in the real signatures, from the hand-written signature list
+        // (explicit form), from reflection against `--classpath` (`use { ... }`, eager), or left
+        // empty pending on-demand reflection later (bare/lazy form) -- see ExternClassDecl.
         for (ext in program.externs) {
             if (ext.lazyAll) continue // nothing to resolve up front -- resolveExternMethods handles it per call site
             val methods = if (ext.useNames != null) {
@@ -216,11 +223,73 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                         retType = if (isCtor) Ty.Unit_ else m.retType?.let { resolveType(it) } ?: Ty.Unit_,
                         isStatic = m.isStatic || (!isInstance && m.name != "new"),
                         isCtor = isCtor,
+                        paramIsRef = restParams.map { it.type.isRef },
+                        paramIsMut = restParams.map { it.type.isMut },
                     )
                 }
             }
+            val fields = ext.fields.map { f -> ExternFieldInfo(f.name, resolveType(f.type), f.isStatic) }
             // Replace the empty method list with the resolved one.
-            externClasses[ext.name] = ExternClassInfo(ext.name, ext.binaryName, methods)
+            externClasses[ext.name] = ExternClassInfo(ext.name, ext.binaryName, methods, fields = fields, isInterface = ext.isInterface)
+        }
+
+        // `@serializable struct S { ... }` -- synthesizes `pub fn encode(packet: &S, buf: &mut
+        // FriendlyByteBuf)` / `pub fn decode(buf: &mut FriendlyByteBuf) -> S` as real AST, fed
+        // through the same `implFns` pipeline as every other synthesized fn (see the `by field`
+        // delegation block above for the same pattern). Deliberately scoped to exactly one
+        // target extern class (an alias literally named "FriendlyByteBuf", matching this
+        // project's Forge networking use case) and to Int/Long/Float/Double/Bool/String fields
+        // only -- each maps to a real FriendlyByteBuf.writeX/readX call, in field-declaration
+        // order, so encode/decode round-trip each other by construction. Whether the user's own
+        // `extern class FriendlyByteBuf = ...` declaration actually has the needed methods is
+        // left to the normal checker pass over these synthesized bodies to catch (same "no
+        // special-cased validation duplicated here" reasoning as `by field` delegation).
+        for (s in program.structs.filter { it.serializable && it.typeParams.isEmpty() }) {
+            if (!externClasses.containsKey("FriendlyByteBuf")) {
+                errors += "struct '${s.name}': '@serializable' needs an 'extern class FriendlyByteBuf = ...' declared in this compile"
+                continue
+            }
+            val fields = structs[s.name]?.fields ?: continue
+            val ops = fields.map { (fname, fty) ->
+                val pair = when (fty) {
+                    Ty.Int_ -> "writeInt" to "readInt"
+                    Ty.Long_ -> "writeLong" to "readLong"
+                    Ty.Float_ -> "writeFloat" to "readFloat"
+                    Ty.Double_ -> "writeDouble" to "readDouble"
+                    Ty.Bool_ -> "writeBoolean" to "readBoolean"
+                    is Ty.Str_ -> if (!fty.nullable) "writeUtf" to "readUtf" else null
+                    else -> null
+                }
+                if (pair == null) {
+                    errors += "struct '${s.name}': '@serializable' field '$fname' has unsupported type $fty (only Int/Long/Float/Double/Bool/String are supported)"
+                }
+                fname to pair
+            }
+            if (ops.any { it.second == null }) continue
+            val encodeParams = listOf(
+                Param("packet", TypeRef(s.name, isRef = true)),
+                Param("buf", TypeRef("FriendlyByteBuf", isRef = true, isMut = true)),
+            )
+            val encodeBody = Block(ops.map { (fname, methods) ->
+                Stmt.ExprStmt(Expr.MethodCall(Expr.Ident("buf", 0), methods!!.first, listOf(Expr.FieldAccess(Expr.Ident("packet", 0), fname, 0)), 0))
+            })
+            val encodeFn = FnDecl(
+                name = "encode", params = encodeParams, retType = null, body = encodeBody, line = 0,
+                moduleName = s.moduleName, visible = true, sourceUnit = s.sourceUnit,
+            )
+            val decodeParams = listOf(Param("buf", TypeRef("FriendlyByteBuf", isRef = true, isMut = true)))
+            val decodeBody = Block(listOf(
+                Stmt.Return(
+                    Expr.StructLit(s.name, ops.map { (fname, methods) -> fname to Expr.MethodCall(Expr.Ident("buf", 0), methods!!.second, emptyList(), 0) }, 0),
+                    0,
+                )
+            ))
+            val decodeFn = FnDecl(
+                name = "decode", params = decodeParams, retType = TypeRef(s.name, isRef = false), body = decodeBody, line = 0,
+                moduleName = s.moduleName, visible = true, sourceUnit = s.sourceUnit,
+            )
+            implFns += encodeFn
+            implFns += decodeFn
         }
 
         // `struct S extends C { }` -- real JVM `extends` (S's generated class has C's binary
@@ -368,24 +437,39 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (m.params.isNotEmpty()) errors += "fn main must take no parameters"
         }
 
-        // `pub static NAME: Type = initExpr;` -- checked in an empty scope (no locals, and
-        // deliberately no access to *other* statics -- sidesteps cross-static init-order
-        // entirely for this first pass). Registered after fn signatures (an initializer may
-        // call an ordinary fn) but before fn bodies are checked, since every fn body needs
-        // every static already in `statics` to inject them into its own scope.
+        // `pub static NAME: Type = initExpr;` -- checked with every *already-registered* static
+        // in scope (same mechanism checkFn uses to inject the full `statics` map, just seeded
+        // incrementally here since `statics` is still being built) but no locals otherwise.
+        // Backward references only, by construction: a static's init runs this loop body before
+        // any later static gets added to `statics` at all, so forward references are simply
+        // unresolvable, not specially rejected -- no cross-static circularity is possible.
+        // Sound at codegen time too: same-module statics initialize in this same declared order
+        // within one shared `<clinit>` (see CodeGen.genHolderClass/genStruct), and a read of a
+        // different module's static triggers that module's own class-init first, ordinary JVM
+        // `<clinit>`-on-first-use semantics. Registered after fn signatures (an initializer may
+        // call an ordinary fn) but before fn bodies are checked, since every fn body needs every
+        // static already in `statics` to inject them into its own scope.
         for (s in program.statics) {
             if (statics.containsKey(s.name)) { errors += "Line ${s.line}: duplicate static '${s.name}'"; continue }
             val ty = resolveType(s.type)
             val emptyEnv = Env()
             emptyEnv.push()
+            for ((name, info) in statics) {
+                emptyEnv.declare(name, VarInfo(info.ty, mutable = true, canMutateFields = true))
+            }
             val (initTy, _) = checkExpr(s.init, emptyEnv, emptyMap(), consume = true, expectedTy = ty)
             if (!tyCompatible(initTy, ty)) {
                 errors += "Line ${s.line}: cannot assign ${initTy} to static '${s.name}' of declared type ${ty}"
             }
-            statics[s.name] = StaticInfo(s.name, ty, s.init, s.moduleName, s.visible)
+            statics[s.name] = StaticInfo(s.name, ty, s.init, s.moduleName, s.visible, s.sourceUnit)
         }
 
         for (f in (program.fns + implFns).filter { it.typeParams.isEmpty() }) checkFn(f)
+
+        // See checkGenericFnBoundValidity's own doc comment: this is the missing half of what a
+        // declared `<T: Trait>` bound is supposed to guarantee, checked once per template here,
+        // independent of whether/how the generic ever actually gets instantiated for real.
+        for (f in genericFnTemplates.values) checkGenericFnBoundValidity(f)
 
         // Type-check interface default method bodies. `self` is typed as `&dyn Interface`
         // (not the concrete struct) -- this is what correctly restricts a default body to
@@ -477,7 +561,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             return emptyList()
         }
         val aliasKey = externClasses.entries.first { it.value === ext }.key
-        externClasses[aliasKey] = ExternClassInfo(ext.name, ext.binaryName, ext.methods + found, lazy = true)
+        externClasses[aliasKey] = ExternClassInfo(ext.name, ext.binaryName, ext.methods + found, lazy = true, isInterface = ext.isInterface)
         return found
     }
 
@@ -493,8 +577,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         candidates.firstOrNull { it.params.size == argCount } ?: candidates[0]
 
     private fun resolveType(t: TypeRef): Ty {
-        if (t.isNullable && !externClasses.containsKey(t.name)) {
-            errors += "'${t.name}?': nullable types are only supported for 'extern class' types"
+        if (t.isNullable && t.name != "String" && !externClasses.containsKey(t.name)) {
+            errors += "'${t.name}?': nullable types are only supported for 'extern class' types and 'String'"
         }
         if (t.isDyn) {
             if (!t.isRef) errors += "'dyn ${t.name}' must be used behind & or &mut, e.g. &dyn ${t.name}"
@@ -507,7 +591,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             "Float" -> Ty.Float_
             "Double" -> Ty.Double_
             "Bool" -> Ty.Bool_
-            "String" -> Ty.Str_
+            "String" -> Ty.Str_(nullable = t.isNullable)
             "Unit" -> Ty.Unit_
             "Array" -> Ty.Array(resolveType(t.typeArgs.getOrNull(0) ?: TypeRef("Unit", false)))
             "Arena" -> {
@@ -542,7 +626,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         Ty.Float_ -> "Float"
         Ty.Double_ -> "Double"
         Ty.Bool_ -> "Bool"
-        Ty.Str_ -> "String"
+        is Ty.Str_ -> "String"
         Ty.Unit_ -> "Unit"
         is Ty.Struct -> t.name
         is Ty.Array -> "Array_${tyName(t.elem)}"
@@ -627,6 +711,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Expr.Binary -> Expr.Binary(e.op, substituteExpr(e.left, subst), substituteExpr(e.right, subst), e.line)
         is Expr.Unary -> Expr.Unary(e.op, substituteExpr(e.expr, subst), e.line)
         is Expr.Cast -> Expr.Cast(substituteExpr(e.inner, subst), e.target, e.line)
+        is Expr.InstanceOf -> Expr.InstanceOf(substituteExpr(e.inner, subst), e.target, e.line)
         is Expr.Borrow -> Expr.Borrow(substituteExpr(e.inner, subst), e.isMut)
         is Expr.Assign -> Expr.Assign(e.name, substituteExpr(e.value, subst), e.line)
         is Expr.Call -> Expr.Call(e.callee, e.args.map { substituteExpr(it, subst) }, e.line)
@@ -635,6 +720,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Expr.StructLit -> Expr.StructLit(e.typeName, e.fields.map { it.first to substituteExpr(it.second, subst) }, e.line)
         is Expr.MethodCall -> Expr.MethodCall(substituteExpr(e.recv, subst), e.method, e.args.map { substituteExpr(it, subst) }, e.line)
         is Expr.StaticCall -> Expr.StaticCall(e.typeName, e.method, e.args.map { substituteExpr(it, subst) }, e.line)
+        is Expr.StaticFieldGet -> Expr.StaticFieldGet(e.typeName, e.field, e.line)
         is Expr.ArrayLit -> Expr.ArrayLit(e.elements.map { substituteExpr(it, subst) }, e.line)
         is Expr.ArrayRepeat -> Expr.ArrayRepeat(substituteExpr(e.value, subst), substituteExpr(e.count, subst), e.line)
         is Expr.Index -> Expr.Index(substituteExpr(e.arr, subst), substituteExpr(e.index, subst), e.line)
@@ -653,24 +739,138 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Expr.BoolLit -> Expr.BoolLit(e.value)
         is Expr.NullLit -> Expr.NullLit()
         is Expr.Ident -> Expr.Ident(e.name, e.line)
+        is Expr.If -> Expr.If(substituteExpr(e.cond, subst), substituteBlock(e.thenB, subst), substituteBlock(e.elseB, subst), e.line)
+        is Expr.Match -> Expr.Match(
+            substituteExpr(e.scrutinee, subst),
+            e.arms.map { it.copy(body = substituteBlock(it.body, subst)) },
+            e.line,
+        )
     }
 
-    // `T: Trait1 + Trait2`: since generics here are checked only once fully monomorphized
-    // (never abstractly against the bound, unlike Rust), this is the actual enforcement point
-    // -- without it, an unbounded generic body calling a method on `T` would only ever fail
-    // (or silently succeed) per instantiation, C++-template-style. A declared bound turns that
-    // into a clear, immediate error naming exactly what's missing.
+    // `T: Trait1 + Trait2`, checked at every real instantiation site: does the concrete `Ty`
+    // substituted for `T` actually implement every required trait? This alone was the *only*
+    // enforcement a bound gave for a long time -- see `checkGenericFnBoundValidity` below for
+    // the other, more important half (does the *body* only ever rely on what the bound
+    // promises?) that used to be completely missing. A `Ty.Dyn` argument -- the synthetic
+    // merged-bound interface `checkGenericFnBoundValidity` instantiates with, or a real `&dyn
+    // Trait`-typed value inferred as a type argument at a genuine call site -- satisfies a
+    // required trait if its own interface name matches, or (transitively) if that interface was
+    // built by merging a bound list that included it (see `boundInterfaceComponents`).
     private fun checkTypeParamBounds(typeParams: List<String>, bounds: Map<String, List<String>>, typeArgs: List<Ty>, line: Int, what: String) {
         if (bounds.isEmpty()) return
         for ((name, ty) in typeParams.zip(typeArgs)) {
             val required = bounds[name] ?: continue
-            val ownerName = (ty as? Ty.Struct)?.let { structInstanceTemplate[it.name] ?: it.name }
-            val implemented = ownerName?.let { structInterfaces[it] } ?: emptySet()
+            val implemented: Set<String> = when (ty) {
+                is Ty.Struct -> {
+                    val ownerName = structInstanceTemplate[ty.name] ?: ty.name
+                    structInterfaces[ownerName] ?: emptySet()
+                }
+                is Ty.Dyn -> setOf(ty.interfaceName) + (boundInterfaceComponents[ty.interfaceName] ?: emptySet())
+                else -> emptySet()
+            }
             val missing = required.filter { it !in implemented }
             if (missing.isNotEmpty()) {
                 errors += "Line $line: $what: '$ty' for type param '$name' doesn't implement ${missing} (required by 'T: ${required.joinToString(" + ")}')"
             }
         }
+    }
+
+    // synthetic merged-bound-interface name -> the real trait names it was merged from (so
+    // `checkTypeParamBounds` can recognize a `Ty.Dyn` pointing at one of these as satisfying
+    // each individual bound it was built to cover). Keyed by the *interface name*, not the
+    // bound list, since that's all `checkTypeParamBounds` has to work with once the Dyn value
+    // already exists.
+    private val boundInterfaceComponents = mutableMapOf<String, Set<String>>()
+    // bound list (sorted, for a stable cache key) -> the merged interface's name, or null if
+    // synthesizing it failed (already reported). See `checkGenericFnBoundValidity`.
+    private val boundInterfaceCache = mutableMapOf<List<String>, String?>()
+
+    // Synthesizes a real (checker-internal only -- registered in `interfaces`, never in
+    // `program.interfaces`, so codegen never sees it and no classfile is ever emitted for it) merged
+    // interface combining every method every trait in `bounds` declares, so a bounded type param
+    // can be checked *abstractly*, before any real instantiation exists, by typing it as `Ty.Dyn`
+    // against this interface -- reusing the exact same method-resolution path a real `&dyn Trait`
+    // receiver already goes through in `checkMethodCall`, which is exactly the restriction a
+    // bound is supposed to provide (only members the bound trait(s) actually declare are visible).
+    private fun syntheticBoundInterface(bounds: List<String>, line: Int): String? {
+        val key = bounds.sorted()
+        if (boundInterfaceCache.containsKey(key)) return boundInterfaceCache[key]
+        val merged = InterfaceInfo("\$Bound\$" + key.joinToString("\$"))
+        for (b in bounds) {
+            val info = interfaces[b]
+            if (info == null) {
+                errors += "Line $line: unknown bound trait '$b'"
+                boundInterfaceCache[key] = null
+                return null
+            }
+            for ((mname, msig) in info.methods) {
+                val existing = merged.methods[mname]
+                if (existing != null && existing.paramTys != msig.paramTys) {
+                    errors += "Line $line: bound combination '${bounds.joinToString(" + ")}' declares conflicting signatures for method '$mname' -- no real type could implement both compatibly"
+                    boundInterfaceCache[key] = null
+                    return null
+                }
+                merged.methods[mname] = msig
+            }
+        }
+        interfaces[merged.name] = merged
+        boundInterfaceComponents[merged.name] = key.toSet()
+        boundInterfaceCache[key] = merged.name
+        return merged.name
+    }
+
+    // The other half of what a declared bound is supposed to guarantee, previously entirely
+    // missing: not just "does the concrete type at each instantiation site implement the bound"
+    // (checkTypeParamBounds, above) but "does the body itself only ever rely on what the bound
+    // actually promises." Without this, a bounded generic's body was checked exactly like an
+    // *unbounded* one -- fully duck-typed against whatever concrete type happened to get
+    // substituted in -- so a body could compile fine against the first instantiation tried
+    // (accidentally relying on some method that merely happens to exist on that one concrete
+    // type, not on anything the bound declares) and only fail, confusingly, at a *different*,
+    // later call site instantiating the same generic with a type that satisfies the identical
+    // declared bound but lacks that extra method. That defeats the entire point of writing a
+    // bound in the first place: the promise that "compiles once" means "works for every type
+    // satisfying the bound," not merely "works for the type someone happened to test first."
+    //
+    // Fixed by checking the template's body exactly once, abstractly: every bounded type param
+    // is substituted with `Ty.Dyn(mergedBoundInterface)` instead of any real concrete type (see
+    // syntheticBoundInterface), so every method call the body makes on a bound-typed value goes
+    // through the same restricted `&dyn Trait` resolution a real interface value already does --
+    // only methods the bound(s) actually declare resolve at all. This is genuinely a *stronger*
+    // check than any single real instantiation could give, since it holds for every future
+    // instantiation simultaneously, checked exactly once, cached, and entirely independent of
+    // whether the generic is ever actually called anywhere in the program (matching how a real
+    // bounded generic's correctness shouldn't depend on which instantiations someone happened to
+    // exercise) -- run once per template right after registration, not lazily at first use.
+    //
+    // Scoped to fns where *every* type param has a declared bound (a mixed `<T: Trait, U>` has
+    // no way to abstractly type the unbounded `U` at all -- falls back to today's
+    // per-instantiation-only checking for such fns, unchanged, not a regression) and to
+    // top-level fns only (a `self` param on a generic struct's own impl method would also need
+    // `Self`/`Owner<T>` itself abstracted, real design work not attempted in this pass).
+    private val boundValidityChecked = mutableSetOf<String>()
+    private fun checkGenericFnBoundValidity(template: FnDecl) {
+        if (template.typeParams.isEmpty()) return
+        if (template.params.firstOrNull()?.name == "self") return
+        if (!template.typeParams.all { template.typeParamBounds.containsKey(it) }) return
+        if (!boundValidityChecked.add(template.name)) return
+        val typeArgs = template.typeParams.map { tp ->
+            val bounds = template.typeParamBounds.getValue(tp)
+            val ifaceName = syntheticBoundInterface(bounds, template.line) ?: return
+            Ty.Dyn(ifaceName)
+        }
+        val mangled = mangle(template.name, typeArgs)
+        if (fns.containsKey(mangled)) return
+        val subst = template.typeParams.zip(typeArgs).toMap()
+        val newParams = template.params.map { Param(it.name, substituteTypeRef(it.type, subst)) }
+        val newRet = template.retType?.let { substituteTypeRef(it, subst) }
+        val sig = FnSig(newParams, newParams.map { resolveType(it.type) }, newRet?.let { resolveType(it) } ?: Ty.Unit_)
+        fns[mangled] = sig // register before checking: supports a self-recursive bounded generic
+        val newDecl = FnDecl(mangled, newParams, newRet, substituteBlock(template.body, subst), template.line, moduleName = template.moduleName, visible = template.visible)
+        checkFn(newDecl)
+        // Deliberately not registered in `fnInstances` -- this synthetic instantiation is purely
+        // a checker-time validation pass and is never emitted by codegen (nothing in
+        // `program.fns`/`genericFnTemplates` ever references this mangled name).
     }
 
     private fun getOrInstantiateFn(template: FnDecl, typeArgs: List<Ty>, line: Int): FnSig {
@@ -950,13 +1150,20 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         env.pop()
     }
 
+    // `beforeCheck`: runs right after `env.push()`, before any statement in `block` is checked --
+    // its only real use is narrowing a nullable extern binding for exactly this block's own
+    // scope (see the `Stmt.If` narrowing below), since a declare here lands in the frame this
+    // call's own `env.pop()` discards, never leaking into a sibling branch or code after the
+    // block.
     private fun checkBlock(
         block: Block,
         env: Env,
         movedIn: Map<String, Boolean>,
         retTy: Ty,
+        beforeCheck: (() -> Unit)? = null,
     ): Map<String, Boolean> {
         env.push()
+        beforeCheck?.invoke()
         dropScopeStack.addLast(mutableListOf())
         var moved: Map<String, Boolean> = HashMap(movedIn)
         for (stmt in block.stmts) {
@@ -973,12 +1180,33 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     // other than a bare identifier). Deliberately narrow pattern matching, not general
     // expression analysis -- this only needs to recognize the one guard-clause idiom the
     // narrowing above cares about.
-    private fun nullCheckedIdentName(cond: Expr): String? {
-        if (cond !is Expr.Binary || cond.op != "==") return null
-        return when {
+    // `if x == null { ... }` / `if x != null { ... }` (either literal order) -- returns the
+    // checked ident's name paired with which branch is the one where `x` is proven non-null:
+    // `true` for `!=` (the *then* branch is non-null), `false` for `==` (the *else* branch is,
+    // and -- see the `Stmt.If` handling below -- so is everything *after* the whole statement,
+    // if there's no `else` and the `then` branch always exits). Any other condition shape (not
+    // `==`/`!=`, not exactly `ident <op> null`) returns null -- deliberately narrow pattern
+    // matching, not general expression analysis.
+    private fun nullCheckedIdentName(cond: Expr): Pair<String, Boolean>? {
+        if (cond !is Expr.Binary || (cond.op != "==" && cond.op != "!=")) return null
+        val name = when {
             cond.left is Expr.Ident && cond.right is Expr.NullLit -> cond.left.name
             cond.right is Expr.Ident && cond.left is Expr.NullLit -> cond.right.name
             else -> null
+        } ?: return null
+        return name to (cond.op == "!=")
+    }
+
+    // Re-declares `name` in `env`'s *current* top frame as non-nullable, if it's currently a
+    // nullable `Ty.JavaExtern` or `Ty.Str_` -- shared by every narrowing call site below. A
+    // no-op for anything else (already non-nullable, not a nullable-capable type, unknown name),
+    // so it's safe to call unconditionally wherever a narrowing candidate might apply.
+    private fun narrowNonNull(env: Env, name: String) {
+        val info = env.lookup(name) ?: return
+        when (val ty = info.ty) {
+            is Ty.JavaExtern -> if (ty.nullable) env.declare(name, info.copy(ty = ty.copy(nullable = false)))
+            is Ty.Str_ -> if (ty.nullable) env.declare(name, info.copy(ty = Ty.Str_(nullable = false)))
+            else -> {}
         }
     }
 
@@ -1020,8 +1248,21 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Stmt.If -> {
             val (condTy, m0) = checkExpr(stmt.cond, env, moved, consume = true)
             if (condTy != Ty.Bool_) errors += "if condition must be Bool, got ${condTy}"
-            val thenState = checkBlock(stmt.thenB, env, m0, retTy)
-            val elseState = stmt.elseB?.let { checkBlock(it, env, m0, retTy) } ?: m0
+            // `if x != null { ... }` narrows `x` for the *then* branch's own scope only;
+            // `if x == null { ... } else { ... }` narrows it for the *else* branch's own scope
+            // only (its `then` branch is where `x` is null, not the else). Each narrowing is
+            // scoped to exactly that one block via `checkBlock`'s `beforeCheck` hook -- it can
+            // never leak into the sibling branch or outlive the `if`, since it's declared into a
+            // frame that block's own `env.pop()` discards.
+            val narrow = nullCheckedIdentName(stmt.cond)
+            val thenState = checkBlock(stmt.thenB, env, m0, retTy, beforeCheck = {
+                if (narrow != null && narrow.second) narrowNonNull(env, narrow.first)
+            })
+            val elseState = stmt.elseB?.let {
+                checkBlock(it, env, m0, retTy, beforeCheck = {
+                    if (narrow != null && !narrow.second) narrowNonNull(env, narrow.first)
+                })
+            } ?: m0
             val merged = HashMap<String, Boolean>()
             for (k in m0.keys) merged[k] = (thenState[k] ?: false) || (elseState[k] ?: false)
             // `if x == null { <always exits> }`, no `else` -- the only way execution reaches
@@ -1029,14 +1270,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             // for every statement after this one (re-`declare`ing into the same `Env` frame the
             // original `let`/`var`/param lives in). Deliberately narrow, not general: only this
             // exact guard-clause shape is recognized, not arbitrary reachability analysis.
-            if (stmt.elseB == null && blockAlwaysExits(stmt.thenB)) {
-                nullCheckedIdentName(stmt.cond)?.let { name ->
-                    val info = env.lookup(name)
-                    val ty = info?.ty
-                    if (info != null && ty is Ty.JavaExtern && ty.nullable) {
-                        env.declare(name, info.copy(ty = ty.copy(nullable = false)))
-                    }
-                }
+            if (stmt.elseB == null && narrow != null && !narrow.second && blockAlwaysExits(stmt.thenB)) {
+                narrowNonNull(env, narrow.first)
             }
             merged
         }
@@ -1049,7 +1284,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             merged
         }
         is Stmt.For -> checkFor(stmt, env, moved, retTy)
-        is Stmt.Match -> checkMatch(stmt, env, moved, retTy)
+        is Stmt.Match -> checkMatch(stmt.scrutinee, stmt.arms, stmt.line, env, moved, retTy)
         is Stmt.Return -> {
             if (stmt.expr == null) {
                 if (retTy != Ty.Unit_) errors += "Line ${stmt.line}: expected return value of type ${retTy}"
@@ -1138,19 +1373,19 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     // consumed (moved) -- fields get destructured into fresh bindings, mirroring Rust's default
     // `match x { }` semantics for a non-Copy `x`. Exhaustive unless a `_` wildcard is present;
     // moved-state merges conservatively across arms, same as if/else with N branches.
-    private fun checkMatch(stmt: Stmt.Match, env: Env, moved: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
-        val (scrutTy, m0) = checkExpr(stmt.scrutinee, env, moved, consume = true)
-        if (scrutTy is Ty.Dyn) return checkSealedMatch(stmt, scrutTy, env, m0, retTy)
+    private fun checkMatch(scrutinee: Expr, arms: List<MatchArm>, line: Int, env: Env, moved: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
+        val (scrutTy, m0) = checkExpr(scrutinee, env, moved, consume = true)
+        if (scrutTy is Ty.Dyn) return checkSealedMatch(arms, line, scrutTy, env, m0, retTy)
         if (scrutTy !is Ty.Enum) {
-            errors += "Line ${stmt.line}: match requires an enum value or a &dyn sealed interface, got ${scrutTy}"
-            for (arm in stmt.arms) checkBlock(arm.body, env, m0, retTy)
+            errors += "Line ${line}: match requires an enum value or a &dyn sealed interface, got ${scrutTy}"
+            for (arm in arms) checkBlock(arm.body, env, m0, retTy)
             return m0
         }
         val enumInfo = enums.getValue(scrutTy.name)
         val covered = mutableSetOf<String>()
         var hasWildcard = false
         val armStates = mutableListOf<Map<String, Boolean>>()
-        for (arm in stmt.arms) {
+        for (arm in arms) {
             if (hasWildcard) errors += "Line ${arm.line}: unreachable arm after wildcard '_'"
             if (arm.variantName == null) {
                 hasWildcard = true
@@ -1184,7 +1419,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         if (!hasWildcard) {
             val missing = enumInfo.variantNames.toSet() - covered
             if (missing.isNotEmpty()) {
-                errors += "Line ${stmt.line}: match on '${scrutTy.name}' isn't exhaustive, missing ${missing} (add arms or a '_' wildcard)"
+                errors += "Line ${line}: match on '${scrutTy.name}' isn't exhaustive, missing ${missing} (add arms or a '_' wildcard)"
             }
         }
         val merged = HashMap<String, Boolean>()
@@ -1196,17 +1431,17 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     // `X` is `sealed`. Arm patterns name concrete implementer structs (not enum variants);
     // dispatch is an `instanceof` chain in `impl` declaration order, not a tag compare -- see
     // genMatch. Bindings destructure the struct's own fields, same shape as enum matching.
-    private fun checkSealedMatch(stmt: Stmt.Match, scrutTy: Ty.Dyn, env: Env, m0: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
+    private fun checkSealedMatch(arms: List<MatchArm>, line: Int, scrutTy: Ty.Dyn, env: Env, m0: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
         val iface = interfaces[scrutTy.interfaceName]
         if (iface == null || !iface.sealed) {
-            errors += "Line ${stmt.line}: match over '&dyn ${scrutTy.interfaceName}' requires '${scrutTy.interfaceName}' to be a 'sealed interface'"
-            for (arm in stmt.arms) checkBlock(arm.body, env, m0, retTy)
+            errors += "Line ${line}: match over '&dyn ${scrutTy.interfaceName}' requires '${scrutTy.interfaceName}' to be a 'sealed interface'"
+            for (arm in arms) checkBlock(arm.body, env, m0, retTy)
             return m0
         }
         val covered = mutableSetOf<String>()
         var hasWildcard = false
         val armStates = mutableListOf<Map<String, Boolean>>()
-        for (arm in stmt.arms) {
+        for (arm in arms) {
             if (hasWildcard) errors += "Line ${arm.line}: unreachable arm after wildcard '_'"
             if (arm.variantName == null) {
                 hasWildcard = true
@@ -1237,12 +1472,59 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         if (!hasWildcard) {
             val missing = iface.implementers.toSet() - covered
             if (missing.isNotEmpty()) {
-                errors += "Line ${stmt.line}: match on '&dyn ${scrutTy.interfaceName}' isn't exhaustive, missing ${missing} (add arms or a '_' wildcard)"
+                errors += "Line ${line}: match on '&dyn ${scrutTy.interfaceName}' isn't exhaustive, missing ${missing} (add arms or a '_' wildcard)"
             }
         }
         val merged = HashMap<String, Boolean>()
         for (k in m0.keys) merged[k] = armStates.any { it[k] == true }
         return merged
+    }
+
+    // A branch/arm body used as a value must be exactly one bare-expression statement -- see
+    // `Expr.If`'s doc for why (no full Rust-style block-tail-value grammar, deliberately). Runs
+    // the normal `checkBlock` over it regardless (for move/drop bookkeeping) before validating
+    // the shape, so a badly-shaped branch still gets its contents checked instead of skipped.
+    // `Ty.Unit_` stands in for `retTy`: safe because a single `Stmt.ExprStmt` can never be a
+    // `Stmt.Return`, so `checkBlock`'s `retTy` is provably never consulted for this call.
+    private fun checkValueBlock(block: Block, env: Env, moved: Map<String, Boolean>, line: Int, label: String): Triple<Ty, Expr?, Map<String, Boolean>> {
+        val after = checkBlock(block, env, moved, Ty.Unit_)
+        val sole = block.stmts.singleOrNull()
+        if (sole !is Stmt.ExprStmt) {
+            errors += "Line ${line}: ${label} must be exactly one expression (got ${block.stmts.size} statement(s))"
+            return Triple(Ty.Unit_, null, after)
+        }
+        return Triple(sole.expr.ty ?: Ty.Unit_, sole.expr, after)
+    }
+
+    private fun checkIfExpr(expr: Expr.If, env: Env, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
+        val (condTy, m0) = checkExpr(expr.cond, env, moved, consume = true)
+        if (condTy != Ty.Bool_) errors += "Line ${expr.line}: if-expression condition must be Bool, got ${condTy}"
+        val (thenTy, _, thenState) = checkValueBlock(expr.thenB, env, m0, expr.line, "if-expression's 'then' branch")
+        val (elseTy, _, elseState) = checkValueBlock(expr.elseB, env, m0, expr.line, "if-expression's 'else' branch")
+        if (thenTy != elseTy) {
+            errors += "Line ${expr.line}: if-expression branches have incompatible types (${thenTy} vs ${elseTy})"
+        }
+        val merged = HashMap<String, Boolean>()
+        for (k in m0.keys) merged[k] = (thenState[k] ?: false) || (elseState[k] ?: false)
+        return thenTy to merged
+    }
+
+    private fun checkMatchExpr(expr: Expr.Match, env: Env, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
+        val merged = checkMatch(expr.scrutinee, expr.arms, expr.line, env, moved, Ty.Unit_)
+        val armTypes = expr.arms.map { arm ->
+            val sole = arm.body.stmts.singleOrNull()
+            if (sole !is Stmt.ExprStmt) {
+                errors += "Line ${arm.line}: match-expression arm must be exactly one expression (got ${arm.body.stmts.size} statement(s))"
+                Ty.Unit_
+            } else {
+                sole.expr.ty ?: Ty.Unit_
+            }
+        }
+        val ty = armTypes.firstOrNull() ?: Ty.Unit_
+        if (armTypes.any { it != ty }) {
+            errors += "Line ${expr.line}: match-expression arms have incompatible types (${armTypes.distinct()})"
+        }
+        return ty to merged
     }
 
     // Returns (type-of-expr, moved-state-after-evaluating-expr). `consume` marks any
@@ -1264,14 +1546,21 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             is Expr.LongLit -> Ty.Long_ to moved
             is Expr.FloatLit -> Ty.Float_ to moved
             is Expr.DoubleLit -> Ty.Double_ to moved
-            is Expr.StringLit -> Ty.Str_ to moved
+            is Expr.StringLit -> Ty.Str_() to moved
             is Expr.BoolLit -> Ty.Bool_ to moved
-            // Never a real value of any type on its own -- only meaningful as a direct operand
-            // of `==`/`!=`, handled entirely inside the `Expr.Binary` case below (which checks
-            // for this case before recursing into either side normally). Reached here only if
-            // `null` appears somewhere else in the program, which `Ty.Unit_` makes into an
-            // ordinary type-mismatch error at whatever expected the real type instead.
-            is Expr.NullLit -> Ty.Unit_ to moved
+            // Two legal shapes: a direct operand of `==`/`!=` (handled entirely inside the
+            // `Expr.Binary` case below, which checks for this before recursing normally), or
+            // *constructing* a nullable value in a position whose expected type is already
+            // known to be a nullable extern type -- `return null;` against a `Type?`-returning
+            // function, `let x: Type? = null;` -- mirroring the same `expectedTy`-hint
+            // mechanism bare `None` already needed for generic unit-variant construction.
+            // Anywhere else, `Ty.Unit_` turns a bare `null` into an ordinary type-mismatch
+            // error at whatever expected the real type instead.
+            is Expr.NullLit -> {
+                if (expectedTy is Ty.JavaExtern && expectedTy.nullable) expectedTy to moved
+                else if (expectedTy is Ty.Str_ && expectedTy.nullable) expectedTy to moved
+                else Ty.Unit_ to moved
+            }
             is Expr.Ident -> {
                 val info = env.lookup(expr.name)
                 if (info == null) {
@@ -1337,10 +1626,34 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             is Expr.Cast -> {
                 val (innerTy, m) = checkExpr(expr.inner, env, moved, consume = true)
                 val targetTy = resolveType(expr.target)
-                if (!isNumeric(innerTy) || !isNumeric(targetTy)) {
-                    errors += "Line ${expr.line}: 'as' only supports numeric conversions between Int/Long/Float/Double, got ${innerTy} as ${targetTy}"
+                // Two, and only two, kinds of `as`: numeric widening/narrowing between
+                // Int/Long/Float/Double (existing), or a reference-type cast between two
+                // object-reference types (Str_/Struct/Enum/Dyn/JavaExtern/Array), compiling to
+                // a real `CHECKCAST` -- the actual bridge from a Java generic API's erased
+                // `Object` (a `List<Component>.add(Object)`, a `Supplier<T>.get(): Object`,
+                // anything erasure touches) back to a concrete, usable type. Trusted like every
+                // other `extern` interaction in this language: a wrong cast type-checks fine and
+                // throws a real `ClassCastException` at runtime, not a compile error -- the
+                // compiler has no classfile-level hierarchy info to verify it against, same
+                // "honesty" tradeoff already documented for `extern class` itself.
+                val bothNumeric = isNumeric(innerTy) && isNumeric(targetTy)
+                val bothObjectRef = innerTy.isObjectRef() && targetTy.isObjectRef()
+                if (!bothNumeric && !bothObjectRef) {
+                    errors += "Line ${expr.line}: 'as' only supports numeric conversions (Int/Long/Float/Double) or reference-type casts, got ${innerTy} as ${targetTy}"
                 }
                 targetTy to m
+            }
+            is Expr.InstanceOf -> {
+                // Deliberately `consume = false` -- a runtime type check is a peek at the value,
+                // not a move (same reasoning as `x == null`'s non-consuming borrow): the checked
+                // expression needs to stay usable right after, e.g. `if (x is Foo) { x.bar(); }`.
+                val (innerTy, m) = checkExpr(expr.inner, env, moved, consume = false)
+                val targetTy = resolveType(expr.target)
+                if (!innerTy.isObjectRef() || !targetTy.isObjectRef()) {
+                    errors += "Line ${expr.line}: 'is' only supports reference types (Struct/Enum/Dyn/JavaExtern/Array/String), got ${innerTy} is ${targetTy}"
+                }
+                expr.resolvedTargetTy = targetTy
+                Ty.Bool_ to m
             }
             is Expr.Binary -> if (expr.left is Expr.NullLit || expr.right is Expr.NullLit) {
                 // `x == null` / `null == x` -- deliberately NOT `consume = true`: comparing
@@ -1354,8 +1667,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 }
                 val other = if (expr.left is Expr.NullLit) expr.right else expr.left
                 val (otherTy, m1) = checkExpr(other, env, moved, consume = false)
-                if (otherTy !is Ty.JavaExtern) {
-                    errors += "Line ${expr.line}: 'null' can only be compared against an extern class value, got ${otherTy}"
+                if (otherTy !is Ty.JavaExtern && otherTy !is Ty.Str_) {
+                    errors += "Line ${expr.line}: 'null' can only be compared against an extern class value or a String, got ${otherTy}"
                 }
                 Ty.Bool_ to m1
             } else {
@@ -1364,7 +1677,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 val ty = when (expr.op) {
                     "+" -> when {
                         isNumeric(lty) && lty == rty -> lty
-                        lty == Ty.Str_ && rty == Ty.Str_ -> Ty.Str_
+                        lty == Ty.Str_() && rty == Ty.Str_() -> Ty.Str_()
                         else -> { errors += "Line ${expr.line}: '+' needs matching Int/Long/Float/Double operands or String+String, got ${lty} + ${rty}"; Ty.Int_ }
                     }
                     "-", "*", "/", "%" -> {
@@ -1408,6 +1721,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             is Expr.StructLit -> checkStructLit(expr, env, moved, expectedTy)
             is Expr.MethodCall -> checkMethodCall(expr, env, moved)
             is Expr.StaticCall -> checkStaticCall(expr, env, moved)
+            is Expr.StaticFieldGet -> checkStaticFieldGet(expr, moved)
             is Expr.FieldAssign -> checkFieldAssign(expr, env, moved)
             is Expr.ArrayLit -> checkArrayLit(expr, env, moved)
             is Expr.ArrayRepeat -> checkArrayRepeat(expr, env, moved)
@@ -1419,6 +1733,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 errors += "Line ${expr.line}: a range (a..b) can only appear directly in 'for x in a..b { }'"
                 Ty.Unit_ to moved
             }
+            is Expr.If -> checkIfExpr(expr, env, moved)
+            is Expr.Match -> checkMatchExpr(expr, env, moved)
         }
         expr.ty = result.first
         return result
@@ -1442,7 +1758,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             val iface = interfaces[recvTy.interfaceName]
             val msig = iface?.methods?.get(expr.method)
             if (iface == null) {
-                errors += "Line ${expr.line}: unknown interface 'dyn ${recvTy.interfaceName}'"
+                errors += "Line ${expr.line}: unknown interface '${recvTy}'"
                 return Ty.Unit_ to m
             }
             if (msig == null) {
@@ -1450,7 +1766,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 // added this method (only possible if the interface is `open`).
                 val extMangled = extensionFns[recvTy.interfaceName to expr.method]
                 if (extMangled == null) {
-                    errors += "Line ${expr.line}: 'dyn ${recvTy.interfaceName}' has no method '${expr.method}'"
+                    errors += "Line ${expr.line}: '${recvTy}' has no method '${expr.method}'"
                     return Ty.Unit_ to m
                 }
                 sig = fns.getValue(extMangled)
@@ -1551,12 +1867,13 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 return Ty.Unit_ to m
             }
             val em = pickCandidate(candidates, expr.args.size)
-            sig = FnSig(listOf(Param("self", TypeRef(ext.name, isRef = true))) + em.params.map { Param("_", TypeRef("Unit", false)) }, listOf(recvTy) + em.params, em.retType)
+            sig = FnSig(listOf(Param("self", TypeRef(ext.name, isRef = true))) + em.params.indices.map { i -> Param("_", TypeRef("Unit", isRef = em.paramIsRef.getOrElse(i) { false }, isMut = em.paramIsMut.getOrElse(i) { false })) }, listOf(recvTy) + em.params, em.retType)
             expr.resolvedName = expr.method
             expr.externOwner = recvTy.binaryName
             expr.externParamTys = em.params
             expr.isStaticExtern = em.isStatic
-        } else if (recvTy == Ty.Str_) {
+            expr.isExternInterface = ext.isInterface
+        } else if (recvTy is Ty.Str_) {
             // A native HC `String` (`Ty.Str_`) and an `extern class Foo = "java.lang.String"
             // { ... }` declaration are the exact same JVM type underneath -- both compile to
             // descriptor `Ljava/lang/String;` -- so a value the checker calls `Str_` is free to
@@ -1566,6 +1883,9 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             // ever emits the receiver's real bytecode value). This is the actual bridge from
             // native strings to things like `.split()`/`.charAt()`/`.trim()` that a bare `Ty.Str_`
             // has no methods of its own for -- see the README's "String instance methods" note.
+            if (recvTy.nullable) {
+                errors += "Line ${expr.line}: cannot call '${expr.method}' on a possibly-null value -- check `== null`/`!= null` first"
+            }
             val ext = externClasses.values.firstOrNull { it.binaryName == "java/lang/String" }
             val candidates = ext?.let { resolveExternMethods(it, expr.method, expr.line) }?.filter { !it.isCtor }.orEmpty()
             if (ext == null || candidates.isEmpty()) {
@@ -1578,6 +1898,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             expr.externOwner = "java/lang/String"
             expr.externParamTys = em.params
             expr.isStaticExtern = em.isStatic
+            expr.isExternInterface = ext.isInterface
         } else {
             errors += "Line ${expr.line}: method call on non-struct type ${recvTy}"
             return Ty.Unit_ to m
@@ -1630,6 +1951,28 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         return sig.ret to m
     }
 
+    // `Alias::FIELD` -- a declared `extern class` static field read (GETSTATIC). Never a move
+    // source: like a `static`, the same field can be read again by anyone else later, so `moved`
+    // passes through unchanged.
+    private fun checkStaticFieldGet(expr: Expr.StaticFieldGet, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
+        val ext = externClasses[expr.typeName]
+        if (ext == null) {
+            errors += "Line ${expr.line}: unknown extern class '${expr.typeName}'"
+            return Ty.Unit_ to moved
+        }
+        val f = ext.field(expr.field)
+        if (f == null) {
+            errors += "Line ${expr.line}: '${expr.typeName}' has no declared static field '${expr.field}'"
+            return Ty.Unit_ to moved
+        }
+        if (!f.isStatic) {
+            errors += "Line ${expr.line}: '${expr.typeName}::${expr.field}' is declared as an instance field, not static -- read it via '<value>.${expr.field}' instead"
+            return Ty.Unit_ to moved
+        }
+        expr.resolvedName = ext.binaryName
+        return f.type to moved
+    }
+
     private fun checkStaticCall(expr: Expr.StaticCall, env: Env, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
         var m = moved
         for (a in expr.args) m = checkExpr(a, env, m, consume = true).second
@@ -1654,10 +1997,11 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             }
             expr.resolvedName = ext.binaryName
             expr.externParamTys = em.params
+            expr.isExternInterface = ext.isInterface
             val retTy = if (em.isCtor) Ty.JavaExtern(ext.binaryName) else em.retType
             return retTy to m
         }
-        
+
         // `S::new(args)` for a `struct S extends C { }` -- not a user-written static method
         // (there's no `impl S { fn new(...) }` anywhere), auto-derived from `C`'s own declared
         // extern constructor: args get forwarded straight through to it (see genStruct's ctor
@@ -1847,6 +2191,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 m = m2
                 if (ty !is Ty.Int_ && ty !is Ty.Long_ && ty !is Ty.Float_ && ty !is Ty.Double_ && ty !is Ty.Bool_ && ty !is Ty.Str_) {
                     errors += "Line ${expr.line}: print only supports Int, Long, Float, Double, Bool, String (got ${ty})"
+                } else if (ty is Ty.Str_ && ty.nullable) {
+                    errors += "Line ${expr.line}: cannot print a possibly-null String -- check `== null`/`!= null` first"
                 }
             }
             expr.resolvedName = "print"
@@ -1855,7 +2201,12 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         if (expr.callee == "read_line") {
             if (expr.args.isNotEmpty()) errors += "Line ${expr.line}: read_line takes no arguments"
             expr.resolvedName = "read_line"
-            return Ty.Str_ to moved
+            // Honestly, `BufferedReader.readLine()` really can return null (at EOF) -- this
+            // stays non-nullable for now to avoid a breaking change to every existing program
+            // that already calls `read_line()` without narrowing (see IDEAS.md for the real
+            // follow-up: making this `String?` once there's an appetite for fixing every
+            // existing call site, not silently here).
+            return Ty.Str_() to moved
         }
         if (expr.callee == "drop") {
             if (expr.args.size != 1) {
@@ -1942,18 +2293,22 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     // already knows how to render. No user-defined `toString`/interpolation overloads exist in
     // this language, so anything else (a struct, an extern type) is a clear compile-time error
     // rather than silently printing something useless like a JVM default toString.
-    private val STRINGIFIABLE = setOf(Ty.Int_, Ty.Long_, Ty.Float_, Ty.Double_, Ty.Bool_, Ty.Str_)
+    private val STRINGIFIABLE = setOf(Ty.Int_, Ty.Long_, Ty.Float_, Ty.Double_, Ty.Bool_, Ty.Str_())
 
     private fun checkStringInterp(expr: Expr.StringInterp, env: Env, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
         var m = moved
         for (e in expr.exprs) {
             val (ty, m2) = checkExpr(e, env, m, consume = true)
             if (ty !in STRINGIFIABLE) {
-                errors += "Line ${expr.line}: cannot interpolate ${ty} into a string -- only Int/Long/Float/Double/Bool/String are supported"
+                // `ty is Ty.Str_ && ty.nullable` falls into this branch too (correctly) -- not
+                // in STRINGIFIABLE (which only contains the non-nullable form), same "must
+                // narrow first" discipline as print()/`+`.
+                errors += "Line ${expr.line}: cannot interpolate ${ty} into a string -- only Int/Long/Float/Double/Bool/String are supported" +
+                    if (ty is Ty.Str_ && ty.nullable) " (this String is possibly-null -- check `== null`/`!= null` first)" else ""
             }
             m = m2
         }
-        return Ty.Str_ to m
+        return Ty.Str_() to m
     }
 
     private fun checkArrayLit(expr: Expr.ArrayLit, env: Env, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
@@ -2037,6 +2392,44 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (expr.field != "length") errors += "Line ${expr.line}: array has no field '${expr.field}' (only 'length')"
             return Ty.Int_ to m
         }
+        if (oty is Ty.JavaExtern) {
+            // `recv.FIELD` on an `extern class` value -- a real instance field read (GETFIELD),
+            // the receiver-borrow counterpart to `Alias::FIELD`'s static one. Same "trust the
+            // declared shape" honesty as everything else under `extern`.
+            if (oty.nullable) {
+                errors += "Line ${expr.line}: cannot access field '${expr.field}' on a possibly-null value -- check `== null`/`!= null` first"
+            }
+            val ext = externClasses.values.firstOrNull { it.binaryName == oty.binaryName }
+            val f = ext?.field(expr.field)
+            if (ext == null || f == null) {
+                // Property-style sugar: no declared field named `expr.field`, but a zero-arg
+                // Java-bean getter (`getField`/`isField`) exists -- resolve to that instead of
+                // erroring. Scoped to non-`lazy` extern classes only (explicit signature or
+                // `use { }` reflection, both fully resolved up front): probing two candidate
+                // names (`getX` then `isX`) through the *lazy* on-demand reflection path would
+                // fire a real classpath lookup, and log a real "no such member" error, for every
+                // name that doesn't happen to exist -- fine for a single deliberate method call,
+                // noisy (up to two spurious errors before this function's own) for a guess.
+                if (ext != null && !ext.lazy) {
+                    val cap = expr.field.replaceFirstChar { it.uppercase() }
+                    val getter = ext.method("get$cap").firstOrNull { !it.isCtor && !it.isStatic && it.params.isEmpty() }
+                        ?: ext.method("is$cap").firstOrNull { !it.isCtor && !it.isStatic && it.params.isEmpty() }
+                    if (getter != null) {
+                        expr.externGetterMethod = getter.name
+                        expr.resolvedName = ext.binaryName
+                        return getter.retType to m
+                    }
+                }
+                errors += "Line ${expr.line}: '${oty}' has no declared field '${expr.field}' (and no zero-arg getter 'get${expr.field.replaceFirstChar { it.uppercase() }}'/'is${expr.field.replaceFirstChar { it.uppercase() }}' to use as a property)"
+                return Ty.Unit_ to m
+            }
+            if (f.isStatic) {
+                errors += "Line ${expr.line}: '${expr.field}' is declared as a static field -- read it via '${ext.name}::${expr.field}' instead"
+                return Ty.Unit_ to m
+            }
+            expr.resolvedName = ext.binaryName
+            return f.type to m
+        }
         val fty = (oty as? Ty.Struct)?.let { structs[it.name]?.fieldType(expr.field) }
         if (oty !is Ty.Struct) {
             errors += "Line ${expr.line}: field access on non-struct type ${oty}"
@@ -2081,6 +2474,18 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         if (expectedTy is Ty.Dyn && argTy is Ty.Struct) {
             val owner = structInstanceTemplate[argTy.name] ?: argTy.name
             return structInterfaces[owner]?.contains(expectedTy.interfaceName) == true
+        }
+        // A definitely-non-null value trivially satisfies a "maybe null" expectation --
+        // `return get_pos_raw(...)` (never null) against a `-> BlockPos?`-declared function,
+        // `let x: Type? = someNonNullValue;`. The reverse direction (a possibly-null value
+        // where non-nullable is expected) is deliberately NOT allowed here -- that's exactly
+        // what forces the `== null` guard-clause check in the first place.
+        if (expectedTy is Ty.JavaExtern && argTy is Ty.JavaExtern && expectedTy.nullable && !argTy.nullable) {
+            return argTy.binaryName == expectedTy.binaryName
+        }
+        // Same widening, for the one nullable-capable type that isn't a `JavaExtern`.
+        if (expectedTy is Ty.Str_ && argTy is Ty.Str_ && expectedTy.nullable && !argTy.nullable) {
+            return true
         }
         return false
     }

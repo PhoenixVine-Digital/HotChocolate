@@ -100,7 +100,7 @@ class ClasspathReflector(classpathEntries: List<String>) {
         c == java.lang.Double.TYPE -> Ty.Double_
         c == java.lang.Boolean.TYPE -> Ty.Bool_
         c == java.lang.Void.TYPE -> Ty.Unit_
-        c == java.lang.String::class.java -> Ty.Str_
+        c == java.lang.String::class.java -> Ty.Str_()
         c.isArray -> javaClassToTyOrNull(c.componentType)?.let { Ty.Array(it) }
         c.isPrimitive -> null // byte, short, char -- unrepresentable here
         else -> Ty.JavaExtern(c.name.replace('.', '/'))

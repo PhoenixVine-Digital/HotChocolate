@@ -11,7 +11,13 @@ sealed class Ty {
     object Float_ : Ty() { override fun toString() = "Float" }
     object Double_ : Ty() { override fun toString() = "Double" }
     object Bool_ : Ty() { override fun toString() = "Bool" }
-    object Str_ : Ty() { override fun toString() = "String" }
+    // `nullable`: this value came from a JVM call declared `-> String?` and hasn't been
+    // null-checked yet -- same meaning, same narrowing mechanism (`Checker.narrowNonNull`) as
+    // `JavaExtern.nullable`, just for the one built-in type that isn't itself a `JavaExtern`
+    // (native strings get real `+`/interpolation/etc. support `JavaExtern` doesn't). Default
+    // `false` so every existing bare `Ty.Str_()` call site (a plain `String`) is unaffected --
+    // only `resolveType` ever constructs the `nullable = true` form, from a declared `String?`.
+    data class Str_(val nullable: Boolean = false) : Ty() { override fun toString() = "String" + (if (nullable) "?" else "") }
     object Unit_ : Ty() { override fun toString() = "Unit" }
     data class Struct(val name: String) : Ty() { override fun toString() = name }
     data class Array(val elem: Ty) : Ty() { override fun toString() = "[$elem]" }
@@ -21,7 +27,17 @@ sealed class Ty {
     // `&dyn InterfaceName` / `&mut dyn InterfaceName` -- a reference that can point to any
     // struct implementing the interface, dispatched dynamically (INVOKEINTERFACE). Always
     // used behind a borrow; there's no owned `dyn X` in this language.
-    data class Dyn(val interfaceName: String) : Ty() { override fun toString() = "dyn $interfaceName" }
+    // `$Bound$A$B`-named interfaces are checker-internal synthetic ones (see
+    // Checker.syntheticBoundInterface) merging a `<T: A + B>` bound's traits so the body can be
+    // checked abstractly -- never a real declared interface a user wrote, so error messages
+    // render them back as the `T: A + B` bound syntax that actually produced them, not the
+    // synthetic name itself (which would otherwise leak an implementation detail into output a
+    // user never wrote).
+    data class Dyn(val interfaceName: String) : Ty() {
+        override fun toString() = if (interfaceName.startsWith("\$Bound\$")) {
+            "T: " + interfaceName.removePrefix("\$Bound\$").split("\$").joinToString(" + ")
+        } else "dyn $interfaceName"
+    }
     // A flat tagged union (no inheritance): one JVM class holding every variant's fields
     // side by side (namespaced `variant$field`), discriminated by an int tag. See EnumInfo.
     data class Enum(val name: String) : Ty() { override fun toString() = name }
@@ -56,7 +72,7 @@ fun Ty.descriptor(): String = when (this) {
     Ty.Float_ -> "F"
     Ty.Double_ -> "D"
     Ty.Bool_ -> "Z"
-    Ty.Str_ -> "Ljava/lang/String;"
+    is Ty.Str_ -> "Ljava/lang/String;"
     Ty.Unit_ -> "V"
     is Ty.Struct -> "L${this.name};"
     is Ty.Array -> "[${elem.descriptor()}"
@@ -71,15 +87,37 @@ fun Ty.isObjectRef(): Boolean = this is Ty.Str_ || this is Ty.Struct || this is 
 // `extern class` method table: `params`/`retType` are already resolved `Ty`s (from the exact
 // erased-JVM-signature the extern decl gave). `isStatic == false && name != "new"` -> instance
 // method (INVOKEVIRTUAL, first param is NOT `self` -- self is the receiver, not in this list).
-class ExternMethodInfo(val name: String, val params: List<Ty>, val retType: Ty, val isStatic: Boolean, val isCtor: Boolean)
+// `paramIsRef`/`paramIsMut`: whether each param was declared `&`/`&mut` in the *source* extern
+// signature -- a real JVM call doesn't care (a reference and an owned object-typed value compile
+// identically), but the checker's own borrow-checking (checkMethodCall's arg-borrow validation)
+// needs it to correctly accept e.g. `sup: &dyn JSupplier` called as `foo.bar(&someStruct{})`
+// instead of always assuming "owned" for every extern param. Default all-`false` for reflected
+// signatures (`use {}`/lazy forms): reflection has no way to know source-level `&`-ness, and
+// every reflected param is treated as owned, same as before this was tracked at all.
+class ExternMethodInfo(
+    val name: String,
+    val params: List<Ty>,
+    val retType: Ty,
+    val isStatic: Boolean,
+    val isCtor: Boolean,
+    val paramIsRef: List<Boolean> = params.map { false },
+    val paramIsMut: List<Boolean> = params.map { false },
+)
+// A declared `NAME: Type;`/`static NAME: Type;` inside an `extern class` body -- a real JVM
+// field on the real binary class, e.g. `Minecraft.player` (instance) or `ForgeRegistries.ITEMS`/
+// `Style.EMPTY` (static). Explicit-signature form only (not resolved via `use {}`/lazy
+// reflection) -- scoped narrowly for now, same "trust the declared shape" honesty as an extern
+// method's signature.
+class ExternFieldInfo(val name: String, val type: Ty, val isStatic: Boolean = true)
 // `lazy`: this class's members were declared with no signatures at all (bare `extern class X =
 // "binary.Name";`, option 3) -- `methods` starts empty and the checker fills entries in one
 // name at a time, on demand, the first time a call site actually asks for that name (see
 // Checker.resolveExternMethods). Not set for the `use { name, ... }` form (option 2): those
 // resolve every requested name up front at registration time, same as hand-written signatures,
 // so `methods` is already complete by the time any call site is checked.
-class ExternClassInfo(val name: String, val binaryName: String, val methods: List<ExternMethodInfo>, val lazy: Boolean = false) {
+class ExternClassInfo(val name: String, val binaryName: String, val methods: List<ExternMethodInfo>, val lazy: Boolean = false, val fields: List<ExternFieldInfo> = emptyList(), val isInterface: Boolean = false) {
     fun method(name: String): List<ExternMethodInfo> = methods.filter { it.name == name }
+    fun field(name: String): ExternFieldInfo? = fields.firstOrNull { it.name == name }
 }
 
 class StructInfo(val name: String, val fields: List<Pair<String, Ty>>) {

@@ -45,7 +45,7 @@ data class Program(
 // injected into every fn's scope) with one difference: a read is *never* treated as a move,
 // since there's no scope for the value to be "used up" by -- the next reader anywhere in the
 // program still needs to see it.
-data class StaticDecl(val name: String, val type: TypeRef, val init: Expr, val line: Int, val moduleName: String? = null, val visible: Boolean = false)
+data class StaticDecl(val name: String, val type: TypeRef, val init: Expr, val line: Int, val moduleName: String? = null, val visible: Boolean = false, val sourceUnit: String? = null)
 
 // `extend Target { fn newMethod(&self, ...) -> T { body } }` -- adds a new, callable method to
 // an existing type *without* touching its own declaration, from any module. `target` is either
@@ -78,13 +78,33 @@ data class ExtendBlock(val targetName: String, val methods: List<FnDecl>, val mo
 //      actually asks for that name (Checker.resolveExternMethods), and cached from then on.
 //      Least ceremony, but also the least checkable up front: a typo'd method name isn't an
 //      error until/unless something calls it.
+// `isInterface`: the real JVM type this alias trusts is an `interface`, not a `class` --
+// `extern class Alias = "some.Interface" interface { ... }`. Matters purely for codegen's choice
+// of invoke instruction/constant-pool-entry kind: an interface's *instance* methods need
+// INVOKEINTERFACE (not INVOKEVIRTUAL), and even its *static* methods (legal since Java 8) still
+// need an InterfaceMethodref constant, not a plain Methodref, despite still using the INVOKESTATIC
+// opcode. Getting this wrong compiles clean and `javap`-verifies fine (ASM emits a structurally
+// valid classfile either way) but throws `IncompatibleClassChangeError: ... must be
+// InterfaceMethodref constant` the moment the JVM actually links the call -- verified the hard
+// way against a real Forge mod calling `Component.literal(String)` (`Component` is a real
+// interface with a static factory method). Distinct from `extern interface` (see InterfaceDecl's
+// doc): that's for an HC struct to *implement* a real interface; this is for *calling* one's own
+// methods (static or instance) the same way `extern class` already does for a real class.
 data class ExternClassDecl(
     val name: String,
     val binaryName: String,
     val methods: List<ExternMethodDecl>,
     val useNames: List<String>? = null,
     val lazyAll: Boolean = false,
+    val fields: List<ExternFieldDecl> = emptyList(),
+    val isInterface: Boolean = false,
 )
+// `NAME: Type;` (instance field, read via `recv.NAME` -- ordinary Expr.FieldAccess, same syntax
+// a struct field uses) or `static NAME: Type;` (static field, read via `Alias::NAME` -- see
+// Expr.StaticFieldGet) inside an `extern class` body -- a real JVM field (e.g. `Minecraft
+// .player`, `ForgeRegistries.ITEMS`). Explicit-signature form only, same scope cut as
+// ExternMethodDecl.
+data class ExternFieldDecl(val name: String, val type: TypeRef, val line: Int, val isStatic: Boolean = true)
 // `self` present (params[0].name == "self") -> instance method (INVOKEVIRTUAL). No self and
 // name == "new" -> constructor (NEW + INVOKESPECIAL <init>). No self otherwise -> static
 // method (INVOKESTATIC). Types in `params`/`retType` must be the exact erased JVM signature --
@@ -153,6 +173,27 @@ data class InterfaceMethodDecl(val name: String, val params: List<Param>, val re
 // on what it thinks is a plain `Item`) reaches them via ordinary JVM virtual dispatch -- no shim
 // class, no reflection. The actual mechanism that lets a whole Forge/Minecraft `Item`/`Block`/
 // etc. subclass be written natively in HC instead of needing a thin Java shell.
+// `sourceUnit`: which `.hc` FILE this was declared in, stamped on only for a directory-mode
+// multi-file compile (see Main.kt's `compileEntry`) -- `null` for a single-file compile, where
+// there's only one file so the distinction is meaningless. Exists specifically so CodeGen's
+// "named holder" merge (see IDEAS.md's now-shipped "Named binary target for module-level pub
+// fn/pub static") can group by *file*, not just by `moduleName`: multiple files legitimately
+// share one module today (`client/CopyToolHudOverlay.hc`, `CopyToolSelectionRender.hc`,
+// `RenderUtil.hc` all declare `module ...client;`), each with its own struct meant to be its
+// own separately-named class -- grouping by module alone would silently merge all three files'
+// top-level fns onto whichever struct happened to be first, breaking every other file's
+// `OtherStruct::its_fn(...)` call sites that assumed their own file's struct was still the
+// target. See CodeGen's `moduleFirstStructName`.
+// `@serializable`: a bare compiler *directive*, not a real Java annotation -- distinguished from
+// `@"binary.Name"(...)` purely by the absence of a quoted string right after `@` (see the
+// parser's `leadingMarkers`). Triggers real code generation (two synthesized top-level `pub fn`s,
+// `encode`/`decode`, fed through the exact same checking/codegen pipeline any hand-written fn
+// goes through -- see Checker's `genSerializationFns`), not a classfile attribute; nothing about
+// it is emitted as bytecode metadata the way `annotations` above is. Scoped to exactly one
+// target for this first pass -- a real JVM `FriendlyByteBuf` (Forge's network-packet buffer
+// wrapper) the struct's own fields get written to/read from, field-by-field, in declaration
+// order -- see the README's "`@serializable`" section for why this target and not a general
+// pluggable one.
 data class StructDecl(
     val name: String,
     val fields: List<FieldDecl>,
@@ -162,7 +203,44 @@ data class StructDecl(
     val moduleName: String? = null,
     val visible: Boolean = false,
     val superclass: String? = null,
+    val annotations: List<AnnotationUse> = emptyList(),
+    val sourceUnit: String? = null,
+    val serializable: Boolean = false,
 )
+
+// `@"binary.Name"(argName: value, ...)` immediately before a top-level `struct`/`fn` -- a real
+// Java annotation, emitted as a genuine classfile `RuntimeVisibleAnnotations` attribute (see
+// CodeGen's `emitAnnotations`), not just a compiler-internal marker. Exists specifically to
+// reach reflection-driven Java frameworks (Forge's `@SubscribeEvent`/`@Mod.EventBusSubscriber`
+// event-bus scanning being the motivating case -- see the README's "Java annotations" section)
+// where there's no programmatic registration API to call instead. Annotation argument *values*
+// are compile-time constants baked directly into the classfile attribute, not executable code --
+// deliberately a much smaller grammar than a real expression (`AnnotationValue`, below), not the
+// general `Expr` this language uses everywhere else.
+data class AnnotationUse(val binaryName: String, val args: List<Pair<String, AnnotationValue>>, val line: Int)
+sealed class AnnotationValue {
+    data class Str(val value: String) : AnnotationValue()
+    // A real Java `enum` constant (e.g. `Dist.CLIENT`), stored as (the enum's own binary name,
+    // the constant's name) -- exactly what `AnnotationVisitor.visitEnum` needs, and exactly what
+    // the classfile format itself stores for an enum-typed annotation argument (there's no
+    // "executable reference" to a JVM enum constant the way `GETSTATIC` reads one at runtime;
+    // annotation metadata is inert data read back via reflection, never executed).
+    data class EnumConst(val enumBinaryName: String, val constName: String) : AnnotationValue()
+    // `[value, value, ...]` -- an array-typed annotation attribute (e.g. Forge's
+    // `Mod.EventBusSubscriber.value()`, which is `Dist[]`, not a single `Dist`). Classfile-level
+    // array annotation values are a genuinely different encoding from a scalar one
+    // (`AnnotationVisitor.visitArray` wrapping N nested element writes, vs one direct `visit`/
+    // `visitEnum` call) -- there's no reflection against a real `@interface` to infer this from
+    // (see AnnotationUse's doc), so the source has to say which shape it means: bare
+    // `enum("...", "CLIENT")` for a scalar-typed attribute, `[enum("...", "CLIENT")]` (even with
+    // one element) for an array-typed one. Writing a bare value where the real attribute is
+    // actually array-typed compiles fine but produces a classfile a real annotation-array
+    // consumer chokes on at class-load/scan time (verified: Forge's own `@Mod.EventBusSubscriber`
+    // handling throws a `ClassCastException` casting its scanned `EnumHolder` to `List` when
+    // `value` was written scalar) -- exactly the kind of "trust the declaration" failure mode
+    // every other `extern`-adjacent feature in this language already has, not a new one.
+    data class Arr(val values: List<AnnotationValue>) : AnnotationValue()
+}
 data class FieldDecl(val name: String, val type: TypeRef)
 
 // `moduleName`/`visible` are only meaningful for a *top-level* fn -- methods desugared from an
@@ -185,6 +263,10 @@ data class FnDecl(
     val moduleName: String? = null,
     val visible: Boolean = false,
     val isOverride: Boolean = false,
+    val annotations: List<AnnotationUse> = emptyList(),
+    // See StructDecl's `sourceUnit` doc -- same purpose, same "which file, for a directory-mode
+    // compile only" meaning.
+    val sourceUnit: String? = null,
 )
 data class Param(val name: String, val type: TypeRef)
 
@@ -272,10 +354,29 @@ sealed class Expr {
     // `expr as Type` -- numeric conversion only (Int/Float/Double), compiling directly to a
     // primitive JVM conversion instruction (I2F, D2I, ...), never a method call.
     data class Cast(val inner: Expr, val target: TypeRef, val line: Int) : Expr()
+    // `expr is Type` -- a real runtime type check (JVM `INSTANCEOF`), the boolean-returning
+    // counterpart to `as`'s (potentially-throwing) cast. Same reference-type-only scope as `as`.
+    // `expr.ty` (inherited from the base class) ends up `Bool_` (this node's own result type),
+    // so the checker's resolved *target* type is cached separately here for codegen to read back
+    // (`checkcastOperand` needs the real Ty, not the raw `target: TypeRef`).
+    data class InstanceOf(val inner: Expr, val target: TypeRef, val line: Int) : Expr() {
+        var resolvedTargetTy: Ty? = null
+    }
     data class Borrow(val inner: Expr, val isMut: Boolean = false) : Expr()
     data class Assign(val name: String, val value: Expr, val line: Int) : Expr()
     data class Call(val callee: String, val args: List<Expr>, val line: Int) : Expr()
-    data class FieldAccess(val obj: Expr, val field: String, val line: Int) : Expr()
+    data class FieldAccess(val obj: Expr, val field: String, val line: Int) : Expr() {
+        // Set by the checker (checkFieldAccess) when `field` doesn't name a declared
+        // `extern class` field but DOES match a zero-arg `getField`/`isField` instance method --
+        // property-style sugar (`enemy.health` reading as `enemy.getHealth()`) so interop-heavy
+        // code doesn't have to spell out Java's bean-getter ceremony. Holds the real method name
+        // to call (`"getHealth"`/`"isHealth"`, not `"health"`); `resolvedName` (inherited) is
+        // still the owning extern class's binary name, same field both plain field reads and
+        // this sugar populate. Null for every other `FieldAccess` (struct fields, array
+        // `.length`, arena fields, a real declared extern field) -- codegen's default GETFIELD
+        // path is unaffected.
+        var externGetterMethod: String? = null
+    }
     data class FieldAssign(val obj: Expr, val field: String, val value: Expr, val line: Int) : Expr()
     // Doubles as an enum variant construction (`Circle { radius: 5 }`): `resolvedName` is
     // still the NEW target's class name either way (the struct's own, or the owning enum's),
@@ -302,12 +403,21 @@ sealed class Expr {
         // at runtime against the real external method with a mismatched signature.
         var externParamTys: List<Ty>? = null
         var isStaticExtern: Boolean = false
+        // See ExternClassDecl's `isInterface` doc -- codegen needs this to pick INVOKEINTERFACE
+        // over INVOKEVIRTUAL for an instance call (and the right constant-pool-entry kind for a
+        // static one) when the real target is a Java interface, not a class.
+        var isExternInterface: Boolean = false
     }
     // `TypeName::method(args)` -- a constructor (`method == "new"`, NEW + INVOKESPECIAL) or a
     // static method (INVOKESTATIC) on an `extern class`. `resolvedName` (inherited) is set to
     // the extern class's binary name. `externParamTys` -- see MethodCall.externParamTys.
+    // `Alias::FIELD` -- reads a declared `extern class` static field (GETSTATIC). Distinguished
+    // from StaticCall at parse time by the absence of a following `(...)`.
+    data class StaticFieldGet(val typeName: String, val field: String, val line: Int) : Expr()
     data class StaticCall(val typeName: String, val method: String, val args: List<Expr>, val line: Int) : Expr() {
         var externParamTys: List<Ty>? = null
+        // See ExternClassDecl's `isInterface` doc.
+        var isExternInterface: Boolean = false
     }
     data class ArrayLit(val elements: List<Expr>, val line: Int) : Expr()
     data class ArrayRepeat(val value: Expr, val count: Expr, val line: Int) : Expr()
@@ -317,4 +427,21 @@ sealed class Expr {
     data class ArenaNew(val structName: String, val count: Expr, val line: Int) : Expr()
     // Only valid directly as a `for x in a..b` iterable -- not a general-purpose expression.
     data class Range(val start: Expr, val end: Expr, val line: Int) : Expr()
+    // `if cond { thenExpr } else { elseExpr }` used as a value (a `let` RHS, a call arg, ...) --
+    // distinct from `Stmt.If` (parsed at statement position, no value needed, `elseB` optional).
+    // Deliberately narrow first pass: `else` is required (no value without one), and each branch
+    // block must contain *exactly one* statement, itself a bare expression (`Stmt.ExprStmt`) --
+    // this is a ternary-shaped if-expression (every branch a single expression), not Rust's full
+    // "last statement in any block, sans semicolon, is the block's value" model, which would need
+    // a real grammar change (this needs none: `{ expr; }` already parses today, just previously
+    // only ever discarded as a statement). The checker enforces the one-ExprStmt-per-branch shape
+    // and that both branches produce the same type; codegen reads each branch's sole statement's
+    // expr directly (no `genBlock`, no scope/drop machinery -- a single bare expression can't
+    // introduce a `let` binding that would need either).
+    data class If(val cond: Expr, val thenB: Block, val elseB: Block, val line: Int) : Expr()
+    // `match scrutinee { Variant { a, b } => expr, _ => expr }` used as a value -- same
+    // "exactly one expression per arm" restriction as `If` above, same reason. Otherwise
+    // shares every dispatch rule (enum tag compare vs `&dyn sealed interface` instanceof chain,
+    // exhaustiveness) with the statement form (`Stmt.Match`).
+    data class Match(val scrutinee: Expr, val arms: List<MatchArm>, val line: Int) : Expr()
 }

@@ -9,6 +9,7 @@ import hc.sema.StaticInfo
 import hc.sema.StructInfo
 import hc.sema.Ty
 import hc.sema.descriptor
+import hc.sema.isObjectRef
 import hc.sema.isWide
 import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.Label
@@ -54,6 +55,37 @@ private fun descOf(t: Ty, moduleOf: Map<String, String?>, externInterfaceBinaryN
     is Ty.Enum -> "L${qualify(t.name, moduleOf)};"
     is Ty.Array -> "[${descOf(t.elem, moduleOf, externInterfaceBinaryNames)}"
     else -> t.descriptor()
+}
+
+// Emits a real classfile `RuntimeVisibleAnnotations` attribute for each declared `@"..."`
+// (see AnnotationUse) -- shared between struct-class and method annotation sites via the
+// `visitAnn` lambda, since `ClassVisitor.visitAnnotation` and `MethodVisitor.visitAnnotation`
+// have the same shape but no common supertype worth depending on here. `visible = true`
+// (RUNTIME retention) always -- reflection-driven consumers like Forge's event bus need it at
+// runtime, and there's no source-level way to ask for a lesser retention policy (matches this
+// language's "no configuration knobs beyond what's actually needed" bias elsewhere).
+private fun emitAnnotations(annotations: List<AnnotationUse>, visitAnn: (String, Boolean) -> org.objectweb.asm.AnnotationVisitor) {
+    for (ann in annotations) {
+        val av = visitAnn("L${ann.binaryName};", true)
+        for ((argName, value) in ann.args) emitAnnotationValue(av, argName, value)
+        av.visitEnd()
+    }
+}
+
+// `argName` is ignored by ASM for an array element's own nested writes (conventionally passed
+// `null` there, per `AnnotationVisitor.visitArray`'s contract) -- recursion handles that
+// uniformly rather than duplicating the `when` once for top-level args and once for array
+// elements.
+private fun emitAnnotationValue(av: org.objectweb.asm.AnnotationVisitor, argName: String?, value: AnnotationValue) {
+    when (value) {
+        is AnnotationValue.Str -> av.visit(argName, value.value)
+        is AnnotationValue.EnumConst -> av.visitEnum(argName, "L${value.enumBinaryName};", value.constName)
+        is AnnotationValue.Arr -> {
+            val arrAv = av.visitArray(argName)
+            for (elem in value.values) emitAnnotationValue(arrAv, null, elem)
+            arrAv.visitEnd()
+        }
+    }
 }
 
 // Shared mutable flag so callers can tell, after generate(), whether the emitted bytecode
@@ -110,41 +142,105 @@ class CodeGen(
         for (e in enums.values) put(e.name, e.visible)
     }
 
-    // Which module each top-level fn (including desugared impl/extend methods) was declared
-    // in -- drives which per-module holder class it compiles onto (see genHolderClass). Unlike
-    // types, a fn's *own* `pub`/private-ness is still only checker-tracked (every fn is emitted
-    // as a real public or package-private JVM method either way -- see genFn -- but which
-    // holder class it lands on doesn't yet vary per fn the way a struct's own class does).
-    private val fnModuleOf: Map<String, String?> = program.fns.associate { it.name to it.moduleName }
+    // A "compile unit" a fn/struct/static belongs to: its declaring module, *plus* which source
+    // file it came from in a directory-mode multi-file compile (`sourceUnit`; always `null` for
+    // a single-file compile, where every declaration necessarily shares the one file). Holder-
+    // class grouping (below) keys on this pair, not the module alone -- see StructDecl's
+    // `sourceUnit` doc for exactly why: multiple files can (and in real projects do) legitimately
+    // share one `module` line, each meaning its own struct to be its own separately-named class.
+    private data class Unit(val module: String?, val sourceUnit: String?)
 
-    // The module `fn main()` lives in -- including the default/unnamed module (`null`) if
-    // `main()` itself never declared one, which is the common case and must NOT fall through
-    // to guessing a different module just because *some* other fn happens to have one. Only
-    // when there's no `main()` at all (a "library" compile, e.g. examples/interop-style .hc
-    // meant to be embedded rather than run) does this fall back to the first module any fn
-    // declared. That module's holder class keeps the CLI-supplied `mainClassName` and gets the
-    // real JVM `public static void main(String[])` entry point and the `read_line()` backing
-    // reader; every other module's fns land on their own `$Fns` holder class in their own
-    // package. `$` can't collide with a user identifier -- the lexer never accepts it in one.
-    private val entryModuleName: String? = run {
+    // Which unit each top-level fn (including desugared impl/extend methods) was declared in --
+    // drives which holder class it compiles onto (see genHolderClass). Unlike types, a fn's
+    // *own* `pub`/private-ness is still only checker-tracked (every fn is emitted as a real
+    // public or package-private JVM method either way -- see genFn -- but which holder class it
+    // lands on doesn't yet vary per fn the way a struct's own class does).
+    private val fnUnitOf: Map<String, Unit> = program.fns.associate { it.name to Unit(it.moduleName, it.sourceUnit) }
+
+    // The unit `fn main()` lives in -- including the default/unnamed module (`null` module,
+    // `null` sourceUnit) if `main()` itself never declared one, which is the common case and
+    // must NOT fall through to guessing a different unit just because *some* other fn happens to
+    // have one. Only when there's no `main()` at all (a "library" compile, e.g. examples/
+    // interop-style .hc meant to be embedded rather than run) does this fall back to the first
+    // unit any fn declared. That unit's holder class keeps the CLI-supplied `mainClassName` and
+    // gets the real JVM `public static void main(String[])` entry point and the `read_line()`
+    // backing reader; every other unit's fns land on their own holder in their own package --
+    // named after that unit's own source file when one is known (a directory-mode compile), or
+    // the synthetic `$Fns` when it isn't (a single-file compile with no struct to name it after).
+    // `$` can't collide with a user identifier -- the lexer never accepts it in one.
+    private val entryUnit: Unit = run {
         val mainFn = program.fns.firstOrNull { it.name == "main" }
-        if (mainFn != null) mainFn.moduleName else fnModuleOf.values.firstOrNull { it != null }
+        if (mainFn != null) Unit(mainFn.moduleName, mainFn.sourceUnit)
+        else fnUnitOf.values.firstOrNull() ?: Unit(null, null)
     }
 
-    private fun holderClassName(mod: String?): String {
-        val simple = if (mod == entryModuleName) mainClassName else "\$Fns"
-        val prefix = mod?.let { it.replace('.', '/') + "/" } ?: ""
+    // Whether the program declares a *genuine* `fn main()` anywhere, vs. `entryUnit` above only
+    // being an arbitrary fallback pick (the first unit any fn happened to declare, since `hc
+    // build`/`hc run` need *some* launchable class to exist even for a program that never
+    // actually declares one). This distinction matters below: a real `main()` has an earned,
+    // load-bearing claim to `mainClassName` (predictable `hc run` launch target) even if some
+    // unrelated struct happens to share its unit; an arbitrary fallback pick has no such claim,
+    // and forcing `mainClassName` onto it anyway would be actively wrong once that unit already
+    // has a real name of its own to use instead (its own struct, or -- in a directory-mode
+    // compile -- its own source file's name) -- exactly the bug a real multi-file library compile
+    // (no `main()` anywhere, several units each meaning to keep their own class identity) hits.
+    private val hasRealMain: Boolean = program.fns.any { it.name == "main" }
+
+    // A unit that declares at least one struct doesn't need a synthetic `$Fns` holder for its
+    // top-level fns/statics at all -- they land as ordinary static members on that unit's *first*
+    // declared struct's own class instead, so Java code can reference e.g. `Items.COPY_TOOL` by a
+    // real name instead of an undiscoverable `$Fns` one (see the README's "Named binary target
+    // for module-level pub fn/pub static"). Scoped to exactly "first struct wins"; a unit mixing
+    // multiple structs with top-level fns still only merges onto the first one. Excludes the
+    // entry unit only when there's a *genuine* `main()` claiming it (see `hasRealMain`) -- that
+    // case keeps the CLI-supplied `mainClassName` unconditionally, since that's the one binary
+    // name `hc run`/`hc build` are contractually allowed to assume. An arbitrary fallback entry
+    // unit's own struct (if it has one) is preferred instead, same as any other unit.
+    private val unitFirstStructName: Map<Unit, String> = buildMap {
+        for (s in program.structs) {
+            val u = Unit(s.moduleName, s.sourceUnit)
+            if (u != entryUnit || !hasRealMain) putIfAbsent(u, s.name)
+        }
+    }
+
+    private fun holderClassName(unit: Unit): String {
+        val prefix = unit.module?.let { it.replace('.', '/') + "/" } ?: ""
+        unitFirstStructName[unit]?.let { return qualify(it, moduleOf) }
+        // `mainClassName` is only the right fallback for the entry unit when either a real
+        // `main()` earned it (see `hasRealMain`), or this is a single-file compile (`sourceUnit
+        // == null`) -- there, `mainClassName` already *is* this file's own name by construction
+        // (`Main.kt`: `mainClassName = file.nameWithoutExtension`), so it's correct even for an
+        // arbitrary fallback pick. Otherwise (a directory-mode compile's arbitrary fallback
+        // entry, no struct of its own either) prefer this unit's own source file's name -- a far
+        // better identity than either the wrong `mainClassName` (the whole *directory's* name,
+        // unrelated to this specific file) or the anonymous `$Fns`.
+        if (unit == entryUnit && (hasRealMain || unit.sourceUnit == null)) return prefix + mainClassName
+        val simple = unit.sourceUnit?.replaceFirstChar { it.uppercase() } ?: "\$Fns"
         return prefix + simple
     }
     // Public so Main.kt knows the exact (already-qualified) binary name to launch for `hc run`.
-    val entryHolderClassName: String = holderClassName(entryModuleName)
-    private val fnOwnerClass: Map<String, String> = fnModuleOf.mapValues { (_, mod) -> holderClassName(mod) }
+    val entryHolderClassName: String = holderClassName(entryUnit)
+    private val fnOwnerClass: Map<String, String> = fnUnitOf.mapValues { (_, unit) -> holderClassName(unit) }
+
+    // True exactly when the entry unit has its own registered first struct in `unitFirstStructName`
+    // -- i.e. `holderClassName(entryUnit)` resolves via that struct, not `mainClassName`. Without
+    // this check, `generate()` would emit *two different classfiles* under the same qualified
+    // name for such a unit -- genStruct's (fields, `<init>`, any `@annotation`) and
+    // genHolderClass's (merged statics/fns, the `main`/`$in` wrapper) -- and since both land in
+    // the same output map keyed by that one name, the second write silently clobbers the first.
+    // Confirmed this was already happening, silently, for `Items.hc`: its compiled class was
+    // missing its own zero-arg constructor entirely (harmless there, since nothing calls `new
+    // Items()` -- but not for a struct needing a class-level `@annotation`, which is what
+    // surfaced this). When true, genStruct takes over the entry-holder's own responsibilities too
+    // (see its `isEntry` param) and the redundant genHolderClass call for this unit is skipped
+    // entirely -- see `generate()`.
+    private val entryUnitFirstStructIsHolder: Boolean = unitFirstStructName.containsKey(entryUnit)
 
     // `pub static NAME: Type = init;` compiles onto its own declaring module's holder class
     // too, right alongside that module's fns -- a real static field, `pub`/private mapped onto
     // ACC_PUBLIC vs package-private same as everything else, initialized once in the holder's
     // own `<clinit>` (see genHolderClass).
-    private val staticOwnerClass: Map<String, String> = statics.mapValues { (_, info) -> holderClassName(info.moduleName) }
+    private val staticOwnerClass: Map<String, String> = statics.mapValues { (_, info) -> holderClassName(Unit(info.moduleName, info.sourceUnit)) }
 
     // `extern interface Alias = "some.Interface" { }` declares a shape for an existing JVM
     // interface -- there's no new class to emit for it (genInterface would try to define a
@@ -159,17 +255,39 @@ class CodeGen(
 
     fun generate(): Map<String, ByteArray> {
         val out = mutableMapOf<String, ByteArray>()
-        for (s in program.structs) out[qualify(s.name)] = genStruct(structs.getValue(s.name))
+        for (s in program.structs) {
+            val unit = Unit(s.moduleName, s.sourceUnit)
+            val isEntryHolder = entryUnitFirstStructIsHolder && unit == entryUnit &&
+                program.structs.first { Unit(it.moduleName, it.sourceUnit) == entryUnit }.name == s.name
+            val isHolder = unitFirstStructName[unit] == s.name || isEntryHolder
+            out[qualify(s.name)] = genStruct(
+                structs.getValue(s.name),
+                if (isHolder) program.fns.filter { fnUnitOf[it.name] == unit } else emptyList(),
+                if (isHolder) statics.values.filter { Unit(it.moduleName, it.sourceUnit) == unit } else emptyList(),
+                s.annotations,
+                isEntryHolder,
+            )
+        }
         for (i in interfaceDecls.filter { it.externBinaryName == null }) out[qualify(i.name)] = genInterface(i)
         for (e in enums.values) out[qualify(e.name)] = genEnum(e)
-        // Always includes the entry module, even if it has zero fns/statics of its own (a
-        // program with no `fn main()` at all, say) -- `hc run`/`hc build` still need a class to
-        // exist there. Also includes any module that only ever declares a `static` and no fns.
-        for (mod in fnModuleOf.values.toSet() + statics.values.map { it.moduleName } + entryModuleName) {
-            out[holderClassName(mod)] = genHolderClass(
-                mod,
-                program.fns.filter { fnModuleOf[it.name] == mod },
-                statics.values.filter { it.moduleName == mod },
+        // Always includes the entry unit, even if it has zero fns/statics of its own (a program
+        // with no `fn main()` at all, say) -- `hc run`/`hc build` still need a class to exist
+        // there. Also includes any unit that only ever declares a `static` and no fns. Skips any
+        // non-entry unit whose fns/statics already got merged onto its first struct's own class
+        // above (see unitFirstStructName) -- that struct's class already covers it, and
+        // holderClassName(unit) now points at that same qualified name for such a unit, so
+        // emitting a second class here would just silently clobber the struct's own bytecode.
+        // Same reasoning for the entry unit specifically when entryUnitFirstStructIsHolder --
+        // genStruct already took over the entry-holder's own responsibilities above.
+        val allUnits = program.fns.map { Unit(it.moduleName, it.sourceUnit) }.toSet() +
+            statics.values.map { Unit(it.moduleName, it.sourceUnit) }.toSet() + entryUnit
+        for (unit in allUnits) {
+            if (unit != entryUnit && unitFirstStructName[unit] != null) continue
+            if (unit == entryUnit && entryUnitFirstStructIsHolder) continue
+            out[holderClassName(unit)] = genHolderClass(
+                unit,
+                program.fns.filter { Unit(it.moduleName, it.sourceUnit) == unit },
+                statics.values.filter { Unit(it.moduleName, it.sourceUnit) == unit },
             )
         }
         return out
@@ -219,7 +337,12 @@ class CodeGen(
         }
     }
 
-    private fun genStruct(info: StructInfo): ByteArray {
+    // `isEntry`: this struct is ALSO the entry module's holder (see entryModuleFirstStructIsHolder)
+    // -- takes over genHolderClass's own responsibilities for that module (the `read_line()`
+    // backing reader field + its `<clinit>` init, and the real JVM `main(String[])` wrapper)
+    // instead of a separate genHolderClass call emitting a second, colliding classfile under the
+    // same qualified name.
+    private fun genStruct(info: StructInfo, fnsForModule: List<FnDecl> = emptyList(), staticsForModule: List<StaticInfo> = emptyList(), annotations: List<AnnotationUse> = emptyList(), isEntry: Boolean = false): ByteArray {
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
         val ifaceNames = structInterfaces[info.name]?.map { jvmIfaceName(it, moduleOf, externInterfaceBinaryNames) }?.toTypedArray()
         // `struct S extends C { }` -- S's real JVM superclass is C's binary name, not
@@ -229,6 +352,7 @@ class CodeGen(
         val superExt = superAlias?.let { externClasses.getValue(it) }
         val superName = superExt?.binaryName ?: "java/lang/Object"
         cw.visit(V17, classAccess(info.name) or ACC_FINAL, qualify(info.name), null, superName, if (ifaceNames.isNullOrEmpty()) null else ifaceNames)
+        emitAnnotations(annotations) { desc, visible -> cw.visitAnnotation(desc, visible) }
 
         for ((fname, fty) in info.fields) {
             cw.visitField(ACC_PUBLIC, fname, descOf(fty, moduleOf, externInterfaceBinaryNames), null, null).visitEnd()
@@ -292,6 +416,56 @@ class CodeGen(
             }
         }
 
+        // This struct is its module's designated holder (see moduleFirstStructName) -- its
+        // module's top-level `pub static`/fns land here as ordinary static members, exactly the
+        // same shape genHolderClass would have used, just on a real name instead of `$Fns`.
+        for (s in staticsForModule) {
+            cw.visitField((if (s.visible) ACC_PUBLIC else 0) or ACC_STATIC, s.name, descOf(s.ty, moduleOf, externInterfaceBinaryNames), null, null).visitEnd()
+        }
+        if (isEntry || staticsForModule.isNotEmpty()) {
+            val clinit = cw.visitMethod(ACC_STATIC, "<clinit>", "()V", null, null)
+            clinit.visitCode()
+            if (isEntry) {
+                // Same `read_line()` backing-reader init genHolderClass's own isEntry path does --
+                // see its comment for why this exists and why it's always the entry holder's job.
+                clinit.visitTypeInsn(NEW, "java/io/BufferedReader")
+                clinit.visitInsn(DUP)
+                clinit.visitTypeInsn(NEW, "java/io/InputStreamReader")
+                clinit.visitInsn(DUP)
+                clinit.visitFieldInsn(GETSTATIC, "java/lang/System", "in", "Ljava/io/InputStream;")
+                clinit.visitMethodInsn(INVOKESPECIAL, "java/io/InputStreamReader", "<init>", "(Ljava/io/InputStream;)V", false)
+                clinit.visitMethodInsn(INVOKESPECIAL, "java/io/BufferedReader", "<init>", "(Ljava/io/Reader;)V", false)
+                clinit.visitFieldInsn(PUTSTATIC, qualify(info.name), STDIN_FIELD, "Ljava/io/BufferedReader;")
+            }
+            val fnGen = newFnCodeGen(clinit)
+            for (s in staticsForModule) {
+                fnGen.pushScope()
+                fnGen.genStandaloneExpr(s.init)
+                fnGen.popScope()
+                clinit.visitFieldInsn(PUTSTATIC, qualify(info.name), s.name, descOf(s.ty, moduleOf, externInterfaceBinaryNames))
+            }
+            clinit.visitInsn(RETURN)
+            clinit.visitMaxs(0, 0)
+            clinit.visitEnd()
+        }
+        if (isEntry) {
+            cw.visitField(ACC_PRIVATE or ACC_STATIC, STDIN_FIELD, "Ljava/io/BufferedReader;", null, null).visitEnd()
+        }
+
+        for (f in fnsForModule) genFn(cw, f)
+
+        if (isEntry) {
+            // public static void main(String[] args) -> forwards to user main() if present.
+            val mv = cw.visitMethod(ACC_PUBLIC or ACC_STATIC, "main", "([Ljava/lang/String;)V", null, null)
+            mv.visitCode()
+            if (fnsForModule.any { it.name == "main" }) {
+                mv.visitMethodInsn(INVOKESTATIC, qualify(info.name), "main_", "()V", false)
+            }
+            mv.visitInsn(RETURN)
+            mv.visitMaxs(0, 0)
+            mv.visitEnd()
+        }
+
         cw.visitEnd()
         return cw.toByteArray()
     }
@@ -341,11 +515,11 @@ class CodeGen(
     // own fns as static methods on a `$Fns` holder in its own package. This is what makes a
     // `pub fn` in one module a genuinely separate, independently-linkable JVM method from a
     // same-named private one in another -- they're not even in the same class anymore.
-    private fun genHolderClass(mod: String?, fnsForModule: List<FnDecl>, staticsForModule: List<StaticInfo>): ByteArray {
+    private fun genHolderClass(unit: Unit, fnsForModule: List<FnDecl>, staticsForModule: List<StaticInfo>): ByteArray {
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
-        val qname = holderClassName(mod)
+        val qname = holderClassName(unit)
         cw.visit(V17, ACC_PUBLIC or ACC_FINAL, qname, null, "java/lang/Object", null)
-        val isEntry = mod == entryModuleName
+        val isEntry = unit == entryUnit
 
         for (s in staticsForModule) {
             cw.visitField((if (s.visible) ACC_PUBLIC else 0) or ACC_STATIC, s.name, descOf(s.ty, moduleOf, externInterfaceBinaryNames), null, null).visitEnd()
@@ -430,6 +604,7 @@ class CodeGen(
         // owning struct/trait's own visibility, not an independent per-method one.
         val access = (if (f.visible) ACC_PUBLIC else 0) or ACC_STATIC
         val mv = cw.visitMethod(access, jvmName, desc, null, null)
+        emitAnnotations(f.annotations) { d, visible -> mv.visitAnnotation(d, visible) }
         mv.visitCode()
 
         val fnGen = newFnCodeGen(mv)
@@ -567,7 +742,7 @@ private class FnCodeGen(
                 mv.visitLabel(end)
             }
             is Stmt.For -> genFor(stmt)
-            is Stmt.Match -> genMatch(stmt)
+            is Stmt.Match -> genMatch(stmt.scrutinee, stmt.arms) { genBlock(it) }
             is Stmt.Return -> {
                 if (stmt.expr == null) {
                     for (name in stmt.varsToDropBeforeReturn) genDropCall(name)
@@ -646,6 +821,10 @@ private class FnCodeGen(
             is Expr.Borrow -> genExpr(expr.inner)
             is Expr.Unary -> genUnary(expr)
             is Expr.Cast -> genCast(expr)
+            is Expr.InstanceOf -> {
+                genExpr(expr.inner)
+                mv.visitTypeInsn(INSTANCEOF, checkcastOperand(expr.resolvedTargetTy!!))
+            }
             is Expr.Binary -> genBinary(expr)
             is Expr.StringInterp -> genStringInterp(expr)
             is Expr.Assign -> {
@@ -668,6 +847,17 @@ private class FnCodeGen(
                     genExpr(expr.obj)
                     if (expr.obj.ty is Ty.Array) {
                         mv.visitInsn(ARRAYLENGTH)
+                    } else if (expr.obj.ty is Ty.JavaExtern) {
+                        // `resolvedName` (set by checkFieldAccess) is the extern class's real
+                        // binary name; `expr.ty` is the field's resolved type.
+                        val getter = expr.externGetterMethod
+                        if (getter != null) {
+                            // Property-style sugar (`enemy.health` -> `enemy.getHealth()`) --
+                            // see `Expr.FieldAccess.externGetterMethod`'s doc.
+                            mv.visitMethodInsn(INVOKEVIRTUAL, expr.resolvedName!!, getter, "()" + descOf(expr.ty!!, moduleOf, externInterfaceBinaryNames), false)
+                        } else {
+                            mv.visitFieldInsn(GETFIELD, expr.resolvedName!!, expr.field, descOf(expr.ty!!, moduleOf, externInterfaceBinaryNames))
+                        }
                     } else {
                         val structName = (expr.obj.ty as Ty.Struct).name
                         val fty = structs.getValue(structName).fieldType(expr.field)!!
@@ -679,6 +869,10 @@ private class FnCodeGen(
             is Expr.Call -> genCall(expr)
             is Expr.MethodCall -> genMethodCall(expr)
             is Expr.StaticCall -> genStaticCall(expr)
+            // `Alias::FIELD` -- `resolvedName` (set by checkStaticFieldGet) is the extern class's
+            // real binary name; `expr.ty` (set by the same checker pass) is the field's resolved
+            // type, giving the exact descriptor GETSTATIC needs.
+            is Expr.StaticFieldGet -> mv.visitFieldInsn(GETSTATIC, expr.resolvedName!!, expr.field, descOf(expr.ty!!, moduleOf, externInterfaceBinaryNames))
             is Expr.FieldAssign -> {
                 val idxObj = expr.obj as? Expr.Index
                 if (idxObj != null && idxObj.ty is Ty.Arena) {
@@ -708,6 +902,22 @@ private class FnCodeGen(
             }
             is Expr.ArenaNew -> genArenaNew(expr)
             is Expr.Range -> throw CodeGenError("codegen: bare range (checker should have rejected this)")
+            is Expr.If -> {
+                // Each branch is checker-guaranteed to be exactly one `Stmt.ExprStmt` -- generate
+                // its expr directly rather than `genBlock` (which would `POP` the value this
+                // if-expression needs to leave on the stack, and which brings scope/drop
+                // machinery a single bare expression can never actually need).
+                genExpr(expr.cond)
+                val elseLabel = Label()
+                val endLabel = Label()
+                mv.visitJumpInsn(IFEQ, elseLabel)
+                genExpr((expr.thenB.stmts[0] as Stmt.ExprStmt).expr)
+                mv.visitJumpInsn(GOTO, endLabel)
+                mv.visitLabel(elseLabel)
+                genExpr((expr.elseB.stmts[0] as Stmt.ExprStmt).expr)
+                mv.visitLabel(endLabel)
+            }
+            is Expr.Match -> genMatch(expr.scrutinee, expr.arms, producesValue = true) { b -> genExpr((b.stmts[0] as Stmt.ExprStmt).expr) }
         }
     }
 
@@ -823,7 +1033,7 @@ private class FnCodeGen(
             Ty.Float_ -> mv.visitIntInsn(NEWARRAY, T_FLOAT)
             Ty.Double_ -> mv.visitIntInsn(NEWARRAY, T_DOUBLE)
             Ty.Bool_ -> mv.visitIntInsn(NEWARRAY, T_BOOLEAN)
-            Ty.Str_ -> mv.visitTypeInsn(ANEWARRAY, "java/lang/String")
+            is Ty.Str_ -> mv.visitTypeInsn(ANEWARRAY, "java/lang/String")
             is Ty.Struct -> mv.visitTypeInsn(ANEWARRAY, qualify(elemTy.name))
             is Ty.Array -> mv.visitTypeInsn(ANEWARRAY, descOf(elemTy, moduleOf, externInterfaceBinaryNames))
             is Ty.Arena -> mv.visitTypeInsn(ANEWARRAY, "java/lang/foreign/MemorySegment")
@@ -932,7 +1142,12 @@ private class FnCodeGen(
             } else {
                 for (a in expr.args) genExpr(a)
                 val desc = "(" + paramTys.joinToString("") { descOf(it, moduleOf, externInterfaceBinaryNames) } + ")" + descOf(expr.ty!!, moduleOf, externInterfaceBinaryNames)
-                mv.visitMethodInsn(INVOKESTATIC, binaryName, expr.method, desc, false)
+                // Still INVOKESTATIC even for a real interface's static method (legal since Java
+                // 8) -- but the constant-pool entry must be an InterfaceMethodref, which is what
+                // ASM's trailing `isInterface` param controls, not the opcode. Getting this wrong
+                // for a genuinely-interface extern class shipped a real
+                // `IncompatibleClassChangeError` at link time (see ExternClassDecl's doc).
+                mv.visitMethodInsn(INVOKESTATIC, binaryName, expr.method, desc, expr.isExternInterface)
             }
         } else {
             // Native Hot Chocolate static call (mangled name)
@@ -957,8 +1172,17 @@ private class FnCodeGen(
             // use INVOKESTATIC. Otherwise, it's an instance method (INVOKEVIRTUAL).
             // Args were already pushed by the unconditional prologue above -- do not push again.
             val desc = "(" + paramTys.joinToString("") { descOf(it, moduleOf, externInterfaceBinaryNames) } + ")" + descOf(expr.ty!!, moduleOf, externInterfaceBinaryNames)
-            val opcode = if (expr.isStaticExtern) INVOKESTATIC else INVOKEVIRTUAL
-            mv.visitMethodInsn(opcode, externOwner, target, desc, false)
+            // A real interface's *instance* method needs INVOKEINTERFACE, not INVOKEVIRTUAL (the
+            // JVM verifier rejects INVOKEVIRTUAL resolving to an ACC_INTERFACE class) -- its
+            // static method still uses INVOKESTATIC, just with an InterfaceMethodref constant
+            // (the trailing `isInterface` arg to `visitMethodInsn`, unrelated to the opcode
+            // choice). See ExternClassDecl's `isInterface` doc for the real crash this fixes.
+            val opcode = when {
+                expr.isStaticExtern -> INVOKESTATIC
+                expr.isExternInterface -> INVOKEINTERFACE
+                else -> INVOKEVIRTUAL
+            }
+            mv.visitMethodInsn(opcode, externOwner, target, desc, expr.isExternInterface)
             return
         }
         when {
@@ -1019,13 +1243,33 @@ private class FnCodeGen(
         }
     }
 
-    // `expr as Type` -- a genuine primitive JVM conversion instruction, never a method call.
-    // Same-type casts (checker allows `x as Int` where `x` is already Int) are a no-op.
+    // For CHECKCAST's operand: object types want the bare internal name (no `L`/`;`), but an
+    // array type's own descriptor (e.g. `[Ljava/lang/String;`) IS what ASM expects there --
+    // the one case where the "internal name" and "descriptor" forms genuinely differ for this
+    // instruction.
+    private fun checkcastOperand(ty: Ty): String = when (ty) {
+        is Ty.Str_ -> "java/lang/String"
+        is Ty.Struct -> qualify(ty.name)
+        is Ty.Enum -> qualify(ty.name)
+        is Ty.Dyn -> jvmIfaceName(ty.interfaceName, moduleOf, externInterfaceBinaryNames)
+        is Ty.JavaExtern -> ty.binaryName
+        is Ty.Array -> descOf(ty, moduleOf, externInterfaceBinaryNames)
+        else -> throw CodeGenError("codegen: '$ty' isn't a valid reference-cast target")
+    }
+
+    // `expr as Type` -- either a genuine primitive JVM conversion instruction (never a method
+    // call), or a `CHECKCAST` for a reference-type cast. Same-type casts (checker allows
+    // `x as Int` where `x` is already Int, or a redundant reference cast to its own type) are a
+    // no-op either way.
     private fun genCast(expr: Expr.Cast) {
         genExpr(expr.inner)
         val from = expr.inner.ty!!
         val to = expr.ty!!
         if (from == to) return
+        if (from.isObjectRef() && to.isObjectRef()) {
+            mv.visitTypeInsn(CHECKCAST, checkcastOperand(to))
+            return
+        }
         val op = when (from) {
             Ty.Int_ -> when (to) {
                 Ty.Long_ -> I2L
@@ -1129,7 +1373,7 @@ private class FnCodeGen(
             return
         }
         val lty = expr.left.ty!!
-        if (expr.op == "+" && lty == Ty.Str_) {
+        if (expr.op == "+" && lty == Ty.Str_()) {
             mv.visitTypeInsn(NEW, "java/lang/StringBuilder")
             mv.visitInsn(DUP)
             mv.visitMethodInsn(INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
@@ -1141,10 +1385,21 @@ private class FnCodeGen(
             return
         }
         if (expr.op == "==" || expr.op == "!=") {
-            if (lty == Ty.Str_) {
+            if (lty is Ty.Str_) {
+                // Only safe to call `.equals()` directly (INVOKEVIRTUAL on the left operand)
+                // when BOTH sides are known non-null -- a genuinely-null nullable `String?` on
+                // the left would NPE calling a method on it at all. `Objects.equals(a, b)` is
+                // the null-safe general case (true if both null, false if exactly one is,
+                // `a.equals(b)` otherwise) -- used whenever either side might actually be null.
+                val rty = expr.right.ty!!
+                val bothNonNull = !lty.nullable && rty is Ty.Str_ && !rty.nullable
                 genExpr(expr.left)
                 genExpr(expr.right)
-                mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "equals", "(Ljava/lang/Object;)Z", false)
+                if (bothNonNull) {
+                    mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "equals", "(Ljava/lang/Object;)Z", false)
+                } else {
+                    mv.visitMethodInsn(INVOKESTATIC, "java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z", false)
+                }
                 if (expr.op == "!=") {
                     mv.visitInsn(ICONST_1)
                     mv.visitInsn(IXOR)
@@ -1166,7 +1421,20 @@ private class FnCodeGen(
                 genBoolFromBranch(if (expr.op == "==") IFEQ else IFNE)
                 return
             }
-            genBoolFromBranch(if (expr.op == "==") IF_ICMPEQ else IF_ICMPNE)
+            // `Int`/`Bool` are the only remaining types that reach here as a genuine single-word
+            // JVM primitive (`I`) -- IF_ICMPEQ/IF_ICMPNE compare stack ints. Everything else
+            // still possible here (`JavaExtern`, `Struct`, `Enum`, `Dyn`, `Array`) is a real JVM
+            // reference type, which needs IF_ACMPEQ/IF_ACMPNE (reference identity) instead --
+            // using the int-compare opcode against two references is invalid bytecode that only
+            // fails at class-*verify* time (a real crash this shipped as: comparing two
+            // extern-class values with `!=`, e.g. `event.getOverlay() != x.type()`, verified
+            // fine at compile time and threw `VerifyError: Bad type on operand stack` the moment
+            // Forge actually loaded the class).
+            if (lty == Ty.Int_ || lty == Ty.Bool_) {
+                genBoolFromBranch(if (expr.op == "==") IF_ICMPEQ else IF_ICMPNE)
+            } else {
+                genBoolFromBranch(if (expr.op == "==") IF_ACMPEQ else IF_ACMPNE)
+            }
             return
         }
         genExpr(expr.left)
@@ -1270,20 +1538,43 @@ private class FnCodeGen(
 
     // `match scrutinee { Variant { a, b } => { }, _ => { } }` -- an if/else chain comparing
     // `tag`, destructuring the matched variant's fields into fresh locals before its arm body.
-    private fun genMatch(stmt: Stmt.Match) {
-        if (stmt.scrutinee.ty is Ty.Dyn) { genSealedMatch(stmt); return }
-        val enumName = (stmt.scrutinee.ty as Ty.Enum).name
+    // `emitArm`: how to compile each matched arm's body -- `{ genBlock(it) }` for the statement
+    // form (executes the block as statements, drops its own values), or a callback that reads a
+    // single-`Stmt.ExprStmt` body's expr and leaves its value on the stack for the expression
+    // form (`Expr.Match` in genExpr) -- same split responsibility as `Expr.If`/`Stmt.If` above.
+    // `producesValue`: true for the `Expr.Match` (value-producing) form -- every matched arm
+    // leaves exactly one value on the stack before jumping to `endLabel`, so the "no arm
+    // matched" fallthrough (only reachable when there's no wildcard arm -- exhaustiveness is
+    // still checker-guaranteed via "every variant has its own explicit arm") needs to leave a
+    // value too, or ASM's frame computation sees mismatched stack depths merging at `endLabel`
+    // and throws (a real verifier requirement, not just a hypothetical). Traps instead, same
+    // "provably unreachable at runtime, but the verifier can't know that" idiom as
+    // `emitReturnOrTrap`'s "missing return" -- correct because the checker already rejected any
+    // match that *isn't* exhaustive. The statement form never needs this: every arm already
+    // leaves the stack exactly as it found it (no value ever pushed), so an empty fallthrough is
+    // trivially stack-consistent already.
+    private fun genMatch(scrutinee: Expr, arms: List<MatchArm>, producesValue: Boolean = false, emitArm: (Block) -> Unit) {
+        if (scrutinee.ty is Ty.Dyn) { genSealedMatch(scrutinee, arms, producesValue, emitArm); return }
+        val enumName = (scrutinee.ty as Ty.Enum).name
         val qEnumName = qualify(enumName)
         val info = enums.getValue(enumName)
-        genExpr(stmt.scrutinee)
+        genExpr(scrutinee)
         val scrutSlot = allocTemp()
         mv.visitVarInsn(ASTORE, scrutSlot)
 
         val endLabel = Label()
         var wildcardArm: MatchArm? = null
-        for (arm in stmt.arms) {
+        for (arm in arms) {
             if (arm.variantName == null) { wildcardArm = arm; continue }
-            val variant = info.variant(arm.variantName) ?: continue
+            // `Base::Variant` arms (e.g. `Option::Some { .. }`) carry the qualifier in
+            // `arm.variantName` -- the checker already strips it before doing its own variant
+            // lookup (see checkMatch), but this lookup didn't, so a qualified arm silently
+            // matched nothing here and got skipped via `?: continue` -- no error, no crash, the
+            // whole arm's tag-check/binding/body bytecode just never got emitted. Verified: a
+            // real mod's `match opt { Option::Some { value } => { .. } Option::None {} => { .. }
+            // }` compiled clean and silently ran neither arm at runtime.
+            val bareVariantName = arm.variantName.substringAfterLast("::")
+            val variant = info.variant(bareVariantName) ?: continue
             val nextLabel = Label()
             mv.visitVarInsn(ALOAD, scrutSlot)
             mv.visitFieldInsn(GETFIELD, qEnumName, "tag", "I")
@@ -1298,13 +1589,25 @@ private class FnCodeGen(
                 val slot = declareLocal(bindName, fty)
                 mv.visitVarInsn(storeOpcode(fty), slot)
             }
-            genBlock(arm.body)
+            emitArm(arm.body)
             popScope()
             mv.visitJumpInsn(GOTO, endLabel)
             mv.visitLabel(nextLabel)
         }
-        wildcardArm?.let { genBlock(it.body) }
+        if (wildcardArm != null) {
+            emitArm(wildcardArm.body)
+        } else if (producesValue) {
+            genTrap("non-exhaustive match")
+        }
         mv.visitLabel(endLabel)
+    }
+
+    private fun genTrap(message: String) {
+        mv.visitTypeInsn(NEW, "java/lang/IllegalStateException")
+        mv.visitInsn(DUP)
+        mv.visitLdcInsn(message)
+        mv.visitMethodInsn(INVOKESPECIAL, "java/lang/IllegalStateException", "<init>", "(Ljava/lang/String;)V", false)
+        mv.visitInsn(ATHROW)
     }
 
     // `match d { Player { hp } => { }, _ => { } }` where `d: &dyn SealedInterface` -- an
@@ -1313,16 +1616,17 @@ private class FnCodeGen(
     // Compiling the matched case's body this way, rather than an INVOKEINTERFACE call through
     // `d`, is the actual "cheaper dispatch" payoff of a sealed interface: once matched, any
     // method called on the destructured value is a direct zero-cost static call, not virtual.
-    private fun genSealedMatch(stmt: Stmt.Match) {
-        genExpr(stmt.scrutinee)
+    private fun genSealedMatch(scrutinee: Expr, arms: List<MatchArm>, producesValue: Boolean = false, emitArm: (Block) -> Unit) {
+        genExpr(scrutinee)
         val scrutSlot = allocTemp()
         mv.visitVarInsn(ASTORE, scrutSlot)
 
         val endLabel = Label()
         var wildcardArm: MatchArm? = null
-        for (arm in stmt.arms) {
+        for (arm in arms) {
             if (arm.variantName == null) { wildcardArm = arm; continue }
-            val structName = arm.variantName
+            // Same `Base::Variant` qualifier-stripping as genMatch above -- see its comment.
+            val structName = arm.variantName.substringAfterLast("::")
             val qStructName = qualify(structName)
             val fields = structs[structName]?.fields ?: continue
             val nextLabel = Label()
@@ -1342,12 +1646,16 @@ private class FnCodeGen(
                 val slot = declareLocal(bindName, fty)
                 mv.visitVarInsn(storeOpcode(fty), slot)
             }
-            genBlock(arm.body)
+            emitArm(arm.body)
             popScope()
             mv.visitJumpInsn(GOTO, endLabel)
             mv.visitLabel(nextLabel)
         }
-        wildcardArm?.let { genBlock(it.body) }
+        if (wildcardArm != null) {
+            emitArm(wildcardArm.body)
+        } else if (producesValue) {
+            genTrap("non-exhaustive match")
+        }
         mv.visitLabel(endLabel)
     }
 

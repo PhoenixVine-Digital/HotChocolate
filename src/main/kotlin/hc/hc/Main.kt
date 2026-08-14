@@ -32,22 +32,42 @@ private fun mergeProgram(a: Program, b: Program): Program = Program(
 fun compile(source: String, mainClassName: String, classpath: List<String> = emptyList()): CompileResult =
     compileProgram(Parser(Lexer(source).tokenize()).parseProgram(), mainClassName, classpath)
 
-// `path` a single file compiles just that file (as before); a directory compiles every
-// `.hc` file directly inside it (non-recursive) as one flat program -- no import statements,
-// every top-level name (struct/fn/interface/enum/extern class) shares one global namespace
-// across all of them, exactly as if they'd been pasted into a single file. This is also what
-// makes `sealed interface` actually mean something: "every implementer is declared in this
-// compilation unit" now spans a real multi-file project, not just one file trivially.
+// `path` a single file compiles just that file (as before); a directory compiles every `.hc`
+// file *anywhere under it* (recursive -- matches the Java/Kotlin source-root convention of
+// nesting files under directories mirroring their package/module path, e.g. `client/Foo.hc`
+// declaring `module ...client;`) as one flat program -- no import statements, every top-level
+// name (struct/fn/interface/enum/extern class) shares one global namespace across all of them,
+// exactly as if they'd been pasted into a single file, regardless of which subdirectory each
+// came from. This is also what makes `sealed interface` actually mean something: "every
+// implementer is declared in this compilation unit" now spans a real multi-file project, not
+// just one file trivially. A file's `module` line is never *checked* against its directory path
+// (see IDEAS.md's "Verify a declared module matches the file's directory path" -- an opt-in
+// check, deliberately not required) -- nesting is a pure organizational convenience here, not a
+// requirement the compiler enforces.
+// Stamps every top-level struct/fn/static in a just-parsed single file's `Program` with that
+// file's own name (its `sourceUnit`) before folding it into the directory-wide merge -- see
+// StructDecl's `sourceUnit` doc for why this matters (CodeGen's "named holder" merge needs to
+// group by file, not just by module, whenever multiple files share one module).
+private fun stampSourceUnit(program: Program, unit: String): Program = Program(
+    structs = program.structs.map { it.copy(sourceUnit = unit) },
+    fns = program.fns.map { it.copy(sourceUnit = unit) },
+    impls = program.impls,
+    interfaces = program.interfaces,
+    enums = program.enums,
+    externs = program.externs,
+    extends = program.extends,
+    statics = program.statics.map { it.copy(sourceUnit = unit) },
+)
+
 fun compileEntry(path: File, mainClassName: String, classpath: List<String> = emptyList()): CompileResult {
     if (path.isDirectory) {
-        val files = path.listFiles { f -> f.isFile && f.extension == "hc" }
-            ?.sortedBy { it.name }
-            ?: emptyList()
+        val files = path.walkTopDown().filter { it.isFile && it.extension == "hc" }.toList()
+            .sortedBy { it.relativeTo(path).path }
         if (files.isEmpty()) throw CodegenEntryError("no .hc files found in directory '${path.path}'")
         var merged = Program(structs = emptyList(), fns = emptyList())
         for (f in files) {
             val parsed = Parser(Lexer(f.readText()).tokenize()).parseProgram()
-            merged = mergeProgram(merged, parsed)
+            merged = mergeProgram(merged, stampSourceUnit(parsed, f.nameWithoutExtension))
         }
         return compileProgram(merged, mainClassName, classpath)
     }
@@ -65,7 +85,7 @@ fun compileProgram(userProgram: Program, mainClassName: String, classpath: List<
     val reflector = ClasspathReflector(classpath)
     val checker = Checker(program, reflector)
     checker.check()
-    val fnRetTypes = checker.fns.mapValues { it.value.ret } + ("print" to Ty.Unit_) + ("read_line" to Ty.Str_)
+    val fnRetTypes = checker.fns.mapValues { it.value.ret } + ("print" to Ty.Unit_) + ("read_line" to Ty.Str_())
     val fnParamTypes = checker.fns.mapValues { it.value.paramTys }
     val codegen = CodeGen(
         checker.resolvedProgram(), checker.structs, fnRetTypes, fnParamTypes, mainClassName, checker.arenaLayouts,
@@ -194,7 +214,13 @@ fun main(rawArgs: Array<String>) {
                 classFile.parentFile?.mkdirs()
                 classFile.writeBytes(bytes)
             }
-            val proc = ProcessBuilder(javaExe, "-cp", outDir.path, result.mainClassBinaryName.replace('/', '.'))
+            // `classpath` (--classpath/HC_CLASSPATH) is also needed at runtime, not just at
+            // compile time -- any `extern class` whose methods came from real classfile
+            // reflection (`use { ... }`/bare form) names a real external class the JVM has to
+            // actually load and link against when its methods get called, same as any other
+            // dependency jar.
+            val runCp = (listOf(outDir.path) + classpath).joinToString(File.pathSeparator)
+            val proc = ProcessBuilder(javaExe, "-cp", runCp, result.mainClassBinaryName.replace('/', '.'))
                 .inheritIO()
                 .start()
             val exitCode = proc.waitFor()

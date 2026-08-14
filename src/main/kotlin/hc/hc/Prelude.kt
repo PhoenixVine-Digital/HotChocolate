@@ -23,7 +23,22 @@ package hc
 // Known limitation: no true `Vec::new()` with zero elements -- construction always needs at
 // least one seed value (`vec_of`/`registry_new`), since this language has no per-type
 // default/zero value to fill an empty backing array with. A real gap, not just a caveat.
+// `module hc.prelude;` is load-bearing, not decorative: with no `module` line, every prelude
+// declaration -- and, critically, every monomorphized instantiation of a generic one
+// (`Option_net_minecraft_core_BlockPos`, `Vec_Int`, ...) -- compiles into the JVM's default
+// (unnamed) package. That's invisible for a plain `hc run`/`hc build` program, but a real Forge
+// mod's classes load through a module-aware classloader (`cpw.mods.cl.ModuleClassLoader`, from
+// `securejarhandler`), which cannot resolve a class with no package at all -- shipped a real
+// `NoClassDefFoundError` at runtime the moment a mod actually instantiated `Option<T>` with a
+// real Minecraft type, despite compiling and `javap`-verifying cleanly (module resolution is a
+// classloading-time concern, invisible to the compiler and to a bytecode-shape check alike). A
+// monomorphized instantiation's `moduleName` is copied straight from its template (see
+// `getOrInstantiateStruct`/`getOrInstantiateEnum`/`getOrInstantiateFn` in Checker.kt), so this
+// one line fixes every current and future generic prelude instantiation at once, not just
+// `Option<T>`.
 val PRELUDE_SOURCE = """
+module hc.prelude;
+
 pub enum Option<T> {
     Some { value: T },
     None,

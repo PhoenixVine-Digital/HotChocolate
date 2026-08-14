@@ -8,11 +8,21 @@ JVM/JDK interop, static typing) but give the compiler enough discipline about
 ownership that memory bugs and accidental aliasing get caught before runtime,
 the way Rust does.
 
+**New to Hot Chocolate?** Start with [TUTORIAL.md](TUTORIAL.md) — a
+from-zero, example-driven walkthrough of the language (assumes you already
+know how to program in *something*). Never programmed at all before? Start
+with [FIRST_LANGUAGE.md](FIRST_LANGUAGE.md) instead. This README is the
+full reference and design rationale, not an introduction.
+
 **License**: [Business Source License 1.1](LICENSE) — source-available now,
 free for effectively all use (including compiling and distributing your own
 programs written in it) except offering Hot Chocolate itself as a competing
-commercial product or service; converts automatically to Apache 2.0 on
-2029-08-13.
+commercial product or service; converts automatically to the GNU Affero
+General Public License v3.0 on 2029-08-13, deliberately a strong-copyleft
+license rather than a permissive one — chosen so that even after the BSL
+window ends, nobody can take Hot Chocolate proprietary or rebrand it as
+their own closed product, including as a hosted/network service (the "SaaS
+loophole" plain GPL leaves open, which AGPL specifically closes).
 
 ## Status: phase 1 (this repo)
 
@@ -353,15 +363,56 @@ monomorphized (never abstractly against a bound, unlike real Rust), an
 **unbounded** `T` can already call any method that happens to exist on
 whatever concrete type it's eventually instantiated with — genuinely
 duck-typed, C++-template-style, errors surfacing per-instantiation rather
-than at the generic declaration. A declared bound doesn't change that
-mechanism; what it adds is **validation at the instantiation site**:
-`checkTypeParamBounds` runs when `T` gets substituted with a concrete type,
-confirming that type actually implements every bound trait, producing one
-clear error naming exactly what's missing — verified: instantiating
-`apply_damage` with a plain `Int` (which doesn't implement `Damageable`)
-is rejected with `'Int' for type param 'T' doesn't implement [Damageable]`,
-right at the call site, rather than failing confusingly deep inside the
-body. Multiple bounds combine with `+`: `<T: A + B>`.
+than at the generic declaration. A declared bound gives two guarantees on
+top of that, not one:
+
+- **Validation at every instantiation site**: `checkTypeParamBounds` runs
+  when `T` gets substituted with a concrete type, confirming that type
+  actually implements every bound trait, producing one clear error naming
+  exactly what's missing — verified: instantiating `apply_damage` with a
+  plain `Int` (which doesn't implement `Damageable`) is rejected with
+  `'Int' for type param 'T' doesn't implement [Damageable]`, right at the
+  call site, rather than failing confusingly deep inside the body.
+- **The body itself is checked once, abstractly, against the bound** —
+  every bounded type param is substituted with a real `&dyn` value (a
+  synthetic interface merging every bound trait's methods, built
+  specifically for this check) instead of any concrete type, so a method
+  call the body makes on a `T`-typed value only resolves if the bound
+  actually declares it. This is the guarantee that makes a bound worth
+  writing at all: without it (this was a real gap in the original
+  bounded-generics pass, fixed once it was flagged as a lynchpin blocking
+  other, bigger features — see `IDEAS.md`), a bounded generic's body was
+  checked exactly like an
+  *unbounded* one, fully duck-typed against whichever concrete type
+  happened to be substituted in wherever it was first called — so a body
+  could compile fine against the first instantiation tried (accidentally
+  relying on some method that merely happens to exist on that one
+  concrete type, not on anything the bound actually promises) and only
+  fail, confusingly, at a *different*, later call site instantiating the
+  same generic with a type that satisfies the identical declared bound
+  but lacks that extra method. Verified directly: a body calling a method
+  outside the declared bound (`x.describe()` inside `<T: Damageable>`,
+  where `describe` isn't part of `Damageable`) is now rejected with `'T:
+  Damageable' has no method 'describe'` — even though the one concrete
+  type actually used at the call site (`Player`) really does have a
+  `describe()` method. The check runs exactly once per generic, cached,
+  entirely independent of whether or how many times it's ever actually
+  instantiated — matching how a real bound's correctness shouldn't depend
+  on which instantiations someone happened to exercise.
+
+Multiple bounds combine with `+`: `<T: A + B>` — checked against the
+union of both traits' methods, and rejected up front if the two bounds
+declare conflicting signatures for the same method name (no real type
+could implement both compatibly anyway).
+
+**Known limitation**: this second guarantee only covers top-level
+generic fns where *every* type param has a declared bound. A mixed
+`<T: Trait, U>` (some params bounded, some not) has no way to abstractly
+type the unbounded `U` at all, so it falls back to the original
+per-instantiation-only checking for such fns — not a regression, just
+not yet improved by this fix. Generic struct/impl methods (where the
+receiver itself would need abstracting, not just its params) aren't
+covered yet either.
 
 ### Composition delegation sugar: `impl Interface for Struct by field`
 
@@ -422,12 +473,11 @@ project's composition-first direction elsewhere.
   deliberate constraint to keep bare-name resolution (`Point` without an
   `enum::` qualifier) unambiguous; documented as a limitation, not
   something to work around.
-- **`match`** is a statement, not an expression (consistent with `if`/`while`/`for`,
-  none of which produce values in this language either) — every arm is a
-  `{ block }` executing side effects, not a value. Field patterns bind by
-  position against the variant's declared field order (`Circle { radius }`
-  binds a fresh local named `radius`) — no renaming, no nested patterns,
-  no literal-value matching.
+- **`match` works as a statement or a value** — see "`if`/`match` as
+  expressions" below for the value form. Field patterns bind by position
+  against the variant's declared field order (`Circle { radius }` binds a
+  fresh local named `radius`) — no renaming, no nested patterns, no
+  literal-value matching.
 - **Exhaustiveness is enforced at compile time.** Every variant must be
   covered by name, or a `_` wildcard arm must be present (which must come
   last) — verified: a `match` missing two of three variants and no
@@ -463,6 +513,56 @@ because nothing had substituted a generic parameter with those kinds of
 types before. Fixed by making the substitution machinery convert a
 resolved type back into a proper reference-shaped `TypeRef` (setting
 `isRef`/`isDyn` correctly) rather than just using its mangled name.
+
+### `if`/`match` as expressions
+
+```
+let min_x = if pos1.getX() < pos2.getX() { pos1.getX(); } else { pos2.getX(); };
+
+let area = match shape {
+    Circle { radius } => { radius * radius * 3; }
+    Square { side } => { side * side; }
+    Point => { 0; }
+};
+```
+
+`if`/`match` still work as plain statements exactly as above; this is the
+same syntax additionally usable anywhere an expression is expected (a `let`
+RHS, a call argument, ...) — reachable because the parser now also accepts
+a leading `if`/`match` as a primary expression, not just at statement
+position, so this is purely additive (existing statement-form code is
+completely unaffected).
+
+- **Deliberately not full Rust-style block-tail-value semantics.** Each
+  branch/arm is still an ordinary `{ ... }` block using the normal
+  statement grammar (every statement needs its usual `;`) — but to be used
+  as a value, that block must contain **exactly one statement**, itself a
+  bare expression (`radius * radius * 3;`, not `let`/`if`/`return`/...).
+  This is a ternary-shaped if/match-expression (ML/Kotlin's `if` model),
+  not "the last statement in any block, sans semicolon, is the block's
+  value" — that would need a real grammar change (distinguishing a
+  semicolon-terminated statement from a value-producing tail expression);
+  this needs none, since `{ expr; }` already parsed as an ordinary
+  statement block before this feature existed, just always discarded.
+  A branch with more than one statement, or whose one statement isn't a
+  bare expression, is a clear compile-time error naming the branch.
+- **`if`-expressions require `else`** (no value without one); chained
+  `else if` works the same as the statement form.
+- **Both branches/every arm must produce the same type** — a compile-time
+  error otherwise, naming both/all the mismatched types.
+- **`match`-expressions keep the statement form's exhaustiveness rules**
+  (every variant covered by name, or a `_` wildcard) — same error, same
+  wording. An exhaustive match with no explicit wildcard (every variant
+  gets its own arm) compiles to a runtime trap on the "no arm matched"
+  path instead of a fallthrough, purely to satisfy the JVM bytecode
+  verifier's static stack-shape check (every other path already leaves a
+  value on the stack) — provably unreachable given the checker's own
+  exhaustiveness guarantee, same idiom already used for a function that
+  falls off its end without a `return`.
+- **No null-narrowing inside an if-expression's condition** — the
+  `if x != null { ... }` narrowing the statement form supports (see
+  "Nullable extern references") isn't applied here; out of scope for this
+  first pass.
 
 ### Sealed interfaces and `match`-by-concrete-type
 
@@ -655,6 +755,44 @@ signature (`Object`, not `String`), or the `INVOKEVIRTUAL`/
 `INVOKEINTERFACE` link-fails at runtime even though the declaration
 "looks" correct.
 
+#### `extern class Alias = "..." interface { ... }`: when the real target is an interface, not a class
+
+```
+extern class JList = "java.util.List" interface {
+    fn add(&mut self, item: JObject) -> Bool;
+}
+extern class Component = "net.minecraft.network.chat.Component" interface {
+    static fn literal(text: String) -> Component;
+}
+```
+
+Plenty of real JVM APIs you'd reach for with `extern class` are actually
+backed by an `interface`, not a class — `java.util.List`/`Set`/
+`Iterator`/`Map.Entry`, `java.lang.Iterable`, `java.util.function
+.Supplier`, and plenty of framework types (Minecraft's own `Component`,
+`Registry`, ...). The JVM encodes a call to an interface's method
+differently at the constant-pool level than a call to a class's — an
+*instance* method needs `INVOKEINTERFACE` (not `INVOKEVIRTUAL`), and even
+a *static* one (legal since Java 8) needs an `InterfaceMethodref`
+constant, not a plain `Methodref`, despite still using the `INVOKESTATIC`
+opcode. Since there's no classfile introspection here (same "trust the
+declaration" honesty as everything else under `extern`), the source has
+to say which kind the real target is: append `interface` right after the
+binary name string, on any of the three declaration forms (explicit,
+`use { }`, or bare/lazy).
+
+**Getting this wrong is a real, silent-until-link-time failure mode**,
+not just a style nicety — a wrong invoke kind compiles clean and even
+`javap`-verifies as a structurally valid classfile, then throws
+`IncompatibleClassChangeError: ... must be InterfaceMethodref constant`
+(static) or the `INVOKEVIRTUAL`-against-an-interface equivalent
+(instance) the moment the JVM actually *links* the call — verified
+against a real Forge mod calling `Component.literal(String)` and
+`List.add(Object)`, both of which crashed exactly this way before this
+existed. If you're declaring an `extern class` for something and aren't
+sure whether it's really a class or an interface, check with `javap` —
+guessing wrong is invisible until the call actually runs.
+
 #### `extern interface`: implementing a Java interface
 
 `extern class` lets Hot Chocolate code call *into* an existing JVM
@@ -700,6 +838,273 @@ doesn't allow it. It also can't `extends` another interface, and its
 methods can't have default bodies (there's no interface class here to
 attach one to — every method must be overridden). Both are the same
 "declare the trusted shape, nothing more" scope cut as `extern class`.
+
+#### Reference-type casts (`as`, compiling to `CHECKCAST`)
+
+Generic Java APIs erase their type parameters to `Object` at the bytecode
+level — `List<Component>.add(Component)` really has the erased descriptor
+`add(Ljava/lang/Object;)Z`, so an `extern class` declaration for it must say
+`item: JObject`, not the concrete type. `as` bridges that gap in both
+directions:
+
+```
+extern class JList = "java.util.List" {
+    fn add(&mut self, item: JObject) -> Bool;
+}
+extern class JObject = "java.lang.Object" {}
+
+tooltip.add(Component::literal("hi") as JObject);   // concrete -> erased
+let s = (someObject as MyExternType);                // erased -> concrete
+```
+
+- `as` now accepts a reference-type cast (both sides `Ty.isObjectRef()` —
+  `Str_`/`Struct`/`Enum`/`Dyn`/`JavaExtern`/`Array`) as an alternative to its
+  existing numeric-conversion form, compiling to a plain `CHECKCAST` against
+  the target's descriptor.
+- Same honesty tradeoff as `extern class` itself: a wrong cast type-checks
+  fine and throws `ClassCastException` at runtime, not a compile error — this
+  is a trusted assertion, not a verified one.
+- This is what actually makes generic JDK collections (`List`, `Map`,
+  iterators, ...) usable from HC: declare the erased `Object` signature, then
+  cast on the way in and out.
+
+#### Runtime type checks: `expr is Type`
+
+`as`'s boolean-returning counterpart — a real JVM `INSTANCEOF`, not a cast:
+
+```
+extern class JObject = "java.lang.Object" {}
+extern class JList = "java.util.List" {}
+
+fn describe(x: JObject) {
+    if x is JList {
+        print("it's a list");
+    }
+}
+```
+
+- Same scope as `as`'s reference-type form: both sides must be an object
+  reference type (`Str_`/`Struct`/`Enum`/`Dyn`/`JavaExtern`/`Array`) — `is`
+  doesn't apply to `Int`/`Long`/`Float`/`Double`/`Bool`, same as real Java.
+- Deliberately non-consuming (unlike `as`, which moves its operand) — `x is
+  Foo` is a peek at `x`, not a move, the same reasoning `x == null`'s own
+  non-consuming check already uses. `x` stays fully usable right after,
+  including inside the `if` body.
+- Same precedence tier as `as` (binds tighter than arithmetic, looser than
+  unary), and the two chain together freely in either order.
+
+#### `extern class` fields — static (`Alias::FIELD`) and instance (`recv.FIELD`)
+
+Some real JVM APIs expose state through a `public` field instead of a
+getter method — `Integer.MAX_VALUE`/`Style.EMPTY`/`ForgeRegistries.ITEMS`
+(static), or `Minecraft.player`/`Minecraft.font` (instance). `extern
+class` bodies can declare either alongside their methods:
+
+```
+extern class JInteger = "java.lang.Integer" {
+    static MAX_VALUE: Int;
+}
+extern class JPoint = "java.awt.Point" {
+    fn new(x: Int, y: Int) -> Self;
+    x: Int;
+    y: Int;
+}
+
+fn main() {
+    print(JInteger::MAX_VALUE);       // 2147483647 -- static, via ::
+    let p = JPoint::new(3, 4);
+    print(p.x);                       // 3 -- instance, via .
+}
+```
+
+- `static NAME: Type;` declares a static field, read via `Alias::NAME`
+  (no parens — that's what distinguishes it from `Alias::method()`),
+  compiling to `GETSTATIC`. `NAME: Type;` (no `static`) declares an
+  instance field, read via `recv.NAME` — the exact same syntax a struct
+  field already uses — compiling to `GETFIELD` against the receiver.
+  Either form is distinguished from a method purely by the absence of
+  `fn` (no parens follow the name either way).
+- Same trust model as everything else under `extern`: the declared type is
+  never checked against the real field's actual type, so a wrong one
+  type-checks fine and throws at runtime (`NoSuchFieldError` or a
+  `ClassCastException`-shaped failure at the first real use), not a
+  compile error. Reading the wrong access kind (`Alias::instanceField` or
+  `value.staticField`) *is* a compile error, though — the checker tracks
+  which kind each declared field is and points you at the right syntax.
+- **Read-only, explicit-signature form only** for this first pass — no
+  `= value` write for either kind, and not resolvable via the `use { }`/
+  lazy reflected forms yet (a field has no "candidate list" the way an
+  overloaded method name does, so reflecting it isn't the same shape of
+  problem — just not wired up this pass).
+
+#### Property-style access: `recv.field` reading as `recv.getField()`/`recv.isField()`
+
+```
+extern class JFile = "java.io.File" {
+    fn new(path: String) -> Self;
+    fn getName(self) -> String;
+    fn isDirectory(self) -> Bool;
+}
+
+fn main() {
+    let f = JFile::new("hello.txt");
+    print(f.name);        // -- f.getName(), a Java-bean getter
+    print(f.directory);   // -- f.isDirectory(), a Bool-returning "isX" getter
+}
+```
+
+`recv.field` first tries to resolve as a real declared instance field (see
+above); when there isn't one, it falls back to a zero-arg `getField`/
+`isField` instance method (Java bean-getter naming — `field` capitalized
+and prefixed) before giving up, cutting the getter-call ceremony that
+dominates interop-heavy code (`stack.getTag()`, `pos1.getX()`,
+`enemy.getHealth()`).
+
+- **A real declared field always wins** — this is pure fallback sugar,
+  never a silent choice between two things: if `Alias` has both a
+  declared instance field named `foo` and a `getFoo`/`isFoo` method, `.foo`
+  always reads the field.
+- **Read-only for this first pass** — no `recv.field = value` sugar over a
+  `setField` method yet (see the ideas backlog: unlike the getter case,
+  there's currently no extern instance field *write* path at all to layer
+  sugar over, so it's a bigger, separate addition).
+- **Scoped to non-`lazy` `extern class` declarations** (explicit signature
+  or `use { }` reflection, both fully resolved up front) — a bare/lazy
+  declaration resolves members on demand via real classpath reflection,
+  and probing it for two guessed candidate names (`getField` then
+  `isField`) on every unmatched field access would mean firing (and
+  potentially erroring on) speculative reflection lookups instead of one
+  deliberate method call.
+- Same "trust the declaration" honesty as everything else under `extern`:
+  a `getField`/`isField` method that doesn't actually exist on the real
+  class type-checks fine (the checker only ever sees whatever signature
+  you declared) and throws at runtime.
+
+#### Java annotations: `@"binary.Name"(arg: value, ...)`
+
+Some Java frameworks find your code through annotation *reflection*
+instead of a registration API you can call — Forge's event bus is the
+motivating case: `@Mod.EventBusSubscriber(modid = MODID, value =
+Dist.CLIENT)` on a class plus `@SubscribeEvent` on each handler method is
+how `MinecraftForge.EVENT_BUS`/the mod-bus find your listeners at all.
+`@"binary.Name"` immediately before a top-level `struct` or `fn` declares
+a real Java annotation, emitted as a genuine classfile
+`RuntimeVisibleAnnotations` attribute — not a compiler-internal marker,
+something reflection actually sees:
+
+```
+@"net.minecraftforge.fml.common.Mod$EventBusSubscriber"(
+    modid: "yourmodid",
+    value: [enum("net.minecraftforge.api.distmarker.Dist", "CLIENT")],
+)
+pub struct MyClientEvents {}
+
+@"net.minecraftforge.eventbus.api.SubscribeEvent"
+pub fn onRenderOverlay(event: &RenderGuiOverlayEventPost) {
+    // ...
+}
+```
+
+- `@"binary.Name"` alone is a marker annotation (no args). `@"binary.Name"
+  (argName: value, ...)` supplies named arguments.
+- Three argument value shapes exist, deliberately — annotation arguments
+  are compile-time constants baked directly into the classfile attribute,
+  not executable code, so this is its own small grammar, not the general
+  expression language: a string literal (`"..."`), a real Java `enum`
+  constant via `enum("binary.Name", "CONST")` (compiles to
+  `AnnotationVisitor.visitEnum`, exactly what an enum-typed annotation
+  argument is stored as at the classfile level — there's no "reference" to
+  an enum constant the way `GETSTATIC` reads one at runtime; annotation
+  metadata is inert data read back by reflection, never executed), or an
+  array `[value, value, ...]` of either (`AnnotationVisitor.visitArray`) —
+  needed whenever the real attribute's declared type is itself an array
+  (`Mod.EventBusSubscriber.value()` is `Dist[]`, not a single `Dist`,
+  which is why the example above wraps it in `[...]` even for one
+  element). **Getting this wrong is a real, silent-until-runtime failure
+  mode**, not just a style choice: writing a bare `enum(...)` where the
+  real attribute is array-typed compiles fine and produces a classfile
+  whose array-typed attribute got a scalar value instead — verified to
+  reach all the way through to a `ClassCastException` inside Forge's own
+  `@Mod.EventBusSubscriber` scanner (`EnumHolder` cast to `List`) the
+  moment that class actually loads. There's no reflection against a real
+  `@interface` to catch this at compile time (see below) — the source has
+  to say which shape it means.
+- Scoped to top-level `struct`/`fn` only for this first pass (not `impl`
+  methods, interfaces, or enums) — that's exactly the shape Forge's
+  event-bus pattern needs, paired with "Named binary target for
+  module-level `pub fn`/`pub static`" (above): a module's first struct
+  gets the class-level annotation, its `pub fn`s (compiled as static
+  methods on that same class) get the method-level ones.
+- Always emitted as `RUNTIME` retention (`RuntimeVisibleAnnotations`, not
+  `RuntimeInvisibleAnnotations`) — reflection-driven consumers need it at
+  runtime, and there's no source-level knob to ask for less.
+- Same trust model as `extern`: the annotation's binary name and argument
+  shape are never checked against a real `@interface` declaration (there
+  isn't one to check against — declaring actual Java annotation *types*
+  from HC isn't supported, only *using* existing ones). A typo'd name or
+  wrong argument type compiles fine and just silently doesn't match what
+  the reflecting framework expects — no compile-time or load-time error,
+  since the JVM doesn't validate annotation data against the annotation
+  interface at class-load time either.
+
+#### `@serializable`: compiler-generated `encode`/`decode` for a struct
+
+A bare compiler *directive* (no quoted binary name — distinguished from
+`@"binary.Name"(...)` above at parse time), immediately before a
+top-level `struct`. Generates real `pub fn encode(packet: &S, buf: &mut
+FriendlyByteBuf)` / `pub fn decode(buf: &mut FriendlyByteBuf) -> S`
+top-level fns from the struct's own field list, in declaration order —
+genuinely generated bytecode (`javap` shows real `encode`/`decode`
+methods), not a runtime reflection scheme:
+
+```
+extern class FriendlyByteBuf = "net.minecraft.network.FriendlyByteBuf" {
+    // Really returns `FriendlyByteBuf` itself (fluent chaining), not `void` -- get this wrong
+    // and it compiles fine, then throws `NoSuchMethodError` the moment it's actually called (see
+    // "extern class fields"/"Java interop" below for why: the JVM matches by exact descriptor,
+    // return type included, and there's no reflection here to catch a wrong one at compile time).
+    fn writeUtf(self, v: String) -> FriendlyByteBuf;
+    fn readUtf(self) -> String;
+    // ... one write/read pair per field type actually used below
+}
+
+@serializable
+struct ClipboardPacket {
+    data: String,
+}
+
+fn main() {
+    let packet = ClipboardPacket { data: "hello" };
+    var buf = FriendlyByteBuf::new();
+    encode(&packet, &mut buf);
+    let restored = decode(&mut buf);
+}
+```
+
+- Scoped to exactly one target for this pass: an `extern class` literally
+  named `FriendlyByteBuf` must be declared somewhere in the same compile
+  (Forge's networking buffer type is the motivating case — see
+  `kubejs-aisle-tool`'s `ClipboardPacket`, whose hand-written
+  `encode`/`decode` this replaces). No pluggable backend (NBT/JSON/other
+  wire formats) yet.
+- Field types are limited to `Int`/`Long`/`Float`/`Double`/`Bool`/
+  non-nullable `String`, each mapping to a real
+  `writeInt`/`readInt`, `writeLong`/`readLong`, `writeFloat`/`readFloat`,
+  `writeDouble`/`readDouble`, `writeBoolean`/`readBoolean`,
+  `writeUtf`/`readUtf` call — a struct field of any other type (a nested
+  struct, an enum, a nullable `String?`, another `extern class`) is a
+  compile error naming the unsupported field.
+- Whether the declared `FriendlyByteBuf` extern class actually has the
+  needed `writeX`/`readX` methods is left to the normal checker pass over
+  the synthesized bodies to catch — same "no special-cased validation"
+  approach the `by field` interface-delegation synthesis already uses.
+- `encode`/`decode` are ordinary top-level `pub fn`s (not name-mangled
+  like `impl`-desugared methods), landing on the struct's own holder
+  class via the "named binary target" mechanism above when the struct is
+  its file's first declared one — so a compile with more than one
+  `@serializable` struct needs each in its own file/module to avoid the
+  same flat-global-namespace collision any other same-named top-level
+  `pub fn` pair would hit.
 
 ### String interpolation: `"a {expr} b"`
 
@@ -786,31 +1191,82 @@ fn describe_security_manager() -> String {
   type-check with zero cast or extra ceremony — verified both directions:
   the narrowed call compiles and runs correctly, and the *same* call
   written *without* the preceding null check is correctly rejected.
+- **Branch-scoped narrowing**: `if x != null { ... }` narrows `x` inside
+  that `then` branch's own scope (never leaking to an `else` or to code
+  after the `if`); `if x == null { ... } else { ... }` narrows `x` inside
+  the `else` branch instead. Each is scoped to exactly that block — declared
+  into the same `Env` frame the block's own scope-exit already discards, so
+  there's no risk of a narrowing from one branch bleeding into its sibling.
+  ```
+  if player != null {
+      player.getMainHandItem();  // fine -- narrowed for this block only
+  }
+  // player is still Player? here, unnarrowed
+  ```
 - **Codegen** uses the JVM's own `IFNULL`/`IFNONNULL` branch instructions
   directly against the single reference on the stack — no boxing, no
   constructing an actual `null` constant to compare against.
 
 **Known limitations, real scope cuts, not oversights**:
-- **Only the exact `if x == null { <exits> } ` guard-clause shape
-  narrows.** No `if x != null { ... } else { <exits> }` form, no
-  `if x == null || y == null { ... }`, no narrowing inside a `while`
-  condition — this is pattern-matched narrowly against the one idiom
-  real ported code actually needed, not a general flow-typing system.
+- **Only the exact `ident == null`/`ident != null` shape narrows** (either
+  literal order) — no `if x == null || y == null { ... }` compound
+  conditions, no narrowing inside a `while` condition, no narrowing of
+  anything other than a bare identifier (a field access like `mc.player`
+  needs binding to a local first: `let player = mc.player; if player !=
+  null { ... }`). This is pattern-matched narrowly against the idioms real
+  ported code actually needed, not a general flow-typing system.
   (Deliberately so, not just unimplemented: general flow-sensitive
-  re-typing of an *existing* variable would be the first such mechanism
-  in this checker — see `IDEAS.md`'s `if let` entry for the same
-  reasoning applied to `Option`.)
+  re-typing of an *existing* variable would be a much bigger mechanism in
+  this checker — see `IDEAS.md`'s `if let` entry for the same reasoning
+  applied to `Option`.)
 - **No `?.`/`?:` (safe-call/Elvis) operators** — narrow via the guard
   clause, then use the value normally; there's no shorthand for "do
   something only if non-null" inline yet.
-- **Native `String` can't be `String?`** — nullability is implemented as
-  a flag on `Ty.JavaExtern`, and `Ty.Str_` is a separate built-in type
-  (a singleton object, not a data class), so it doesn't carry the flag.
-  A JDK method returning a possibly-null `String` (`Map.get`, `System
-  .getProperty`, ...) needs its own workaround for now — not a rare case,
-  and worth a real follow-up, deliberately not attempted in this pass to
-  avoid a much larger, riskier refactor across every `== Ty.Str_`
-  comparison in the checker/codegen for a first cut of the feature.
+
+### `String?`: the same nullability, for the one built-in type that isn't a `JavaExtern`
+
+```
+extern class Properties = "java.util.Properties" {
+    fn getProperty(&self, key: String) -> String?;
+}
+
+fn describe(p: &Properties, key: String) -> String {
+    let v = p.getProperty(key);
+    if v == null {
+        return "missing";
+    }
+    return "found: " + v;   // v: String here, full String power (+, interpolation, ...)
+}
+```
+
+`Ty.Str_` went from a singleton `object` to a `data class Str_(val nullable: Boolean = false)`
+— same shape as `Ty.JavaExtern.nullable`, same narrowing mechanism
+(`Checker.narrowNonNull`), same `== null`/`!= null`-only restriction
+until narrowed. A real JDK method returning a possibly-null `String`
+(`Map.get`, `System.getProperty`, `Properties.getProperty`, ...) can now
+be declared honestly instead of needing a workaround.
+
+- `+`, string interpolation, and the `.method()` bridge to `extern class
+  ... = "java.lang.String"` declarations (see "Java interop" above) all
+  correctly reject a not-yet-narrowed `String?`, same "must narrow first"
+  discipline as everywhere else nullability applies — `print(s)` and
+  string interpolation both name the specific problem ("possibly-null
+  String") rather than a generic type-mismatch error.
+- **`==`/`!=` between two `String` values is null-safe**, not just
+  narrowing-gated: comparing two still-nullable strings directly (`a ==
+  b`, neither narrowed, either or both potentially actually null at
+  runtime) compiles to `java.util.Objects.equals(a, b)` rather than
+  `a.equals(b)` — the naive translation would NPE the moment the *left*
+  operand happened to genuinely be null. Two provably non-null strings
+  still get the cheaper direct `a.equals(b)` (`INVOKEVIRTUAL`, no static
+  helper call) — verified both codegen paths are actually taken via
+  `javap`, not just that both compile.
+- `read_line()` stays declared non-nullable for now, deliberately, even
+  though the real `BufferedReader.readLine()` it wraps can genuinely
+  return null at EOF (see `examples/input.hc`'s existing, honest-about-
+  itself failure mode) — changing that would be a breaking change to
+  every existing program calling `read_line()` without narrowing.
+  Worth revisiting, just not silently as a side effect of this pass.
 
 ### `extends`: subclassing a real Java class
 
@@ -877,17 +1333,16 @@ fn main() {
   replacement, not an augmentation.
 - **Single inheritance only, no further subclassing.** `S` itself is
   generated `final`; nothing can extend an `extends`-struct.
-- **The real, concrete blocker on porting further real Forge classes
-  entirely**: overriding a method whose body needs a null check (Forge's
+- **Resolved**: overriding a method whose body needs a null check (Forge's
   `Item.useOn(UseOnContext)` calling `context.getPlayer()`, which is
-  legitimately null for a non-player use context like a dispenser) isn't
-  possible yet — HC has no nullable-extern-type/null-check mechanism at all
-  (see "Nullable extern references: `Type?`" in `IDEAS.md`, already the
-  top-priority backlog item). This is why the real mod's `CopyToolItem`
-  hasn't been migrated off its thin Java shell despite `extends` existing:
-  its `use()` method has no such blocker and could move today, but `useOn()`
-  does, and shipping an override that skips a genuinely-needed null check
-  would trade a working design for a crash risk just to call the port done.
+  legitimately null for a non-player use context like a dispenser) used to
+  be blocked here, before "Nullable extern references: `Type?`" shipped.
+  The real mod's `CopyToolItem` is now fully off its Java shell — see
+  `kubejs-aisle-tool/hc/CopyToolItem.hc`, a real `extends Item` struct
+  overriding `use`/`useOn`/`appendHoverText`, verified end-to-end against
+  the real Forge classpath (`javap` confirms the generated class really
+  `extends net.minecraft.world.item.Item`, and the full mod build links
+  against it).
 
 ### Logical operators: `&&` / `||`
 
@@ -1100,24 +1555,37 @@ of that being unblocked.)
 ./gradlew run --args="run examples/multifile"
 ```
 
-Every `.hc` file directly inside the directory (non-recursive) is parsed
-and merged into one flat program — the exact same merge the prelude
-already goes through — before checking and codegen. There's no `use`/
-`import` statement: every top-level name (struct, fn, interface, enum,
-`extern class`) shares one global namespace across every file in the
-directory, so a name can only be declared once total, same as within a
-single file today. See `examples/multifile/` (a `sealed interface` in
-one file, implemented by structs in two others, matched over from a
-fourth) for a working example.
+Every `.hc` file *anywhere under* the directory — recursively, nested
+subdirectories included — is parsed and merged into one flat program —
+the exact same merge the prelude already goes through — before checking
+and codegen. There's no `use`/`import` statement: every top-level name
+(struct, fn, interface, enum, `extern class`) shares one global
+namespace across every file in the tree, so a name can only be declared
+once total, same as within a single file today. See `examples/
+multifile/` (a `sealed interface` in one file, implemented by structs
+in two others, matched over from a fourth) for a working example.
+
+Nesting files under subdirectories mirroring their own `module` path
+(`client/Foo.hc` declaring `module ...client;`, matching the Java/
+Kotlin source-root convention) is a real, supported organizational
+choice — a real Minecraft mod project's own `.hc` files are laid out
+exactly this way — but it's purely a convenience for humans/tooling
+browsing the source tree; the compiler itself never checks a file's
+declared `module` against its actual directory path (see `IDEAS.md`'s
+"Verify a declared module matches the file's directory path" for the
+opt-in check that would add that, deliberately not built by default).
+A perfectly flat directory with every file's module declared explicitly
+works exactly as well — nesting changes nothing about how names resolve
+or which class each file's own declarations land on.
 
 This is also what makes `sealed interface`'s "every implementer is
 declared in this compilation unit" guarantee actually mean something —
 previously the entire program was always one file, so it was trivially
-true; now it spans a real multi-file project directory.
+true; now it spans a real multi-file project directory (or tree).
 
-**Known limitation**: no explicit dependency graph — every file in the
-directory is compiled together regardless of whether anything in it is
-actually used. Per-file namespacing, though, is exactly what `module`
+**Known limitation**: no explicit dependency graph — every file under
+the directory is compiled together regardless of whether anything in it
+is actually used. Per-file namespacing, though, is exactly what `module`
 (below) gives you.
 
 ### Modules: `module`, `pub`, `open`, `extend`
@@ -1197,17 +1665,71 @@ fn main() {
   every normal method-lookup path has already failed — no new runtime
   mechanism, no vtable patching.
 
-Top-level functions get real per-module enforcement too, not just
-types: each module's fns (including desugared impl/extend methods) land
-on their own holder class in their own package — a `pub fn` in one
-module is a genuinely separate, independently-linkable JVM method from
-a same-named private one in another, not two methods sharing a class.
-`fn main()`'s own module (or the default/unnamed one, if it never
-declared one) keeps the CLI-supplied class name and the real JVM entry
-point; every other module gets an internal `$Fns` holder. See
-`examples/modules/` for a working two-module example (`extend` reaching
-across module boundaries, a private struct genuinely inaccessible
-cross-module — verified with `javap`, not just by reading the source).
+Top-level functions get real enforcement too, not just types: every fn
+(including desugared impl/extend methods) lands on its own holder class
+in its own package — a `pub fn` in one file is a genuinely separate,
+independently-linkable JVM method from a same-named private one in
+another, not two methods sharing a class. `fn main()`'s own file (or
+the default/unnamed module, if it never declared one) keeps the
+CLI-supplied class name and the real JVM entry point. Every other file
+gets a **named binary target**: if it declares at least one `struct`,
+its top-level `pub fn`/`pub static` land as ordinary static members
+directly on *that file's own first* declared struct's class — a real
+name Java code can reference by writing it, not a hidden one. Only a
+file with no struct at all falls back to an internal `$Fns` holder.
+
+```
+module defs;
+
+pub struct Items { }   // this file's first struct -- the "named holder"
+
+pub static COUNT: Int = 7;
+pub fn bump(x: Int) -> Int { return x + 1; }
+```
+
+```java
+// From plain Java: Items.COUNT and Items.bump(x) are real static
+// members on defs.Items, not an undiscoverable defs.$Fns.
+int n = defs.Items.bump(defs.Items.COUNT);
+```
+
+This is exactly the shape a Forge-style "registry holder" class needs
+(`DeferredRegister`/`RegistryObject` fields other files read by name) —
+see `kubejs-aisle-tool/src/main/hc/Items.hc` for a real one, compiling to
+`net.oktawia.structruretokubejsaisles.defs.Items` with a real
+`Items.COPY_TOOL` field other Java files in that mod read directly.
+Scoped to exactly "first struct wins" per file — a file mixing multiple
+structs with top-level fns still only merges onto the first one
+declared.
+
+**Grouped by file, not just by module** — deliberately, and this
+matters the moment `sourceDir`/directory-mode compilation is in the
+picture: multiple files can (and in a real project do) legitimately
+share one `module` line, each meaning its own struct to keep its own
+separately-named class. `kubejs-aisle-tool`'s `client` module has three
+files this way (`CopyToolHudOverlay.hc`, `CopyToolSelectionRender.hc`,
+`RenderUtil.hc`), each with its own struct — grouping by module alone
+would have silently merged all three files' top-level fns onto
+whichever struct happened to be first, breaking the other two files'
+`OtherStruct::its_fn(...)`-shaped call sites the moment directory mode
+put them in one compile together. A file with no struct at all (a
+fn-only file like `Aisletool.hc`/`Copytool.hc`, both sharing a module
+too) still gets its own file-named holder in that case, not a shared
+`$Fns` — matches the exact TitleCase-file-name-is-the-class-name
+convention a single-file compile's own entry class already follows.
+Verified directly: `Aisletool.hc` and `Copytool.hc` compiled together
+(no `fn main()` anywhere in either) still produce two separately-named
+`Aisletool`/`Copytool` classes, not one merged class under an arbitrary
+name — real regression coverage exists for exactly this shape now
+(`Foo.hc`/`Bar.hc` sharing a module, each keeping its own class; a
+fn-only file with no struct at all, arbitrarily chosen as the
+compile's fallback "entry," still keeping its own name instead of
+being renamed to the directory's own basename).
+
+See `examples/modules/` for a working two-module example (`extend`
+reaching across module boundaries, a private struct genuinely
+inaccessible cross-module — verified with `javap`, not just by reading
+the source).
 
 ### Global state: `pub static NAME: Type = initExpr;`
 
@@ -1241,9 +1763,19 @@ pub fn seedPhoenixTiers() {
   class, initialized once in that class's `<clinit>` — `pub`/private
   maps onto `ACC_PUBLIC`/package-private exactly like everything else
   here.
-- The initializer is checked in an empty scope: no locals, and
-  deliberately no access to *other* statics either, sidestepping
-  cross-static init-order for this first pass.
+- The initializer is checked with no locals, but every *already-declared*
+  static is in scope — so a later static can read an earlier one:
+  `pub static ITEMS: DeferredRegister = DeferredRegister::create(...);`
+  followed by `pub static COPY_TOOL: RegistryObject = ITEMS.register(...);`
+  works (see `Items.hc` again). This is backward-reference-only by
+  construction, not a general dependency solver — a static's init is
+  checked before any *later* static is added to the table at all, so a
+  forward reference is simply unresolvable (an "unknown variable" error),
+  never a special circularity case to detect. Sound at codegen time too:
+  same-module statics initialize in this same declared order within one
+  shared `<clinit>`, and a read of a different module's static just
+  triggers that module's own class-init first, ordinary JVM
+  `<clinit>`-on-first-use semantics.
 - Reading/writing works exactly like a `var` local everywhere in the
   checker (same Ident/Assign/method-call code paths, injected into
   every fn's scope) with one difference: a read is *never* treated as a
@@ -1288,11 +1820,49 @@ plugins {
 }
 
 hotChocolate {
-    compilerHome = file("$rootDir/../../HotChocolate/build/install/hotchocolate")
+    version = "v0.1.5"   // resolves the compiler from JitPack -- see "Published on JitPack" below
     source file('hc/foo.hc')
     source file('hc/bar.hc')   // compiled after foo.hc, so it can `extern class` reach foo's output
 }
 ```
+
+#### `version` vs `compilerHome`: where the compiler itself comes from
+
+`hotChocolate { }` needs exactly one of two ways to find the actual
+compiler:
+
+- **`version = "v0.1.5"`** — resolves the compiler as a real, already-
+  published JitPack dependency (`com.github.P-H-O-E-N-I-X-PackForge:
+  HotChocolate:v0.1.5`, adding the `jitpack.io` Maven repository to the
+  consuming project automatically) instead of requiring a local
+  `./gradlew installDist` against a sibling checkout. **This is the
+  right default for essentially every consuming project**: no local
+  HotChocolate checkout, no manual build step, a pinned version like any
+  other dependency — reproducible on a machine (or CI runner) that's
+  never touched the HotChocolate repo at all, the way `compilerHome`
+  (pointing at whatever happens to be installed on one developer's
+  machine) never was. Verified end-to-end: pointed a real consuming
+  project's `hotChocolate { }` block at `version = "v0.1.5"`, confirmed
+  the compiler genuinely resolves and runs over the network (not a
+  silently-stale local copy) by observing it reject syntax added to the
+  language *after* that tag was cut, then reverted back to local
+  development's own `compilerHome`.
+- **`compilerHome = file(...)`** — the local-dev escape hatch, unchanged
+  from before: point it at a local `./gradlew installDist` output (e.g.
+  a sibling checkout via `includeBuild`, as in the example above). Use
+  this when you're actually working on the compiler itself and need an
+  uncommitted, unpublished change to show up immediately. **Wins over
+  `version` when both are set** — an explicit local override always
+  beats a resolved artifact.
+
+Note this only replaces where the *compiler jar* comes from — applying
+the plugin itself still goes through `pluginManagement.includeBuild`
+(above) for now, same as before. The plugin's own jar is also published
+on JitPack (see "Published on JitPack" below), but resolving it via a
+plugin repository (`pluginManagement { repositories { maven { url =
+"https://jitpack.io" } } } ... plugins { id("hc") version "v0.1.5" }`,
+skipping `includeBuild` entirely) hasn't been verified yet — a real next
+step, not something this change claims to already deliver.
 
 Applying the plugin registers one `hcCompile<Name>` task per declared
 source (`hcCompileFoo`, `hcCompileBar`, ...), each depending on the one
@@ -1305,6 +1875,34 @@ lands in the mod's jar (`javap`/`unzip -l` both confirm the real
 `.class` files are present under the expected package), and
 `./gradlew build` succeeds.
 
+**`sourceDir`, the directory-mode counterpart** (alongside `source`, in
+the same `hotChocolate { }` block):
+
+```groovy
+hotChocolate {
+    compilerHome = file("$rootDir/../../HotChocolate/build/install/hotchocolate")
+    sourceDir file('src/main/hc')
+}
+```
+
+One `hcCompile<DirName>` task compiling every `.hc` file anywhere under
+the directory (recursively — nested subdirectories, e.g. mirroring each
+file's own `module` path, work exactly the same as a flat layout) as a
+single shared, `extern`-free-between-them compile (the Gradle-plugin
+side of the CLI's own `hc build <dir> <outDir>` — see "Multi-file
+projects" above). Declaration order between files stops mattering
+entirely once this is used — a real mod project's own `.hc` files can
+reference each other directly, no `extern class Foo =
+"already.compiled.Foo" { ... }` bridging needed for the project's *own*
+compiled classes. Verified end-to-end against the real Minecraft mod:
+switching its 9-file `hotChocolate { }` block (previously nine chained
+`source(file(...))` entries, several needing hand-written `extern class`
+bridges purely to reach each other's output) to one `sourceDir` removed
+every one of those bridges, `javap` confirms the real mod's already-
+public classes (`Aisletool`, `Copytool`, `Items`, ...) all kept their
+exact same binary names and cross-package visibility, and `./gradlew
+build` still succeeds.
+
 **What this deliberately is not**: a replacement for Gradle, a
 dependency resolver, or a Maven Central publisher — it's Gradle's own
 composite-build (`includeBuild`) and plugin mechanisms, used the way
@@ -1312,13 +1910,15 @@ they're meant to be used. See `IDEAS.md` for why a from-scratch build
 tool ("Marshmallow") was considered and declined; this plugin is the
 actual right-sized version of that want.
 
-**Known limitation**: `compilerHome` still points at a locally-built
-install distribution (`./gradlew installDist`), not a published
-artifact, so *using the plugin* still needs a local HotChocolate
-checkout built once — `includeBuild`, not a version string, is how a
-consuming project's `settings.gradle` resolves the plugin itself. Fine
-for this repo's own current use (a sibling checkout), not yet a "add one
-line, no local setup" experience for an arbitrary outside project.
+**Known limitation, narrowed**: the compiler itself no longer requires a
+local install (`hotChocolate { version = "v0.1.5" }` resolves it from
+JitPack — see "`version` vs `compilerHome`" above) — what's left is that
+*applying the plugin* still goes through `pluginManagement.includeBuild`
+pointing at a local checkout, not a version string, so a genuinely
+"add one line, no local setup at all" experience for an arbitrary
+outside project still needs the plugin itself resolvable the same way
+(a plugin-repository JitPack lookup, or eventual Gradle Plugin Portal
+publication) — not yet built or verified.
 
 ### Published on JitPack
 

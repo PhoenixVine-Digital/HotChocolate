@@ -24,13 +24,20 @@ class Parser(private val tokens: List<Token>) {
         val extends = mutableListOf<ExtendBlock>()
         val statics = mutableListOf<StaticDecl>()
         while (!check(TokType.EOF)) {
+            val (annotations, serializable) = leadingMarkers()
             val pub = match(TokType.PUB)
             val open = match(TokType.OPEN)
             if (open && !check(TokType.INTERFACE) && !check(TokType.SEALED)) throw err("'open' can only be used on an 'interface'")
+            if (annotations.isNotEmpty() && !check(TokType.STRUCT) && !check(TokType.FN)) {
+                throw err("annotations can only precede a top-level 'struct' or 'fn'")
+            }
+            if (serializable && !check(TokType.STRUCT)) {
+                throw err("'@serializable' can only precede a top-level 'struct'")
+            }
             when {
-                check(TokType.STRUCT) -> structs += structDecl(pub)
+                check(TokType.STRUCT) -> structs += structDecl(pub, annotations, serializable)
                 check(TokType.ARENA) -> structs += arenaStructDecl(pub)
-                check(TokType.FN) -> fns += fnDecl(pub)
+                check(TokType.FN) -> fns += fnDecl(pub, annotations)
                 check(TokType.STATIC) -> statics += staticDecl(pub)
                 check(TokType.IMPL) -> { if (pub) throw err("'pub' doesn't apply to 'impl' blocks -- mark the struct/interface itself 'pub'"); impls += implDecl() }
                 check(TokType.INTERFACE) -> interfaces += interfaceDecl(pub, open)
@@ -92,11 +99,21 @@ class Parser(private val tokens: List<Token>) {
         val name = expect(TokType.IDENT).text
         expect(TokType.EQ)
         val binaryName = expect(TokType.STRING).text.replace('.', '/')
+        // Optional `interface` marker right after the binary name -- see ExternClassDecl's
+        // `isInterface` doc for why this needs to be spelled out (no reflection here to infer it
+        // from the real classfile's ACC_INTERFACE flag automatically, same "trust the
+        // declaration" honesty as everything else under `extern`).
+        val isInterface = match(TokType.INTERFACE)
 
         if (match(TokType.SEMI)) {
-            return ExternClassDecl(name, binaryName, emptyList(), lazyAll = true)
+            return ExternClassDecl(name, binaryName, emptyList(), lazyAll = true, isInterface = isInterface)
         }
-        if (match(TokType.USE)) {
+        // Contextual keyword, not a reserved word -- see the lexer's comment on why "use" isn't
+        // in its KEYWORDS map at all (a real Java method can be named exactly "use", as
+        // `Item.use(...)` is). Checked by peeking an IDENT token's text right here, the one
+        // position it means anything special.
+        if (check(TokType.IDENT) && peek().text == "use") {
+            advance()
             expect(TokType.LBRACE)
             val useNames = mutableListOf<String>()
             while (!check(TokType.RBRACE)) {
@@ -105,13 +122,26 @@ class Parser(private val tokens: List<Token>) {
             }
             expect(TokType.RBRACE)
             expect(TokType.SEMI)
-            return ExternClassDecl(name, binaryName, emptyList(), useNames = useNames)
+            return ExternClassDecl(name, binaryName, emptyList(), useNames = useNames, isInterface = isInterface)
         }
 
         expect(TokType.LBRACE)
         val methods = mutableListOf<ExternMethodDecl>()
+        val fields = mutableListOf<ExternFieldDecl>()
         while (!check(TokType.RBRACE)) {
             val isStatic = match(TokType.STATIC)
+            if (!check(TokType.FN)) {
+                // `NAME: Type;` (instance field, read via `recv.NAME`) or `static NAME: Type;`
+                // (static field, read via `Alias::NAME`) -- both share this branch, distinguished
+                // purely by the `static` keyword; neither has a `fn` following the name.
+                val fline = peek().line
+                val fname = expect(TokType.IDENT).text
+                expect(TokType.COLON)
+                val ftype = typeRef()
+                expect(TokType.SEMI)
+                fields += ExternFieldDecl(fname, ftype, fline, isStatic)
+                continue
+            }
             val line = expect(TokType.FN).line
             val mname = expect(TokType.IDENT).text
             val params = paramList()
@@ -121,7 +151,7 @@ class Parser(private val tokens: List<Token>) {
             methods += ExternMethodDecl(mname, params, retType, line, isStatic)
         }
         expect(TokType.RBRACE)
-        return ExternClassDecl(name, binaryName, methods)
+        return ExternClassDecl(name, binaryName, methods, fields = fields, isInterface = isInterface)
     }
 
     // `extern interface Alias = "java.lang.Runnable" { fn run(&self); }` -- a declared, trusted
@@ -240,7 +270,7 @@ class Parser(private val tokens: List<Token>) {
         return ImplBlock(structName, typeParams, methods, interfaceName, delegateField, bounds)
     }
 
-    private fun structDecl(pub: Boolean = false): StructDecl {
+    private fun structDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList(), serializable: Boolean = false): StructDecl {
         expect(TokType.STRUCT)
         val name = expect(TokType.IDENT).text
         val (typeParams, bounds) = typeParamListWithBounds()
@@ -256,7 +286,70 @@ class Parser(private val tokens: List<Token>) {
             if (!check(TokType.RBRACE)) expect(TokType.COMMA)
         }
         expect(TokType.RBRACE)
-        return StructDecl(name, fields, typeParams, typeParamBounds = bounds, moduleName = currentModule, visible = pub, superclass = superclass)
+        return StructDecl(name, fields, typeParams, typeParamBounds = bounds, moduleName = currentModule, visible = pub, superclass = superclass, annotations = annotations, serializable = serializable)
+    }
+
+    // `@"binary.Name"` (marker) or `@"binary.Name"(argName: value, ...)` -- a real Java
+    // annotation, zero or more, immediately before a top-level `struct`/`fn`. See AnnotationUse's
+    // doc for why argument values are their own small grammar (`annotationValue()`) instead of a
+    // full expression. `@serializable` (bare identifier, no string) is the one recognized
+    // compiler *directive* so far -- distinguished from a real annotation purely by the absence
+    // of a quoted string right after `@` -- see StructDecl's own doc comment for what it does.
+    // Both forms can repeat and mix freely in any order in front of one declaration.
+    private fun leadingMarkers(): Pair<List<AnnotationUse>, Boolean> {
+        val out = mutableListOf<AnnotationUse>()
+        var serializable = false
+        while (check(TokType.AT)) {
+            val line = expect(TokType.AT).line
+            if (check(TokType.STRING)) {
+                val binaryName = advance().text.replace('.', '/')
+                val args = mutableListOf<Pair<String, AnnotationValue>>()
+                if (match(TokType.LPAREN)) {
+                    while (!check(TokType.RPAREN)) {
+                        val argName = expect(TokType.IDENT).text
+                        expect(TokType.COLON)
+                        args += argName to annotationValue()
+                        if (!check(TokType.RPAREN)) expect(TokType.COMMA)
+                    }
+                    expect(TokType.RPAREN)
+                }
+                out += AnnotationUse(binaryName, args, line)
+            } else if (check(TokType.IDENT) && peek().text == "serializable") {
+                advance()
+                serializable = true
+            } else {
+                throw err("expected a quoted annotation name (@\"binary.Name\") or a known compiler directive (@serializable) after '@'")
+            }
+        }
+        return out to serializable
+    }
+
+    // `"a string literal"` or `enum("binary.Name", "CONST")` -- the only two annotation-argument
+    // shapes ported code has needed so far (Forge's `modid = "..."` and `value = Dist.CLIENT`).
+    private fun annotationValue(): AnnotationValue {
+        // "enum" is already a hard keyword (TokType.ENUM, from `enum Name { }` declarations),
+        // not an IDENT here -- check the reserved token, not IDENT-with-matching-text like the
+        // lexer's "use" contextual keyword does.
+        if (check(TokType.ENUM)) {
+            advance()
+            expect(TokType.LPAREN)
+            val enumBinaryName = expect(TokType.STRING).text.replace('.', '/')
+            expect(TokType.COMMA)
+            val constName = expect(TokType.STRING).text
+            expect(TokType.RPAREN)
+            return AnnotationValue.EnumConst(enumBinaryName, constName)
+        }
+        if (check(TokType.LBRACKET)) {
+            advance()
+            val values = mutableListOf<AnnotationValue>()
+            while (!check(TokType.RBRACKET)) {
+                values += annotationValue()
+                if (!check(TokType.RBRACKET)) expect(TokType.COMMA)
+            }
+            expect(TokType.RBRACKET)
+            return AnnotationValue.Arr(values)
+        }
+        return AnnotationValue.Str(expect(TokType.STRING).text)
     }
 
     // `arena struct Name { field: Int, ... }` -- no type params, fields must be
@@ -297,7 +390,7 @@ class Parser(private val tokens: List<Token>) {
         return names to bounds
     }
 
-    private fun fnDecl(pub: Boolean = false): FnDecl {
+    private fun fnDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList()): FnDecl {
         val isOverride = match(TokType.OVERRIDE)
         val line = peek().line
         expect(TokType.FN)
@@ -309,7 +402,7 @@ class Parser(private val tokens: List<Token>) {
             retType = typeRef()
         }
         val body = block()
-        return FnDecl(name, params, retType, body, line, typeParams, bounds, currentModule, pub, isOverride)
+        return FnDecl(name, params, retType, body, line, typeParams, bounds, currentModule, pub, isOverride, annotations)
     }
 
     // `(self, ...)` / `(&self, ...)` / `(&mut self, ...)` / `(name: Type, ...)`.
@@ -487,6 +580,61 @@ class Parser(private val tokens: List<Token>) {
         return Stmt.Match(scrutinee, arms, line)
     }
 
+    // `if cond { expr } else { expr }` as a value -- see Ast.kt's `Expr.If` doc for the exact
+    // scope cut (each branch is a single-expression block, `else` required). Reachable only from
+    // `primary()`, so `if`/`match` used at statement position keep going through `ifStmt()`/
+    // `matchStmt()` above, completely unaffected -- this is purely additive.
+    private fun ifExpr(): Expr {
+        val line = expect(TokType.IF).line
+        val cond = expression()
+        val thenB = block()
+        expect(TokType.ELSE)
+        // Chained `else if` in expression position must itself yield a value -- wrapped in a
+        // single `Stmt.ExprStmt` so it satisfies the same "exactly one expression" shape the
+        // checker enforces on every other branch, rather than needing a separate AST shape for it.
+        val elseB = if (check(TokType.IF)) Block(listOf(Stmt.ExprStmt(ifExpr()))) else block()
+        return Expr.If(cond, thenB, elseB, line)
+    }
+
+    // `match scrutinee { Variant { a, b } => expr, _ => expr }` as a value -- same arm grammar as
+    // `matchStmt()` (each arm's body is still a normal `{ ... }` block), just building `Expr.Match`.
+    private fun matchExpr(): Expr {
+        val line = expect(TokType.MATCH).line
+        val scrutinee = expression()
+        expect(TokType.LBRACE)
+        val arms = mutableListOf<MatchArm>()
+        while (!check(TokType.RBRACE)) {
+            val armLine = peek().line
+            var vname: String? = null
+            if (match(TokType.IDENT)) {
+                vname = tokens[pos - 1].text
+                if (vname != "_" && match(TokType.COLONCOLON)) {
+                    vname += "::" + expect(TokType.IDENT).text
+                }
+            } else {
+                throw err("Expected variant name or '_' in match arm")
+            }
+            val bindings = mutableListOf<String>()
+            if (match(TokType.LBRACE)) {
+                while (!check(TokType.RBRACE)) {
+                    bindings += expect(TokType.IDENT).text
+                    if (match(TokType.COLON)) {
+                        val bindingName = expect(TokType.IDENT).text
+                        bindings.removeAt(bindings.size - 1)
+                        bindings += bindingName
+                    }
+                    if (!check(TokType.RBRACE)) expect(TokType.COMMA)
+                }
+                expect(TokType.RBRACE)
+            }
+            expect(TokType.FATARROW)
+            val body = block()
+            arms += MatchArm(if (vname == "_") null else vname, bindings, body, armLine)
+        }
+        expect(TokType.RBRACE)
+        return Expr.Match(scrutinee, arms, line)
+    }
+
     // `for x in a..b { }` or `for x in arr { }`
     private fun forStmt(): Stmt {
         val line = expect(TokType.FOR).line
@@ -595,15 +743,23 @@ class Parser(private val tokens: List<Token>) {
         return expr
     }
 
-    // `expr as Type` -- binds tighter than the arithmetic operators (`x as Double / y` casts
-    // `x` before dividing, matching Rust's own precedence) but looser than unary (`-x as Float`
-    // negates first, then casts). Chainable: `x as Float as Int` reads left to right.
+    // `expr as Type` / `expr is Type` -- both bind tighter than the arithmetic operators (`x as
+    // Double / y` casts `x` before dividing, matching Rust's own precedence) but looser than
+    // unary (`-x as Float` negates first, then casts). Chainable: `x as Float as Int` reads left
+    // to right; `is` chaining is nonsensical (result is already `Bool`) but not specially
+    // rejected -- `(x is Foo) as ...`/etc is just a checker type error like any other.
     private fun cast(): Expr {
         var expr = unary()
-        while (check(TokType.AS)) {
-            val line = advance().line
-            val target = typeRef()
-            expr = Expr.Cast(expr, target, line)
+        while (check(TokType.AS) || check(TokType.IS)) {
+            if (check(TokType.AS)) {
+                val line = advance().line
+                val target = typeRef()
+                expr = Expr.Cast(expr, target, line)
+            } else {
+                val line = advance().line
+                val target = typeRef()
+                expr = Expr.InstanceOf(expr, target, line)
+            }
         }
         return expr
     }
@@ -698,12 +854,19 @@ class Parser(private val tokens: List<Token>) {
             TokType.LPAREN -> { advance(); val e = expression(); expect(TokType.RPAREN); e }
             TokType.LBRACKET -> arrayLiteralOrRepeat()
             TokType.ARENA -> arenaNewExpr()
+            TokType.IF -> ifExpr()
+            TokType.MATCH -> matchExpr()
             TokType.IDENT -> {
                 if (peekAt(1).type == TokType.COLONCOLON) {
-                    if (peekAt(3).type == TokType.LBRACE) {
-                        structLiteral()
-                    } else {
-                        staticCall()
+                    when {
+                        // Same ambiguity as the bare-Ident case below (`if x { }` vs `x { }`),
+                        // just one token further out: `if Alias::FIELD { }` (a static-field read
+                        // used as an if-condition) tokenizes identically up through the `{` as
+                        // `Alias::Variant { field: val }` (an enum-variant struct literal), so
+                        // the same lookahead heuristic decides it -- not just LBRACE-presence.
+                        peekAt(3).type == TokType.LBRACE && looksLikeVariantStructLiteral() -> structLiteral()
+                        peekAt(3).type == TokType.LPAREN -> staticCall()
+                        else -> staticFieldGet()
                     }
                 } else if (peekAt(1).type == TokType.LBRACE && looksLikeStructLiteral()) {
                     // lookahead for struct literal: Ident { ... }
@@ -722,6 +885,19 @@ class Parser(private val tokens: List<Token>) {
     private fun looksLikeStructLiteral(): Boolean {
         val save = pos
         advance() // ident
+        advance() // lbrace
+        val result = check(TokType.RBRACE) ||
+            (check(TokType.IDENT) && peekAt(1).type == TokType.COLON)
+        pos = save
+        return result
+    }
+
+    // Same disambiguation, shifted past a `Base::Variant` prefix instead of a bare `Ident`.
+    private fun looksLikeVariantStructLiteral(): Boolean {
+        val save = pos
+        advance() // base ident
+        advance() // ::
+        advance() // variant ident
         advance() // lbrace
         val result = check(TokType.RBRACE) ||
             (check(TokType.IDENT) && peekAt(1).type == TokType.COLON)
@@ -765,6 +941,16 @@ class Parser(private val tokens: List<Token>) {
         }
         val line = expect(TokType.RPAREN).line
         return Expr.StaticCall(typeName, method, args, line)
+    }
+
+    // `Alias::FIELD` -- reads a declared `extern class` static field (GETSTATIC). Only reached
+    // when staticCall()'s LPAREN lookahead fails, i.e. nothing follows the member name that
+    // would make it a call.
+    private fun staticFieldGet(): Expr {
+        val typeName = expect(TokType.IDENT).text
+        expect(TokType.COLONCOLON)
+        val field = expect(TokType.IDENT)
+        return Expr.StaticFieldGet(typeName, field.text, field.line)
     }
 
     // `[e1, e2, e3]` (literal) or `[value; count]` (repeated value).

@@ -32,13 +32,20 @@ private val KEYWORDS = mapOf(
     "extend" to TokType.EXTEND,
     "static" to TokType.STATIC,
     "as" to TokType.AS,
-    "use" to TokType.USE,
+    // Deliberately NOT a keyword -- "use" only means anything special immediately after an
+    // `extern class Alias = "binary.Name"` header (the eager-reflection form), a single
+    // context the parser checks for by peeking an IDENT's text (see externClassDecl) rather
+    // than reserving the word globally. A real Java method can be (and, for `Item.use(...)`,
+    // is) named exactly "use" -- reserving it as a hard keyword would make that name
+    // undeclarable in an extern class's method list, a genuine collision found while porting
+    // CopyToolItem.hc.
     "try" to TokType.TRY,
     "catch" to TokType.CATCH,
     "throw" to TokType.THROW,
     "extends" to TokType.EXTENDS,
     "override" to TokType.OVERRIDE,
     "null" to TokType.NULL,
+    "is" to TokType.IS,
 )
 
 class Lexer(private val src: String) {
@@ -102,6 +109,7 @@ class Lexer(private val src: String) {
             '/' -> tok(TokType.SLASH, "/")
             '%' -> tok(TokType.PERCENT, "%")
             '?' -> tok(TokType.QUESTION, "?")
+            '@' -> tok(TokType.AT, "@")
             '&' -> if (match('&')) tok(TokType.AMPAMP, "&&") else tok(TokType.AMP, "&")
             '|' -> if (match('|')) tok(TokType.PIPEPIPE, "||") else throw LexError("Unexpected character '|' at line $startLine")
             '=' -> when {
