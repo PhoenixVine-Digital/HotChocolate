@@ -32,9 +32,9 @@ private fun mergeProgram(a: Program, b: Program): Program = Program(
 fun compile(source: String, mainClassName: String, classpath: List<String> = emptyList()): CompileResult =
     compileProgram(Parser(Lexer(source).tokenize()).parseProgram(), mainClassName, classpath)
 
-// `path` a single file compiles just that file (as before); a directory compiles every `.hc`
+// `path` a single file compiles just that file (as before); a directory compiles every `.hotc`
 // file *anywhere under it* (recursive -- matches the Java/Kotlin source-root convention of
-// nesting files under directories mirroring their package/module path, e.g. `client/Foo.hc`
+// nesting files under directories mirroring their package/module path, e.g. `client/Foo.hotc`
 // declaring `module ...client;`) as one flat program -- no import statements, every top-level
 // name (struct/fn/interface/enum/extern class) shares one global namespace across all of them,
 // exactly as if they'd been pasted into a single file, regardless of which subdirectory each
@@ -61,9 +61,9 @@ private fun stampSourceUnit(program: Program, unit: String): Program = Program(
 
 fun compileEntry(path: File, mainClassName: String, classpath: List<String> = emptyList()): CompileResult {
     if (path.isDirectory) {
-        val files = path.walkTopDown().filter { it.isFile && it.extension == "hc" }.toList()
+        val files = path.walkTopDown().filter { it.isFile && it.extension == "hotc" }.toList()
             .sortedBy { it.relativeTo(path).path }
-        if (files.isEmpty()) throw CodegenEntryError("no .hc files found in directory '${path.path}'")
+        if (files.isEmpty()) throw CodegenEntryError("no .hotc files found in directory '${path.path}'")
         var merged = Program(structs = emptyList(), fns = emptyList())
         for (f in files) {
             val parsed = Parser(Lexer(f.readText()).tokenize()).parseProgram()
@@ -177,13 +177,13 @@ fun main(rawArgs: Array<String>) {
     val (argsWithProfile, classpath) = extractClasspath(rawArgs)
     val (args, profilePath) = extractProfileFlag(argsWithProfile)
     if (args.isEmpty()) {
-        System.err.println("usage: hc <run|build> <file.hc | project-dir> [outDir] [--classpath a.jar:b.jar] [--profile[=out.jfr]]")
+        System.err.println("usage: hc <run|build> <file.hotc | project-dir> [outDir] [--classpath a.jar:b.jar] [--profile[=out.jfr]]")
         return
     }
     val cmd = args[0]
     val path = args.getOrNull(1)
     if (path == null) {
-        System.err.println("missing <file.hc | project-dir>")
+        System.err.println("missing <file.hotc | project-dir>")
         return
     }
     val file = File(path)
@@ -191,7 +191,7 @@ fun main(rawArgs: Array<String>) {
         System.err.println("no such file or directory '$path'")
         return
     }
-    // A directory's class name has no `.hc` extension to strip -- just its own name.
+    // A directory's class name has no `.hotc` extension to strip -- just its own name.
     val mainClassName = (if (file.isDirectory) file.name else file.nameWithoutExtension)
         .replaceFirstChar { it.uppercase() }
 
@@ -227,8 +227,8 @@ fun main(rawArgs: Array<String>) {
                 if (version == null || version < 22) {
                     System.err.println(
                         "this program uses 'arena struct', which needs a JDK 22+ 'java' to run " +
-                            "(found ${version?.let { "JDK $it" } ?: "an unrecognized/missing java"} at '$javaExe'). " +
-                            "Set HC_JAVA_HOME (or JAVA_HOME) to a JDK 22+ install."
+                                "(found ${version?.let { "JDK $it" } ?: "an unrecognized/missing java"} at '$javaExe'). " +
+                                "Set HC_JAVA_HOME (or JAVA_HOME) to a JDK 22+ install."
                     )
                     return
                 }
