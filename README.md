@@ -1855,14 +1855,67 @@ compiler:
   `version` when both are set** — an explicit local override always
   beats a resolved artifact.
 
-Note this only replaces where the *compiler jar* comes from — applying
-the plugin itself still goes through `pluginManagement.includeBuild`
-(above) for now, same as before. The plugin's own jar is also published
-on JitPack (see "Published on JitPack" below), but resolving it via a
-plugin repository (`pluginManagement { repositories { maven { url =
-"https://jitpack.io" } } } ... plugins { id("hc") version "v0.1.5" }`,
-skipping `includeBuild` entirely) hasn't been verified yet — a real next
-step, not something this change claims to already deliver.
+#### Zero-clone setup: resolving the plugin itself from JitPack, no `includeBuild`
+
+`includeBuild` (above) needs a literal local checkout to point at — fine
+for working on HotChocolate itself, overkill for just *using* it. The
+plugin's own jar is published on JitPack too (see "Published on
+JitPack" below), so a consuming project can skip `includeBuild` and
+local cloning entirely:
+
+```kotlin
+// settings.gradle.kts
+pluginManagement {
+    repositories {
+        maven { url = uri("https://jitpack.io") }
+        gradlePluginPortal()
+    }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "hc") {
+                useModule("com.github.P-H-O-E-N-I-X-PackForge.HotChocolate:hc-gradle-plugin:${requested.version}")
+            }
+        }
+    }
+}
+```
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("hc") version "v0.1.6"
+}
+
+hotChocolate {
+    version = "v0.1.6"
+    sourceDir("src/main/hc")
+}
+```
+
+The `resolutionStrategy.eachPlugin` block is required, not optional —
+Gradle's normal `plugins { id(...) version ... }` resolution looks for a
+*plugin marker* artifact at coordinates `hc:hc.gradle.plugin:vX.Y.Z`
+(the plugin id used verbatim as the marker's groupId, a Gradle
+convention independent of the project's own group), and JitPack has no
+way to publish anything under that arbitrary namespace — it only ever
+publishes under `com.github.<user>...`. `eachPlugin` sidesteps the
+marker lookup entirely, mapping the plugin id directly to the real
+module coordinate. That coordinate's own shape is also JitPack-specific
+and easy to get wrong by guessing: a Gradle multi-module build's
+submodule publishes as `com.github.<user>.<repo>:<module-name>:version`
+(the repo name folded into the *group*, not a separate path segment) —
+confirmed by fetching the real POM directly rather than assuming.
+
+Verified end-to-end, from a project directory containing nothing but
+the two files above (no HotChocolate checkout anywhere on disk, no
+`includeBuild`): `id("hc") version "v0.1.6"` resolves the plugin,
+`hotChocolate { version = "v0.1.6" }` resolves the compiler, and a real
+`.hc` file compiles to a real `.class` file. The compiler's own
+transitive dependencies (Kotlin stdlib, ASM) are ordinary Maven Central
+artifacts JitPack doesn't mirror — the plugin adds `mavenCentral()`
+itself when resolving via `version`, so this works even for a project
+that hasn't already declared it (virtually every real project has, but
+a genuinely bare one shouldn't need to know that).
 
 Applying the plugin registers one `hcCompile<Name>` task per declared
 source (`hcCompileFoo`, `hcCompileBar`, ...), each depending on the one
@@ -1910,15 +1963,12 @@ they're meant to be used. See `IDEAS.md` for why a from-scratch build
 tool ("Marshmallow") was considered and declined; this plugin is the
 actual right-sized version of that want.
 
-**Known limitation, narrowed**: the compiler itself no longer requires a
-local install (`hotChocolate { version = "v0.1.5" }` resolves it from
-JitPack — see "`version` vs `compilerHome`" above) — what's left is that
-*applying the plugin* still goes through `pluginManagement.includeBuild`
-pointing at a local checkout, not a version string, so a genuinely
-"add one line, no local setup at all" experience for an arbitrary
-outside project still needs the plugin itself resolvable the same way
-(a plugin-repository JitPack lookup, or eventual Gradle Plugin Portal
-publication) — not yet built or verified.
+**Resolved**: neither the compiler (`hotChocolate { version = "v0.1.6" }`)
+nor the plugin itself (`plugins { id("hc") version "v0.1.6" }` + the
+`eachPlugin` mapping) needs a local install or checkout anymore — see
+"Zero-clone setup" above. `includeBuild` remains the right tool
+specifically for working on HotChocolate's own compiler/plugin code,
+not a requirement for using either one.
 
 ### Published on JitPack
 

@@ -104,7 +104,15 @@ class HotChocolatePlugin : Plugin<Project> {
             val compilerClasspath: FileCollection = if (home != null) {
                 project.fileTree(File(home, "lib")) { it.include("*.jar") }
             } else {
+                // The compiler jar itself resolves from JitPack, but its own transitive
+                // dependencies (Kotlin stdlib, ASM) are ordinary Maven Central artifacts --
+                // JitPack doesn't mirror those, so resolution fails on them specifically (not on
+                // the compiler jar itself) for any project that doesn't already declare
+                // `mavenCentral()` in its own `repositories { }`. Virtually every real project
+                // already has it (Forge's own tooling adds it by default), but a genuinely bare
+                // project shouldn't need to know that -- add both here rather than depend on it.
                 project.repositories.maven { it.setUrl(JITPACK_URL) }
+                project.repositories.mavenCentral()
                 val dependency = project.dependencies.create("$COMPILER_GROUP:$COMPILER_ARTIFACT:$ver")
                 project.configurations.detachedConfiguration(dependency)
             }
