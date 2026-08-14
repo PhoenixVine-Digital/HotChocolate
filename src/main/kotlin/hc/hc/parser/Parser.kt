@@ -24,7 +24,7 @@ class Parser(private val tokens: List<Token>) {
         val extends = mutableListOf<ExtendBlock>()
         val statics = mutableListOf<StaticDecl>()
         while (!check(TokType.EOF)) {
-            val (annotations, serializable) = leadingMarkers()
+            val (annotations, serializable, entry) = leadingMarkers()
             val pub = match(TokType.PUB)
             val open = match(TokType.OPEN)
             if (open && !check(TokType.INTERFACE) && !check(TokType.SEALED)) throw err("'open' can only be used on an 'interface'")
@@ -34,10 +34,13 @@ class Parser(private val tokens: List<Token>) {
             if (serializable && !check(TokType.STRUCT)) {
                 throw err("'@serializable' can only precede a top-level 'struct'")
             }
+            if (entry != null && !check(TokType.FN)) {
+                throw err("'@entry(...)' can only precede a top-level 'fn'")
+            }
             when {
                 check(TokType.STRUCT) -> structs += structDecl(pub, annotations, serializable)
                 check(TokType.ARENA) -> structs += arenaStructDecl(pub)
-                check(TokType.FN) -> fns += fnDecl(pub, annotations)
+                check(TokType.FN) -> fns += fnDecl(pub, annotations, entry)
                 check(TokType.STATIC) -> statics += staticDecl(pub)
                 check(TokType.IMPL) -> { if (pub) throw err("'pub' doesn't apply to 'impl' blocks -- mark the struct/interface itself 'pub'"); impls += implDecl() }
                 check(TokType.INTERFACE) -> interfaces += interfaceDecl(pub, open)
@@ -289,16 +292,20 @@ class Parser(private val tokens: List<Token>) {
         return StructDecl(name, fields, typeParams, typeParamBounds = bounds, moduleName = currentModule, visible = pub, superclass = superclass, annotations = annotations, serializable = serializable)
     }
 
+    private data class LeadingMarkers(val annotations: List<AnnotationUse>, val serializable: Boolean, val entry: EntryDirective?)
+
     // `@"binary.Name"` (marker) or `@"binary.Name"(argName: value, ...)` -- a real Java
     // annotation, zero or more, immediately before a top-level `struct`/`fn`. See AnnotationUse's
     // doc for why argument values are their own small grammar (`annotationValue()`) instead of a
-    // full expression. `@serializable` (bare identifier, no string) is the one recognized
-    // compiler *directive* so far -- distinguished from a real annotation purely by the absence
-    // of a quoted string right after `@` -- see StructDecl's own doc comment for what it does.
-    // Both forms can repeat and mix freely in any order in front of one declaration.
-    private fun leadingMarkers(): Pair<List<AnnotationUse>, Boolean> {
+    // full expression. `@serializable` (bare identifier, no string) and `@entry("target", ...)`
+    // (bare identifier, but followed by a parenthesized arg list -- see EntryDirective's doc) are
+    // the two recognized compiler *directives* so far -- both distinguished from a real
+    // annotation purely by the absence of a quoted string right after `@`. All forms can repeat
+    // and mix freely in any order in front of one declaration.
+    private fun leadingMarkers(): LeadingMarkers {
         val out = mutableListOf<AnnotationUse>()
         var serializable = false
+        var entry: EntryDirective? = null
         while (check(TokType.AT)) {
             val line = expect(TokType.AT).line
             if (check(TokType.STRING)) {
@@ -317,11 +324,23 @@ class Parser(private val tokens: List<Token>) {
             } else if (check(TokType.IDENT) && peek().text == "serializable") {
                 advance()
                 serializable = true
+            } else if (check(TokType.IDENT) && peek().text == "entry") {
+                advance()
+                expect(TokType.LPAREN)
+                val target = expect(TokType.STRING).text
+                val entryArgs = mutableListOf<Pair<String, AnnotationValue>>()
+                while (match(TokType.COMMA)) {
+                    val argName = expect(TokType.IDENT).text
+                    expect(TokType.COLON)
+                    entryArgs += argName to annotationValue()
+                }
+                expect(TokType.RPAREN)
+                entry = EntryDirective(target, entryArgs, line)
             } else {
-                throw err("expected a quoted annotation name (@\"binary.Name\") or a known compiler directive (@serializable) after '@'")
+                throw err("expected a quoted annotation name (@\"binary.Name\") or a known compiler directive (@serializable, @entry(\"target\", ...)) after '@'")
             }
         }
-        return out to serializable
+        return LeadingMarkers(out, serializable, entry)
     }
 
     // `"a string literal"` or `enum("binary.Name", "CONST")` -- the only two annotation-argument
@@ -390,7 +409,7 @@ class Parser(private val tokens: List<Token>) {
         return names to bounds
     }
 
-    private fun fnDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList()): FnDecl {
+    private fun fnDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList(), entry: EntryDirective? = null): FnDecl {
         val isOverride = match(TokType.OVERRIDE)
         val line = peek().line
         expect(TokType.FN)
@@ -402,7 +421,7 @@ class Parser(private val tokens: List<Token>) {
             retType = typeRef()
         }
         val body = block()
-        return FnDecl(name, params, retType, body, line, typeParams, bounds, currentModule, pub, isOverride, annotations)
+        return FnDecl(name, params, retType, body, line, typeParams, bounds, currentModule, pub, isOverride, annotations, entry = entry)
     }
 
     // `(self, ...)` / `(&self, ...)` / `(&mut self, ...)` / `(name: Type, ...)`.
@@ -793,6 +812,18 @@ class Parser(private val tokens: List<Token>) {
                     val line = expect(TokType.RPAREN).line
                     Expr.Call(expr.name, args, line)
                 }
+                check(TokType.DOT) && peekAt(1).type == TokType.CLASS -> {
+                    // `Type.class` -- "class" is already a keyword (used by `extern class`), so
+                    // this is recognized directly off TokType.CLASS right after a dot, before it
+                    // ever reaches ordinary FieldAccess parsing below (which only ever expects a
+                    // plain IDENT there). Only sensible directly after a bare type name (`expr
+                    // is Expr.Ident`) --
+                    // anything else here is a parse-level error, not deferred to the checker.
+                    val line = advance().line // '.'
+                    advance() // 'class'
+                    if (expr !is Expr.Ident) throw err("'.class' can only follow a bare type name")
+                    Expr.ClassLit(expr.name, line)
+                }
                 check(TokType.DOT) -> {
                     advance()
                     val fname = expect(TokType.IDENT).text
@@ -856,6 +887,12 @@ class Parser(private val tokens: List<Token>) {
             TokType.ARENA -> arenaNewExpr()
             TokType.IF -> ifExpr()
             TokType.MATCH -> matchExpr()
+            // `||` only ever reaches primary() at a position where a NEW expression is
+            // starting (logicalOr's own `||`-as-operator handling checks the token directly,
+            // without going through primary() -- see its doc comment), so there's no ambiguity
+            // between "zero-param lambda" and "logical or with no left operand" to resolve here.
+            TokType.PIPEPIPE -> { val line = advance().line; Expr.Lambda(emptyList(), expression(), line) }
+            TokType.PIPE -> lambdaExpr()
             TokType.IDENT -> {
                 if (peekAt(1).type == TokType.COLONCOLON) {
                     when {
@@ -951,6 +988,19 @@ class Parser(private val tokens: List<Token>) {
         expect(TokType.COLONCOLON)
         val field = expect(TokType.IDENT)
         return Expr.StaticFieldGet(typeName, field.text, field.line)
+    }
+
+    // `|x, y| body` (one-or-more params -- the zero-param `|| body` case is handled directly in
+    // primary() off the single PIPEPIPE token the lexer already merges those two bars into).
+    private fun lambdaExpr(): Expr {
+        val line = expect(TokType.PIPE).line
+        val params = mutableListOf<String>()
+        while (!check(TokType.PIPE)) {
+            params += expect(TokType.IDENT).text
+            if (!check(TokType.PIPE)) expect(TokType.COMMA)
+        }
+        expect(TokType.PIPE)
+        return Expr.Lambda(params, expression(), line)
     }
 
     // `[e1, e2, e3]` (literal) or `[value; count]` (repeated value).

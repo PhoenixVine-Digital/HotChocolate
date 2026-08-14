@@ -39,6 +39,44 @@ reinterpreting the original. Keeping that invariant (a variable's type
 never silently changes mid-function) is worth more than the extra
 brevity here.
 
+### ~~Lambdas / closures~~ -- now shipped
+
+```
+// || body  or  |x, y| body -- targets a single-method 'extern interface',
+// inferred from the call argument's own declared type. Captures enclosing
+// locals by move (a real field on a synthesized implementer class, set
+// from a real constructor call at the use site -- no invokedynamic, this
+// compiler generates direct bytecode the way javac itself used to for
+// pre-Java-8 anonymous inner classes).
+PacketDistributor::PLAYER.with(|| p as JObject);
+```
+
+Shipped as `|params| expr` lambda literals (`Expr.Lambda` in the AST,
+`Checker.checkLambda`, `CodeGen.genLambdaClass`) -- scoped exactly as
+suggested below: target must be a single-abstract-method `extern
+interface`, inferred only from a call argument's declared param type
+(`checkMethodCall`/`checkStaticCall`), body is one expression (no
+statements of its own, same "ternary-shaped" cut as `Expr.If`/
+`Expr.Match`'s value forms already use). No bare method-reference syntax
+(`Type::method` used directly as a value) shipped alongside it -- a
+lambda wrapping the call (`|x| Type::method(x)`) covers the same ground
+with one extra token, so it wasn't worth a second grammar form yet.
+Verified end-to-end via `javap` against a real captured-closure call site
+(NEW+DUP+ALOAD-captures+INVOKESPECIAL at the use site, a real `implements
+java.util.function.Supplier` class with a `cap$name` field per capture at
+the definition site).
+
+**Still open**: Java class-literal syntax (`Foo.class`, needed by
+`SimpleChannel.registerMessage(int, Class, BiConsumer, Function,
+BiConsumer)`'s second arg) has no HC equivalent yet -- this is what's
+still blocking `NetworkHandler.java` specifically from a full port even
+with lambdas now available (`CTab.java`/`ClipboardPacketHandler.java`
+have no such requirement and are fair game today). Small, self-contained
+addition when it's next up: a new `Expr.ClassLit(binaryName)` producing
+`Ty.JavaExtern("java/lang/Class")`, compiling to `LDC <Type>.class`
+(`Type` a real ASM `Type` operand, not a String) -- no target-type
+inference or new declaration form needed, unlike lambdas.
+
 ### Inclusive ranges: `a..=b`
 
 ```

@@ -218,6 +218,21 @@ data class StructDecl(
 // deliberately a much smaller grammar than a real expression (`AnnotationValue`, below), not the
 // general `Expr` this language uses everywhere else.
 data class AnnotationUse(val binaryName: String, val args: List<Pair<String, AnnotationValue>>, val line: Int)
+
+// `@entry("forge.mod", modid: "yourmodid")` immediately before a zero-arg, `Unit`-returning
+// top-level `fn` -- a compiler directive (not a real annotation, same "no quoted binary name at
+// all" distinction `@serializable` already uses), scoped narrowly to exactly one `target` for
+// this first pass: `"forge.mod"`. Generates a real `@Mod("yourmodid")`-annotated class whose
+// constructor calls this fn -- Forge's own `@Mod` class is instantiated via a real no-arg
+// constructor with an actual imperative body (registering the mod event bus, ...), unlike
+// `@SubscribeEvent`'s pure method-scanning, so this is the one piece of "a whole Forge mod
+// written in HC" that genuinely needs new codegen (a struct's constructor synthesizing a real
+// extra call), not just reuse of the existing annotation-emission machinery. The target struct
+// this attaches to is found the same way `@serializable`'s generated fns find their landing
+// class: the *first* struct declared in the same file (module + sourceUnit) as this fn -- see
+// Checker's `@entry` handling. `args` reuses `AnnotationValue`'s existing small grammar (a
+// string literal is all `"forge.mod"` needs right now) rather than inventing a separate one.
+data class EntryDirective(val target: String, val args: List<Pair<String, AnnotationValue>>, val line: Int)
 sealed class AnnotationValue {
     data class Str(val value: String) : AnnotationValue()
     // A real Java `enum` constant (e.g. `Dist.CLIENT`), stored as (the enum's own binary name,
@@ -267,6 +282,7 @@ data class FnDecl(
     // See StructDecl's `sourceUnit` doc -- same purpose, same "which file, for a directory-mode
     // compile only" meaning.
     val sourceUnit: String? = null,
+    val entry: EntryDirective? = null,
 )
 data class Param(val name: String, val type: TypeRef)
 
@@ -444,4 +460,57 @@ sealed class Expr {
     // shares every dispatch rule (enum tag compare vs `&dyn sealed interface` instanceof chain,
     // exhaustiveness) with the statement form (`Stmt.Match`).
     data class Match(val scrutinee: Expr, val arms: List<MatchArm>, val line: Int) : Expr()
+    // `|params| body` -- a lambda literal, e.g. `|| p as JObject` or `|x| ClipboardPacket
+    // ::encode(x, buf)`. `body` is a single expression (no statements, no locals of its own,
+    // no explicit `return`) -- same "ternary-shaped" scope cut as `Expr.If`/`Expr.Match`'s
+    // value forms, chosen because every real motivating case (a Forge `Supplier`/`Function`/
+    // custom functional-interface argument) is a one-expression forwarding call anyway; a
+    // richer body just factors the real logic into an ordinary top-level `fn` and forwards to
+    // it from here. Only ever legal where the surrounding context already pins down a target
+    // type (a call argument whose declared param type is a single-method `extern interface`) --
+    // there is no way to spell a lambda's type out explicitly the way a `let`'s does, so it's
+    // always inferred, never declared. Compiles to a genuine tiny implementer class (this
+    // compiler has no `invokedynamic`/`LambdaMetafactory` support), not a bootstrap-method call
+    // site -- see CodeGen's `genLambdaClass`.
+    data class Lambda(val params: List<String>, val body: Expr, val line: Int) : Expr() {
+        // Everything below is filled in by the checker (Checker.checkLambda) once the call
+        // argument's declared type resolves this lambda's target -- null on every Lambda the
+        // checker rejected (already reported as an error; codegen never reaches those).
+        var targetInterfaceName: String? = null // the HC-side 'extern interface' name
+        var targetBinaryName: String? = null // the real JVM interface this implements
+        var targetMethodName: String? = null // the single abstract method being implemented
+        var paramTys: List<Ty> = emptyList() // that method's own resolved param types
+        var retTy: Ty = hc.sema.Ty.Unit_ // that method's own resolved return type
+        // Enclosing-scope locals this lambda's body reads, in first-use order -- become fields
+        // on the synthesized implementer class, populated from a real constructor call at the
+        // lambda's own use site (an ordinary move-capture, exactly like passing the same local
+        // to any other call: the outer function can't read it again afterward).
+        var captures: List<LambdaCapture> = emptyList()
+        // This lambda's synthesized implementer class name -- a bare "Lambda$N" right after the
+        // checker assigns it, then rewritten in place to the fully-module-qualified JVM name by
+        // CodeGen.generate() before any class bodies are emitted (see CodeGen's lambda-collection
+        // pass) -- every codegen call site (both the class's own generation and every NEW/
+        // INVOKESPECIAL construction at a use site) reads this same field, so the two can never
+        // disagree on the name.
+        var syntheticName: String? = null
+    }
+    // `Type.class` -- a real Java class-literal value (`Ljava/lang/Class;`), needed wherever a
+    // Java API asks for a `Class<T>` directly rather than an instance (Forge's
+    // `SimpleChannel.registerMessage(int, Class<MSG>, ...)` being the motivating case). Parsed
+    // directly off the `IDENT '.' 'class'` token sequence (see Parser's callOrPrimary) rather
+    // than going through ordinary FieldAccess/MethodCall machinery -- "class" is deliberately
+    // not a reserved keyword (see the lexer's own note on "use"), so this is recognized purely
+    // by the literal text "class" appearing right after a dot, same as any other dot-suffix
+    // token the parser peeks at.
+    data class ClassLit(val typeName: String, val line: Int) : Expr() {
+        // `resolvedName` (inherited): the JVM binary name to embed in the LDC operand. For an
+        // `extern class`/`extern interface` alias, that's the real trusted binary name
+        // (`isExtern = true`, no further translation needed). For a name this compiler itself
+        // declared (a struct/enum), `resolvedName` is left as the bare declared name and
+        // CodeGen has to run it through its own `qualify()` at codegen time (module-prefixed) --
+        // the checker has no `moduleOf` map to do that here, same split responsibility every
+        // other AST node with a possibly-HC-owned target name already has.
+        var isExtern: Boolean = false
+    }
 }
+data class LambdaCapture(val name: String, val ty: Ty)

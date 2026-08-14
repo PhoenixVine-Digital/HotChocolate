@@ -111,7 +111,11 @@ class Lexer(private val src: String) {
             '?' -> tok(TokType.QUESTION, "?")
             '@' -> tok(TokType.AT, "@")
             '&' -> if (match('&')) tok(TokType.AMPAMP, "&&") else tok(TokType.AMP, "&")
-            '|' -> if (match('|')) tok(TokType.PIPEPIPE, "||") else throw LexError("Unexpected character '|' at line $startLine")
+            // Lone '|' opens a lambda param list (`|x, y| body`); '||' is either the logical-or
+            // operator (parsed in logicalOr, only ever reached with a left operand already on
+            // hand) or a zero-param lambda (`|| body`, parsed in primary()) -- the parser tells
+            // the two apart purely by position, so the lexer just hands back one token either way.
+            '|' -> if (match('|')) tok(TokType.PIPEPIPE, "||") else tok(TokType.PIPE, "|")
             '=' -> when {
                 match('=') -> tok(TokType.EQEQ, "==")
                 match('>') -> tok(TokType.FATARROW, "=>")

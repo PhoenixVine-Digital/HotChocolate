@@ -839,6 +839,51 @@ methods can't have default bodies (there's no interface class here to
 attach one to — every method must be overridden). Both are the same
 "declare the trusted shape, nothing more" scope cut as `extern class`.
 
+#### Lambda literals: `|params| expr`
+
+`impl Run for Greeter` above is the right tool when a Java callback
+needs real named struct fields or gets implemented in more than one
+place. For the common case — a one-off, single-call-site functional
+argument (`Supplier<T>`, `Function<T,R>`, a Forge `Predicate`/
+`BiConsumer`, ...) — a lambda literal skips the struct+impl ceremony
+entirely:
+
+```
+extern interface JSupplier = "java.util.function.Supplier" {
+    fn get(&self) -> JObject;
+}
+extern class PacketDistributorTarget = "net.minecraftforge.network.PacketDistributor$PacketTarget" {}
+extern class PacketDistributor = "net.minecraftforge.network.PacketDistributor" {
+    static PLAYER: PacketDistributor;
+    fn with(&self, supplier: &dyn JSupplier) -> PacketDistributorTarget;
+}
+
+fn target_for(p: ServerPlayer) -> PacketDistributorTarget {
+    return PacketDistributor::PLAYER.with(|| p as JObject);
+}
+```
+
+`|params| expr` (or `|| expr` for zero params) is only ever legal
+directly as a call argument whose declared param type is a **single-
+method `extern interface`** — there's no way to spell a lambda's type
+out explicitly, so it's always inferred from that context, never
+declared. The body is one expression, not a statement block (the same
+"ternary-shaped" cut `if`/`match`-as-expressions already use) — for
+anything that needs real locals or multiple statements, factor the logic
+into an ordinary top-level `fn` and forward to it from a one-line lambda
+(`|buf| SomePacket::decode(buf)`) instead.
+
+A lambda **captures enclosing locals by move**, exactly like passing the
+same value to any other call — `p` above can't be read again after this
+call. There's no `invokedynamic`/`LambdaMetafactory` involved: each
+lambda literal compiles to its own small, real implementer class (one
+`cap$name` field per capture, set from a real constructor call at the
+lambda's own use site), the same strategy javac itself used for
+anonymous inner classes before Java 8. No bare method-reference syntax
+(`Type::method` used directly as a value) — wrap the call instead
+(`|x| Type::method(x)`); one extra token, same result, no second grammar
+form to maintain.
+
 #### Reference-type casts (`as`, compiling to `CHECKCAST`)
 
 Generic Java APIs erase their type parameters to `Object` at the bytecode
@@ -2035,6 +2080,35 @@ name, then throws three enemies at you:
 ```bash
 ./gradlew playBattle
 ```
+
+### Profiling a program: `hc run --profile`
+
+```bash
+hc run my_program.hc --profile
+hc run my_program.hc --profile=out.jfr   # custom path, default is ./profile.jfr
+```
+
+Records a real JDK Flight Recorder session around the run — no
+HC-specific profiling machinery, deliberately. HC-compiled code is just
+ordinary JVM bytecode (real class/method names via ASM, nothing marking
+it as "not javac output"), so standard JVM tooling already sees it
+correctly with zero special support needed — verified by profiling a
+real CPU-bound HC loop and confirming JFR's recorded stack samples show
+the actual HC-declared fn name (`Profile_test.is_prime(int)`, not
+"unknown" or some synthetic placeholder). Open the resulting `.jfr` file
+in [JDK Mission Control](https://adoptium.net/jmc/) for flamegraphs/
+hot-method breakdowns, or inspect it from the command line with the
+JDK's own bundled `jfr` tool:
+
+```bash
+jfr print --events jdk.ExecutionSample out.jfr
+```
+
+Only wired up for `hc run` (a `build`-only invocation never executes
+anything, so there's nothing to record). `-XX:+FlightRecorder` is
+deliberately not passed — JFR has been unlocked by default since JDK 11,
+and that flag is now deprecated and prints a startup warning for no
+benefit.
 
 ## Language sample
 

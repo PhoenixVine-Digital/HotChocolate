@@ -15,6 +15,7 @@ import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.Label
 import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes.*
+import org.objectweb.asm.Type as AsmType
 
 class CodeGenError(message: String) : RuntimeException(message)
 
@@ -55,6 +56,58 @@ private fun descOf(t: Ty, moduleOf: Map<String, String?>, externInterfaceBinaryN
     is Ty.Enum -> "L${qualify(t.name, moduleOf)};"
     is Ty.Array -> "[${descOf(t.elem, moduleOf, externInterfaceBinaryNames)}"
     else -> t.descriptor()
+}
+
+// Walks every statement/expression reachable from a function body looking for `Expr.Lambda`
+// literals (see CodeGen.generate()'s lambda-collection pass, which needs to find every one in
+// the whole program up front so each can get its own synthesized implementer class before any
+// other class body is emitted). DOES recurse into a found lambda's own body too -- lambdas can
+// nest (a Supplier lambda passing an icon/displayItems lambda to a builder call, say -- see
+// Checker.checkLambda's transitive-capture handling), and each nesting level still needs its
+// own separate synthesized class.
+private fun collectLambdasInBlock(block: Block, out: MutableList<Expr.Lambda>) {
+    for (s in block.stmts) collectLambdasInStmt(s, out)
+}
+private fun collectLambdasInStmt(s: Stmt, out: MutableList<Expr.Lambda>) {
+    when (s) {
+        is Stmt.Let -> collectLambdasInExpr(s.init, out)
+        is Stmt.ExprStmt -> collectLambdasInExpr(s.expr, out)
+        is Stmt.If -> { collectLambdasInExpr(s.cond, out); collectLambdasInBlock(s.thenB, out); s.elseB?.let { collectLambdasInBlock(it, out) } }
+        is Stmt.While -> { collectLambdasInExpr(s.cond, out); collectLambdasInBlock(s.body, out) }
+        is Stmt.For -> { collectLambdasInExpr(s.iterable, out); collectLambdasInBlock(s.body, out) }
+        is Stmt.Return -> s.expr?.let { collectLambdasInExpr(it, out) }
+        is Stmt.Nested -> collectLambdasInBlock(s.block, out)
+        is Stmt.Match -> { collectLambdasInExpr(s.scrutinee, out); for (arm in s.arms) collectLambdasInBlock(arm.body, out) }
+        is Stmt.Try -> { collectLambdasInBlock(s.tryBlock, out); for (c in s.catches) collectLambdasInBlock(c.body, out) }
+        is Stmt.Throw -> collectLambdasInExpr(s.expr, out)
+    }
+}
+private fun collectLambdasInExpr(e: Expr, out: MutableList<Expr.Lambda>) {
+    if (e is Expr.Lambda) { out += e; collectLambdasInExpr(e.body, out); return }
+    when (e) {
+        is Expr.Binary -> { collectLambdasInExpr(e.left, out); collectLambdasInExpr(e.right, out) }
+        is Expr.Unary -> collectLambdasInExpr(e.expr, out)
+        is Expr.Cast -> collectLambdasInExpr(e.inner, out)
+        is Expr.InstanceOf -> collectLambdasInExpr(e.inner, out)
+        is Expr.Borrow -> collectLambdasInExpr(e.inner, out)
+        is Expr.Assign -> collectLambdasInExpr(e.value, out)
+        is Expr.Call -> e.args.forEach { collectLambdasInExpr(it, out) }
+        is Expr.FieldAccess -> collectLambdasInExpr(e.obj, out)
+        is Expr.FieldAssign -> { collectLambdasInExpr(e.obj, out); collectLambdasInExpr(e.value, out) }
+        is Expr.StructLit -> e.fields.forEach { collectLambdasInExpr(it.second, out) }
+        is Expr.MethodCall -> { collectLambdasInExpr(e.recv, out); e.args.forEach { collectLambdasInExpr(it, out) } }
+        is Expr.StaticCall -> e.args.forEach { collectLambdasInExpr(it, out) }
+        is Expr.ArrayLit -> e.elements.forEach { collectLambdasInExpr(it, out) }
+        is Expr.ArrayRepeat -> { collectLambdasInExpr(e.value, out); collectLambdasInExpr(e.count, out) }
+        is Expr.Index -> { collectLambdasInExpr(e.arr, out); collectLambdasInExpr(e.index, out) }
+        is Expr.IndexAssign -> { collectLambdasInExpr(e.arr, out); collectLambdasInExpr(e.index, out); collectLambdasInExpr(e.value, out) }
+        is Expr.ArenaNew -> collectLambdasInExpr(e.count, out)
+        is Expr.StringInterp -> e.exprs.forEach { collectLambdasInExpr(it, out) }
+        is Expr.If -> { collectLambdasInExpr(e.cond, out); collectLambdasInBlock(e.thenB, out); collectLambdasInBlock(e.elseB, out) }
+        is Expr.Match -> { collectLambdasInExpr(e.scrutinee, out); for (arm in e.arms) collectLambdasInBlock(arm.body, out) }
+        is Expr.Range -> { collectLambdasInExpr(e.start, out); collectLambdasInExpr(e.end, out) }
+        else -> {} // literals, Ident, NullLit, StaticFieldGet -- no sub-expressions to walk
+    }
 }
 
 // Emits a real classfile `RuntimeVisibleAnnotations` attribute for each declared `@"..."`
@@ -120,6 +173,14 @@ class CodeGen(
     private val structSuperclass: Map<String, String> = emptyMap(),
     private val externClasses: Map<String, ExternClassInfo> = emptyMap(),
     private val superclassOverrideFns: Map<String, List<FnDecl>> = emptyMap(),
+    // `@entry("forge.mod", modid: "...")` -- see EntryDirective's/Checker's doc. `entryClassName`
+    // (a struct name, not yet qualified) gets an extra `@Mod("<entryModid>")` annotation and its
+    // generated `<init>` gets an extra call to `entryInitFn` (a zero-arg static fn landing on
+    // that same class) right before it returns -- see `generate()`/`genStruct`. All three null
+    // together (the overwhelmingly common case) means no `@entry` fn exists in this compile.
+    private val entryClassName: String? = null,
+    private val entryModid: String? = null,
+    private val entryInitFn: String? = null,
 ) {
     private val usage = CodeGenUsage()
     val usesArena: Boolean get() = usage.usesArena
@@ -253,18 +314,138 @@ class CodeGen(
     private fun qualify(name: String) = qualify(name, moduleOf)
     private fun classAccess(name: String): Int = if (visibleOf[name] == true) ACC_PUBLIC else 0
 
+    // Every `Expr.Lambda` literal in the whole program, each tagged with the module its
+    // enclosing top-level declaration belongs to (so its synthesized implementer class lands in
+    // a real JVM package -- a lambda class in the unqualified default package hits the exact
+    // same `ModuleClassLoader` failure a bare `module`-less prelude did once, see the compiler's
+    // own history). `impl`/`extend` methods fall back to their owning struct's/block's own
+    // module (impl-desugared FnDecls don't carry one of their own) -- a lambda literal written
+    // inside one is a corner case (the whole point of a lambda is usually to replace that exact
+    // pattern), but still resolved correctly rather than silently landing unqualified.
+    private fun collectAllLambdas(): List<Pair<Expr.Lambda, String?>> {
+        val out = mutableListOf<Pair<Expr.Lambda, String?>>()
+        for (f in program.fns) {
+            val found = mutableListOf<Expr.Lambda>()
+            collectLambdasInBlock(f.body, found)
+            for (l in found) out += l to f.moduleName
+        }
+        for (impl in program.impls) {
+            val mod = program.structs.firstOrNull { it.name == impl.structName }?.moduleName
+            for (m in impl.methods) {
+                val found = mutableListOf<Expr.Lambda>()
+                collectLambdasInBlock(m.body, found)
+                for (l in found) out += l to mod
+            }
+        }
+        for (ext in program.extends) {
+            for (m in ext.methods) {
+                val found = mutableListOf<Expr.Lambda>()
+                collectLambdasInBlock(m.body, found)
+                for (l in found) out += l to ext.moduleName
+            }
+        }
+        // NOT `program.statics` -- `Checker.resolvedProgram()` (what `program` actually is here)
+        // never populates that field at all (its `Program(...)` call only sets `structs`/`fns`,
+        // leaving `statics` at its default `emptyList()`), so a lambda inside a `pub static`
+        // initializer would silently never be found this way. `this.statics` (CodeGen's own
+        // dedicated `Map<String, StaticInfo>` field, passed in separately from `checker.statics`)
+        // holds each static's real, already-checked `init` expr instance instead.
+        for (s in statics.values) {
+            val found = mutableListOf<Expr.Lambda>()
+            collectLambdasInExpr(s.init, found)
+            for (l in found) out += l to s.moduleName
+        }
+        return out
+    }
+
+    // Synthesizes each lambda literal's implementer class and rewrites its `syntheticName` from
+    // the checker's bare "Lambda$N" to the real, fully-qualified JVM name -- done up front, into
+    // `out` directly, before any other class body is generated, so every use-site NEW/
+    // INVOKESPECIAL (see FnCodeGen's genExpr Lambda case) and the class's own generation agree
+    // on the same name. Lambdas the checker rejected (`syntheticName == null`, already reported
+    // as a compile error) are silently skipped -- there's nothing valid to emit for them.
+    private fun genLambdaClasses(out: MutableMap<String, ByteArray>) {
+        val all = collectAllLambdas()
+        // Two passes, deliberately: a nested lambda (e.g. an icon/displayItems lambda inside an
+        // outer Supplier lambda's own body) needs ITS qualified name available while the OUTER
+        // lambda's class body is generated (its NEW/INVOKESPECIAL at that inner use site reads
+        // `syntheticName` mid-generation) -- but `collectAllLambdas` visits outer before inner,
+        // so a single combined loop would generate the outer's body before the inner's own name
+        // was ever rewritten from the checker's bare "Lambda$N". Rewriting every name first,
+        // in its own pass, before any class body is generated, sidesteps that ordering entirely.
+        for ((lambda, mod) in all) {
+            val base = lambda.syntheticName ?: continue
+            lambda.syntheticName = if (mod != null) mod.replace('.', '/') + "/" + base else base
+        }
+        for ((lambda, _) in all) {
+            val qname = lambda.syntheticName ?: continue
+            out[qname] = genLambdaClass(lambda, qname)
+        }
+    }
+
+    private fun genLambdaClass(lambda: Expr.Lambda, qname: String): ByteArray {
+        val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
+        cw.visit(V17, ACC_FINAL, qname, null, "java/lang/Object", arrayOf(lambda.targetBinaryName!!))
+        for (c in lambda.captures) {
+            cw.visitField(ACC_PRIVATE or ACC_FINAL, "cap\$${c.name}", descOf(c.ty, moduleOf, externInterfaceBinaryNames), null, null).visitEnd()
+        }
+        val ctorDesc = "(" + lambda.captures.joinToString("") { descOf(it.ty, moduleOf, externInterfaceBinaryNames) } + ")V"
+        val ctor = cw.visitMethod(ACC_PUBLIC, "<init>", ctorDesc, null, null)
+        ctor.visitCode()
+        ctor.visitVarInsn(ALOAD, 0)
+        ctor.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+        var slot = 1
+        for (c in lambda.captures) {
+            ctor.visitVarInsn(ALOAD, 0)
+            ctor.visitVarInsn(loadOpcode(c.ty), slot)
+            ctor.visitFieldInsn(PUTFIELD, qname, "cap\$${c.name}", descOf(c.ty, moduleOf, externInterfaceBinaryNames))
+            slot += if (c.ty.isWide()) 2 else 1
+        }
+        ctor.visitInsn(RETURN)
+        ctor.visitMaxs(0, 0)
+        ctor.visitEnd()
+
+        val desc = "(" + lambda.paramTys.joinToString("") { descOf(it, moduleOf, externInterfaceBinaryNames) } + ")" + descOf(lambda.retTy, moduleOf, externInterfaceBinaryNames)
+        val mv = cw.visitMethod(ACC_PUBLIC, lambda.targetMethodName!!, desc, null, null)
+        mv.visitCode()
+        val fnGen = newFnCodeGen(mv)
+        fnGen.pushScope()
+        // Slot 0 is `this`, reserved (not loaded by name -- lambda bodies have no `self`
+        // concept) exactly like `genInstanceMethod`'s own identical "self" reservation.
+        fnGen.declareParam("\$self", Ty.Unit_)
+        for (i in lambda.params.indices) fnGen.declareParam(lambda.params[i], lambda.paramTys[i])
+        for (c in lambda.captures) fnGen.declareCaptureField(c.name, c.ty, qname)
+        fnGen.genExprAndReturn(lambda.body)
+        fnGen.popScope()
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+
+        cw.visitEnd()
+        return cw.toByteArray()
+    }
+
     fun generate(): Map<String, ByteArray> {
         val out = mutableMapOf<String, ByteArray>()
+        genLambdaClasses(out)
         for (s in program.structs) {
             val unit = Unit(s.moduleName, s.sourceUnit)
             val isEntryHolder = entryUnitFirstStructIsHolder && unit == entryUnit &&
                 program.structs.first { Unit(it.moduleName, it.sourceUnit) == entryUnit }.name == s.name
             val isHolder = unitFirstStructName[unit] == s.name || isEntryHolder
+            // `@entry("forge.mod", modid: "...")`'s target struct (see the class-level doc
+            // above) gets a real `@Mod("<modid>")` annotation appended here -- same
+            // `RuntimeVisibleAnnotations` machinery `@"binary.Name"` already uses, just a
+            // synthetic `AnnotationUse` instead of one the parser produced from source text.
+            val structAnnotations = if (s.name == entryClassName && entryModid != null) {
+                s.annotations + AnnotationUse("net/minecraftforge/fml/common/Mod", listOf("value" to AnnotationValue.Str(entryModid)), 0)
+            } else {
+                s.annotations
+            }
             out[qualify(s.name)] = genStruct(
                 structs.getValue(s.name),
                 if (isHolder) program.fns.filter { fnUnitOf[it.name] == unit } else emptyList(),
                 if (isHolder) statics.values.filter { Unit(it.moduleName, it.sourceUnit) == unit } else emptyList(),
-                s.annotations,
+                structAnnotations,
                 isEntryHolder,
             )
         }
@@ -389,6 +570,14 @@ class CodeGen(
                 mv.visitVarInsn(loadOpcode(fty), slot)
                 mv.visitFieldInsn(PUTFIELD, qualify(info.name), fname, descOf(fty, moduleOf, externInterfaceBinaryNames))
                 slot += if (fty.isWide()) 2 else 1
+            }
+            // `@entry("forge.mod", ...)`'s one piece of genuinely new codegen: Forge instantiates
+            // the `@Mod` class via this exact no-arg constructor and expects real bootstrap work
+            // to happen inside it (registering the mod event bus, ...) -- `entryInitFn` is a
+            // plain zero-arg static fn landing on this same class (Checker already validated the
+            // struct/fn share a file, so `qualify(info.name)` is guaranteed to be its real owner).
+            if (info.name == entryClassName && entryInitFn != null) {
+                mv.visitMethodInsn(INVOKESTATIC, qualify(info.name), entryInitFn, "()V", false)
             }
             mv.visitInsn(RETURN)
             mv.visitMaxs(0, 0)
@@ -668,6 +857,27 @@ private class FnCodeGen(
     // outside this class should be generating expressions mid-body.
     fun genStandaloneExpr(e: Expr) = genExpr(e)
 
+    // Loads a lambda's synthesized implementer class's own `cap$<name>` field (populated by its
+    // constructor -- see CodeGen.genLambdaClass) into a fresh local, so the lambda body's own
+    // Ident reads (checked against the *outer* function's scope, in Checker.checkLambda) resolve
+    // exactly like any other declared local once codegen reaches the synthesized SAM method's
+    // own body -- no special-casing needed in genExpr's Ident case at all.
+    fun declareCaptureField(name: String, ty: Ty, ownerClass: String) {
+        mv.visitVarInsn(ALOAD, 0)
+        mv.visitFieldInsn(GETFIELD, ownerClass, "cap\$$name", descOf(ty, moduleOf, externInterfaceBinaryNames))
+        val slot = declareLocal(name, ty)
+        mv.visitVarInsn(storeOpcode(ty), slot)
+    }
+
+    // Entry point for a lambda's own single-expression body -- generates it and returns its
+    // value, the SAM method's entire body (see CodeGen.genLambdaClass). Distinct from ordinary
+    // fn-body codegen (genBlock + emitReturnOrTrap): there's no statement list, no drops, and no
+    // "control fell off the end" case to trap (a bare expression always produces its value).
+    fun genExprAndReturn(e: Expr) {
+        genExpr(e)
+        mv.visitInsn(returnOpcode(e.ty!!))
+    }
+
     fun declareParam(name: String, ty: Ty) {
         scopes.last()[name] = nextSlot to ty
         nextSlot += if (ty.isWide()) 2 else 1
@@ -918,6 +1128,28 @@ private class FnCodeGen(
                 mv.visitLabel(endLabel)
             }
             is Expr.Match -> genMatch(expr.scrutinee, expr.arms, producesValue = true) { b -> genExpr((b.stmts[0] as Stmt.ExprStmt).expr) }
+            is Expr.Lambda -> {
+                // `syntheticName` is already the fully-qualified JVM name by the time codegen
+                // ever reaches a use site -- CodeGen.generate()'s lambda-collection pass
+                // rewrites it in place from the checker's bare "Lambda$N" before any class body
+                // (including this one) is emitted. Captures are loaded from THIS function's own
+                // locals (the same scope chain the checker recorded them from -- see
+                // Checker.checkLambda), in the same first-use order the synthesized class's
+                // constructor expects them in.
+                val qname = expr.syntheticName!!
+                mv.visitTypeInsn(NEW, qname)
+                mv.visitInsn(DUP)
+                for (c in expr.captures) {
+                    val (slot, ty) = resolve(c.name)
+                    mv.visitVarInsn(loadOpcode(ty), slot)
+                }
+                val ctorDesc = "(" + expr.captures.joinToString("") { descOf(it.ty, moduleOf, externInterfaceBinaryNames) } + ")V"
+                mv.visitMethodInsn(INVOKESPECIAL, qname, "<init>", ctorDesc, false)
+            }
+            is Expr.ClassLit -> {
+                val binaryName = if (expr.isExtern) expr.resolvedName!! else qualify(expr.resolvedName!!)
+                mv.visitLdcInsn(AsmType.getObjectType(binaryName))
+            }
         }
     }
 

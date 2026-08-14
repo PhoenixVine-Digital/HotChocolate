@@ -44,6 +44,14 @@ private class Env {
         for (i in scopes.indices.reversed()) scopes[i][name]?.let { return it }
         return null
     }
+    // How many scopes are currently pushed -- lambda-capture detection (see Checker's
+    // `captureStack`) needs to tell "declared inside this lambda's own param scope" apart from
+    // "declared somewhere further out," which a plain `lookup` can't distinguish.
+    fun depth(): Int = scopes.size
+    fun lookupWithDepth(name: String): Pair<VarInfo, Int>? {
+        for (i in scopes.indices.reversed()) scopes[i][name]?.let { return it to i }
+        return null
+    }
 }
 
 /**
@@ -61,6 +69,15 @@ private class Env {
  * field (zero-cost, no boxing) exactly like `Box<Player>` gets a real `Player` field.
  */
 class Checker(private val program: Program, private val classpathReflector: ClasspathReflector? = null) {
+    companion object {
+        // Max chars `@serializable`'s synthesized `writeUtf`/`readUtf` calls pass explicitly
+        // (see the `@serializable` codegen loop below) instead of relying on vanilla
+        // `FriendlyByteBuf.writeUtf(String)`'s silent 1-arg default of `Short.MAX_VALUE`
+        // (32767). Generous enough for real payload-carrying strings (e.g. a copied
+        // structure's NBT/SNBT blob); still finite so a matching `readUtf(N)` on the receiving
+        // end can't be tricked into an unbounded allocation by a corrupt/hostile length prefix.
+        const val SERIALIZABLE_STRING_MAX_LEN = 2_097_151
+    }
     val structs = mutableMapOf<String, StructInfo>()
     val fns = mutableMapOf<String, FnSig>()
     val arenaLayouts = mutableMapOf<String, ArenaLayout>()
@@ -86,7 +103,23 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     private val implFns = mutableListOf<FnDecl>() // methods, desugared to top-level fns named "Owner$method"
     private val extensionFns = mutableMapOf<Pair<String, String>, String>() // (targetName, methodName) -> mangled fn name, see the `extend` processing loop
     val statics = mutableMapOf<String, StaticInfo>()
+    // Set by the `@entry("forge.mod", ...)` handling below when present -- CodeGen reads these
+    // three directly (no AST mutation) to add the `@Mod("...")` annotation and the extra
+    // constructor call onto exactly one struct's generated class. Null/null/null when no
+    // `@entry` fn exists in this compile (the overwhelmingly common case).
+    var entryClassName: String? = null
+    var entryModid: String? = null
+    var entryInitFn: String? = null
     private val errors = mutableListOf<String>()
+    // One entry per lambda literal currently being checked (a stack since lambdas could in
+    // principle nest, though checkLambda rejects that for v1 -- see its own doc): `first` is
+    // the Env depth right after that lambda's own param scope was pushed (see Env.depth), so
+    // any Ident resolved at a shallower depth is a genuine capture, not one of the lambda's own
+    // params; `second` accumulates each captured name's type, in first-use order (a
+    // LinkedHashMap so codegen's field/constructor-param order is deterministic and matches
+    // what the capturing use site loads in).
+    private val captureStack = ArrayDeque<Pair<Int, LinkedHashMap<String, Ty>>>()
+    private var lambdaCounter = 0
     // Mirrors the Env scope stack while checking a function body: one frame per open block,
     // holding (in declaration order) the names of that block's own `let`/`var` locals whose
     // type has a `drop` method. Used to compute Block.dropsAtEnd and Stmt.Return's
@@ -99,8 +132,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     fun resolvedProgram(): Program = Program(
         structs = program.structs.filter { it.typeParams.isEmpty() && !it.isArena } + structInstances.values,
         fns = program.fns.filter { it.typeParams.isEmpty() } +
-            implFns.filter { it.typeParams.isEmpty() } +
-            fnInstances.values,
+                implFns.filter { it.typeParams.isEmpty() } +
+                fnInstances.values,
     )
 
     fun check() {
@@ -244,6 +277,21 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         // `extern class FriendlyByteBuf = ...` declaration actually has the needed methods is
         // left to the normal checker pass over these synthesized bodies to catch (same "no
         // special-cased validation duplicated here" reasoning as `by field` delegation).
+        //
+        // String fields always emit the explicit-max-length overload (`writeUtf(s, N)` /
+        // `readUtf(N)`), never the bare 1-arg `writeUtf(s)` -- that overload silently defaults
+        // to `Short.MAX_VALUE` (32767 chars) in vanilla `FriendlyByteBuf`, which throws mid-write
+        // on anything holding real payload data (a copied structure's NBT/SNBT blob, etc.) and,
+        // because that throw happens after the packet's length/id header is already on the wire,
+        // desyncs every packet after it on the same connection rather than failing cleanly. The
+        // bound below (`SERIALIZABLE_STRING_MAX_LEN`) is deliberately generous but still finite
+        // -- unlike passing `Int.MAX_VALUE`, a hostile/corrupt incoming packet can't use the
+        // matching `readUtf(N)` to claim an unbounded string length and force a huge allocation.
+        // The `extern class FriendlyByteBuf` declaration this compile provides needs a matching
+        // 2-arg `writeUtf`/`readUtf` overload for this to link -- `pickCandidate` (see
+        // `checkMethodCall`'s `Ty.JavaExtern` branch) resolves extern overloads by arg count, so
+        // adding a 2-arg pair alongside an existing 1-arg one is additive, not a breaking change
+        // for any other caller of the 1-arg form.
         for (s in program.structs.filter { it.serializable && it.typeParams.isEmpty() }) {
             if (!externClasses.containsKey("FriendlyByteBuf")) {
                 errors += "struct '${s.name}': '@serializable' needs an 'extern class FriendlyByteBuf = ...' declared in this compile"
@@ -263,15 +311,19 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 if (pair == null) {
                     errors += "struct '${s.name}': '@serializable' field '$fname' has unsupported type $fty (only Int/Long/Float/Double/Bool/String are supported)"
                 }
-                fname to pair
+                // Only String fields get the extra max-length arg -- writeInt/writeLong/etc.
+                // take no such param, and passing one would just be a bogus extra arg.
+                val extraArg: Expr? = if (fty is Ty.Str_) Expr.IntLit(SERIALIZABLE_STRING_MAX_LEN) else null
+                Triple(fname, pair, extraArg)
             }
             if (ops.any { it.second == null }) continue
             val encodeParams = listOf(
                 Param("packet", TypeRef(s.name, isRef = true)),
                 Param("buf", TypeRef("FriendlyByteBuf", isRef = true, isMut = true)),
             )
-            val encodeBody = Block(ops.map { (fname, methods) ->
-                Stmt.ExprStmt(Expr.MethodCall(Expr.Ident("buf", 0), methods!!.first, listOf(Expr.FieldAccess(Expr.Ident("packet", 0), fname, 0)), 0))
+            val encodeBody = Block(ops.map { (fname, methods, extraArg) ->
+                val args = listOfNotNull(Expr.FieldAccess(Expr.Ident("packet", 0), fname, 0), extraArg)
+                Stmt.ExprStmt(Expr.MethodCall(Expr.Ident("buf", 0), methods!!.first, args, 0))
             })
             val encodeFn = FnDecl(
                 name = "encode", params = encodeParams, retType = null, body = encodeBody, line = 0,
@@ -280,7 +332,9 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             val decodeParams = listOf(Param("buf", TypeRef("FriendlyByteBuf", isRef = true, isMut = true)))
             val decodeBody = Block(listOf(
                 Stmt.Return(
-                    Expr.StructLit(s.name, ops.map { (fname, methods) -> fname to Expr.MethodCall(Expr.Ident("buf", 0), methods!!.second, emptyList(), 0) }, 0),
+                    Expr.StructLit(s.name, ops.map { (fname, methods, extraArg) ->
+                        fname to Expr.MethodCall(Expr.Ident("buf", 0), methods!!.second, listOfNotNull(extraArg), 0)
+                    }, 0),
                     0,
                 )
             ))
@@ -290,6 +344,54 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             )
             implFns += encodeFn
             implFns += decodeFn
+        }
+
+        // `@entry("forge.mod", modid: "...")` -- see EntryDirective's doc. Scoped to exactly one
+        // target ("forge.mod") and at most one `@entry` fn per compile for this first pass.
+        // Validates the fn's own shape and finds the struct CodeGen should attach the generated
+        // `@Mod`-annotated class + constructor call to -- the *first* struct declared in the same
+        // file (module + sourceUnit) as the `@entry` fn, the same "named holder" convention every
+        // other per-file feature here already uses (see StructDecl's `sourceUnit` doc). Nothing
+        // here mutates `program.structs` -- `entryClassName`/`entryModid`/`entryInitFn` are read
+        // directly by CodeGen's `genStruct` instead, the same "no AST mutation, a side table
+        // CodeGen consults" shape `structSuperclass` etc. already use.
+        val entryFns = program.fns.filter { it.entry != null }
+        if (entryFns.size > 1) {
+            errors += "only one '@entry(...)' fn is allowed per compile, found ${entryFns.size}: ${entryFns.joinToString(", ") { it.name }}"
+        }
+        for (fn in entryFns) {
+            val directive = fn.entry!!
+            if (directive.target != "forge.mod") {
+                errors += "Line ${directive.line}: unknown '@entry' target '${directive.target}' (only \"forge.mod\" is supported)"
+                continue
+            }
+            if (fn.params.isNotEmpty()) {
+                errors += "Line ${directive.line}: '@entry(\"forge.mod\", ...)' fn '${fn.name}' must take zero parameters"
+            }
+            if (fn.retType != null) {
+                errors += "Line ${directive.line}: '@entry(\"forge.mod\", ...)' fn '${fn.name}' must return nothing"
+            }
+            val modid = (directive.args.firstOrNull { it.first == "modid" }?.second as? AnnotationValue.Str)?.value
+            if (modid == null) {
+                errors += "Line ${directive.line}: '@entry(\"forge.mod\", ...)' needs a 'modid: \"...\"' argument"
+                continue
+            }
+            val targetStruct = program.structs.firstOrNull { it.moduleName == fn.moduleName && it.sourceUnit == fn.sourceUnit }
+            if (targetStruct == null) {
+                errors += "Line ${directive.line}: '@entry(\"forge.mod\", ...)' needs a struct declared in the same file to attach the generated '@Mod' class to (e.g. 'pub struct YourModName {}')"
+                continue
+            }
+            // Forge instantiates the `@Mod` class via a genuine no-arg constructor -- the target
+            // struct needs the same "plain zero-field, no `extends`" shape `genStruct` already
+            // requires to emit that exact constructor shape (a superclass forwards a *different*
+            // ctor signature; any field would need a *non*-zero-arg one).
+            if (targetStruct.fields.isNotEmpty() || targetStruct.superclass != null) {
+                errors += "Line ${directive.line}: '@entry(\"forge.mod\", ...)' target struct '${targetStruct.name}' must have no fields and no 'extends' -- Forge needs a real no-arg constructor to instantiate it"
+                continue
+            }
+            entryClassName = targetStruct.name
+            entryModid = modid
+            entryInitFn = fn.name
         }
 
         // `struct S extends C { }` -- real JVM `extends` (S's generated class has C's binary
@@ -318,7 +420,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (template != null) {
                 if (impl.typeParams.size != template.typeParams.size) {
                     errors += "'impl${if (impl.typeParams.isEmpty()) "" else "<...>"} ${impl.interfaceName} for ${impl.structName}': " +
-                        "expected ${template.typeParams.size} type param(s) to match '${impl.structName}', got ${impl.typeParams.size}"
+                            "expected ${template.typeParams.size} type param(s) to match '${impl.structName}', got ${impl.typeParams.size}"
                 }
                 genericInterfaceImpls.getOrPut(impl.structName) { mutableListOf() } += impl
                 continue
@@ -401,7 +503,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                     continue
                 }
                 val alreadyReal = iface?.methods?.containsKey(m.name) == true ||
-                    (isStruct && (fns.containsKey("${ext.targetName}\$${m.name}") || genericFnTemplates.containsKey("${ext.targetName}\$${m.name}")))
+                        (isStruct && (fns.containsKey("${ext.targetName}\$${m.name}") || genericFnTemplates.containsKey("${ext.targetName}\$${m.name}")))
                 if (alreadyReal) {
                     errors += "Line ${m.line}: 'extend ${ext.targetName}': '${m.name}' already exists as a real method -- extensions can add new methods, not override"
                     continue
@@ -745,6 +847,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             e.arms.map { it.copy(body = substituteBlock(it.body, subst)) },
             e.line,
         )
+        is Expr.Lambda -> Expr.Lambda(e.params, substituteExpr(e.body, subst), e.line)
+        is Expr.ClassLit -> Expr.ClassLit(e.typeName, e.line)
     }
 
     // `T: Trait1 + Trait2`, checked at every real instantiation site: does the concrete `Ty`
@@ -981,7 +1085,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         val retTy = m.retType?.let { resolveType(fixSelf(it)) } ?: Ty.Unit_
         if (restTys != em.params || retTy != em.retType) {
             errors += "Line ${m.line}: 'override fn ${m.name}' doesn't match '${superAlias}'s signature for this method " +
-                "(expected (${em.params.joinToString(", ")}) -> ${em.retType})"
+                    "(expected (${em.params.joinToString(", ")}) -> ${em.retType})"
         }
         val newDecl = FnDecl(m.name, m.params.map { Param(it.name, fixSelf(it.type)) }, m.retType?.let { fixSelf(it) }, m.body, m.line)
         superclassOverrideFns.getOrPut(structName) { mutableListOf() } += newDecl
@@ -1396,7 +1500,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             val qualified = arm.variantName.split("::")
             val baseName = qualified[0]
             val variantName = if (qualified.size > 1) qualified[1] else arm.variantName
-            
+
             val variant = enumInfo.variant(variantName)
             if (variant == null) {
                 errors += "Line ${arm.line}: '${variantName}' is not a variant of '${scrutTy.name}'"
@@ -1451,7 +1555,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             }
             val qualified = arm.variantName.split("::")
             val structName = if (qualified.size > 1) qualified[1] else arm.variantName
-            
+
             if (structName !in iface.implementers) {
                 errors += "Line ${arm.line}: '${structName}' doesn't implement sealed interface '${scrutTy.interfaceName}'"
                 continue
@@ -1563,6 +1667,25 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             }
             is Expr.Ident -> {
                 val info = env.lookup(expr.name)
+                // If this read resolves outside the innermost open lambda's own param scope,
+                // it's a capture -- record its type so checkLambda/codegen know to synthesize a
+                // field for it. `statics` are never captured this way: codegen reaches them via
+                // a fixed GETSTATIC regardless of lexical position, same as any other read.
+                if (info != null && captureStack.isNotEmpty() && !statics.containsKey(expr.name)) {
+                    val (_, depth) = env.lookupWithDepth(expr.name)!!
+                    // Record on EVERY currently-open lambda frame this read is declared outside
+                    // of, not just the innermost -- a nested lambda (see checkLambda's own doc:
+                    // supported, e.g. a Supplier lambda whose body itself passes an icon/
+                    // displayItems lambda to a builder call) capturing something declared
+                    // outside an OUTER lambda too needs that value threaded through the outer
+                    // lambda's own capture (and constructor call) to ever reach the inner one's
+                    // -- exactly like passing a value down through an ordinary nested function
+                    // call chain. Each frame's own `first` (its param-scope depth) is
+                    // independent, so no early-exit is needed or correct here.
+                    for (frame in captureStack) {
+                        if (depth < frame.first) frame.second[expr.name] = info.ty
+                    }
+                }
                 if (info == null) {
                     val enumName = enumVariantOwner[expr.name]
                     if (enumName != null && enums.containsKey(enumName)) {
@@ -1590,7 +1713,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                             Ty.Enum(info.name) to moved
                         } else {
                             errors += "Line ${expr.line}: cannot infer type argument(s) for generic unit variant '${expr.name}' " +
-                                "-- use it somewhere the target type is already known (a typed 'let', or a function's declared return type)"
+                                    "-- use it somewhere the target type is already known (a typed 'let', or a function's declared return type)"
                             Ty.Unit_ to moved
                         }
                     } else {
@@ -1735,9 +1858,105 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             }
             is Expr.If -> checkIfExpr(expr, env, moved)
             is Expr.Match -> checkMatchExpr(expr, env, moved)
+            is Expr.Lambda -> checkLambda(expr, env, moved, expectedTy)
+            is Expr.ClassLit -> checkClassLit(expr, moved)
         }
         expr.ty = result.first
         return result
+    }
+
+    // `|params| body` -- only ever resolvable when `expectedTy` (threaded in from the call
+    // argument position it appeared in -- see checkMethodCall/checkStaticCall's Lambda
+    // special-casing) is a `Ty.Dyn` naming a declared interface with exactly one method AND a
+    // real `extern interface` binary name to implement (see the class-level doc on Expr.Lambda
+    // for why "single-method extern interface" is this language's whole functional-interface
+    // story). Anywhere else -- no expected type, an expected type that isn't `Ty.Dyn`, a
+    // multi-method interface, a native (non-extern) HC interface -- is a clear compile error,
+    // not silent inference failure: there is no fallback target-type source (no declared lambda
+    // type syntax exists) for this to fall back to.
+    private fun checkLambda(expr: Expr.Lambda, env: Env, moved: Map<String, Boolean>, expectedTy: Ty?): Pair<Ty, Map<String, Boolean>> {
+        if (expectedTy !is Ty.Dyn) {
+            errors += "Line ${expr.line}: cannot infer a target type for this lambda -- use it directly as an argument whose declared type is a single-method 'extern interface' (&dyn SomeInterface)"
+            return Ty.Unit_ to moved
+        }
+        val iface = interfaces[expectedTy.interfaceName]
+        if (iface == null) {
+            errors += "Line ${expr.line}: unknown interface '${expectedTy.interfaceName}'"
+            return Ty.Unit_ to moved
+        }
+        if (iface.methods.size != 1) {
+            errors += "Line ${expr.line}: '${expectedTy.interfaceName}' has ${iface.methods.size} methods -- a lambda can only target a single-method (functional) interface"
+            return Ty.Unit_ to moved
+        }
+        val binaryName = program.interfaces.firstOrNull { it.name == expectedTy.interfaceName }?.externBinaryName
+        if (binaryName == null) {
+            errors += "Line ${expr.line}: a lambda can only target an 'extern interface' (a real JVM interface) -- '${expectedTy.interfaceName}' is a native Hot Chocolate interface, implement it with a real 'impl' block instead"
+            return Ty.Unit_ to moved
+        }
+        val (methodName, msig) = iface.methods.entries.first()
+        if (msig.params.size != expr.params.size) {
+            errors += "Line ${expr.line}: lambda has ${expr.params.size} param(s), '${expectedTy.interfaceName}::${methodName}' expects ${msig.params.size}"
+            return Ty.Unit_ to moved
+        }
+        env.push()
+        for (i in expr.params.indices) {
+            env.declare(expr.params[i], VarInfo(msig.paramTys[i], mutable = false, canMutateFields = false))
+        }
+        // The scope INDEX the lambda's own params live in (env.depth() - 1, not env.depth()
+        // itself -- push() already created that scope, so depth() counts it; a param declared
+        // into it resolves at exactly that index via lookupWithDepth, not one past it). Getting
+        // this off by one would make every lambda incorrectly capture its own params as fields.
+        val lambdaDepth = env.depth() - 1
+        captureStack.addLast(lambdaDepth to LinkedHashMap())
+        val (bodyTy, m2raw) = checkExpr(expr.body, env, moved, consume = true, expectedTy = msig.ret)
+        val captured = captureStack.removeLast().second
+        env.pop()
+        // Same unwind `checkBlock` already does for an ordinary nested scope: strip out any
+        // entry the lambda's OWN params (or anything else scoped to just this lambda body)
+        // added, keeping only keys the CALLER's own `moved` map already had. Without this, a
+        // sibling lambda literal reusing the same param name (`|s| ...` used twice in a row, a
+        // Predicate arg being a real, common shape) sees a stale "moved" entry left over from
+        // the FIRST lambda's own now-finished param scope and wrongly rejects its own fresh
+        // same-named param as already used.
+        val m2 = m2raw.filterKeys { moved.containsKey(it) }
+        if (!tyCompatible(bodyTy, msig.ret)) {
+            errors += "Line ${expr.line}: lambda body has type ${bodyTy}, '${expectedTy.interfaceName}::${methodName}' expects ${msig.ret}"
+        }
+        expr.targetInterfaceName = expectedTy.interfaceName
+        expr.targetBinaryName = binaryName
+        expr.targetMethodName = methodName
+        expr.paramTys = msig.paramTys
+        expr.retTy = msig.ret
+        expr.captures = captured.map { (n, t) -> LambdaCapture(n, t) }
+        expr.syntheticName = "Lambda\$${lambdaCounter++}"
+        return expectedTy to m2
+    }
+
+    // `Type.class` -- `Type` names either a real `extern class`/`extern interface` alias (the
+    // real binary name goes straight into `resolvedName`, `isExtern = true`) or one of this
+    // compiler's own struct/enum declarations (bare name into `resolvedName`, `isExtern =
+    // false`, letting CodeGen run it through its own module-qualifying `qualify()` -- see
+    // Expr.ClassLit's own doc). Never a `Ty.Struct`/`Ty.Enum` *value*'s runtime class (there's
+    // no `x.getClass()`-equivalent here) -- only ever a compile-time-known type name.
+    private fun checkClassLit(expr: Expr.ClassLit, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
+        externClasses[expr.typeName]?.let {
+            expr.resolvedName = it.binaryName
+            expr.isExtern = true
+            return Ty.JavaExtern("java/lang/Class") to moved
+        }
+        val externIfaceBinary = program.interfaces.firstOrNull { it.name == expr.typeName }?.externBinaryName
+        if (externIfaceBinary != null) {
+            expr.resolvedName = externIfaceBinary
+            expr.isExtern = true
+            return Ty.JavaExtern("java/lang/Class") to moved
+        }
+        if (structs.containsKey(expr.typeName) || enums.containsKey(expr.typeName)) {
+            expr.resolvedName = expr.typeName
+            expr.isExtern = false
+            return Ty.JavaExtern("java/lang/Class") to moved
+        }
+        errors += "Line ${expr.line}: '${expr.typeName}.class' -- unknown type '${expr.typeName}'"
+        return Ty.Unit_ to moved
     }
 
     private fun checkMethodCall(expr: Expr.MethodCall, env: Env, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
@@ -1749,7 +1968,11 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         }
         val (recvTy, m0) = checkExpr(expr.recv, env, moved, consume = false)
         var m = m0
-        for (a in expr.args) m = checkExpr(a, env, m, consume = true).second
+        // A lambda literal's own type-checking needs the resolved call target's declared param
+        // type (see checkLambda) -- not known yet at this point, before `sig` below exists --
+        // so it's deliberately skipped here and checked later, once `sig` is available (see the
+        // loop right before the final `sig.params.size != ...` validation below).
+        for (a in expr.args) if (a !is Expr.Lambda) m = checkExpr(a, env, m, consume = true).second
 
         val sig: FnSig
         if (recvTy is Ty.Dyn) {
@@ -1791,9 +2014,9 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             // INVOKESTATIC.
             val overrideKey = "$concreteName@${expr.method}"
             val hasExplicitOverride = fns.containsKey(overrideKey) && (
-                interfaceImplFns[concreteName]?.any { it.name == expr.method } == true ||
-                superclassOverrideFns[concreteName]?.any { it.name == expr.method } == true
-            )
+                    interfaceImplFns[concreteName]?.any { it.name == expr.method } == true ||
+                            superclassOverrideFns[concreteName]?.any { it.name == expr.method } == true
+                    )
             val candidates = structInterfaces[concreteName].orEmpty()
                 .mapNotNull { ifaceName -> interfaces[ifaceName]?.methods?.get(expr.method)?.let { ifaceName to it } }
             if (hasExplicitOverride) {
@@ -1811,7 +2034,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 // reaches here as 2 candidates: `structInterfaces` is a set, so it only appears
                 // once regardless of how many paths reach it.
                 errors += "Line ${expr.line}: call to '${expr.method}' on '${ownerTemplateName}' is ambiguous between interfaces " +
-                    "${candidates.map { it.first }} -- add an explicit override in an impl block to resolve it"
+                        "${candidates.map { it.first }} -- add an explicit override in an impl block to resolve it"
                 return Ty.Unit_ to m
             } else if (candidates.isNotEmpty()) {
                 val msig = candidates[0].second
@@ -1929,18 +2152,26 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             val a = expr.args[i]
             val param = sig.params.getOrNull(i + 1)
             val expectRef = param?.type?.isRef ?: false
-            if (expectRef && a !is Expr.Borrow) {
-                errors += "Line ${expr.line}: argument ${i + 1} to '${expr.method}' must be borrowed (use &${describeArg(a)})"
-            }
-            if (!expectRef && a is Expr.Borrow) {
-                errors += "Line ${expr.line}: argument ${i + 1} to '${expr.method}' takes ownership, don't borrow it"
-            }
-            if (a is Expr.Borrow) {
-                if (expectRef && a.isMut != param?.type?.isMut) {
-                    errors += "Line ${expr.line}: argument ${i + 1} to '${expr.method}' expects ${if (param?.type?.isMut == true) "&mut" else "&"}, got ${if (a.isMut) "&mut" else "&"}"
+            if (a is Expr.Lambda) {
+                // A lambda needs no explicit '&' -- it always constructs a brand-new object
+                // reference at its use site, never an existing local that borrow-vs-own rules
+                // would need to arbitrate (see Expr.Lambda's own doc).
+                val (_, m2) = checkExpr(a, env, m, consume = true, expectedTy = sig.paramTys.getOrNull(i + 1))
+                m = m2
+            } else {
+                if (expectRef && a !is Expr.Borrow) {
+                    errors += "Line ${expr.line}: argument ${i + 1} to '${expr.method}' must be borrowed (use &${describeArg(a)})"
                 }
-                if (a.isMut) checkMutBorrowTarget(a.inner, env, expr.line, "call to '${expr.method}'")
-                (a.inner as? Expr.Ident)?.let { borrows += it.name to a.isMut }
+                if (!expectRef && a is Expr.Borrow) {
+                    errors += "Line ${expr.line}: argument ${i + 1} to '${expr.method}' takes ownership, don't borrow it"
+                }
+                if (a is Expr.Borrow) {
+                    if (expectRef && a.isMut != param?.type?.isMut) {
+                        errors += "Line ${expr.line}: argument ${i + 1} to '${expr.method}' expects ${if (param?.type?.isMut == true) "&mut" else "&"}, got ${if (a.isMut) "&mut" else "&"}"
+                    }
+                    if (a.isMut) checkMutBorrowTarget(a.inner, env, expr.line, "call to '${expr.method}'")
+                    (a.inner as? Expr.Ident)?.let { borrows += it.name to a.isMut }
+                }
             }
             val expectedTy = sig.paramTys.getOrNull(i + 1)
             if (expectedTy != null && !tyCompatible(a.ty!!, expectedTy)) {
@@ -1975,8 +2206,10 @@ class Checker(private val program: Program, private val classpathReflector: Clas
 
     private fun checkStaticCall(expr: Expr.StaticCall, env: Env, moved: Map<String, Boolean>): Pair<Ty, Map<String, Boolean>> {
         var m = moved
-        for (a in expr.args) m = checkExpr(a, env, m, consume = true).second
-        
+        // See checkMethodCall's identical comment -- a Lambda arg needs the resolved callee's
+        // declared param type first, so it's checked later in each branch below instead of here.
+        for (a in expr.args) if (a !is Expr.Lambda) m = checkExpr(a, env, m, consume = true).second
+
         val ext = externClasses[expr.typeName]
         if (ext != null) {
             val candidates = resolveExternMethods(ext, expr.method, expr.line).filter { it.isStatic || it.isCtor }
@@ -1989,8 +2222,10 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 errors += "Line ${expr.line}: '${expr.typeName}::${expr.method}' expects ${em.params.size} args, got ${expr.args.size}"
             }
             for (i in expr.args.indices) {
+                val a = expr.args[i]
                 val expectedTy = em.params.getOrNull(i) ?: continue
-                val argTy = expr.args[i].ty ?: continue
+                if (a is Expr.Lambda) { val (_, m2) = checkExpr(a, env, m, consume = true, expectedTy = expectedTy); m = m2 }
+                val argTy = a.ty ?: continue
                 if (!tyCompatible(argTy, expectedTy)) {
                     errors += "Line ${expr.line}: argument ${i + 1} to '${expr.typeName}::${expr.method}' expects ${expectedTy}, got ${argTy}"
                 }
@@ -2019,8 +2254,10 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 errors += "Line ${expr.line}: '${expr.typeName}::new' expects ${em.params.size} args, got ${expr.args.size}"
             }
             for (i in expr.args.indices) {
+                val a = expr.args[i]
                 val expectedTy = em.params.getOrNull(i) ?: continue
-                val argTy = expr.args[i].ty ?: continue
+                if (a is Expr.Lambda) { val (_, m2) = checkExpr(a, env, m, consume = true, expectedTy = expectedTy); m = m2 }
+                val argTy = a.ty ?: continue
                 if (!tyCompatible(argTy, expectedTy)) {
                     errors += "Line ${expr.line}: argument ${i + 1} to '${expr.typeName}::new' expects ${expectedTy}, got ${argTy}"
                 }
@@ -2050,8 +2287,10 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 errors += "Line ${expr.line}: '${expr.typeName}::${expr.method}' expects ${sig.params.size} args, got ${expr.args.size}"
             }
             for (i in expr.args.indices) {
+                val a = expr.args[i]
                 val expectedTy = sig.paramTys.getOrNull(i) ?: continue
-                val argTy = expr.args[i].ty ?: continue
+                if (a is Expr.Lambda) { val (_, m2) = checkExpr(a, env, m, consume = true, expectedTy = expectedTy); m = m2 }
+                val argTy = a.ty ?: continue
                 if (!tyCompatible(argTy, expectedTy)) {
                     errors += "Line ${expr.line}: argument ${i + 1} to '${expr.typeName}::${expr.method}' expects ${expectedTy}, got ${argTy}"
                 }
@@ -2128,11 +2367,11 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 }
 
                 if (typeArgs == null) return Ty.Unit_ to m
-                
+
                 val given = expr.fields.map { it.first }.toSet()
                 val expected = templateVariant.fields.map { it.name }.toSet()
                 if (given != expected) errors += "Line ${expr.line}: variant '${variantName}' field mismatch, expected ${expected}"
-                
+
                 val info = getOrInstantiateEnum(genericTemplate_, typeArgs, expr.line)
                 val variant = info.variant(variantName)!!
                 for ((fname, fexpr) in expr.fields) {
@@ -2304,7 +2543,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 // in STRINGIFIABLE (which only contains the non-nullable form), same "must
                 // narrow first" discipline as print()/`+`.
                 errors += "Line ${expr.line}: cannot interpolate ${ty} into a string -- only Int/Long/Float/Double/Bool/String are supported" +
-                    if (ty is Ty.Str_ && ty.nullable) " (this String is possibly-null -- check `== null`/`!= null` first)" else ""
+                        if (ty is Ty.Str_ && ty.nullable) " (this String is possibly-null -- check `== null`/`!= null` first)" else ""
             }
             m = m2
         }

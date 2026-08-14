@@ -91,6 +91,7 @@ fun compileProgram(userProgram: Program, mainClassName: String, classpath: List<
         checker.resolvedProgram(), checker.structs, fnRetTypes, fnParamTypes, mainClassName, checker.arenaLayouts,
         program.interfaces, checker.interfaces, checker.structInterfaces, checker.interfaceImplFns, checker.enums,
         checker.statics, checker.structSuperclass, checker.externClasses, checker.superclassOverrideFns,
+        checker.entryClassName, checker.entryModid, checker.entryInitFn,
     )
     val classes = codegen.generate()
     return CompileResult(classes, codegen.usesArena, codegen.entryHolderClassName)
@@ -149,10 +150,34 @@ private fun extractClasspath(args: Array<String>): Pair<List<String>, List<Strin
     return positional to (flagged + envEntries)
 }
 
+// `--profile[=out.jfr]` on `hc run` -- records a real JDK Flight Recorder session around the
+// program instead of building any HC-specific profiling machinery. HC-compiled code is just
+// ordinary JVM bytecode (real class/method names via ASM, no source-language marker JFR or any
+// other JVM-level tool would need to know about), so standard JFR already sees it correctly --
+// verified by profiling a real CPU-bound HC loop and confirming the recorded stack frames show
+// the actual HC-declared fn names, not "unknown"/synthetic ones. `null` second value = flag not
+// present (no profiling); a bare `--profile` (no `=path`) defaults to `profile.jfr` in the
+// current directory.
+private fun extractProfileFlag(args: List<String>): Pair<List<String>, String?> {
+    val positional = mutableListOf<String>()
+    var profilePath: String? = null
+    for (a in args) {
+        if (a == "--profile") {
+            profilePath = "profile.jfr"
+        } else if (a.startsWith("--profile=")) {
+            profilePath = a.removePrefix("--profile=")
+        } else {
+            positional += a
+        }
+    }
+    return positional to profilePath
+}
+
 fun main(rawArgs: Array<String>) {
-    val (args, classpath) = extractClasspath(rawArgs)
+    val (argsWithProfile, classpath) = extractClasspath(rawArgs)
+    val (args, profilePath) = extractProfileFlag(argsWithProfile)
     if (args.isEmpty()) {
-        System.err.println("usage: hc <run|build> <file.hc | project-dir> [outDir] [--classpath a.jar:b.jar]")
+        System.err.println("usage: hc <run|build> <file.hc | project-dir> [outDir] [--classpath a.jar:b.jar] [--profile[=out.jfr]]")
         return
     }
     val cmd = args[0]
@@ -220,12 +245,23 @@ fun main(rawArgs: Array<String>) {
             // actually load and link against when its methods get called, same as any other
             // dependency jar.
             val runCp = (listOf(outDir.path) + classpath).joinToString(File.pathSeparator)
-            val proc = ProcessBuilder(javaExe, "-cp", runCp, result.mainClassBinaryName.replace('/', '.'))
+            // `-XX:StartFlightRecording` needs an *absolute* path -- JFR resolves a relative
+            // `filename=` against the JVM's own working directory, which is fine here (this
+            // process doesn't change directory), but resolving it explicitly avoids any surprise
+            // if that ever stops being true, and makes the printed path directly openable.
+            // No `-XX:+FlightRecorder` -- JFR has been unlocked by default (no separate flag to
+            // enable it) since JDK 11; that flag is deprecated on modern JDKs and prints a
+            // startup warning for no benefit.
+            val profileArgs = profilePath?.let { p ->
+                listOf("-XX:StartFlightRecording=filename=${File(p).absolutePath},settings=profile")
+            } ?: emptyList()
+            val proc = ProcessBuilder(listOf(javaExe) + profileArgs + listOf("-cp", runCp, result.mainClassBinaryName.replace('/', '.')))
                 .inheritIO()
                 .start()
             val exitCode = proc.waitFor()
             outDir.deleteRecursively()
             if (exitCode != 0) System.err.println("process exited with code $exitCode")
+            if (profilePath != null) println("wrote JFR recording to ${File(profilePath).absolutePath}")
         }
         else -> System.err.println("unknown command '$cmd' (expected 'run' or 'build')")
     }
