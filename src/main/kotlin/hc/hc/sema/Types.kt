@@ -1,69 +1,34 @@
 package hc.sema
 
-// NOTE: each data class below declares its own `override fun toString()` directly in its body
-// -- a data class always auto-generates toString(), which silently shadows one declared only
-// on the sealed parent, so putting it here is the only way it actually takes effect. (Learned
-// the hard way: error messages were printing "Struct(name=Player)" instead of "Player" for a
-// while before this was caught.)
 sealed class Ty {
     object Int_ : Ty() { override fun toString() = "Int" }
     object Long_ : Ty() { override fun toString() = "Long" }
     object Float_ : Ty() { override fun toString() = "Float" }
     object Double_ : Ty() { override fun toString() = "Double" }
     object Bool_ : Ty() { override fun toString() = "Bool" }
-    // `nullable`: this value came from a JVM call declared `-> String?` and hasn't been
-    // null-checked yet -- same meaning, same narrowing mechanism (`Checker.narrowNonNull`) as
-    // `JavaExtern.nullable`, just for the one built-in type that isn't itself a `JavaExtern`
-    // (native strings get real `+`/interpolation/etc. support `JavaExtern` doesn't). Default
-    // `false` so every existing bare `Ty.Str_()` call site (a plain `String`) is unaffected --
-    // only `resolveType` ever constructs the `nullable = true` form, from a declared `String?`.
+
     data class Str_(val nullable: Boolean = false) : Ty() { override fun toString() = "String" + (if (nullable) "?" else "") }
     object Unit_ : Ty() { override fun toString() = "Unit" }
     data class Struct(val name: String) : Ty() { override fun toString() = name }
     data class Array(val elem: Ty) : Ty() { override fun toString() = "[$elem]" }
-    // A contiguous off-heap buffer of `structName` (an `arena struct`), backed by a real
-    // MemorySegment -- no boxing, no per-element JVM object, cache-friendly layout.
+
     data class Arena(val structName: String) : Ty() { override fun toString() = "Arena<$structName>" }
-    // `&dyn InterfaceName` / `&mut dyn InterfaceName` -- a reference that can point to any
-    // struct implementing the interface, dispatched dynamically (INVOKEINTERFACE). Always
-    // used behind a borrow; there's no owned `dyn X` in this language.
-    // `$Bound$A$B`-named interfaces are checker-internal synthetic ones (see
-    // Checker.syntheticBoundInterface) merging a `<T: A + B>` bound's traits so the body can be
-    // checked abstractly -- never a real declared interface a user wrote, so error messages
-    // render them back as the `T: A + B` bound syntax that actually produced them, not the
-    // synthetic name itself (which would otherwise leak an implementation detail into output a
-    // user never wrote).
+
     data class Dyn(val interfaceName: String) : Ty() {
         override fun toString() = if (interfaceName.startsWith("\$Bound\$")) {
             "T: " + interfaceName.removePrefix("\$Bound\$").split("\$").joinToString(" + ")
         } else "dyn $interfaceName"
     }
-    // A flat tagged union (no inheritance): one JVM class holding every variant's fields
-    // side by side (namespaced `variant$field`), discriminated by an int tag. See EnumInfo.
+
     data class Enum(val name: String) : Ty() { override fun toString() = name }
-    // A declared, trusted shape for an existing external JVM class (`extern class`). Move-only,
-    // treated as an opaque object reference -- the compiler never looks inside it beyond the
-    // method table it was declared with. `nullable`: this value came from a JVM call declared
-    // `-> Type?` and hasn't been null-checked yet -- calling a method on it is a checker error
-    // until it's narrowed (see Checker's `nullCheckedIdentName`/guard-clause narrowing). A
-    // `JavaExtern` with `nullable=true` and one with `nullable=false` for the *same* binary name
-    // are deliberately unequal as far as data-class `==` is concerned: that's what makes passing
-    // a still-nullable value anywhere a non-nullable one is expected (an argument, a field, a
-    // `let`'s declared type) fail through the ordinary "expected X, got Y" type-mismatch path,
-    // with no extra checking code needed at any of those call sites.
+
     data class JavaExtern(val binaryName: String, val nullable: Boolean = false) : Ty() {
         override fun toString() = binaryName.substringAfterLast('/') + (if (nullable) "?" else "")
     }
 }
 
-// Value types: assigning/passing them never "moves" the source (Copy semantics).
-// Everything else (structs, arrays, arena buffers, dyn refs) has move semantics like Rust.
 fun Ty.isCopy(): Boolean = this is Ty.Int_ || this is Ty.Long_ || this is Ty.Float_ || this is Ty.Double_ || this is Ty.Bool_ || this is Ty.Str_
 
-// `Double` (like JVM `long`) takes *two* consecutive local-variable-table/operand-stack slots,
-// not one -- every slot-allocating/stack-duplicating call site (declareLocal/declareParam/
-// allocTemp, DUP vs DUP2) needs to check this, not just assume every value is 1 slot wide.
-// `Float` is a normal 1-slot value, same as Int/Bool -- only Double and Long are wide here.
 fun Ty.isWide(): Boolean = this is Ty.Double_ || this is Ty.Long_
 
 fun Ty.descriptor(): String = when (this) {
@@ -84,16 +49,6 @@ fun Ty.descriptor(): String = when (this) {
 
 fun Ty.isObjectRef(): Boolean = this is Ty.Str_ || this is Ty.Struct || this is Ty.Array || this is Ty.Arena || this is Ty.Dyn || this is Ty.Enum || this is Ty.JavaExtern
 
-// `extern class` method table: `params`/`retType` are already resolved `Ty`s (from the exact
-// erased-JVM-signature the extern decl gave). `isStatic == false && name != "new"` -> instance
-// method (INVOKEVIRTUAL, first param is NOT `self` -- self is the receiver, not in this list).
-// `paramIsRef`/`paramIsMut`: whether each param was declared `&`/`&mut` in the *source* extern
-// signature -- a real JVM call doesn't care (a reference and an owned object-typed value compile
-// identically), but the checker's own borrow-checking (checkMethodCall's arg-borrow validation)
-// needs it to correctly accept e.g. `sup: &dyn JSupplier` called as `foo.bar(&someStruct{})`
-// instead of always assuming "owned" for every extern param. Default all-`false` for reflected
-// signatures (`use {}`/lazy forms): reflection has no way to know source-level `&`-ness, and
-// every reflected param is treated as owned, same as before this was tracked at all.
 class ExternMethodInfo(
     val name: String,
     val params: List<Ty>,
@@ -103,18 +58,9 @@ class ExternMethodInfo(
     val paramIsRef: List<Boolean> = params.map { false },
     val paramIsMut: List<Boolean> = params.map { false },
 )
-// A declared `NAME: Type;`/`static NAME: Type;` inside an `extern class` body -- a real JVM
-// field on the real binary class, e.g. `Minecraft.player` (instance) or `ForgeRegistries.ITEMS`/
-// `Style.EMPTY` (static). Explicit-signature form only (not resolved via `use {}`/lazy
-// reflection) -- scoped narrowly for now, same "trust the declared shape" honesty as an extern
-// method's signature.
+
 class ExternFieldInfo(val name: String, val type: Ty, val isStatic: Boolean = true)
-// `lazy`: this class's members were declared with no signatures at all (bare `extern class X =
-// "binary.Name";`, option 3) -- `methods` starts empty and the checker fills entries in one
-// name at a time, on demand, the first time a call site actually asks for that name (see
-// Checker.resolveExternMethods). Not set for the `use { name, ... }` form (option 2): those
-// resolve every requested name up front at registration time, same as hand-written signatures,
-// so `methods` is already complete by the time any call site is checked.
+
 class ExternClassInfo(val name: String, val binaryName: String, val methods: List<ExternMethodInfo>, val lazy: Boolean = false, val fields: List<ExternFieldInfo> = emptyList(), val isInterface: Boolean = false) {
     fun method(name: String): List<ExternMethodInfo> = methods.filter { it.name == name }
     fun field(name: String): ExternFieldInfo? = fields.firstOrNull { it.name == name }
@@ -125,9 +71,6 @@ class StructInfo(val name: String, val fields: List<Pair<String, Ty>>) {
     fun fieldIndex(name: String): Int = fields.indexOfFirst { it.first == name }
 }
 
-// One variant of an enum: `tag` is its 0-based declaration-order index (the discriminant
-// stored in every instance's `tag` field), `fields` are namespaced `variant$field` on the
-// class (see EnumInfo) so two variants can reuse a field name without colliding.
 class EnumVariantInfo(val name: String, val tag: Int, val fields: List<Pair<String, Ty>>) {
     fun fieldType(fieldName: String): Ty? = fields.firstOrNull { it.first == fieldName }?.second
 }
@@ -136,8 +79,6 @@ class EnumInfo(val name: String, val variants: List<EnumVariantInfo>, val module
     val variantNames: List<String> get() = variants.map { it.name }
 }
 
-// Layout for an `arena struct`: every field is 4 or 8 bytes (Int, Long, or Bool), laid out in
-// declaration order. Simple over byte-packed -- a phase-3 concern.
 class ArenaLayout(val structName: String, val fields: List<Pair<String, Ty>>) {
     val elemSize: Int = fields.sumOf { if (it.second.isWide()) 8 else (4 as Int) }
     fun fieldType(name: String): Ty? = fields.firstOrNull { it.first == name }?.second

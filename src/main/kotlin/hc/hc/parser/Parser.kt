@@ -8,9 +8,7 @@ class ParseError(message: String) : RuntimeException(message)
 
 class Parser(private val tokens: List<Token>) {
     private var pos = 0
-    // Set once from an optional leading `module a.b.c;` and stamped onto every top-level decl
-    // parsed afterward in this file -- see Program's doc comment for why this is per-file, not
-    // a single whole-program value the way `package` used to be.
+
     private var currentModule: String? = null
 
     fun parseProgram(): Program {
@@ -56,7 +54,6 @@ class Parser(private val tokens: List<Token>) {
         return Program(structs, fns, impls, interfaces, enums, externs, extends, statics)
     }
 
-    // `[pub] static NAME: Type = initExpr;`
     private fun staticDecl(pub: Boolean = false): StaticDecl {
         val line = expect(TokType.STATIC).line
         val name = expect(TokType.IDENT).text
@@ -68,7 +65,6 @@ class Parser(private val tokens: List<Token>) {
         return StaticDecl(name, type, init, line, currentModule, pub)
     }
 
-    // `module a.b.c;` -- optional, must be the very first thing in a file if present.
     private fun moduleDecl(): String {
         expect(TokType.MODULE)
         val parts = mutableListOf(expect(TokType.IDENT).text)
@@ -77,7 +73,6 @@ class Parser(private val tokens: List<Token>) {
         return parts.joinToString(".")
     }
 
-    // `extend Target { fn newMethod(&self, ...) -> T { body } }` -- see ExtendBlock's doc.
     private fun extendDecl(): ExtendBlock {
         val line = expect(TokType.EXTEND).line
         val targetName = expect(TokType.IDENT).text
@@ -91,30 +86,19 @@ class Parser(private val tokens: List<Token>) {
         return ExtendBlock(targetName, methods, currentModule, line)
     }
 
-    // Three forms after the binary name -- see the comment on ExternClassDecl for what each
-    // produces and when to reach for it:
-    //   `extern class Alias = "java.util.ArrayList" { fn new() -> Self; fn add(&mut self, value: T) -> Bool; }`  (explicit)
-    //   `extern class Alias = "java.util.ArrayList" use { new, add, get, size };`                                (reflected, eager)
-    //   `extern class Alias = "java.util.ArrayList";`                                                            (reflected, lazy)
     private fun externClassDecl(): ExternClassDecl {
         expect(TokType.EXTERN)
         expect(TokType.CLASS)
         val name = expect(TokType.IDENT).text
         expect(TokType.EQ)
         val binaryName = expect(TokType.STRING).text.replace('.', '/')
-        // Optional `interface` marker right after the binary name -- see ExternClassDecl's
-        // `isInterface` doc for why this needs to be spelled out (no reflection here to infer it
-        // from the real classfile's ACC_INTERFACE flag automatically, same "trust the
-        // declaration" honesty as everything else under `extern`).
+
         val isInterface = match(TokType.INTERFACE)
 
         if (match(TokType.SEMI)) {
             return ExternClassDecl(name, binaryName, emptyList(), lazyAll = true, isInterface = isInterface)
         }
-        // Contextual keyword, not a reserved word -- see the lexer's comment on why "use" isn't
-        // in its KEYWORDS map at all (a real Java method can be named exactly "use", as
-        // `Item.use(...)` is). Checked by peeking an IDENT token's text right here, the one
-        // position it means anything special.
+
         if (check(TokType.IDENT) && peek().text == "use") {
             advance()
             expect(TokType.LBRACE)
@@ -134,9 +118,7 @@ class Parser(private val tokens: List<Token>) {
         while (!check(TokType.RBRACE)) {
             val isStatic = match(TokType.STATIC)
             if (!check(TokType.FN)) {
-                // `NAME: Type;` (instance field, read via `recv.NAME`) or `static NAME: Type;`
-                // (static field, read via `Alias::NAME`) -- both share this branch, distinguished
-                // purely by the `static` keyword; neither has a `fn` following the name.
+
                 val fline = peek().line
                 val fname = expect(TokType.IDENT).text
                 expect(TokType.COLON)
@@ -157,10 +139,6 @@ class Parser(private val tokens: List<Token>) {
         return ExternClassDecl(name, binaryName, methods, fields = fields, isInterface = isInterface)
     }
 
-    // `extern interface Alias = "java.lang.Runnable" { fn run(&self); }` -- a declared, trusted
-    // shape for an existing JVM *interface*, so a struct can `impl Alias for Struct { }` it and
-    // get handed off to real Java code expecting that interface type. Methods are always
-    // required (no body -- there's no interface class here to attach a default method to).
     private fun externInterfaceDecl(): InterfaceDecl {
         expect(TokType.EXTERN)
         expect(TokType.INTERFACE)
@@ -182,7 +160,6 @@ class Parser(private val tokens: List<Token>) {
         return InterfaceDecl(name, methods, externBinaryName = binaryName)
     }
 
-    // `enum Name { Variant { field: Type, ... }, UnitVariant, ... }`
     private fun enumDecl(pub: Boolean = false): EnumDecl {
         expect(TokType.ENUM)
         val name = expect(TokType.IDENT).text
@@ -208,7 +185,6 @@ class Parser(private val tokens: List<Token>) {
         return EnumDecl(name, variants, typeParams, bounds, currentModule, pub)
     }
 
-    // `[pub] [open] [sealed] interface Name [: Super, Super2] { ... }`
     private fun interfaceDecl(pub: Boolean = false, open: Boolean = false): InterfaceDecl {
         val sealed = match(TokType.SEALED)
         expect(TokType.INTERFACE)
@@ -225,7 +201,6 @@ class Parser(private val tokens: List<Token>) {
         return InterfaceDecl(name, methods, extends, sealed, moduleName = currentModule, visible = pub || open, open = open)
     }
 
-    // `fn name(params) -> Ret;` (required) or `fn name(params) -> Ret { body }` (default).
     private fun interfaceMethodDecl(): InterfaceMethodDecl {
         val line = expect(TokType.FN).line
         val name = expect(TokType.IDENT).text
@@ -236,14 +211,11 @@ class Parser(private val tokens: List<Token>) {
         return InterfaceMethodDecl(name, params, retType, body, line)
     }
 
-    // `impl [<T>] Name1 [<...>] [by field] { }` (inherent) or
-    // `impl [<T>] Interface for Name1 [<...>] [by field] { }`.
     private fun implDecl(): ImplBlock {
         expect(TokType.IMPL)
         val (typeParams, bounds) = typeParamListWithBounds()
         val name1 = expect(TokType.IDENT).text
-        // Optional `<T>` on the (struct or interface) name, e.g. `impl<T> Box<T> { ... }` -- for
-        // now an impl's type params always map 1:1 onto the struct's own, so this is just consumed.
+
         if (match(TokType.LT)) {
             while (!check(TokType.GT)) {
                 expect(TokType.IDENT)
@@ -294,14 +266,6 @@ class Parser(private val tokens: List<Token>) {
 
     private data class LeadingMarkers(val annotations: List<AnnotationUse>, val serializable: Boolean, val entry: EntryDirective?)
 
-    // `@"binary.Name"` (marker) or `@"binary.Name"(argName: value, ...)` -- a real Java
-    // annotation, zero or more, immediately before a top-level `struct`/`fn`. See AnnotationUse's
-    // doc for why argument values are their own small grammar (`annotationValue()`) instead of a
-    // full expression. `@serializable` (bare identifier, no string) and `@entry("target", ...)`
-    // (bare identifier, but followed by a parenthesized arg list -- see EntryDirective's doc) are
-    // the two recognized compiler *directives* so far -- both distinguished from a real
-    // annotation purely by the absence of a quoted string right after `@`. All forms can repeat
-    // and mix freely in any order in front of one declaration.
     private fun leadingMarkers(): LeadingMarkers {
         val out = mutableListOf<AnnotationUse>()
         var serializable = false
@@ -343,12 +307,8 @@ class Parser(private val tokens: List<Token>) {
         return LeadingMarkers(out, serializable, entry)
     }
 
-    // `"a string literal"` or `enum("binary.Name", "CONST")` -- the only two annotation-argument
-    // shapes ported code has needed so far (Forge's `modid = "..."` and `value = Dist.CLIENT`).
     private fun annotationValue(): AnnotationValue {
-        // "enum" is already a hard keyword (TokType.ENUM, from `enum Name { }` declarations),
-        // not an IDENT here -- check the reserved token, not IDENT-with-matching-text like the
-        // lexer's "use" contextual keyword does.
+
         if (check(TokType.ENUM)) {
             advance()
             expect(TokType.LPAREN)
@@ -371,8 +331,6 @@ class Parser(private val tokens: List<Token>) {
         return AnnotationValue.Str(expect(TokType.STRING).text)
     }
 
-    // `arena struct Name { field: Int, ... }` -- no type params, fields must be
-    // Int/Bool (enforced by the checker; this just parses the plain field list).
     private fun arenaStructDecl(pub: Boolean = false): StructDecl {
         expect(TokType.ARENA)
         expect(TokType.STRUCT)
@@ -390,7 +348,6 @@ class Parser(private val tokens: List<Token>) {
         return StructDecl(name, fields, typeParams = emptyList(), isArena = true, moduleName = currentModule, visible = pub)
     }
 
-    // `<T, U: Trait, V: Trait1 + Trait2>` -- names in declaration order, plus any bounds.
     private fun typeParamListWithBounds(): Pair<List<String>, Map<String, List<String>>> {
         if (!match(TokType.LT)) return emptyList<String>() to emptyMap()
         val names = mutableListOf<String>()
@@ -424,15 +381,14 @@ class Parser(private val tokens: List<Token>) {
         return FnDecl(name, params, retType, body, line, typeParams, bounds, currentModule, pub, isOverride, annotations, entry = entry)
     }
 
-    // `(self, ...)` / `(&self, ...)` / `(&mut self, ...)` / `(name: Type, ...)`.
     private fun paramList(): List<Param> {
         expect(TokType.LPAREN)
         val params = mutableListOf<Param>()
         while (!check(TokType.RPAREN)) {
             if (check(TokType.AMP) && (peekAt(1).text == "self" || (peekAt(1).type == TokType.MUT && peekAt(2).text == "self"))) {
-                advance() // &
+                advance() 
                 val isMut = match(TokType.MUT)
-                advance() // self
+                advance() 
                 params += Param("self", TypeRef("Self", isRef = true, isMut = isMut))
             } else if (check(TokType.IDENT) && peek().text == "self" && peekAt(1).type != TokType.COLON) {
                 advance()
@@ -529,7 +485,7 @@ class Parser(private val tokens: List<Token>) {
     private fun letStmt(): Stmt {
         val line = peek().line
         val mutable = check(TokType.VAR)
-        advance() // consume let/var
+        advance() 
         val name = expect(TokType.IDENT).text
         var declType: TypeRef? = null
         if (match(TokType.COLON)) declType = typeRef()
@@ -557,7 +513,6 @@ class Parser(private val tokens: List<Token>) {
         return Stmt.While(cond, body)
     }
 
-    // `match expr { Variant { a, b } => { }, Other => { }, _ => { } }`
     private fun matchStmt(): Stmt {
         val line = expect(TokType.MATCH).line
         val scrutinee = expression()
@@ -579,10 +534,7 @@ class Parser(private val tokens: List<Token>) {
                 while (!check(TokType.RBRACE)) {
                     bindings += expect(TokType.IDENT).text
                     if (match(TokType.COLON)) {
-                        // Named binding: Variant { field: binding }
-                        // For now we just skip the field name and keep the binding name
-                        // since our Ast.MatchArm only stores a flat list of binding names
-                        // mapped to variant fields by order.
+
                         val bindingName = expect(TokType.IDENT).text
                         bindings.removeAt(bindings.size - 1)
                         bindings += bindingName
@@ -599,24 +551,16 @@ class Parser(private val tokens: List<Token>) {
         return Stmt.Match(scrutinee, arms, line)
     }
 
-    // `if cond { expr } else { expr }` as a value -- see Ast.kt's `Expr.If` doc for the exact
-    // scope cut (each branch is a single-expression block, `else` required). Reachable only from
-    // `primary()`, so `if`/`match` used at statement position keep going through `ifStmt()`/
-    // `matchStmt()` above, completely unaffected -- this is purely additive.
     private fun ifExpr(): Expr {
         val line = expect(TokType.IF).line
         val cond = expression()
         val thenB = block()
         expect(TokType.ELSE)
-        // Chained `else if` in expression position must itself yield a value -- wrapped in a
-        // single `Stmt.ExprStmt` so it satisfies the same "exactly one expression" shape the
-        // checker enforces on every other branch, rather than needing a separate AST shape for it.
+
         val elseB = if (check(TokType.IF)) Block(listOf(Stmt.ExprStmt(ifExpr()))) else block()
         return Expr.If(cond, thenB, elseB, line)
     }
 
-    // `match scrutinee { Variant { a, b } => expr, _ => expr }` as a value -- same arm grammar as
-    // `matchStmt()` (each arm's body is still a normal `{ ... }` block), just building `Expr.Match`.
     private fun matchExpr(): Expr {
         val line = expect(TokType.MATCH).line
         val scrutinee = expression()
@@ -654,7 +598,6 @@ class Parser(private val tokens: List<Token>) {
         return Expr.Match(scrutinee, arms, line)
     }
 
-    // `for x in a..b { }` or `for x in arr { }`
     private fun forStmt(): Stmt {
         val line = expect(TokType.FOR).line
         val varName = expect(TokType.IDENT).text
@@ -678,8 +621,6 @@ class Parser(private val tokens: List<Token>) {
         return Stmt.Return(e, line)
     }
 
-    // ---- expressions (precedence climbing) ----
-
     private fun expression(): Expr = assignment()
 
     private fun assignment(): Expr {
@@ -696,12 +637,6 @@ class Parser(private val tokens: List<Token>) {
         return expr
     }
 
-    // `||` binds looser than `&&`, which binds looser than `==`/comparisons -- same relative
-    // precedence as every C-descended language. Both are real short-circuit operators in
-    // codegen (branch-based, not eager-evaluate-both-sides), which is more than a performance
-    // nicety here: `i < len && !arr[i].isEmpty()` relies on the right side never evaluating once
-    // `i < len` is false, same as `i < lines.length && !lines[i].trim().isEmpty()` in real
-    // ported code.
     private fun logicalOr(): Expr {
         var expr = logicalAnd()
         while (check(TokType.PIPEPIPE)) {
@@ -762,11 +697,6 @@ class Parser(private val tokens: List<Token>) {
         return expr
     }
 
-    // `expr as Type` / `expr is Type` -- both bind tighter than the arithmetic operators (`x as
-    // Double / y` casts `x` before dividing, matching Rust's own precedence) but looser than
-    // unary (`-x as Float` negates first, then casts). Chainable: `x as Float as Int` reads left
-    // to right; `is` chaining is nonsensical (result is already `Bool`) but not specially
-    // rejected -- `(x is Foo) as ...`/etc is just a checker type error like any other.
     private fun cast(): Expr {
         var expr = unary()
         while (check(TokType.AS) || check(TokType.IS)) {
@@ -813,14 +743,9 @@ class Parser(private val tokens: List<Token>) {
                     Expr.Call(expr.name, args, line)
                 }
                 check(TokType.DOT) && peekAt(1).type == TokType.CLASS -> {
-                    // `Type.class` -- "class" is already a keyword (used by `extern class`), so
-                    // this is recognized directly off TokType.CLASS right after a dot, before it
-                    // ever reaches ordinary FieldAccess parsing below (which only ever expects a
-                    // plain IDENT there). Only sensible directly after a bare type name (`expr
-                    // is Expr.Ident`) --
-                    // anything else here is a parse-level error, not deferred to the checker.
-                    val line = advance().line // '.'
-                    advance() // 'class'
+
+                    val line = advance().line 
+                    advance() 
                     if (expr !is Expr.Ident) throw err("'.class' can only follow a bare type name")
                     Expr.ClassLit(expr.name, line)
                 }
@@ -851,12 +776,6 @@ class Parser(private val tokens: List<Token>) {
         }
     }
 
-    // `ISTRING_BEGIN ISTRING_PART(lit0) <expr0 tokens> ISTRING_PART(lit1) ... ISTRING_END` --
-    // literal segments and embedded expressions were already split out by the lexer (see
-    // Lexer.string()); this just walks that flat shape and re-parses each embedded expression
-    // with the ordinary `expression()` entry point. `expression()` naturally stops the moment it
-    // hits a token it can't extend (here, always the next ISTRING_PART/ISTRING_END), so no
-    // lookahead or bracket-matching is needed on the parser side at all.
     private fun interpolatedString(): Expr {
         val line = expect(TokType.ISTRING_BEGIN).line
         val literals = mutableListOf<String>()
@@ -866,7 +785,7 @@ class Parser(private val tokens: List<Token>) {
             exprs += expression()
             literals += expect(TokType.ISTRING_PART).text
         }
-        advance() // ISTRING_END
+        advance() 
         return Expr.StringInterp(literals, exprs, line)
     }
 
@@ -887,26 +806,19 @@ class Parser(private val tokens: List<Token>) {
             TokType.ARENA -> arenaNewExpr()
             TokType.IF -> ifExpr()
             TokType.MATCH -> matchExpr()
-            // `||` only ever reaches primary() at a position where a NEW expression is
-            // starting (logicalOr's own `||`-as-operator handling checks the token directly,
-            // without going through primary() -- see its doc comment), so there's no ambiguity
-            // between "zero-param lambda" and "logical or with no left operand" to resolve here.
+
             TokType.PIPEPIPE -> { val line = advance().line; Expr.Lambda(emptyList(), expression(), line) }
             TokType.PIPE -> lambdaExpr()
             TokType.IDENT -> {
                 if (peekAt(1).type == TokType.COLONCOLON) {
                     when {
-                        // Same ambiguity as the bare-Ident case below (`if x { }` vs `x { }`),
-                        // just one token further out: `if Alias::FIELD { }` (a static-field read
-                        // used as an if-condition) tokenizes identically up through the `{` as
-                        // `Alias::Variant { field: val }` (an enum-variant struct literal), so
-                        // the same lookahead heuristic decides it -- not just LBRACE-presence.
+
                         peekAt(3).type == TokType.LBRACE && looksLikeVariantStructLiteral() -> structLiteral()
                         peekAt(3).type == TokType.LPAREN -> staticCall()
                         else -> staticFieldGet()
                     }
                 } else if (peekAt(1).type == TokType.LBRACE && looksLikeStructLiteral()) {
-                    // lookahead for struct literal: Ident { ... }
+                    
                     structLiteral()
                 } else {
                     advance()
@@ -917,25 +829,22 @@ class Parser(private val tokens: List<Token>) {
         }
     }
 
-    // Disambiguate `Ident {` as a struct literal only when followed by `ident :` inside,
-    // or an immediate `}` (empty struct). Prevents swallowing `if x {`.
     private fun looksLikeStructLiteral(): Boolean {
         val save = pos
-        advance() // ident
-        advance() // lbrace
+        advance() 
+        advance() 
         val result = check(TokType.RBRACE) ||
             (check(TokType.IDENT) && peekAt(1).type == TokType.COLON)
         pos = save
         return result
     }
 
-    // Same disambiguation, shifted past a `Base::Variant` prefix instead of a bare `Ident`.
     private fun looksLikeVariantStructLiteral(): Boolean {
         val save = pos
-        advance() // base ident
-        advance() // ::
-        advance() // variant ident
-        advance() // lbrace
+        advance() 
+        advance() 
+        advance() 
+        advance() 
         val result = check(TokType.RBRACE) ||
             (check(TokType.IDENT) && peekAt(1).type == TokType.COLON)
         pos = save
@@ -965,7 +874,6 @@ class Parser(private val tokens: List<Token>) {
         return Expr.StructLit(name, fields, line)
     }
 
-    // `TypeName::method(args)` -- an extern class's constructor (`method == "new"`) or static method.
     private fun staticCall(): Expr {
         val typeName = expect(TokType.IDENT).text
         expect(TokType.COLONCOLON)
@@ -980,9 +888,6 @@ class Parser(private val tokens: List<Token>) {
         return Expr.StaticCall(typeName, method, args, line)
     }
 
-    // `Alias::FIELD` -- reads a declared `extern class` static field (GETSTATIC). Only reached
-    // when staticCall()'s LPAREN lookahead fails, i.e. nothing follows the member name that
-    // would make it a call.
     private fun staticFieldGet(): Expr {
         val typeName = expect(TokType.IDENT).text
         expect(TokType.COLONCOLON)
@@ -990,8 +895,6 @@ class Parser(private val tokens: List<Token>) {
         return Expr.StaticFieldGet(typeName, field.text, field.line)
     }
 
-    // `|x, y| body` (one-or-more params -- the zero-param `|| body` case is handled directly in
-    // primary() off the single PIPEPIPE token the lexer already merges those two bars into).
     private fun lambdaExpr(): Expr {
         val line = expect(TokType.PIPE).line
         val params = mutableListOf<String>()
@@ -1003,7 +906,6 @@ class Parser(private val tokens: List<Token>) {
         return Expr.Lambda(params, expression(), line)
     }
 
-    // `[e1, e2, e3]` (literal) or `[value; count]` (repeated value).
     private fun arrayLiteralOrRepeat(): Expr {
         val line = expect(TokType.LBRACKET).line
         val first = expression()
@@ -1021,7 +923,6 @@ class Parser(private val tokens: List<Token>) {
         return Expr.ArrayLit(elements, line)
     }
 
-    // `arena Particle[count]`: allocates an off-heap buffer.
     private fun arenaNewExpr(): Expr {
         expect(TokType.ARENA)
         val name = expect(TokType.IDENT).text
@@ -1030,8 +931,6 @@ class Parser(private val tokens: List<Token>) {
         val line = expect(TokType.RBRACKET).line
         return Expr.ArenaNew(name, count, line)
     }
-
-    // ---- helpers ----
 
     private fun peek() = tokens[pos]
     private fun peekAt(offset: Int) = tokens[minOf(pos + offset, tokens.size - 1)]

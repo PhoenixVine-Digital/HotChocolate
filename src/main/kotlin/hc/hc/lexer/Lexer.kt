@@ -32,13 +32,7 @@ private val KEYWORDS = mapOf(
     "extend" to TokType.EXTEND,
     "static" to TokType.STATIC,
     "as" to TokType.AS,
-    // Deliberately NOT a keyword -- "use" only means anything special immediately after an
-    // `extern class Alias = "binary.Name"` header (the eager-reflection form), a single
-    // context the parser checks for by peeking an IDENT's text (see externClassDecl) rather
-    // than reserving the word globally. A real Java method can be (and, for `Item.use(...)`,
-    // is) named exactly "use" -- reserving it as a hard keyword would make that name
-    // undeclarable in an extern class's method list, a genuine collision found while porting
-    // CopyToolItem.hc.
+
     "try" to TokType.TRY,
     "catch" to TokType.CATCH,
     "throw" to TokType.THROW,
@@ -111,10 +105,7 @@ class Lexer(private val src: String) {
             '?' -> tok(TokType.QUESTION, "?")
             '@' -> tok(TokType.AT, "@")
             '&' -> if (match('&')) tok(TokType.AMPAMP, "&&") else tok(TokType.AMP, "&")
-            // Lone '|' opens a lambda param list (`|x, y| body`); '||' is either the logical-or
-            // operator (parsed in logicalOr, only ever reached with a left operand already on
-            // hand) or a zero-param lambda (`|| body`, parsed in primary()) -- the parser tells
-            // the two apart purely by position, so the lexer just hands back one token either way.
+
             '|' -> if (match('|')) tok(TokType.PIPEPIPE, "||") else tok(TokType.PIPE, "|")
             '=' -> when {
                 match('=') -> tok(TokType.EQEQ, "==")
@@ -128,34 +119,28 @@ class Lexer(private val src: String) {
         }
     }
 
-    // `123` -> Int. `123L` -> Long. `1.5` -> Double (Java's own unsuffixed default).
-    // `1.5f`/`1.5F` -> Float, matching Java's own literal suffix convention --
-    // deliberately, since the whole point of adding these is to interop with real
-    // Java/Minecraft signatures that already distinguish the two, and a reader coming
-    // from a Java signature comment should recognize the literal.
-    // Hex literals: `0xABC` -> Int.
     private fun number(c: Char, startLine: Int): Token {
         val start = pos - 1
         if (c == '0' && (peek() == 'x' || peek() == 'X')) {
-            pos++ // consume 'x'
+            pos++ 
             val hexStart = pos
             while (!isAtEnd() && (peek().isDigit() || (peek().lowercaseChar() in 'a'..'f'))) pos++
             val text = src.substring(hexStart, pos)
-            // Use toLong(16) then toInt() to handle unsigned 32-bit hex values like 0xFFFFFFFF
+            
             return Token(TokType.INT, text.toLong(16).toInt().toString(), startLine)
         }
         while (!isAtEnd() && peek().isDigit()) pos++
         if (!isAtEnd() && (peek() == 'l' || peek() == 'L')) {
             val text = src.substring(start, pos)
-            pos++ // consume 'l'/'L'
+            pos++ 
             return Token(TokType.LONG, text, startLine)
         }
         if (!isAtEnd() && peek() == '.' && peekNext().isDigit()) {
-            pos++ // consume '.'
+            pos++ 
             while (!isAtEnd() && peek().isDigit()) pos++
             if (!isAtEnd() && (peek() == 'f' || peek() == 'F')) {
                 val text = src.substring(start, pos)
-                pos++ // consume the suffix
+                pos++ 
                 return Token(TokType.FLOAT, text, startLine)
             }
             return Token(TokType.DOUBLE, src.substring(start, pos), startLine)
@@ -171,24 +156,20 @@ class Lexer(private val src: String) {
         return Token(kw ?: TokType.IDENT, text, startLine)
     }
 
-    // Scans one string literal. No `{` anywhere in it -> exactly the old behavior, a single
-    // STRING token (fully backward compatible). Otherwise -> an ISTRING_BEGIN/ISTRING_PART/
-    // ISTRING_END token sequence with each `{expr}`'s own real tokens spliced in between,
-    // recursively lexed by a fresh `Lexer` over just that substring -- see interpolatedString().
     private fun string(startLine: Int): List<Token> {
         val sb = StringBuilder()
         val parts = mutableListOf<String>()
         val exprToks = mutableListOf<List<Token>>()
         while (!isAtEnd() && peek() != '"') {
             if (peek() == '{') {
-                pos++ // consume '{'
+                pos++ 
                 val exprStart = pos
                 val exprEnd = findMatchingBrace(startLine)
                 val exprSrc = src.substring(exprStart, exprEnd)
                 parts += sb.toString()
                 sb.clear()
-                exprToks += Lexer(exprSrc).tokenize().dropLast(1) // drop that sub-lex's own EOF
-                pos = exprEnd + 1 // past the matching '}'
+                exprToks += Lexer(exprSrc).tokenize().dropLast(1) 
+                pos = exprEnd + 1 
                 continue
             }
             var ch = advance()
@@ -206,7 +187,7 @@ class Lexer(private val src: String) {
             sb.append(ch)
         }
         if (isAtEnd()) throw LexError("Unterminated string at line $startLine")
-        advance() // closing quote
+        advance() 
         if (parts.isEmpty()) {
             return listOf(Token(TokType.STRING, sb.toString(), startLine))
         }
@@ -222,10 +203,6 @@ class Lexer(private val src: String) {
         return out
     }
 
-    // Called with `pos` just past a `{` opened inside a string literal; returns the index of
-    // its matching `}`, tracking nested `{`/`}` depth and skipping over any nested string
-    // literal's own contents (so a struct literal or a nested interpolated string inside the
-    // `{...}` doesn't confuse the brace count or trip over the outer string's own closing `"`).
     private fun findMatchingBrace(startLine: Int): Int {
         var depth = 1
         while (!isAtEnd()) {
@@ -239,7 +216,7 @@ class Lexer(private val src: String) {
                         pos++
                     }
                     if (isAtEnd()) throw LexError("Unterminated string at line $startLine")
-                    pos++ // closing quote of the nested string
+                    pos++ 
                 }
                 '\n' -> { line++; pos++ }
                 else -> pos++

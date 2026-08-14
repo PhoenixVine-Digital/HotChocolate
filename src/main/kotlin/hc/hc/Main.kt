@@ -9,8 +9,6 @@ import hc.sema.ClasspathReflector
 import hc.sema.Ty
 import java.io.File
 
-// `mainClassBinaryName`: the entry class's JVM internal name (slash-separated, package prefix
-// included when one was declared) -- matches a key in `classes`, and is what `hc run` launches.
 class CompileResult(val classes: Map<String, ByteArray>, val usesArena: Boolean, val mainClassBinaryName: String)
 
 private fun mergeProgram(a: Program, b: Program): Program = Program(
@@ -24,30 +22,9 @@ private fun mergeProgram(a: Program, b: Program): Program = Program(
     statics = a.statics + b.statics,
 )
 
-// `classpath`: jar/dir paths used to reflect real signatures for `extern class` members
-// declared with `use { ... }` or with no body at all (see ExternClassDecl) -- e.g. Forge's/
-// Minecraft's own jars for a mod project. Empty is fine for a program that only uses the
-// original, hand-written-signature `extern class` form (or none at all); reflection is never
-// attempted unless a declaration actually asks for it.
 fun compile(source: String, mainClassName: String, classpath: List<String> = emptyList()): CompileResult =
     compileProgram(Parser(Lexer(source).tokenize()).parseProgram(), mainClassName, classpath)
 
-// `path` a single file compiles just that file (as before); a directory compiles every `.hotc`
-// file *anywhere under it* (recursive -- matches the Java/Kotlin source-root convention of
-// nesting files under directories mirroring their package/module path, e.g. `client/Foo.hotc`
-// declaring `module ...client;`) as one flat program -- no import statements, every top-level
-// name (struct/fn/interface/enum/extern class) shares one global namespace across all of them,
-// exactly as if they'd been pasted into a single file, regardless of which subdirectory each
-// came from. This is also what makes `sealed interface` actually mean something: "every
-// implementer is declared in this compilation unit" now spans a real multi-file project, not
-// just one file trivially. A file's `module` line is never *checked* against its directory path
-// (see IDEAS.md's "Verify a declared module matches the file's directory path" -- an opt-in
-// check, deliberately not required) -- nesting is a pure organizational convenience here, not a
-// requirement the compiler enforces.
-// Stamps every top-level struct/fn/static in a just-parsed single file's `Program` with that
-// file's own name (its `sourceUnit`) before folding it into the directory-wide merge -- see
-// StructDecl's `sourceUnit` doc for why this matters (CodeGen's "named holder" merge needs to
-// group by file, not just by module, whenever multiple files share one module).
 private fun stampSourceUnit(program: Program, unit: String): Program = Program(
     structs = program.structs.map { it.copy(sourceUnit = unit) },
     fns = program.fns.map { it.copy(sourceUnit = unit) },
@@ -79,9 +56,7 @@ class CodegenEntryError(message: String) : RuntimeException(message)
 fun compileProgram(userProgram: Program, mainClassName: String, classpath: List<String> = emptyList()): CompileResult {
     val preludeProgram = Parser(Lexer(PRELUDE_SOURCE).tokenize()).parseProgram()
     val program = mergeProgram(preludeProgram, userProgram)
-    // Cheap to construct even when unused -- a URLClassLoader doesn't load anything until a
-    // class is actually requested, so a program with no `use { ... }`/bare `extern class` never
-    // touches the classpath at all despite this always being built.
+
     val reflector = ClasspathReflector(classpath)
     val checker = Checker(program, reflector)
     checker.check()
@@ -97,20 +72,13 @@ fun compileProgram(userProgram: Program, mainClassName: String, classpath: List<
     return CompileResult(classes, codegen.usesArena, codegen.entryHolderClassName)
 }
 
-// A program that never touches `arena struct` compiles to plain JDK-17-compatible bytecode
-// with zero java.lang.foreign references -- that's what makes it embeddable as e.g. a
-// Minecraft 1.20.1 (Java 17) mod. `arena struct` needs java.lang.foreign, stable only from
-// JDK 22+; the compiler itself still only needs JDK 17 (it just emits those calls as ASM
-// string literals -- no compile-time dependency on the classes), but *running* a program that
-// actually uses arenas needs a 22+ `java` to load them, so `hc run` shells out to one instead
-// of executing in-process, and checks the version first when arenas are in play.
 private fun findJava(): String {
     for (envVar in listOf("HC_JAVA_HOME", "JAVA_HOME")) {
         val home = System.getenv(envVar) ?: continue
         val exe = File(home, "bin/java.exe").takeIf { it.exists() } ?: File(home, "bin/java")
         if (exe.exists()) return exe.path
     }
-    return "java" // resolved via PATH
+    return "java" 
 }
 
 private fun javaMajorVersion(javaExe: String): Int? = try {
@@ -120,19 +88,13 @@ private fun javaMajorVersion(javaExe: String): Int? = try {
     val m = Regex("version \"(\\d+)(?:\\.(\\d+))?").find(output)
     when {
         m == null -> null
-        m.groupValues[1] == "1" -> m.groupValues[2].toIntOrNull() // old style "1.8.0_..." -> 8
+        m.groupValues[1] == "1" -> m.groupValues[2].toIntOrNull() 
         else -> m.groupValues[1].toIntOrNull()
     }
 } catch (e: Exception) {
     null
 }
 
-// Pulls `--classpath <entries>` out of the raw args (accepting either the platform path
-// separator -- ':' on Linux/macOS, ';' on Windows -- or ',' since a Java-style classpath string
-// is easy to get wrong on the command line and ',' never collides with a real path). Returns the
-// remaining positional args plus the resolved classpath list, with HC_CLASSPATH's own entries
-// appended after any --classpath flag so both can be used together (e.g. a project keeps its own
-// jars in HC_CLASSPATH and passes extra ones ad hoc via the flag).
 private fun extractClasspath(args: Array<String>): Pair<List<String>, List<String>> {
     val positional = mutableListOf<String>()
     var flagged: List<String> = emptyList()
@@ -150,14 +112,6 @@ private fun extractClasspath(args: Array<String>): Pair<List<String>, List<Strin
     return positional to (flagged + envEntries)
 }
 
-// `--profile[=out.jfr]` on `hc run` -- records a real JDK Flight Recorder session around the
-// program instead of building any HC-specific profiling machinery. HC-compiled code is just
-// ordinary JVM bytecode (real class/method names via ASM, no source-language marker JFR or any
-// other JVM-level tool would need to know about), so standard JFR already sees it correctly --
-// verified by profiling a real CPU-bound HC loop and confirming the recorded stack frames show
-// the actual HC-declared fn names, not "unknown"/synthetic ones. `null` second value = flag not
-// present (no profiling); a bare `--profile` (no `=path`) defaults to `profile.jfr` in the
-// current directory.
 private fun extractProfileFlag(args: List<String>): Pair<List<String>, String?> {
     val positional = mutableListOf<String>()
     var profilePath: String? = null
@@ -191,7 +145,7 @@ fun main(rawArgs: Array<String>) {
         System.err.println("no such file or directory '$path'")
         return
     }
-    // A directory's class name has no `.hotc` extension to strip -- just its own name.
+    
     val mainClassName = (if (file.isDirectory) file.name else file.nameWithoutExtension)
         .replaceFirstChar { it.uppercase() }
 
@@ -209,8 +163,7 @@ fun main(rawArgs: Array<String>) {
             val outDir = File(args.getOrNull(2) ?: "out")
             outDir.mkdirs()
             for ((name, bytes) in classes) {
-                // `name` is a JVM binary name (slash-separated, package prefix included when
-                // one was declared) -- nest into matching subdirectories, same as javac would.
+
                 val classFile = File(outDir, "$name.class")
                 classFile.parentFile?.mkdirs()
                 classFile.writeBytes(bytes)
@@ -239,19 +192,9 @@ fun main(rawArgs: Array<String>) {
                 classFile.parentFile?.mkdirs()
                 classFile.writeBytes(bytes)
             }
-            // `classpath` (--classpath/HC_CLASSPATH) is also needed at runtime, not just at
-            // compile time -- any `extern class` whose methods came from real classfile
-            // reflection (`use { ... }`/bare form) names a real external class the JVM has to
-            // actually load and link against when its methods get called, same as any other
-            // dependency jar.
+
             val runCp = (listOf(outDir.path) + classpath).joinToString(File.pathSeparator)
-            // `-XX:StartFlightRecording` needs an *absolute* path -- JFR resolves a relative
-            // `filename=` against the JVM's own working directory, which is fine here (this
-            // process doesn't change directory), but resolving it explicitly avoids any surprise
-            // if that ever stops being true, and makes the printed path directly openable.
-            // No `-XX:+FlightRecorder` -- JFR has been unlocked by default (no separate flag to
-            // enable it) since JDK 11; that flag is deprecated on modern JDKs and prints a
-            // startup warning for no benefit.
+
             val profileArgs = profilePath?.let { p ->
                 listOf("-XX:StartFlightRecording=filename=${File(p).absolutePath},settings=profile")
             } ?: emptyList()
