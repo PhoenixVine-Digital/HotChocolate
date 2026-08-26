@@ -1,0 +1,19 @@
+extern class JSB = "java/lang/StringBuilder" {
+    fn new() -> Self;
+    fn append(&mut self, s: String) -> Self;
+    fn toString(&self) -> String;
+}
+
+extern class JMath = "java/lang/Math" {
+    static fn max(a: Int, b: Int) -> Int;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var sb = JSB::new();
+    sb = sb.append("hello");
+    sb = sb.append(" world");
+    let s = sb.toString();
+    let n = s.length();
+    let m = JMath::max(a, b);
+    return n + m;
+}

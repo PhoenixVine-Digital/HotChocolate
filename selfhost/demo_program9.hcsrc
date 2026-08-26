@@ -1,0 +1,22 @@
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+struct Line {
+    start: Point,
+    end: Point,
+}
+
+fn length_manhattan(l: Line) -> Int {
+    var dx = l.end.x - l.start.x;
+    var dy = l.end.y - l.start.y;
+    return dx + dy;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var p1 = Point { x: 0, y: 0 };
+    var p2 = Point { x: a, y: b };
+    var l = Line { start: p1, end: p2 };
+    return length_manhattan(l);
+}

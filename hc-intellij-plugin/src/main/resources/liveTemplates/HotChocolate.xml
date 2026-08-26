@@ -1,0 +1,75 @@
+<templateSet group="HotChocolate">
+  <template name="fn" value="fn $NAME$($PARAMS$) {&#10;    $END$&#10;}" description="Function declaration" toReformat="true" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;name&quot;" alwaysStopAt="true"/>
+    <variable name="PARAMS" expression="" defaultValue="" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <template name="fnr" value="fn $NAME$($PARAMS$) -&gt; $RET$ {&#10;    $END$&#10;}" description="Function declaration with a return type" toReformat="true" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;name&quot;" alwaysStopAt="true"/>
+    <variable name="PARAMS" expression="" defaultValue="" alwaysStopAt="true"/>
+    <variable name="RET" expression="" defaultValue="&quot;Int&quot;" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <template name="struct" value="struct $NAME$ {&#10;    $END$&#10;}" description="Struct declaration" toReformat="true" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;Name&quot;" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <template name="if" value="if $COND$ {&#10;    $END$&#10;}" description="if statement" toReformat="true" toShortenFQNames="false">
+    <variable name="COND" expression="" defaultValue="&quot;true&quot;" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <template name="ifelse" value="if $COND$ {&#10;    $IF$&#10;} else {&#10;    $END$&#10;}" description="if/else statement" toReformat="true" toShortenFQNames="false">
+    <variable name="COND" expression="" defaultValue="&quot;true&quot;" alwaysStopAt="true"/>
+    <variable name="IF" expression="" defaultValue="" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <template name="while" value="while $COND$ {&#10;    $END$&#10;}" description="while loop" toReformat="true" toShortenFQNames="false">
+    <variable name="COND" expression="" defaultValue="&quot;true&quot;" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <!-- The iterable is wrapped in parens deliberately: `Ident {` alone is genuinely ambiguous
+       with a struct literal (see HCPsiParser.looksLikeStructLiteral's own header) whenever the
+       loop body that follows happens to look empty at the moment of expansion (exactly the state
+       a freshly expanded template is in, before the user fills anything in). `(Ident) {` sidesteps
+       that ambiguity entirely, since a parenthesized sub expression is never eligible to be read
+       as a struct literal the way a bare identifier is. -->
+  <template name="for" value="for $VAR$ in ($ITER$) {&#10;    $END$&#10;}" description="for loop" toReformat="true" toShortenFQNames="false">
+    <variable name="VAR" expression="" defaultValue="&quot;item&quot;" alwaysStopAt="true"/>
+    <variable name="ITER" expression="" defaultValue="&quot;items&quot;" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <!-- Same reasoning as the for template's own iterable, applied to the scrutinee. -->
+  <template name="match" value="match ($SCRUTINEE$) {&#10;    $END$&#10;}" description="match statement" toReformat="true" toShortenFQNames="false">
+    <variable name="SCRUTINEE" expression="" defaultValue="&quot;value&quot;" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <template name="let" value="let $NAME$ = $VALUE$;" description="let binding" toReformat="true" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;name&quot;" alwaysStopAt="true"/>
+    <variable name="VALUE" expression="" defaultValue="&quot;0&quot;" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+  <template name="print" value="print($VALUE$);" description="print a value" toReformat="true" toShortenFQNames="false">
+    <variable name="VALUE" expression="" defaultValue="" alwaysStopAt="true"/>
+    <context>
+      <option name="HOTCHOCOLATE" value="true"/>
+    </context>
+  </template>
+</templateSet>

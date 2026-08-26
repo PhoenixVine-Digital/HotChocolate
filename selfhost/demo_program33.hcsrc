@@ -1,0 +1,10 @@
+fn combo(a: Int, b: Int) -> Int {
+    let x: Int = 10;
+    var y: Bool = true;
+    let s: String = "hi";
+    var total = x;
+    if y {
+        total = total + s.length();
+    }
+    return total + a + b;
+}

@@ -8,36 +8,222 @@ re-deriving the reasoning from scratch. Move an entry into the README
 gets built; delete an entry if it turns out to be a bad idea on reflection
 rather than leaving it here stale.
 
+Documentation-tooling ideas (everything building on top of the shipped
+`///` doc-comment feature) live in their own file, `DOC_TOOLING_IDEAS.md`,
+rather than mixed in here — it's a coherent enough theme to read as a
+group. Minecraft/Forge-library ideas (a separated `hotc-mc` binding
+library) live in `HOTC_MC_IDEAS.md` — that file also flags a couple of
+compiler-feature requests (generalizing `@serializable` to a second
+target, an `@packet` registration directive) that surfaced while
+sorting library ideas from language ones; worth folding proper entries
+for those into this file if they get picked up. A general-purpose
+concurrency library (`PhoenixPool`/task graphs, built entirely on the
+existing `extern class` FFI, no new compiler feature) lives in
+`PHOENIX_FLIGHT_IDEAS.md`, cross-referenced from this file's own "ECS
+with ownership-derived system scheduling" entry — that's the one place
+a real language feature (compiler-verified parallel-safety) is still
+genuinely needed.
+
 ## High leverage, do these next
 
-### `if let Some(x) = opt { }`
+### ~~Enum `==`/`!=` compares reference identity, not the variant~~ -- tag comparison now shipped, full structural equality still open
+
+Confirmed and fixed while self-hosting the parser (`selfhost/`): `make_foo() == FOO` (where `make_foo()` genuinely returns the `FOO` variant) evaluated to `false`, because `==`/`!=` on two `Ty.Enum` operands fell through to the same `IF_ACMPEQ`/`IF_ACMPNE` (reference identity) path every other reference type gets -- correct for `extern class`/`Struct`/`Dyn` values (there's no sensible structural notion of equality to fall back to for those), actively wrong for `enum`, where comparing "which variant is this" is close to the ONLY thing anyone ever means by `==` on one. This isn't a rare case: any parser/interpreter-shaped code constantly compares a just-read value's kind against an expected one (`token.kind == TokType.FN`) -- exactly what surfaced this, immediately, the moment real self-hosted code tried to write it.
+
+**Shipped**: `CodeGen.genBinary` now special-cases `Ty.Enum` operands, comparing the real `tag: Int` field each variant's generated class already carries (`GETFIELD ... tag` on both sides, then `IF_ICMPEQ`/`IF_ICMPNE`) instead of the raw object reference. Correct and complete for any all-unit-variant enum (`TokType`, and plenty of real enums like it) -- there's no field data to differ on, so tag equality *is* full equality for these.
+
+**Deliberately not attempted yet**: full structural equality for enums whose variants carry fields (`Option<T>`, `Result<T, E>`, this project's own `Expr`/`Stmt` AST). `Some { value: 5 } == Some { value: 5 }` still only compares tags today (both `Some`, so `true`, regardless of whether the `value` fields actually match) -- correct-*enough* for the common "which variant" check, silently wrong for anyone expecting real `#[derive(PartialEq)]`-style deep comparison. The real feature: after a tag match, recursively compare each field by its own type's own equality rule (`Int`/`Bool` primitive compare, `String` via `.equals()`, nested `Struct`/`Enum` via this same mechanism, arrays element-wise) -- genuinely bigger than the tag-only fix (needs a per-enum "compare fields" codegen path, not just one shared opcode sequence), but the tag-only version already shipping makes it a strict extension, not a redesign.
+
+### A `Byte` primitive type (or at minimum, a real `byte[]` bridge)
+
+Confirmed as a genuine, currently-unworkaroundable gap during a real
+ASM-interop spike (see `PHOENIX_FLIGHT_IDEAS.md`-adjacent self-hosting
+work): `Ty` has `Int_`/`Long_`/`Float_`/`Double_`/`Bool_` and nothing
+else numeric — no `Byte`, no `Short`, no `Char` — so there is currently
+no way to declare an `extern class` member whose real signature
+involves `byte[]`/`short`/`char` anywhere, param or return. This isn't
+hypothetical or rare: `ClassWriter.toByteArray()` (the *only* way to
+get finished bytecode out of ASM), `Files.readAllBytes`/most raw-I/O
+APIs, and any crypto/hashing/network-buffer API all return or take
+`byte[]`. `ClasspathReflector`'s own `javaClassToTyOrNull` already
+documents this exact gap in its own comment ("same reasoning ... uses
+for byte/short/char") — it's a known, named limitation, not an
+oversight nobody noticed.
+
+Two possible scopes, worth deciding between explicitly rather than
+defaulting to the bigger one:
+
+- **Full primitive type**: a real `Byte`/`Ty.Byte_` alongside the
+  existing five, with its own descriptor (`B`), its own array element
+  handling (`BALOAD`/`BASTORE`/`T_BYTE` for `NEWARRAY`, not the generic
+  reference-array `ANEWARRAY` path arrays of `JavaExtern`/`Struct` use),
+  arithmetic/cast rules matching `Int`'s (`I2B` narrowing on `as`).
+  `Short`/`Char` would be the same shape again, each its own descriptor
+  and array-instruction pair — worth asking whether all three are
+  actually needed or just `Byte` (the one every real blocking API
+  above actually needs) for a first pass.
+- **Narrower: just enough to bridge `byte[]` opaquely**, without a
+  general `Byte` scalar type at all — e.g. a special-cased `[Byte]`
+  array type usable only as an extern method param/return (GETSTATIC/
+  PUTSTATIC-adjacent bridging, never indexed/constructed from HC source
+  directly). Smaller compiler surface, but a real value can't be built
+  or inspected from HC code, only passed through — fine for "write
+  these bytes to a file" but not for anything that needs to actually
+  read/process byte content in HC itself.
+
+**The pragmatic workaround already verified working, if this stays
+unbuilt**: a tiny same-project Java/Kotlin shim class exposing a
+`byte[]`-free method (`static void writeClass(ClassWriter cw, String
+path)`, internally calling `cw.toByteArray()` and `Files.write` on the
+Java side, never surfacing a `byte[]` in its own signature) — `extern
+class`-bridged from HC like anything else, real ASM `ClassWriter`
+passed straight through as an ordinary extern value. Verified end to
+end: built a real class file via HC-driven ASM calls (`ClassWriter`/
+`MethodVisitor`, real opcodes, no compiler features needed for that
+half at all), wrote it via the shim, and *ran* the resulting class with
+a real `java` invocation — it printed the expected output. This is a
+completely real, available-today path around the gap for exactly the
+self-hosted-codegen use case that motivated finding this in the first
+place; a real `Byte` type would just make it native instead of
+shim-mediated.
+
+### ~~`if let Some(x) = opt { }`~~ -- now shipped
 
 ```
 if let Some(pos1) = pos1_opt {
     // pos1: BlockPos, bound fresh, exactly like a match arm
+} else if let Some(other) = fallback_opt {
+    // else if let chains too, same as plain 'else if'
+} else {
+    // ...
 }
 ```
 
-Sugar over `match`, not a new mechanism: desugars to `match pos1_opt {
-Some { value: pos1 } => { <body> } _ => {} }`, reusing pattern-binding and
-scrutinee-move semantics `match` already has, just without match's
-exhaustiveness requirement (that's the actual point — `if let` is allowed
-to ignore variants it doesn't care about). Cuts real nesting in ported
-code — `CopyToolItem::use_item`'s two-level `match pos1_opt { Some { ... }
-=> { match pos2_opt { ... } } }` is exactly the shape this flattens.
+Shipped exactly as scoped below: sugar over `match`, not a new AST
+node -- `Parser.ifLetStmt()` desugars straight to `Stmt.Match` with the
+pattern as one arm and an always-synthesized `_` wildcard arm (the
+`else` block, or an empty block if omitted). Single pattern per `if
+let`, statement position only, no implicit flow-typing -- all exactly
+as scoped. One thing that came for free: `else if`/`else if let`
+chaining, via a shared `ifOrIfLetStmt()` dispatcher both `ifStmt()`'s
+own `else if` and `ifLetStmt()`'s use, so a chain can freely mix plain
+`else if cond` and `else if let pat = expr`. The variant-pattern
+grammar itself (`Variant`, `Variant::Nested`, `Variant { a, b }`,
+`Variant { field: binding }`, `_`) was factored out of `matchStmt`/
+`matchExpr` (which had it duplicated) into a shared `variantPattern()`
+that `if let` reuses directly, rather than adding a third copy.
+Cut real nesting in ported code as intended --
+`CopyToolItem::use_item`'s two-level `pos1_opt`/`pos2_opt` match is
+now a flat `if let ... else`.
 
-**Scope v1 to a single pattern per `if let`** — no tuple/`and`-chaining
-(`if let Some(a) = x, Some(b) = y { }`, sometimes called "let chains,"
-isn't even stable in Rust yet). Nested `if let`s already solve the
-two-`Option` case reasonably. **Deliberately not doing**: implicit
-flow-typing where an existing `Option<T>` variable gets silently
-re-typed to `T` inside an `if` based on control flow (e.g. `if pos1 and
-pos2 { }` re-typing both in place) — nothing else in this checker
-does flow-sensitive narrowing of an *existing* variable; every other
-narrowing mechanism (`match`) binds into a **fresh** name instead of
-reinterpreting the original. Keeping that invariant (a variable's type
-never silently changes mid-function) is worth more than the extra
-brevity here.
+### `Result<T, E>` (~~shipped~~) + the `?` early-return operator (still open)
+
+```
+enum Result<T, E> {
+    Ok { value: T },
+    Err { error: E },
+}
+
+fn load_texture(path: String) -> Result<Texture, LoadError> {
+    let bytes = read_file(path)?;   // Err(e) returns early as Result<Texture, LoadError>::Err { error: e }
+    let tex = decode(bytes)?;
+    return Result::Ok { value: tex };
+}
+```
+
+**Update: `Result<T, E>` itself shipped** (`Prelude.kt`, alongside
+`Option`/`Vec`/`Registry`) — real `Ok { value: T }`/`Err { error: E }`
+variants, same monomorphized-generic-enum machinery `Option` already
+used, no new AST needed, exactly as predicted below. `?` has not — this
+entry now tracks only that remaining half.
+
+The direct sequel to `Option`, not a new mechanism -- `Option` is
+already a real, shipped enum (`Option::Some { value }` / `None {}`),
+already exhaustively matched, already has `if let` sugar. `Result<T,
+E>` is the exact same monomorphized-generic-enum machinery with two
+type params instead of zero, no new AST beyond what `enum`/generics
+already support. The one genuinely new piece is `?`: needs a real
+`Expr.Try`-shaped node (`expr?`) that, inside a fn returning
+`Result<T, E>`, desugars to match on `expr`'s own `Result` -- `Ok
+{ value }` unwraps to `value`, `Err { error }` triggers an early
+`return Result::Err { error }` (auto-converting the error type only if
+the enclosing fn declares the same `E`, no `From`-style implicit
+conversion for v1 -- that's real added scope, Rust's own `?` needed
+years to get `From` conversion right). Checker-side, `?` should only
+type-check inside a fn whose own return type is `Result<_, E>` with a
+matching `E`, exactly the same "only valid in this specific context"
+restriction `return`/`throw` already have.
+
+Deliberately scoped narrower than "replace exceptions everywhere":
+HC already has real `try`/`catch`/`throw` against `extern class`
+exceptions (genuine JVM interop, unavoidable — a `NoSuchMethodError`
+doesn't become an HC `Result` just because HC exists) and that stays.
+`Result` is for *HC's own* expected-failure return values, the same
+split Rust itself draws between `Result` (recoverable, expected) and
+`panic!`/an uncaught JVM exception (unrecoverable). Don't let `Option`
+grow an implicit "and also nullable-like" story either — the existing
+nullable-`extern class`/`String` mechanism (`Type?`, compared only
+against the `null` literal) stays the FFI-boundary-only feature it
+already is; `Option<T>` is the native-HC-only answer to the same
+question, not a replacement for it.
+
+### ~~Compile-time verification of hand-written `extern class`/`extern interface` declarations~~ -- now shipped
+
+```
+$ hc build --classpath forge.jar src/
+error: extern class 'SimpleChannel': declared 'registerMessage(...)' doesn't match any real
+       overload of 'net.minecraftforge.network.simple.SimpleChannel.registerMessage' on the
+       configured classpath -- found: (Int, Class, BiConsumer, Function, BiConsumer) -> MessageHandler
+```
+
+Shipped as `Checker.verifyExternSignatures` — unconditional whenever
+`--classpath` is provided (not a separate `--verify-extern` flag, and
+not opt-out-able once a classpath is given), running every explicit-
+signature `extern class`'s declared members through the same
+`ClasspathReflector` the lazy form already used, comparing declared vs.
+real param/return types (`realTyKey`) and erroring on any mismatch —
+caught for real during the ASM-interop spike below (`ClassWriter
+.toByteArray()`'s undeclarable `byte[]` return type surfaced as a
+build-time "no public member found" instead of a runtime
+`NoSuchMethodError`, exactly the win this entry predicted). One
+documented, deliberate gap: any declaration involving a type the
+reflector can't represent at all (byte/short/char, an HC-native
+struct/enum param, a bound-generic `Dyn`) is skipped rather than
+flagged, "same 'degrade to no check' reasoning `javaClassToTyOrNull`
+itself already uses" per the checker's own comment — silence there
+means "unable to check," not "verified clean."
+
+The single highest-value item across every idea session this project's
+own port history has generated: something like ten real bugs this
+session alone were exactly this error class — a hand-written `extern
+class`/`extern interface` signature that compiles clean and only fails
+at runtime (`NoSuchMethodError`/`IncompatibleClassChangeError`/wrong
+return type silently accepted). `ClasspathReflector` already exists and
+already does real signature verification, but only for the *lazy*
+(`extern class X = "binary.Name";`, no body) and `use { }` forms —
+never for the explicit-signature form, which is exactly the one every
+wrong-signature bug this session actually hit came from (a hand-typed
+method table is where a typo/wrong-return-type/wrong-erasure mistake
+actually lives; the lazy/reflected forms can't be wrong the same way,
+since nothing was hand-typed to get wrong).
+
+Scoped as a real, opt-in build-time check, not a change to default
+behavior: `extern class` staying trust-by-default (no classpath needed
+unless a program asks for one) is a deliberate, correct design choice
+for exactly the reason `ExternClassDecl`'s own doc gives — same "trust
+the declaration" tradeoff any hand-written FFI layer in any language
+makes. `--verify-extern` (a build flag, not a language feature) runs
+every explicit-signature `ExternMethodDecl`/`ExternFieldDecl` through
+the same `ClasspathReflector` machinery the lazy form already trusts,
+comparing the declared signature/type against the real one and erroring
+on any mismatch — turning this session's entire "wrote 30 lines of
+`extern class`, ran it in-game, got a cryptic `NoSuchMethodError`, went
+back to `javap` the real jar by hand" loop into a single build-time
+error naming the exact line and the real signature. A weaker,
+docs-only version of this idea (annotating `hc doc`'s rendered output
+instead of erroring at build time) is in `DOC_TOOLING_IDEAS.md` — this
+entry is the stronger, build-blocking version, and probably the one
+actually worth building first.
 
 ### ~~Lambdas / closures~~ -- now shipped
 
@@ -66,18 +252,15 @@ Verified end-to-end via `javap` against a real captured-closure call site
 java.util.function.Supplier` class with a `cap$name` field per capture at
 the definition site).
 
-**Still open**: Java class-literal syntax (`Foo.class`, needed by
-`SimpleChannel.registerMessage(int, Class, BiConsumer, Function,
-BiConsumer)`'s second arg) has no HC equivalent yet -- this is what's
-still blocking `NetworkHandler.java` specifically from a full port even
-with lambdas now available (`CTab.java`/`ClipboardPacketHandler.java`
-have no such requirement and are fair game today). Small, self-contained
-addition when it's next up: a new `Expr.ClassLit(binaryName)` producing
-`Ty.JavaExtern("java/lang/Class")`, compiling to `LDC <Type>.class`
-(`Type` a real ASM `Type` operand, not a String) -- no target-type
-inference or new declaration form needed, unlike lambdas.
+**`Foo.class` literal**: shipped too (`Expr.ClassLit` in the AST,
+`Checker.checkClassLit`, `CodeGen`'s `LDC <Type>.class` via a real ASM
+`Type` operand) -- needed by `SimpleChannel.registerMessage(int, Class,
+BiConsumer, Function, BiConsumer)`'s second arg, and confirmed to be
+what was actually unblocking `NetworkHandler.java` from a full port
+(`CTab.java`/`ClipboardPacketHandler.java` didn't need it and were
+already fair game with lambdas alone).
 
-### Inclusive ranges: `a..=b`
+### ~~~Inclusive ranges: `a..=b`~~~ shipped
 
 ```
 for z in min_z..=max_z {
@@ -89,7 +272,7 @@ for z in min_z..=max_z {
 
 Add `..=` (inclusive) as a **new** option alongside the existing `..`
 (exclusive) — don't rename `..` to `..<` for symmetry, since that would
-be a breaking migration across every `.hc` file that exists today
+be a breaking migration across every `.hotc` file that exists today
 (including the whole real mod port) for a purely cosmetic gain. Low risk:
 one new lexer token, parser accepts it in the same range-in-`for`-header
 spot `..` already occupies, and codegen either desugars `a..=b` to the
@@ -97,7 +280,7 @@ existing `a..(b+1)` or just flips the loop-exit comparison
 (`IF_ICMPGE`→`IF_ICMPGT`). Directly fixes the actual misreadable spot in
 real code: `for z in min_z..max_z + 1` reads worse than `..=max_z` would.
 
-### Structured `///` doc comments (compiler-understood, not Javadoc-style text blobs)
+### ~~Structured `///` doc comments~~ (compiler-understood, not Javadoc-style text blobs) -- now shipped
 
 ```
 /// Attacks an enemy and returns the resulting damage.
@@ -107,35 +290,44 @@ real code: `for z in min_z..max_z + 1` reads worse than `..=max_z` would.
 fn attack(target: &Enemy) -> Int { ... }
 ```
 
-The actual differentiator isn't prettier HTML output, it's that a doc
-comment becomes a real `DocComment` node the parser attaches to the
-`FnDecl`/`StructDecl`/etc. it precedes — `@param`/`@returns`/`@example`/
-`@warning`/`@see`/`@deprecated` structured as tagged fields, not opaque
-text a separate tool re-parses later the way Javadoc does. Two things
-fall out of that almost for free once the model exists:
+Shipped as designed: a doc comment is a real `DocComment`/`DocSeeRef`
+node the parser attaches to the `FnDecl`/`StructDecl` it precedes
+(`Parser.docComment()`), not opaque text a separate tool re-parses
+later. `///` is now a real lexer token (`TokType.DOC_COMMENT`,
+`Lexer.docComment()`) rather than discarded trivia the way a plain
+`//` comment is -- `////` (four+ slashes) deliberately stays an
+ordinary comment, same convention Rust uses, so a decorative divider
+line doesn't suddenly start attaching itself to the next declaration.
+`@param`/`@returns`/`@example`/`@warning`/`@see`/`@deprecated` are all
+structured tagged fields; an untagged `///` line continues whatever
+section came before it (so a tag's text can wrap across multiple
+lines), except `@see`, whose target is always exactly one line.
 
-- **`@see` targets get checked against the real symbol table.** The
-  checker already resolves every name in the program — cross-referencing
-  a `@see SomeStruct.method` against that same resolution is a small
-  addition on existing infrastructure, and "no dead doc links, ever" is
-  an immediate, concrete improvement over every other language's docs.
-- **One clean renderer** (an `hc doc <dir>` CLI command emitting
-  Markdown/HTML in the README's own prose style, not a Javadoc-style API
-  dump) already beats Javadoc aesthetically, and every other output
-  format (IDE hover, a Javadoc-compat export for Java-side consumers,
-  an LLM-readable reference dump) is just another renderer over the same
-  structured model later — don't build more than one up front.
+Both things that were supposed to fall out of the model almost for
+free did:
 
-**Deliberately NOT doing**: a parallel `doc fn { summary ... }` block
-declaration syntax — it duplicates the signature you already wrote once
-and pushes the real `fn` declaration further down the file for no
-capability gain over structured `///` tags. Also not doing (yet):
-compiled/verified `@example` blocks (extract each example, compile+run it
-as its own program, fail the doc build on mismatch) — genuinely valuable,
-"documentation that can't go stale because it's tested," but it's a
-second compiler entry point (a doc-test mode), not a parser addition —
-real phase-2 material once the structured model itself exists and has a
-consumer.
+- **`@see` resolves against the real symbol table.**
+  `Checker.checkDocSees`/`resolveDocSeeTarget` runs once, at the very
+  end of `check()` (once every symbol table is fully populated),
+  resolving both bare names (`SomeStruct`, `some_fn`) and dotted forms
+  (`SomeStruct.field`, `SomeEnum.Variant`) against structs/fns/enums/
+  interfaces/`extern class`es -- and errors on anything that doesn't
+  resolve. "No dead doc links, ever" is a real compile error now, not
+  just an aspiration.
+- **One renderer**: `hc doc <dir|file> [outFile]` (default `api.md`),
+  emitting plain Markdown -- headings per documented `struct`/`fn`,
+  parameters as a bullet list, `@warning`s as blockquotes, `@see`s
+  marked `(unresolved)` inline if they didn't resolve. Runs a real
+  checker pass first (same as `build`/`run`) so `@see` resolution has
+  actually happened before rendering.
+
+**Scoped to top-level `fn`/`struct` only** -- an `impl` block's own
+methods don't carry doc comments yet (this language's `impl` is
+struct-only, so there was no natural extension point to wire up
+without more design than the feature needed for v1). **Still not
+doing**, as planned: no `doc fn { }` block syntax, no compiled/verified
+`@example` blocks -- both remain real phase-2 material, not v1 scope
+creep.
 
 ### Property-style *write* access for `extern class` setters (the read half already shipped)
 
@@ -160,7 +352,7 @@ that name (a real field always wins, never a silent choice between the
 two), and needs a matching single-arg `setX` method whose param type
 matches the assigned value's type.
 
-### `@must_use` — compiler-enforced "don't silently drop this return value"
+### ~~`@must_use`~~ — compiler-enforced "don't silently drop this return value" -- now shipped
 
 ```
 @must_use
@@ -172,19 +364,39 @@ fn main() {
 }
 ```
 
-Proven pattern (Rust's `#[must_use]`, C++'s `[[nodiscard]]`) that pairs
-naturally with `Result<T, E>` (already shipped, see "Error handling" in
-the README): a fallible operation whose failure case is silently ignored
-is one of the most common real bug classes in exactly the kind of code
-this language targets (game/engine APIs where "did the spawn actually
-happen" matters). Cheap to build: a checker-level annotation (reusing the
-`@"binary.Name"` machinery, or a lighter HC-only marker that never needs
-to reach bytecode at all — this one's purely a compile-time discipline,
-not something Java reflection needs to see) recorded per `fn`, checked
-at every `Stmt.ExprStmt` whose expression is a `Call`/`MethodCall`/
-`StaticCall` targeting a `@must_use` fn. General-purpose, not
-game-specific — applies equally to any fallible HC-native fn, not just
-engine APIs.
+Shipped as a bare compiler directive (`leadingMarkers()`, same "no
+quoted binary name" distinction `@serializable`/`@entry` already use --
+never reaches bytecode, purely a compile-time check), scoped to
+top-level `fn` only (same cut `@entry` already made). Checker rejects
+`@must_use` on a `Unit`-returning fn outright (nothing to enforce
+using), and errors on any `Stmt.ExprStmt` that's a bare `Expr.Call` to
+one, naming the fn and line.
+
+**Widened**: `@must_use` can now also precede a method inside an `impl`
+block (both instance and static/factory methods), and a dropped
+`Expr.MethodCall`/`Expr.StaticCall` to one is caught the same way a
+dropped `Expr.Call` always was. `implDecl()`'s method loop parses
+`@must_use` on its own now (deliberately not the full `leadingMarkers()`
+-- annotations/`@serializable`/`@entry`/doc comments aren't part of
+this widening), threading `mustUse` through the existing `Struct$method`
+(instance)/`Struct@method` (static) desugared-method mangling that
+`Checker`'s `implFns` registration already did for everything else --
+no new tracking structure, `mustUseFns` just holds both bare top-level
+names and mangled method names in one flat set now. Checked after
+`checkExpr` resolves the call (unlike `Expr.Call`'s own source-level
+`callee`, a method's mangled `resolvedName` isn't known until
+resolution happens), so the check runs post-`checkExpr` for these two
+cases specifically.
+
+**Still narrower than fully general, on purpose**: extern class
+methods/static calls (Java interop) aren't covered -- this stays scoped
+to *HC's own* struct methods, the same "not Java interop's problem"
+split `Result<T, E>`'s own entry draws for error handling. A struct
+method reached through interface/`&dyn` dispatch or an explicit
+superclass override (`resolvedName` is a bare, unmangled method name on
+those paths, not the `Struct$method`/`Struct@method` form) also isn't
+covered yet -- a real, documented gap rather than a silent one, same
+spirit as the original v1 cut.
 
 ### Explicit, seeded RNG as a real type
 
@@ -295,6 +507,100 @@ doesn't change type across a mutation today).
 
 ## Good ideas, real design cost — defer
 
+### Extensible/open registries as a first-class alternative to `enum`
+
+**Update: the library-level version of this already shipped.**
+`Registry<T>` (`Prelude.kt`, alongside `Vec`/`Option`/`Result`) is a
+real, string-keyed, open, growable registry — `.register(key, value)`,
+`.get(key) -> Option<T>`, built on `Vec` — verified end to end holding
+two different concrete struct types under `Registry<dyn Trait>` with
+dynamic dispatch through the returned `Option`. That's the actual
+Minecraft-`DeferredRegister`-shaped need this entry was chasing, and it
+needed zero new compiler machinery — same "eat your own dog food, no
+special-casing" story `Vec` itself shipped with. What's below is now
+narrower than originally scoped: not "does an extensible-registry
+concept exist" (it does), but specifically whether `match` deserves
+first-class, checker-understood support for an open `Registry<T>`'s
+values, given `match`'s whole value proposition (exhaustiveness) can't
+apply to an open set — genuinely worth questioning whether that's worth
+building at all versus "use `if let` chains for registry values,
+that's what they're for."
+
+```
+registry BlockKind {
+    Stone,
+    Dirt,
+    // ... this compile's own entries ...
+}
+
+// a different module, a different mod, a different compile even --
+// adds a new "variant" without ever touching BlockKind's own declaration:
+extend registry BlockKind {
+    MyModOre,
+}
+```
+
+Doesn't cleanly fit either existing interface flavor, which is exactly
+why it's worth its own entry rather than folding into `enum`: a `sealed
+interface` is a *closed* set, every implementer known at compile time,
+which is what makes exhaustive `match` sound — the opposite of what's
+wanted here. A plain (non-sealed) `interface` is open-implementer, but
+has no notion of a fixed, enumerable *set of known values* the way an
+`enum`'s variants are a closed, iterable, matchable set. What's being
+asked for is a third shape: an open set of named values, extensible
+*across separately-compiled mods*, that still wants enum-like ergonomics
+(iterate all registered values, match/branch on one, no boxing) without
+enum's closed-set compile-time guarantee. This is, not coincidentally,
+exactly what Minecraft's own `DeferredRegister`/registry pattern already
+is at the Java level — `hotc-mc`'s job is wrapping that real mechanism
+(buildable today, see `HOTC_MC_IDEAS.md`), not inventing a language
+feature to replace it. The case for a *language* feature specifically:
+`match` on an open registry value can never be exhaustive (a `match`
+that handles every value known at compile time still needs a `_` catch-
+all for anything a mod registers later, at class-load time, that this
+compile never saw) — worth deciding explicitly whether that's just "use
+`if`/`if let` chains instead of `match` for registry values" (no new
+mechanism, a real, available answer today) before designing anything
+bigger. Revisit only if the "chain of `if`s" answer turns out to be
+genuinely painful in a real registry-heavy mod, not preemptively.
+
+### A minimal import/visibility system (motivated by a real shared library, not by taste)
+
+Every top-level name (struct/fn/interface/enum/`extern class`) sharing
+one flat global namespace across an entire directory-mode compile is a
+deliberate, working design *within one project* — no import statements
+needed, `McBindings.hotc`'s declarations are just visible everywhere
+else in the same compile already. It stops being obviously fine once a
+real *shared* library (`hotc-mc`, see `HOTC_MC_IDEAS.md`) enters the
+picture: a consumer compiling its own mod alongside a large shared
+binding library now has every one of that library's names — used or
+not — sharing its one global namespace, with real collision risk that
+didn't exist when it was just one project's own files (`hotc-mc`
+declaring a `Level` extern alias colliding with a mod's own unrelated
+`Level` struct, say). This came up unprompted, multiple separate times,
+across a batch of hotc-mc brainstorming (`import mc.client::*;`-shaped
+syntax showing up in examples nobody was asked to write that way) —
+worth treating as a real signal instead of dismissing it as people
+reflexively reaching for Rust/Kotlin muscle memory.
+
+**Not proposing full Rust-style module paths or wildcard imports** —
+that's a much bigger redesign (nested module trees, path resolution,
+re-exports) than the actual problem needs. The narrower version worth
+scoping first: keep the flat namespace as the *default* (small/single
+projects keep working exactly as today, zero migration cost), but let
+a name be declared non-default-visible (something like today's
+`pub`/private split, one level up) so a library can mark internal
+helper types as not polluting a consumer's namespace at all, without
+requiring every consumer to explicitly import every symbol it uses.
+Real design questions before this is buildable: does "library" need to
+become a real compile-time concept distinct from "just another
+directory in the same compile" (ties directly into `HOTC_MC_IDEAS.md`'s
+own "no cross-compile dependency mechanism exists yet" blocker — this
+and that are likely one design effort, not two), and whether collision
+detection alone (a clear compile error naming both declaration sites)
+gets 80% of the value for a fraction of the design cost of real
+scoping.
+
 ### Verify a declared `module` matches the file's directory path (opt-in, not a hard requirement)
 
 Real gap surfaced by this session's own directory-mode work: `module
@@ -312,7 +618,7 @@ written, not later as a confusing cross-reference/import error.
 check**, though. Directory-mode compilation is recursive now (see the
 README's "Multi-file projects"), and `kubejs-aisle-tool` itself has
 since moved to exactly the nested-directory-mirrors-module layout this
-entry describes (`client/CopyToolHudOverlay.hc` declaring `module
+entry describes (`client/CopyToolHudOverlay.hotc` declaring `module
 ...client;`, etc.) — so the flat-layout argument that originally
 motivated keeping this opt-in no longer applies to that project
 specifically. Still worth keeping opt-in rather than default-on,
@@ -336,7 +642,7 @@ larger, multi-team project where the convention actually earns its
 keep, or exactly the shape `kubejs-aisle-tool` has now adopted) without
 forcing it on a smaller project with no real module structure to
 verify. Scoped to directory-mode compiles specifically — a single
-arbitrary file (`hc build foo.hc`) has no meaningful "source root" to
+arbitrary file (`hc build foo.hotc`) has no meaningful "source root" to
 compute a relative path against at all, so there's nothing to check
 there regardless of the flag.
 
@@ -383,9 +689,15 @@ designing this: Bevy's own scheduler and its `SystemParam`/
 `WorldQuery` trait machinery, and where its ergonomics do vs don't
 translate to a language with real static generics instead of Rust's
 trait-solver-driven query DSL. Revisit once the language has a real
-concurrency story at all (see "Native concurrency primitives" below) —
-scheduling *parallel* systems safely presupposes a real threading model
-to schedule them onto.
+concurrency story at all (see "Native concurrency primitives" below,
+and `PHOENIX_FLIGHT_IDEAS.md` for the library layer that story would
+actually run on) — scheduling *parallel* systems safely presupposes a
+real threading model to schedule them onto. `PHOENIX_FLIGHT_IDEAS.md`'s
+task-pool/dependency-graph half is buildable independently and first
+(plain library code, no compiler changes); the compiler-verified
+"these systems can't alias the same `&mut` component" half described
+here is the one genuinely new piece of design — don't track it twice
+under two different names once both files exist.
 
 **Bonus, cheap on top of this if it ships**: a small `@profile` marker
 (same shape as `@must_use`/`@dev` above, no new mechanism) recorded per
@@ -437,6 +749,14 @@ need the full "any unit times any unit" combination-inference machinery,
 just a handful of fixed, known operations on one specific unit family.
 
 ### Numeric range bounds (`Int<0..100>`-style refinement types)
+
+Real, decades-proven prior art worth designing against directly: Ada's
+`subtype Natural is Integer range 0 .. Integer'Last;` is exactly this
+feature, shipped since the 1980s — a named, range-constrained integer
+subtype, checked at compile time where provable and at runtime
+otherwise. Worth reading Ada's own subtype/range-constraint rules
+before inventing HC's syntax from scratch here, rather than rediscovering
+the same design space.
 
 A different, unrelated meaning of "bounds" from "Bounded generics:
 `<T: Trait>`" (see the README) — worth stating explicitly since the two
@@ -567,7 +887,7 @@ touching until there's an established base of real HC games and a
 concrete, specific performance need driving it — not speculatively, the
 way most of this backlog can reasonably be picked up "whenever."
 
-Real repetition already visible in `kubejs-aisle-tool`'s own `.hc` files —
+Real repetition already visible in `kubejs-aisle-tool`'s own `.hotc` files —
 every `extern class` bridging one of HC's *own* already-compiled files
 (`extern class Copytool = "net.oktawia.structruretokubejsaisles.hc.Copytool"
 { static fn use_item(...) -> ...; ... }`) is hand-copied boilerplate
@@ -756,15 +1076,15 @@ motivating the sync-strategy decisions.
 
 ### Macros
 
-Real repetition visible in `kubejs-aisle-tool`'s own `.hc` files, even
+Real repetition visible in `kubejs-aisle-tool`'s own `.hotc` files, even
 after directory-mode compilation (see the README's "Multi-file
 projects"/Gradle plugin sections) eliminated the biggest category of it
 (hand-redeclaring an `extern class` bridging one of HC's *own*
 already-compiled files no longer needed at all, once every file in a
 project compiles together): the min/max `BlockPos` construction pattern
 (`BlockPos::new(JMath::min(p1.getX(), p2.getX()), ...)` repeated for
-X/Y/Z, twice, in both `CopyToolHudOverlay.hc` and
-`CopyToolSelectionRender.hc`) is still the same handful of lines
+X/Y/Z, twice, in both `CopyToolHudOverlay.hotc` and
+`CopyToolSelectionRender.hotc`) is still the same handful of lines
 duplicated almost verbatim — directory mode fixes cross-*file*
 repetition, not repetition *within* a program's own logic. That's
 exactly what a macro system earns its keep on.
@@ -816,6 +1136,32 @@ how a mixin's `pub`/module visibility interacts with a target class it
 doesn't own, and whether this targets HC-compiled classes, real
 externally-compiled ones, or both.
 
+**The one decision worth making explicitly before starting, though**:
+this means "HC's compiler becomes its own ASM-based bytecode patcher"
+(target resolution, injection-point/shift semantics, `@Shadow`-style
+field aliasing against a class HC never compiled) — which is, honestly,
+reimplementing SpongePowered Mixin's own runtime from scratch, a much
+larger and more novel undertaking than anything else in this file. The
+pragmatic version is much smaller: have HC syntax compile down to real,
+standard `@Mixin`/`@Inject`/`@Shadow`-annotated *Java-shaped* class
+output that the existing, already-battle-tested Mixin framework
+processes at Forge's own launch time — same ergonomic win (write the
+injection in HC, get real borrow-checked params), zero new bytecode-
+patching engine, reusing decade-old, widely-deployed machinery instead
+of re-deriving it. Only worth building the from-scratch ASM-patcher
+version if there's a concrete reason the real Mixin framework's own
+output can't be targeted — "we want it to feel native" isn't reason
+enough on its own, given the difference in effort.
+
+Also worth being honest about the safety story if `@shadow` fields ever
+get wired into the borrow checker: HC can enforce move/borrow
+discipline on *its own* code's access to a shadowed field, but has zero
+visibility into the real target class's own internal aliasing (it's
+opaque, already-compiled bytecode) — so "the borrow checker protects
+this shadowed field" is a real but *narrower* guarantee than it sounds,
+not full safety against the vanilla class's own concurrent/aliased
+access to the same field.
+
 ### Pipeline syntax: `xs |> filter(f) |> map(g)`
 
 Reads nicely, but this language doesn't have first-class functions/
@@ -852,9 +1198,9 @@ createEnemy(health: 100, damage: 20, hostile: true, name: "Goblin");
 Real readability win for interop signatures with several same-typed
 params (exactly the kind Minecraft/Forge APIs have a lot of). Pure parser
 + checker sugar — resolve named args to positional slots by looking up the
-callee's declared param names, no codegen change. Not urgent because nothing
-currently blocks writing the positional form; low risk, low urgency, good
-"slow week" pickup.
+  callee's declared param names, no codegen change. Not urgent because nothing
+  currently blocks writing the positional form; low risk, low urgency, good
+  "slow week" pickup.
 
 ### Pattern matching sugar: positional enum patterns
 
@@ -884,7 +1230,7 @@ for zero functional gain.
 ### Collection literal sugar beyond arrays (`{ "key": value }` maps)
 
 No native map type exists — `LinkedHashMap` etc. are reached today purely
-through `extern class` (see `hc/Copytool.hc`'s block-ID mapping for a real
+through `extern class` (see `hc/Copytool.hotc`'s block-ID mapping for a real
 example). A literal syntax needs a real target type to construct into
 first; revisit once/if a native `Map<K, V>` (like `Vec<T>`/`Registry<T>`)
 gets built, not before.
@@ -920,7 +1266,7 @@ depends on. Revisit only if/when Valhalla itself ships stably.
 
 Mostly unnecessary — `extern class`/`extern interface` already reach
 `java.lang.Thread`, `Runnable`, and (JDK 21+) `Thread.ofVirtual()` with
-zero new compiler work; `examples/extern_interface.hc`'s `Runnable`
+zero new compiler work; `examples/extern_interface.hotc`'s `Runnable`
 example basically *is* the threads story already. A native structured-
 concurrency/async primitive is its own large design space and nothing
 concrete is currently blocked on not having one. Revisit only if a real

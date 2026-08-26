@@ -1,6 +1,9 @@
 package hc
 
+import hc.ast.Block
+import hc.ast.DocComment
 import hc.ast.Program
+import hc.ast.Stmt
 import hc.codegen.CodeGen
 import hc.lexer.Lexer
 import hc.parser.Parser
@@ -36,7 +39,7 @@ private fun stampSourceUnit(program: Program, unit: String): Program = Program(
     statics = program.statics.map { it.copy(sourceUnit = unit) },
 )
 
-fun compileEntry(path: File, mainClassName: String, classpath: List<String> = emptyList()): CompileResult {
+private fun parseEntry(path: File): Program {
     if (path.isDirectory) {
         val files = path.walkTopDown().filter { it.isFile && it.extension == "hotc" }.toList()
             .sortedBy { it.relativeTo(path).path }
@@ -46,16 +49,46 @@ fun compileEntry(path: File, mainClassName: String, classpath: List<String> = em
             val parsed = Parser(Lexer(f.readText()).tokenize()).parseProgram()
             merged = mergeProgram(merged, stampSourceUnit(parsed, f.nameWithoutExtension))
         }
-        return compileProgram(merged, mainClassName, classpath)
+        return merged
     }
-    return compile(path.readText(), mainClassName, classpath)
+    return Parser(Lexer(path.readText()).tokenize()).parseProgram()
 }
+
+private fun stripDevCode(program: Program, devMode: Boolean): Program = program.copy(
+    fns = program.fns.filter { devMode || !it.dev }.map { it.copy(body = stripDevBlock(it.body, devMode)) },
+    impls = program.impls.map { it.copy(methods = it.methods.map { m -> m.copy(body = stripDevBlock(m.body, devMode)) }) },
+    extends = program.extends.map { it.copy(methods = it.methods.map { m -> m.copy(body = stripDevBlock(m.body, devMode)) }) },
+)
+
+private fun stripDevBlock(b: Block, devMode: Boolean): Block = Block(b.stmts.mapNotNull { stripDevStmt(it, devMode) })
+
+private fun stripDevStmt(s: Stmt, devMode: Boolean): Stmt? = when (s) {
+    is Stmt.DevIf -> when {
+        devMode -> Stmt.Nested(stripDevBlock(s.thenB, devMode))
+        s.elseB != null -> Stmt.Nested(stripDevBlock(s.elseB, devMode))
+        else -> null
+    }
+    is Stmt.If -> s.copy(thenB = stripDevBlock(s.thenB, devMode), elseB = s.elseB?.let { stripDevBlock(it, devMode) })
+    is Stmt.While -> s.copy(body = stripDevBlock(s.body, devMode))
+    is Stmt.For -> s.copy(body = stripDevBlock(s.body, devMode))
+    is Stmt.Nested -> s.copy(block = stripDevBlock(s.block, devMode))
+    is Stmt.Match -> s.copy(arms = s.arms.map { it.copy(body = stripDevBlock(it.body, devMode)) })
+    is Stmt.Try -> s.copy(
+        tryBlock = stripDevBlock(s.tryBlock, devMode),
+        catches = s.catches.map { it.copy(body = stripDevBlock(it.body, devMode)) },
+    )
+    is Stmt.Let, is Stmt.ExprStmt, is Stmt.Return, is Stmt.Throw, is Stmt.Break, is Stmt.Continue -> s
+}
+
+fun compileEntry(path: File, mainClassName: String, classpath: List<String> = emptyList(), devMode: Boolean = true): CompileResult =
+    compileProgram(parseEntry(path), mainClassName, classpath, devMode)
 
 class CodegenEntryError(message: String) : RuntimeException(message)
 
-fun compileProgram(userProgram: Program, mainClassName: String, classpath: List<String> = emptyList()): CompileResult {
+fun compileProgram(userProgram: Program, mainClassName: String, classpath: List<String> = emptyList(), devMode: Boolean = true): CompileResult {
     val preludeProgram = Parser(Lexer(PRELUDE_SOURCE).tokenize()).parseProgram()
-    val program = mergeProgram(preludeProgram, userProgram)
+
+    val program = mergeProgram(preludeProgram, stripDevCode(userProgram, devMode))
 
     val reflector = ClasspathReflector(classpath)
     val checker = Checker(program, reflector)
@@ -70,6 +103,49 @@ fun compileProgram(userProgram: Program, mainClassName: String, classpath: List<
     )
     val classes = codegen.generate()
     return CompileResult(classes, codegen.usesArena, codegen.entryHolderClassName)
+}
+
+fun generateDocs(path: File, classpath: List<String> = emptyList(), devMode: Boolean = true): String {
+    val userProgram = stripDevCode(parseEntry(path), devMode)
+    val preludeProgram = Parser(Lexer(PRELUDE_SOURCE).tokenize()).parseProgram()
+    val checker = Checker(mergeProgram(preludeProgram, userProgram), ClasspathReflector(classpath))
+    checker.check()
+
+    val sb = StringBuilder("# API Reference\n\n")
+    val docStructs = userProgram.structs.filter { it.docComment != null }.sortedBy { it.name }
+    val docFns = userProgram.fns.filter { it.docComment != null }.sortedBy { it.name }
+    if (docStructs.isNotEmpty()) {
+        sb.append("## Structs\n\n")
+        for (s in docStructs) renderDoc(sb, "struct ${s.name}", s.docComment!!)
+    }
+    if (docFns.isNotEmpty()) {
+        sb.append("## Functions\n\n")
+        for (f in docFns) {
+            val params = f.params.joinToString(", ") { "${it.name}: ${it.type.name}" }
+            val ret = f.retType?.let { " -> ${it.name}" } ?: ""
+            renderDoc(sb, "fn ${f.name}($params)$ret", f.docComment!!)
+        }
+    }
+    return sb.toString()
+}
+
+private fun renderDoc(sb: StringBuilder, heading: String, doc: DocComment) {
+    sb.append("### `$heading`\n\n")
+    if (doc.summary.isNotEmpty()) sb.append("${doc.summary}\n\n")
+    if (doc.params.isNotEmpty()) {
+        sb.append("**Parameters:**\n\n")
+        for ((name, text) in doc.params) sb.append("- `$name`" + (if (text.isNotEmpty()) " -- $text" else "") + "\n")
+        sb.append("\n")
+    }
+    doc.returns?.let { sb.append("**Returns:** $it\n\n") }
+    for (ex in doc.examples) sb.append("**Example:**\n\n```\n$ex\n```\n\n")
+    for (w in doc.warnings) sb.append("> \u26a0\ufe0f $w\n\n")
+    doc.deprecated?.let { sb.append("**Deprecated.**" + (if (it.isNotEmpty()) " $it" else "") + "\n\n") }
+    if (doc.sees.isNotEmpty()) {
+        sb.append("**See also:** ")
+        sb.append(doc.sees.joinToString(", ") { see -> "`${see.target}`" + (if (!see.resolved) " (unresolved)" else "") })
+        sb.append("\n\n")
+    }
 }
 
 private fun findJava(): String {
@@ -127,11 +203,44 @@ private fun extractProfileFlag(args: List<String>): Pair<List<String>, String?> 
     return positional to profilePath
 }
 
+private fun extractReleaseFlag(args: List<String>): Pair<List<String>, Boolean> {
+    val positional = mutableListOf<String>()
+    var release = false
+    for (a in args) {
+        if (a == "--release") release = true else positional += a
+    }
+    return positional to release
+}
+
+// `--debug` (default port 5005, matching the conventional Java default so a plain "Remote JVM
+// Debug" configuration's own default port needs no adjustment) / `--debug=PORT` -- only meaningful
+// for `run`, never `build`/`doc`. Adds a suspended JDWP listener to the SAME inner `java`
+// invocation `run` already spawns via `ProcessBuilder` (see `main`'s own `"run" ->` branch below),
+// rather than duplicating that invocation's classpath/JDK-version-check logic anywhere else (an
+// IDE plugin's own Debug configuration is the intended caller of this flag, wired up in
+// `hc-intellij-plugin`'s own `HCCommandLineState`/`HCDebugState`).
+private fun extractDebugFlag(args: List<String>): Pair<List<String>, Int?> {
+    val positional = mutableListOf<String>()
+    var port: Int? = null
+    for (a in args) {
+        if (a == "--debug") {
+            port = 5005
+        } else if (a.startsWith("--debug=")) {
+            port = a.removePrefix("--debug=").toIntOrNull()
+        } else {
+            positional += a
+        }
+    }
+    return positional to port
+}
+
 fun main(rawArgs: Array<String>) {
     val (argsWithProfile, classpath) = extractClasspath(rawArgs)
-    val (args, profilePath) = extractProfileFlag(argsWithProfile)
+    val (argsWithDebug, profilePath) = extractProfileFlag(argsWithProfile)
+    val (argsWithRelease, debugPort) = extractDebugFlag(argsWithDebug)
+    val (args, release) = extractReleaseFlag(argsWithRelease)
     if (args.isEmpty()) {
-        System.err.println("usage: hc <run|build> <file.hotc | project-dir> [outDir] [--classpath a.jar:b.jar] [--profile[=out.jfr]]")
+        System.err.println("usage: hc <run|build|doc> <file.hotc | project-dir> [outDir] [--classpath a.jar:b.jar] [--profile[=out.jfr]] [--release] [--debug[=port]]")
         return
     }
     val cmd = args[0]
@@ -145,12 +254,27 @@ fun main(rawArgs: Array<String>) {
         System.err.println("no such file or directory '$path'")
         return
     }
+    if (cmd == "doc") {
+
+        val docs = try {
+            generateDocs(file, classpath, devMode = !release)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            System.err.println("compile error: ${e.message}")
+            return
+        }
+        val outPath = File(args.getOrNull(2) ?: "api.md")
+        outPath.parentFile?.mkdirs()
+        outPath.writeText(docs)
+        println("wrote docs to ${outPath.path}")
+        return
+    }
     
     val mainClassName = (if (file.isDirectory) file.name else file.nameWithoutExtension)
         .replaceFirstChar { it.uppercase() }
 
     val result = try {
-        compileEntry(file, mainClassName, classpath)
+        compileEntry(file, mainClassName, classpath, devMode = !release)
     } catch (e: Exception) {
         e.printStackTrace()
         System.err.println("compile error: ${e.message}")
@@ -180,8 +304,8 @@ fun main(rawArgs: Array<String>) {
                 if (version == null || version < 22) {
                     System.err.println(
                         "this program uses 'arena struct', which needs a JDK 22+ 'java' to run " +
-                                "(found ${version?.let { "JDK $it" } ?: "an unrecognized/missing java"} at '$javaExe'). " +
-                                "Set HC_JAVA_HOME (or JAVA_HOME) to a JDK 22+ install."
+                            "(found ${version?.let { "JDK $it" } ?: "an unrecognized/missing java"} at '$javaExe'). " +
+                            "Set HC_JAVA_HOME (or JAVA_HOME) to a JDK 22+ install."
                     )
                     return
                 }
@@ -198,7 +322,19 @@ fun main(rawArgs: Array<String>) {
             val profileArgs = profilePath?.let { p ->
                 listOf("-XX:StartFlightRecording=filename=${File(p).absolutePath},settings=profile")
             } ?: emptyList()
-            val proc = ProcessBuilder(listOf(javaExe) + profileArgs + listOf("-cp", runCp, result.mainClassBinaryName.replace('/', '.')))
+            // `suspend=y` -- the debuggee blocks until a debugger actually attaches, so whatever
+            // launched this (an IDE's Debug configuration) never races the JVM past a breakpoint
+            // that hasn't been registered yet. `address=*:$port` (not `localhost:`) so an IDE
+            // running the SAME process tree can still attach even if it resolves "localhost"
+            // differently than this JVM did -- the standard JDWP form for "listen on all
+            // interfaces." The JVM's own jdwp agent already prints "Listening for transport
+            // dt_socket at address: $port" to stderr once it's actually ready to accept a
+            // connection -- the IDE side watches for exactly that line rather than guessing at a
+            // fixed startup delay.
+            val debugArgs = debugPort?.let { port ->
+                listOf("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:$port")
+            } ?: emptyList()
+            val proc = ProcessBuilder(listOf(javaExe) + profileArgs + debugArgs + listOf("-cp", runCp, result.mainClassBinaryName.replace('/', '.')))
                 .inheritIO()
                 .start()
             val exitCode = proc.waitFor()
@@ -206,6 +342,6 @@ fun main(rawArgs: Array<String>) {
             if (exitCode != 0) System.err.println("process exited with code $exitCode")
             if (profilePath != null) println("wrote JFR recording to ${File(profilePath).absolutePath}")
         }
-        else -> System.err.println("unknown command '$cmd' (expected 'run' or 'build')")
+        else -> System.err.println("unknown command '$cmd' (expected 'run', 'build', or 'doc')")
     }
 }

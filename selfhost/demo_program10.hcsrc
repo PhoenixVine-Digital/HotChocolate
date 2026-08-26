@@ -1,0 +1,26 @@
+struct Counter {
+    value: Int,
+}
+
+impl Counter {
+    fn get(self) -> Int {
+        return self.value;
+    }
+
+    fn add(self, n: Int) -> Int {
+        self.value = self.value + n;
+        return self.value;
+    }
+
+    fn double_it(&mut self) -> Int {
+        self.value = self.value * 2;
+        return self.value;
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var c = Counter { value: a };
+    c.add(b);
+    c.double_it();
+    return c.get();
+}

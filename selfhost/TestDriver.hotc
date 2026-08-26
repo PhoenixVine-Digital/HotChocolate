@@ -1,0 +1,655 @@
+module hc.selfhost.testdriver;
+
+// Exercises the full lex -> parse pipeline end to end on a real function body, then dumps the
+// resulting AST as a readable s-expression-ish string for visual verification -- the actual
+// proof this phase of self-hosting works, not just "it compiled."
+
+fn dump_args(args: Vec<Expr>) -> String {
+    var out = "";
+    var i = 0;
+    while i < args.length() {
+        if i > 0 { out = out + ", "; }
+        out = out + dump_expr(args.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn dump_expr(e: Expr) -> String {
+    match e {
+        IntLit { value } => { return "Int(" + JString::valueOf(value) + ")"; }
+        StringLit { value } => { return "Str(" + value + ")"; }
+        BoolLit { value } => {
+            if value { return "Bool(true)"; }
+            return "Bool(false)";
+        }
+        Ident { name } => { return name; }
+        Binary { op, left, right } => { return "(" + dump_expr(left) + " " + op + " " + dump_expr(right) + ")"; }
+        Unary { op, expr } => { return "(" + op + dump_expr(expr) + ")"; }
+        Call { callee, args } => { return callee + "(" + dump_args(args) + ")"; }
+        FieldAccess { obj, field } => { return dump_expr(obj) + "." + field; }
+        MethodCall { recv, method, args } => { return dump_expr(recv) + "." + method + "(" + dump_args(args) + ")"; }
+        Assign { name, value } => { return name + " = " + dump_expr(value); }
+        FieldAssign { obj, field, value } => { return dump_expr(obj) + "." + field + " = " + dump_expr(value); }
+        StructLit { name, field_names, field_values, generic_base } => { return name + " { " + dump_args(field_values) + " }"; }
+        ArrayLit { elements } => { return "[" + dump_args(elements) + "]"; }
+        ArrayRepeat { value, count } => { return "[" + dump_expr(value) + "; " + dump_expr(count) + "]"; }
+        Index { arr, index } => { return dump_expr(arr) + "[" + dump_expr(index) + "]"; }
+        IndexAssign { arr, index, value } => { return dump_expr(arr) + "[" + dump_expr(index) + "] = " + dump_expr(value); }
+        StaticCall { type_name, method, args } => { return type_name + "::" + method + "(" + dump_args(args) + ")"; }
+        Cast { expr, target_type } => { return dump_expr(expr) + " as " + target_type; }
+    }
+}
+
+fn dump_block(stmts: Vec<Stmt>, indent: String) -> String {
+    var out = "";
+    var i = 0;
+    while i < stmts.length() {
+        out = out + indent + dump_stmt(stmts.get(i), indent) + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn dump_stmt(s: Stmt, indent: String) -> String {
+    match s {
+        Let { name, mutable, init } => {
+            if mutable {
+                return "var " + name + " = " + dump_expr(init) + ";";
+            } else {
+                return "let " + name + " = " + dump_expr(init) + ";";
+            }
+        }
+        ExprStmt { expr } => { return dump_expr(expr) + ";"; }
+        Return { value } => {
+            if let Some { value: v } = value {
+                return "return " + dump_expr(v) + ";";
+            }
+            return "return;";
+        }
+        If { cond, then_body, else_body } => {
+            var out = "if " + dump_expr(cond) + " \{\n" + dump_block(then_body, indent + "  ") + indent + "\}";
+            if let Some { value: eb } = else_body {
+                out = out + " else \{\n" + dump_block(eb, indent + "  ") + indent + "\}";
+            }
+            return out;
+        }
+        While { cond, body } => {
+            return "while " + dump_expr(cond) + " \{\n" + dump_block(body, indent + "  ") + indent + "\}";
+        }
+        Match { subject, arms } => {
+            return "match " + dump_expr(subject) + " \{ ... " + JString::valueOf(arms.length()) + " arm(s) ... \}";
+        }
+        Throw { value } => { return "throw " + dump_expr(value) + ";"; }
+        Break {} => { return "break;"; }
+        Continue {} => { return "continue;"; }
+        Try { try_block, catch_var, catch_type, catch_block } => {
+            return "try \{ ... \} catch (" + catch_var + ": " + catch_type + ") \{ ... \}";
+        }
+    }
+}
+
+fn dump_params(params: Vec<Param>) -> String {
+    var out = "";
+    var i = 0;
+    while i < params.length() {
+        if i > 0 { out = out + ", "; }
+        let p = params.get(i);
+        out = out + p.name + ": " + p.type_name;
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn main(args: [String]) {
+    let ob = codepoint_to_string(CP_LBRACE);
+    let cb = codepoint_to_string(CP_RBRACE);
+    let nl = codepoint_to_string(CP_NEWLINE);
+    let src = "fn compute(a: Int, b: Int) -> Int " + ob + nl
+        + "var x = a + b;" + nl
+        + "if x > 10 " + ob + nl
+        + "return x;" + nl
+        + cb + " else " + ob + nl
+        + "a.log(x, b);" + nl
+        + "return 0;" + nl
+        + cb + nl
+        + cb;
+
+    var lex = lexer_new(src);
+    let toks = lex.tokenize();
+    var p = parser_new(toks);
+    let decl = p.fn_decl();
+
+    print("fn " + decl.name + "(" + dump_params(decl.params) + ") -> " + opt_string_get_or(decl.ret_type, "Unit") + " \{");
+    print(dump_block(decl.body, "  "));
+    print("}");
+
+    // Parsed a second, fresh time for the checker pass rather than reusing `decl` -- `FnDecl`
+    // (and everything inside it) is move-only, and the dump above already consumed
+    // `decl.params`/`decl.body` printing it. Parsing is cheap and deterministic; not worth
+    // threading ownership through both a dump and a check of the very same tree in this driver.
+    print("--- checking valid function ---");
+    var lex2 = lexer_new(src);
+    let toks2 = lex2.tokenize();
+    var p2 = parser_new(toks2);
+    let decl2 = p2.fn_decl();
+    var checker = checker_new();
+    checker.fn_sigs.register("compute", FnSig { param_types: two_ints(), ret_type: TyInt });
+    checker.check_fn(decl2);
+    print_errors(checker.errors);
+
+    // A second, deliberately-wrong function -- proves the checker actually catches something,
+    // not just "ran without crashing." `y` is declared `Int` (`0`) then reassigned a `Bool`.
+    print("--- checking a real type error ---");
+    let bad_src = "fn broken(a: Int) -> Int " + ob + nl
+        + "var y = 0;" + nl
+        + "y = true;" + nl
+        + "return y;" + nl
+        + cb;
+    var lex3 = lexer_new(bad_src);
+    let toks3 = lex3.tokenize();
+    var p3 = parser_new(toks3);
+    let decl3 = p3.fn_decl();
+    var checker2 = checker_new();
+    checker2.check_fn(decl3);
+    print_errors(checker2.errors);
+
+    // Codegen: lex+parse a real, control-flow-heavy function one more fresh time (again to
+    // avoid fighting move-only-AST ownership across dump/check/codegen of the same tree), then
+    // drive the self-hosted CodeGen to emit a real, loadable, runnable .class file, and actually
+    // run it with `java` to prove the generated bytecode is correct -- not just "it assembled."
+    print("--- codegen: sum 0..n-1 via a while loop ---");
+    let gen_src = "fn sumto(n: Int) -> Int " + ob + nl
+        + "var total = 0;" + nl
+        + "var i = 0;" + nl
+        + "while i < n " + ob + nl
+        + "total = total + i;" + nl
+        + "i = i + 1;" + nl
+        + cb + nl
+        + "return total;" + nl
+        + cb;
+    var lex4 = lexer_new(gen_src);
+    let toks4 = lex4.tokenize();
+    var p4 = parser_new(toks4);
+    let decl4 = p4.fn_decl();
+    let pnames = sumto_param_names_of(decl4.params);
+    emit_and_write(decl4.name, pnames, decl4.body, "SelfhostSumTo", "SelfhostSumTo", 5, "SelfhostSumTo.class");
+    print("wrote SelfhostSumTo.class (sumto(5) should print 10 when run)");
+
+    // Bootstrap: compile a real, multi-function source *file* end to end (parse_program +
+    // compile_program, including function-to-function calls) -- see Driver.hotc. Takes the
+    // source path from real argv when given one, proving the argv fix works end to end here too,
+    // not just in isolation (see examples/argv_test.hotc).
+    var demo_path = "selfhost/demo_program.hcsrc";
+    if args.length > 0 {
+        demo_path = args[0];
+    }
+    run_bootstrap_demo(demo_path);
+
+    // Also proves `else if` chains (a real parser gap closed this phase, see Parser.hotc's
+    // `statement()`) parse and codegen correctly: `classify(3) + classify(4)` should print 2
+    // (both land in the `n < 10` arm).
+    run_bootstrap_demo("selfhost/demo_program3.hcsrc");
+
+    // Also proves `&&`/`||` short-circuit codegen (a real bug fixed this phase -- see
+    // Codegen.hotc's `gen_binary`, they used to silently fall through to the comparison-operator
+    // branch): `in_range(3, 1, 5) + out_of_range(4, 1, 5)` should print 1 (1 + 0).
+    run_bootstrap_demo("selfhost/demo_program4.hcsrc");
+
+    // Also proves String-typed locals codegen (a real gap closed this phase -- see
+    // Codegen.hotc's header): `check_greeting(3, 4)` builds and compares two equal strings via
+    // `+`/`==` (should return 7), `mismatch(3)` compares two different strings via `!=` (should
+    // return 3) -- `combo(3, 4)` should print 10.
+    run_bootstrap_demo("selfhost/demo_program5.hcsrc");
+
+    // Also proves real String-typed *params and return types* now codegen correctly (a real gap
+    // closed this phase -- see Codegen.hotc's header): `greet` takes a String param and returns
+    // String, `is_hi` takes a String param and returns Bool, both called from the Int-returning
+    // entry fn `combo`. `combo(3, 4)` should print 7.
+    run_bootstrap_demo("selfhost/demo_program6.hcsrc");
+
+    // Also proves built-in String `MethodCall` codegen (a real gap closed this phase -- see
+    // Codegen.hotc's header): `.toUpperCase()`, `.length()`, `.contains()` all used together.
+    // `"hello world".length()` is 11, so `combo(3, 4)` should print 18.
+    run_bootstrap_demo("selfhost/demo_program7.hcsrc");
+
+    // Also proves real struct support (a real gap closed this phase -- see Codegen.hotc's
+    // header): a `Point { x, y }` struct literal, field read/write, and a struct-typed fn param
+    // and return type. `combo(3, 4)`: p=Point{3,4}, shifted by 10 -> Point{13,4}, y+=1 ->
+    // Point{13,5}, manhattan = 13+5 = 18.
+    run_bootstrap_demo("selfhost/demo_program8.hcsrc");
+
+    // Also proves nested struct-typed fields (previously genuinely untested, only assumed to
+    // work via the generic descriptor mechanism -- see Codegen.hotc's header): `Line { start:
+    // Point, end: Point }`. `combo(3, 4)`: p1=Point{0,0}, p2=Point{3,4}, l=Line{p1,p2},
+    // length_manhattan = (3-0) + (4-0) = 7.
+    run_bootstrap_demo("selfhost/demo_program9.hcsrc");
+
+    // Also proves struct methods / impl blocks (a real gap closed this phase -- see
+    // Codegen.hotc's header): `Counter` has three methods (`get`, `add` -- bare `self` --, and
+    // `double_it` -- `&mut self`), each mutating `self.value` and calling through real
+    // INVOKEVIRTUAL. `combo(3, 4)`: c=Counter{3}, add(4) -> 7, double_it() -> 14, get() -> 14.
+    run_bootstrap_demo("selfhost/demo_program10.hcsrc");
+
+    // Also proves enums / match (a real gap closed this phase -- see Codegen.hotc's header):
+    // `Shape` has three variants (`Circle`, `Rect`, and fieldless `Empty {}`), matched by
+    // `area()`. `combo(3, 4)`: area(Circle{3})=27, area(Rect{3,4})=12, area(Empty{})=0, sum=39.
+    run_bootstrap_demo("selfhost/demo_program11.hcsrc");
+
+    // Also proves real `main()` entry-point detection (a genuine bootstrapping step -- the
+    // generated class's own JVM `main` now calls the *program's own* `main`, matching how the
+    // real `hc` compiler's entry wrapper works, instead of always calling a hardcoded test
+    // entry point): `main() -> String { return build_message(7); }` should print "big".
+    run_bootstrap_demo("selfhost/demo_program12.hcsrc");
+
+    // Also proves `pub` (parsed and ignored), `if let` (desugared to `match`), and a Result-like
+    // enum pattern together (a real gap closed this phase -- see Parser.hotc's/Ast.hc's own
+    // headers): `combo(3, 4)`: safe_div(4, 3) = Ok2{1} (4/3 integer division), describe extracts
+    // it via `if let`, so `combo(3, 4)` should print 1.
+    run_bootstrap_demo("selfhost/demo_program13.hcsrc");
+
+    // Also proves arrays (a real gap closed this phase -- see Ast.hc's/Parser.hotc's own
+    // headers): `[Int]` param type, array literal, indexed read/write, `.length`.
+    // `combo(3, 4)`: nums=[3,4,7,12], nums[0]+=100 -> [103,4,7,12], sum = 126.
+    run_bootstrap_demo("selfhost/demo_program14.hcsrc");
+
+    // Also proves generics (the biggest gap closed this phase -- see Checker.hotc's/
+    // Codegen.hotc's own headers): `struct Box<T> { value: T }`, monomorphized on demand into
+    // real, separate `Box$Int`/`Box$String` classes. `combo(3, 4)`: unwrap_int(Box<Int>{7}) +
+    // unwrap_int(Box<Int>{12}) + "hello".length() = 7 + 12 + 5 = 24.
+    run_bootstrap_demo("selfhost/demo_program15.hcsrc");
+
+    // Also proves extern classes (the last big gap closed this phase -- see Ast.hc's/
+    // Codegen.hotc's own headers): a real `java.lang.StringBuilder` ctor + fluent instance
+    // methods (`Self`-returning), plus a real static `java.lang.Math.max` call. `combo(3, 4)`:
+    // "hello world".length() + max(3, 4) = 11 + 4 = 15.
+    run_bootstrap_demo("selfhost/demo_program16.hcsrc");
+
+    // Also proves `module` declarations (parsed and ignored, same as `pub` -- a real gap closed
+    // this phase -- see Parser.hotc's own header). `combo(3, 4)`: double_it(3) + double_it(4) =
+    // 6 + 8 = 14.
+    run_bootstrap_demo("selfhost/demo_program17.hcsrc");
+
+    // Also proves static impl methods (a real gap closed this phase -- see Ast.hc's own header):
+    // `Counter2::zero()` and `Counter2::make(n)` (both static factory methods, called via the same
+    // `Expr::StaticCall` syntax extern classes use) alongside a real instance method `get`.
+    // `combo(3, 4)`: zero().get() + make(7).get() = 0 + 7 = 7.
+    run_bootstrap_demo("selfhost/demo_program18.hcsrc");
+
+    // Proves extern-typed struct fields and fn params/returns (a real gap closed this phase --
+    // see Codegen.hc's own header): `Wrapper { sb: JSB, tag: Int }` has a field of extern type,
+    // `build_it(sb: JSB) -> Wrapper` takes an extern-typed param, `describe(w: Wrapper) -> String`
+    // reads `w.sb.toString()` (extern-typed field access + method call).
+    // `combo(3, 4)`: tag=7, s="count=" (length 6), so 7 + 6 = 13.
+    run_bootstrap_demo("selfhost/demo_program19.hcsrc");
+
+    // Proves generic enums (a real gap closed this phase -- see Ast.hc's own `EnumDecl` header):
+    // `enum Opt<T> { Some { value: T }, None {} }` used at TWO different concrete type arguments
+    // in the same program (`Opt<Int>` and `Opt<String>`), each constructed via the explicitly-
+    // qualified `Opt<Int>::Some { value: ... }` form and each matched via plain `Some { value }` /
+    // `None {}` arms (bare, unqualified -- match codegen keys everything off the subject's own
+    // concrete runtime type, needing no qualification).
+    // `combo(3, 4)`: n1 = unwrap_or_int(Some(41), -1) = 41, n2 = unwrap_or_int(None, -1) = -1,
+    // s1 = unwrap_or_str(Some("hi"), "fallback") = "hi" (length 2). 41 + (-1) + 2 = 42.
+    run_bootstrap_demo("selfhost/demo_program20.hcsrc");
+
+    // Proves array-typed generic fields (a real gap closed this phase -- see Checker.hc/Codegen.hc
+    // headers): `struct Bag<T> { items: [T] }`'s `data` field substitutes `"[T]"` -> `"[Int]"`
+    // (not just the plain exact-match `"T"` -> `"Int"` case generics already handled), needed for
+    // `Vec<T>`'s own real `data: [T]` field. `combo(3, 4)`: sum_bag_ints(Bag { items: [10,20,30] })
+    // = 60, so 60 + 3 + 4 = 67.
+    run_bootstrap_demo("selfhost/demo_program21.hcsrc");
+
+    // Proves `[value; count]` repeat-element array literals (a real gap closed this phase -- see
+    // Ast.hc's own `ArrayRepeat` header): a NEW `Expr` variant, distinct from `ArrayLit`, needed
+    // for the prelude's own `Vec<T>` (`[value; newCap]` in `push`, `[first; 4]` in `vec_of`) --
+    // `count` is a runtime expression (unlike `ArrayLit`'s compile-time-known element count), so
+    // codegen fills the array via a real runtime loop. Exercised at both a primitive-int element
+    // type and a ref (`String`) element type, since the two take different array/store opcodes
+    // (`NEWARRAY`/`IASTORE` vs `ANEWARRAY`/`AASTORE`).
+    // `combo(3, 4)`: make_and_sum(5, 7) = 5*7 = 35, make_and_join(3, "hi") = 3*2 = 6.
+    // 35 + 6 + 3 + 4 = 48.
+    run_bootstrap_demo("selfhost/demo_program22.hcsrc");
+
+    // Proves nested/cascading generic instantiation (a real gap closed this phase -- see
+    // Checker.hc's own `ensure_instantiated`/`substitute_field_type` headers): `Wrapper<T> { inner:
+    // Box<T>, tag: Int }`'s `inner` field names a *different* generic instantiation (`Box<T>`) as
+    // its own declared type, not just `T` or `[T]` directly -- substituting `"Box$T"` ->
+    // `"Box$Int"` (or `"Box$String"`) when `Wrapper$Int`/`Wrapper$String` get instantiated, and
+    // eagerly `ensure_instantiated`-ing the nested name too so it actually gets emitted as a real
+    // class, not just named in a field descriptor. Exercised at two different outer instantiations
+    // (`Wrapper<Int>` and `Wrapper<String>`) to prove each one's `inner` field cascades to ITS OWN
+    // correct nested type, not a fixed/wrong one.
+    // `combo(3, 4)`: unwrap_int(Wrapper{inner:Box{value:90},tag:9}) = 90+9 = 99,
+    // make_wrapper_str("hello").inner.value.length() = 5. 99 + 5 + 3 + 4 = 111.
+    run_bootstrap_demo("selfhost/demo_program23.hcsrc");
+
+    // Proves type-inferred generic functions (the last real gap toward self-hosting the real
+    // prelude's Vec<T>/Option<T> -- see Ast.hc's own `FnDecl` header): `fn identity<T>(x: T) -> T`
+    // and `fn pick_first<T>(a: T, b: T) -> T` are never called with an explicit `<Arg>` the way a
+    // generic struct/enum construction site must -- the checker/codegen each independently infer
+    // the concrete type argument from whichever arg's corresponding declared param type is exactly
+    // the bare type parameter (`Checker.hotc`'s own `check_generic_call`, redone independently in
+    // `Codegen.hotc`'s own `Call` codegen since this file doesn't share the checker's registries).
+    // Exercised at two different instantiations of the SAME generic fn (`identity$Int`,
+    // `identity$String`) plus a two-param generic fn sharing one `T` across both params
+    // (`pick_first$Int`), proving inference correctly threads through both shapes. (This round's
+    // own scope cut -- a generic fn's body referencing its still-abstract `T` inside a nested
+    // generic construction site -- is closed in `demo_program25.hcsrc` right below.)
+    // `combo(3, 4)`: identity(37) = 37, identity("hello").length() = 5, pick_first(7, 999) = 7.
+    // 37 + 5 + 7 = 49.
+    run_bootstrap_demo("selfhost/demo_program24.hcsrc");
+
+    // Proves a generic fn's own body CAN reference its still-abstract `T` inside a nested generic
+    // construction site (the last disclosed gap toward self-hosting the real prelude's own
+    // `vec_of<T>`/`registry_new<T>`, which rely on exactly this -- see Checker.hc's own
+    // `ensure_fn_instantiated`/`subst_expr` headers): `fn boxed<T>(v: T) -> Box<T> { return Box<T>
+    // { value: v }; }` -- a real whole-body `Stmt`/`Expr` substitution pass (`subst_stmt_list`,
+    // mirrored independently in Codegen.hotc) fixes up the body's own `Box<T>` to the real
+    // concrete instantiation (`Box$Int`/`Box$String`) before each monomorphized copy is checked
+    // and emitted, so the checker's own `ensure_instantiated` cascades into the nested struct
+    // exactly like it would for hand-written concrete source.
+    // `combo(3, 4)`: boxed(42).value = 42, boxed("hey").value.length() = 3. 42 + 3 + 3 + 4 = 52.
+    run_bootstrap_demo("selfhost/demo_program25.hcsrc");
+
+    // Proves generic instance methods (the real prelude's own `Vec<T>` -- `impl Vec2<T> { fn
+    // push(&mut self, value: T) { ... } fn get(&self, i: Int) -> T { ... } fn length(&self) -> Int
+    // { ... } }`, a real, growable, array-backed generic struct with real methods, not a
+    // hypothetical stand-in): `Checker.hotc`'s `ensure_method_instantiated` infers `T` directly
+    // from the receiver's own concrete mono type (`mono_arg("Vec2$Int")` = `"Int"` -- no scanning
+    // needed, unlike a generic top-level fn's own call-site inference), substitutes params/return/
+    // body (reusing `subst_stmt_list`/`substitute_field_type`), and `Codegen.hotc`'s own
+    // `gen_struct` now emits each mono struct's own substituted methods onto ITS OWN class file
+    // (`monomorphized_methods_for_struct_cg`) -- `gen_expr`'s `MethodCall` codegen itself needed
+    // zero changes, since it already keys lookups off the receiver's own concrete type name.
+    // `push`'s own resize logic (doubling capacity via `[value; newCap]`, copying old elements)
+    // exercises array-typed generic fields, `[value; count]` literals, and generic methods all
+    // together -- the same shape the real prelude's `Vec<T>` itself uses.
+    // `combo(3, 4)`: vi ends up [10,20,30,40,50] (sum 150, via 5 pushes onto a starting capacity of
+    // 1, forcing 3 real resizes: 1->2->4->8). vs.get(0).length() + vs.get(1).length() = 2 + 3 = 5.
+    // 150 + 5 + 3 + 4 = 162.
+    run_bootstrap_demo("selfhost/demo_program26.hcsrc");
+
+    // Proves 3-level nested generic instantiation -- the real prelude's own `Registry<T> { entries:
+    // Vec<RegistryEntry<T>> }` shape, stress-tested here as `Reg<T> { entries: Vec3<RegEntry<T>> }`
+    // -- and found TWO real bugs doing it (both in `Checker.hotc`/`Codegen.hotc`'s own
+    // `substitute_field_type[_cg]` and `ensure_instantiated`, see their headers): (1) field-type
+    // substitution only handled ONE level of mono-name nesting (`mono_arg(ftype) == type_param`
+    // required the WHOLE argument to be the bare type parameter) -- `"Vec3$RegEntry$T"` fell
+    // through completely unsubstituted, since its own `mono_arg` is `"RegEntry$T"`, not `"T"`;
+    // fixed by recursing into the argument portion instead of demanding an exact match. (2) the
+    // cascade-trigger that instantiates a nested generic field's OWN class treated
+    // `"[RegEntry$Int]"` (an array-of-mono-name field, e.g. `Vec3<T>`'s own `data: [T]` after `T`
+    // substitutes to a mono name) as if the WHOLE bracketed string were itself a mono name to
+    // instantiate -- silently no-oping instead of cascading into the real element type; fixed by
+    // unwrapping one array level first. `vec3_of<T>` uses call-site inference specifically because
+    // construction sites can't spell out a nested generic type argument directly (see its own
+    // header) -- `entries: Vec3<RegEntry<T>>` itself parses fine as a plain field DECLARATION,
+    // since `type_name_ref` is naturally recursive.
+    // `combo(3, 4)`: reg_get(r, "x"/"y"/"z") = 10/20/30. 10 + 20 + 30 + 3 + 4 = 67.
+    run_bootstrap_demo("selfhost/demo_program27.hcsrc");
+
+    // The real self-hosting feasibility check: a faithful transcription of the REAL Kotlin
+    // compiler's own `Prelude.kt` (`Vec<T>`, `Option<T>`, `RegistryEntry<T>`, `Registry<T>` --
+    // renamed `Vec3`/`Opt`/`RegEntry`/`Reg` only to avoid colliding with THIS file's own real
+    // auto-injected prelude) combined into one program and exercised end to end: growable generic
+    // arrays, a generic enum used for "might not be there," a 3-level nested generic struct, a
+    // generic fn calling another generic fn from inside a generic method's own body
+    // (`reg_new<T>` -> `vec3_of<T>`, `Reg<T>::get` -> `Opt<T>::Some`/`::None`), all through real
+    // `match` exhaustiveness checking. Every generics gap found and fixed this whole session shows
+    // up here at once -- this is what "the self-hosted compiler can express the real prelude's own
+    // shape" actually looks like as a single coherent program, not five separate isolated proofs.
+    // `combo(3, 4)`: r has {first:100, second:200, third:300}. found1/2/3 = Some(100/200/300),
+    // missing = None. total = 100+200+300 = 600, r.length() = 3, missing_flag = 0.
+    // 600 + 3 + 0 + 3 + 4 = 610.
+    //
+    // **Real bug this integration test found, previously undiscovered anywhere else this whole
+    // session**: not in the generics work at all -- in the real Kotlin compiler's own bootstrap
+    // `Prelude.kt`, `Registry<T>.register` always APPENDED a new entry instead of overwriting an
+    // existing one under the same key, so `get`'s own linear scan (always returning the FIRST
+    // match) silently ignored every later `register` call for an already-used key. This bit the
+    // self-hosted `CodeGen`'s own local-slot allocator specifically: `Registry<Int>.register(name,
+    // slot)` is how it shadows an earlier slot when the same variable name is bound again in a
+    // sibling scope (this program's own four separate `match` statements each binding a field
+    // called `value`, say) -- with the bug, every `match` after the first read the FIRST match's
+    // now-stale slot instead of its own, producing a real `VerifyError: Bad local variable type`
+    // at class-verification time. Fixed in `Prelude.kt` itself (`register` now scans for an
+    // existing key and overwrites in place, real "last write wins" map semantics) -- this is a
+    // real, previously-latent correctness bug in the PRODUCTION compiler, affecting any real
+    // program using `Registry<T>` with duplicate-key re-registration, not just self-hosting.
+    run_bootstrap_demo("selfhost/demo_program28.hcsrc");
+
+    // Proves top-level `pub static NAME: Type = expr;` constants (a real gap found attempting to
+    // self-compile the compiler's OWN `Lexer.hotc`, which uses dozens of these as named codepoint
+    // constants standing in for char literals HC doesn't have -- see Ast.hc's own `StaticDecl`
+    // header): a new top-level declaration form, a real `<clinit>` computing each one's value and
+    // a real `static` field on the class (`Codegen.hotc`'s own `gen_static_init`), and `Ident`
+    // codegen checking locals first so a same-named local still shadows a static.
+    // `combo(3, 4)`: is_upper(65)=true, is_upper(90)=true, is_upper(97)=false -> count=2.
+    // GREETING.length()=2, CP_A=65. 2 + 2 + 65 + 3 + 4 = 76.
+    run_bootstrap_demo("selfhost/demo_program29.hcsrc");
+
+    // Proves bare fieldless enum-variant DECLARATIONS (`Red,` with no `{ }` at all) -- another
+    // real gap found self-compiling `Lexer.hotc`, whose own `TokType` enum declares ~60 variants
+    // exactly this bare way (`INT, LONG, FLOAT, ...`). Scope cut, disclosed at the time -- since
+    // closed, see `demo_program31.hcsrc` right below: this demo itself still uses the explicit
+    // `{ }` form consistently at every construction/match site, matching what was ACTUALLY
+    // supported when it was written.
+    // `combo(3, 4)`: score(Red{})=1, score(Green{})=2, score(Blue{})=3,
+    // score(Custom{r:10,g:20,b:30})=60. 1+2+3+60+3+4 = 73.
+    run_bootstrap_demo("selfhost/demo_program30.hcsrc");
+
+    // Proves a BARE variant name usable as an ordinary value expression (no `{ }` at all) --
+    // the real remaining gap `demo_program30.hcsrc`'s own header disclosed, and the actual shape
+    // `Lexer.hotc`'s/`Parser.hotc`'s own `TokKind`-style enums need (`Token { kind: FN }`, `kind ==
+    // RETURN`, treating a fieldless enum's variants like plain named constants, not
+    // constructed values). Implemented by extracting the `StructLit` variant-construction bytecode
+    // into a shared `gen_variant_construct` method (`Codegen.hotc`) and having `gen_expr`'s own
+    // `Ident` arm call it directly with empty field lists when a bare name resolves via
+    // `variant_owner`'s bare-name table -- `Checker.hotc`'s own `check_ident` does the equivalent,
+    // delegating straight to `check_struct_lit`. Only bare, non-generic variants resolve this way.
+    //
+    // **Real bug this demo found, previously undiscovered anywhere else this whole session**:
+    // `gen_binary`'s own `==`/`!=` codegen treated ANY ref-type comparison uniformly as reference-
+    // identity (`if_acmpeq`/`ne`) -- correct for plain structs (no per-field structural equality,
+    // a real, disclosed gap matching the real compiler's own), but WRONG for enums: two separately
+    // -constructed instances of the same variant (`t1.kind` and a freshly-built `FN` value, say)
+    // are never the SAME object, so `kind == FN` was silently always `false` regardless of the
+    // real tag values -- this demo's own first run printed `16`, not the correct `23`, exposing it.
+    // The REAL Kotlin compiler already fixes this in its own `CodeGen.kt` (tag comparison, not
+    // reference identity -- see `Parser.hotc`'s own header, a much earlier finding from early in
+    // this session), but this self-hosted PORT of `gen_binary` never got the equivalent fix until
+    // now. Fixed via a new `is_enum_type` check (backed by `ProgramInfo`'s new `enum_names` list --
+    // an enum's real `tag: Int` field is a pure codegen-time detail never recorded in any field-
+    // name table, so that couldn't be the signal) routing enum `==`/`!=` through a real
+    // `GETFIELD tag` + `SWAP` + `GETFIELD tag` + `IF_ICMPEQ`/`NE` sequence instead.
+    // `combo(3, 4)`: classify(FN)=1, classify(RETURN)=2, classify(IDENT)=3 -> total=6;
+    // t1.kind==FN adds 10 -> 16. 16 + 3 + 4 = 23.
+    run_bootstrap_demo("selfhost/demo_program31.hcsrc");
+
+    // Proves `expr as Type` cast expressions -- the exact real gap found self-compiling
+    // `Lexer.hotc` (`JLong::parseLong(hex_text, 16) as Int`, narrowing a real `java.lang.Long`
+    // extern-method return down to `Int`). A new `Expr::Cast` node (`Ast.hc`), parsed at the same
+    // precedence real Kotlin/HC give it (`Parser.hotc`'s own `cast()`, chained between `unary` and
+    // `call_or_primary`), checked by trusting the declared target type at face value
+    // (`Checker.hotc`'s own `check_cast`), and compiled via a real `L2I` conversion
+    // (`Codegen.hotc`'s own `gen_cast`) -- `Long` itself stays deliberately narrow, never a general
+    // first-class primitive (no `Long` locals/params/fields/arithmetic), only ever a transient
+    // stack value between an extern call returning one and an immediate cast consuming it.
+    // `combo(3, 4)`: parse_hex("FF") = 0xFF = 255. 255 + 3 + 4 = 262.
+    run_bootstrap_demo("selfhost/demo_program32.hcsrc");
+
+    // Proves an explicit `: Type` annotation on `let`/`var` (`let found: Option<TokType> = ...;`
+    // -- another real gap found self-compiling `Lexer.hotc`). Parsed and discarded, not stored:
+    // `Stmt::Let` still has no type field at all, this subset's own `let`/`var` stay always
+    // inferred from `init` -- every real annotation seen so far is redundant with what inference
+    // already produces, so this is purely documentation from the checker's own point of view, same
+    // "accepted syntax, no semantic effect" treatment `pub`/`module` already get.
+    // `combo(3, 4)`: x=10, y=true, s="hi" (length 2). total=10, y true adds 2 -> 12. 12+3+4=19.
+    run_bootstrap_demo("selfhost/demo_program33.hcsrc");
+
+    // Proves field-binding RENAME syntax in `if let`/`match` patterns (`if let Some { value: v } =
+    // o { ... }` -- the compiler's OWN established idiom, used pervasively throughout its own
+    // `Checker.hotc`/`Codegen.hotc`, e.g. `if let Some { value: t } = found { ... }`; a real gap
+    // found self-compiling `Lexer.hotc`). `MatchArm` gained a new `bind_names` field (parallel to
+    // `field_names`, index-paired) -- `field: localName` renames, bare `field` still binds to the
+    // same name as before. Shared by `match_arm`/`if_let_stmt` via a new `one_field_binding`
+    // parser helper (returning a small `FieldBinding` struct rather than taking `&mut Vec<String>`
+    // out-params, since HC has no tuples and this keeps the same "return a real value" shape every
+    // other parser helper already uses).
+    // `combo(3, 4)`: unwrap_or(Some(41), -1)=41, unwrap_or(None, -1)=-1 -> total=40;
+    // `match some_val { Some { value: v2 } => ... }` adds 41 -> 81. 81 + 3 + 4 = 88.
+    run_bootstrap_demo("selfhost/demo_program34.hcsrc");
+
+    // Proves `throw` accepting a real, already-constructed exception object (`throw
+    // LexErr::new(msg);`), not just a plain `String` message -- the real gap that got Lexer.hotc
+    // this far self-compiling: `throw LexError::new(...)` is its own established idiom (`extern
+    // class` support didn't exist AT ALL when the old "String only" restriction was first
+    // written). A `String` value still wraps into a hardcoded `java.lang.RuntimeException`
+    // (unchanged); anything else is now `ATHROW`n directly -- `value` has to be evaluated before
+    // its own type is known to decide which path applies, stashed in a raw temp slot (same trick
+    // `ArrayLit`/`Match`'s own subject already use). This demo's own `throw` path is never
+    // actually TAKEN (n stays under 1000) -- proving real, class-verified codegen for the new path
+    // without crashing the always-succeeds suite; the throw actually firing (a real
+    // `java.lang.RuntimeException: n was positive: 3`, thrown directly with no double-wrapping)
+    // was verified manually and is not part of this always-succeeds run.
+    // `combo(3, 4)`: maybe_fail(3) = 6, maybe_fail(4) = 8. 6 + 8 = 14.
+    run_bootstrap_demo("selfhost/demo_program35.hcsrc");
+
+    // Proves `String.codePointAt`/`.substring` codegen -- two real `java.lang.String` methods
+    // missing from `gen_expr`'s own hardcoded String-builtin dispatch table (a real gap found
+    // self-compiling `Lexer.hotc`, which reads its own source one codepoint at a time this exact
+    // way -- the same methods this file's own `JStringCg`/`JStringChk` extern declarations already
+    // bind, just for THEIR OWN internal use, not exposed to arbitrary user code calling them on a
+    // plain `String` value).
+    // `combo(3, 4)`: "Hello".codePointAt(0) = 72 ('H'). "Hello".substring(1, 4) = "ell" (length 3).
+    // 72 + 3 + 3 + 4 = 82.
+    run_bootstrap_demo("selfhost/demo_program36.hcsrc");
+
+    // Proves `Long` as a REAL, correctly-slotted JVM category-2 primitive -- not the earlier
+    // narrow hack (a transient stack value immediately cast away, never stored). `Ty` gained a
+    // real `TyLong` variant (`Checker.hotc`); `Codegen.hotc`'s own local-slot allocator
+    // (`alloc_slot`) now takes the type being allocated and reserves TWO consecutive slots for a
+    // `Long` (matching what the JVM spec itself requires, not a convention this compiler
+    // invented), with `LLOAD`/`LSTORE` (`load_opcode`/`store_opcode` helpers, replacing the old
+    // `ALOAD`/`ILOAD` two-way split with a real three-way one), `LADD`/`LSUB`/`LMUL`/`LDIV`/`LREM`
+    // arithmetic, `LCMP` + single-operand `IFxx` comparisons (the JVM has no `IF_LCMPxx` the way
+    // it does `IF_ICMPxx`), `LRETURN`, and `POP2` (a `Long` is 2 stack words, not 1). Scope cut,
+    // disclosed: no implicit `Int` -> `Long` widening in binary ops (both operands must already be
+    // the same type), and no `Long`-typed struct fields yet (`FieldAssign`'s own `DUP_X1`
+    // sequencing is category-1-only). `add_longs`'s own `extra: Int` declared right after `z:
+    // Long` is the real proof: if `z` only reserved one slot, `extra` would silently alias its
+    // second half, corrupting both.
+    // `combo(3, 4)`: sum = add_longs(100000, 200000) = 300000 + 1 = 300001. sum > big1, sum == sum
+    // -> cmp_result = 11. back = 300001 as Int. (300001 - 300000) + 11 + 3 + 4 = 19.
+    run_bootstrap_demo("selfhost/demo_program37.hcsrc");
+
+    // Real bug found self-compiling `Lexer.hotc` (the self-hosted compiler's own actual lexer
+    // source, the first real compiler source file self-compiled this session): its `extern class`
+    // declarations use DOT-form binary names ("java.lang.String", etc, matching what the REAL
+    // compiler accepts via its own classpath reflection's dot-to-slash conversion), but this
+    // subset's disclosed scope cut said `binary_name` must already be JVM-internal slash form --
+    // no conversion. This wasn't a compile error: the raw dotted string got used AS-IS in
+    // NEW/INVOKESTATIC/field descriptors, producing a real but invalid class file that failed to
+    // LOAD in the JVM (`ClassFormatError: Illegal class name "java.lang.String"`) -- not caught by
+    // ASM's own COMPUTE_FRAMES at compile time, only surfacing when the class is actually loaded
+    // and run, which is exactly what this demo chain does for every entry. Fixed via
+    // `dot_to_slash_cg` in `Codegen.hotc`, applied at all 3 sites `binary_name` is first read off
+    // the AST. `combo(3, 4)`: parsed = 40. 40 + 3 + 4 - 7 = 40.
+    run_bootstrap_demo("selfhost/demo_program38.hcsrc");
+
+    // Real `break`/`continue` support, added while continuing the self-hosted compiler's own
+    // self-compilation probe (`Parser.hotc`'s own real source uses `break` in `arg_list`) -- see
+    // `demo_program39.hcsrc`'s own header for the full mechanism.
+    run_bootstrap_demo("selfhost/demo_program39.hcsrc");
+
+    // Bare generic struct/enum-variant construction inferred from the surrounding `return`'s own
+    // declared type, plus the 3 follow-on bugs found making it work -- see
+    // `demo_program40.hcsrc`'s own header for the full breakdown.
+    run_bootstrap_demo("selfhost/demo_program40.hcsrc");
+
+    // Bare (braceless) fieldless-variant match arms, plus a per-variant field-type collision fix
+    // in `check_match`/`Match` codegen/`gen_variant_construct` -- both found continuing the self-
+    // compilation probe into `Checker.hotc` itself. See `demo_program41.hcsrc`'s own header.
+    run_bootstrap_demo("selfhost/demo_program41.hcsrc");
+
+    // A `Unit`-returning method call used as a bare statement, both before and inside a `while`
+    // loop -- a real, broadly-applicable `ExprStmt` codegen bug (an unconditional `POP` after
+    // every non-`Long` expression, even when the expression pushed nothing) found finishing the
+    // self-compilation of `Codegen.hotc` itself. See `demo_program42.hcsrc`'s own header.
+    run_bootstrap_demo("selfhost/demo_program42.hcsrc");
+
+    // Real classpath reflection (`try`/`catch`, extern-class arrays, a genuinely `Bool`-returning
+    // extern method) exercised end to end on a real target program -- see `demo_program43.hcsrc`'s
+    // own header for the `NoSuchMethodError` bug this would have caught.
+    run_bootstrap_demo("selfhost/demo_program43.hcsrc");
+
+    // `Registry<T>.register`'s "last write wins" fix, re-synced from the real compiler's own
+    // `Prelude.kt` into this self-hosted mirror's own `prelude_source()` -- see
+    // `demo_program44.hcsrc`'s own header for the always-append bug this would have caught.
+    run_bootstrap_demo("selfhost/demo_program44.hcsrc");
+
+    // A target program's own real `fn main(args: [String])` entry point, with genuine argv
+    // passthrough -- new self-hosted `Codegen.hotc` capability, see `demo_program45.hcsrc`'s own
+    // header for what this proves and how it's actually verified (a separate `java` invocation
+    // with real command-line args, not this demo's own compile-time print).
+    run_bootstrap_demo("selfhost/demo_program45.hcsrc");
+
+    // The actual fixed-point self-hosting test -- see `Driver.hotc`'s own header on
+    // `run_selfcompile_probe` for why a single-file `run_bootstrap_demo` call can't do this.
+    run_selfcompile_probe();
+
+    // `selfhost/demo_program_throw_test.hcsrc` (throws "a was positive" when a>0) is a
+    // deliberately-terminating negative case verifying `throw` codegen for real -- confirmed
+    // manually (a real java.lang.RuntimeException: a was positive), kept out of this fn's own
+    // always-succeeds run the same way `demo_program_bad_call.hcsrc` is.
+
+    // `selfhost/demo_program_bad_call.hcsrc` (calls a function that doesn't exist) is a
+    // deliberately-broken negative case verifying the `known_fns` safeguard in `Codegen.hotc`
+    // throws a clear error instead of silently emitting a broken INVOKESTATIC -- confirmed
+    // manually (`run_bootstrap_demo("selfhost/demo_program_bad_call.hcsrc")` does throw as
+    // expected), kept out of this fn's own always-succeeds run the same way
+    // `examples/bad_test.hotc` is kept separate from the clean-compiling examples.
+}
+
+fn sumto_param_names_of(params: Vec<Param>) -> Vec<String> {
+    var out = vec_of("__init__");
+    var real = Vec { data: out.data, len: 0 };
+    var i = 0;
+    while i < params.length() {
+        real.push(params.get(i).name);
+        i = i + 1;
+    }
+    return real;
+}
+
+fn two_ints() -> Vec<Ty> {
+    var v = vec_of(TyInt);
+    v.push(TyInt);
+    return v;
+}
+
+fn print_errors(errs: Vec<String>) {
+    var i = 0;
+    var any = false;
+    while i < errs.length() {
+        let e = errs.get(i);
+        if e != "" {
+            print(e);
+            any = true;
+        }
+        i = i + 1;
+    }
+    if !any {
+        print("(no errors)");
+    }
+}
+
+// `Option<String>.get_or(default)` -- a tiny convenience the prelude doesn't have, just for this
+// driver's own printing.
+fn opt_string_get_or(o: Option<String>, default_val: String) -> String {
+    if let Some { value: v } = o {
+        return v;
+    }
+    return default_val;
+}

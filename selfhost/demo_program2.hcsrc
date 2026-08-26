@@ -1,0 +1,11 @@
+fn square(x: Int) -> Int {
+    return x * x;
+}
+
+fn addone(x: Int) -> Int {
+    return x + 1;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    return square(a) + addone(b);
+}

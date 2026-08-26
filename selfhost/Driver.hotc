@@ -1,0 +1,334 @@
+module hc.selfhost.driver;
+
+// The self-hosted bootstrap driver, phase 1 -- reads a real source file off disk, runs it through
+// the self-hosted lexer -> parser -> checker -> codegen pipeline (each phase already ported and
+// individually verified), and writes a real, loadable, runnable `.class` file.
+//
+// **Argv gap closed**: HC's own `fn main()` used to take no arguments at all -- fixed at the real
+// compiler level (`Checker.kt`'s main-signature validation, `CodeGen.kt`'s two entry-wrapper
+// blocks) to also accept a single `[String]` param, forwarded straight through from the JVM's own
+// `main(String[])`. `TestDriver.hotc`'s `main(args: [String])` now takes this file's source path
+// from real argv (falling back to the hardcoded demo path when none is given) instead of always
+// reading a compiled-in constant -- see `run_bootstrap_demo` below.
+
+extern class JPath = "java.nio.file.Path" interface {}
+extern class JPaths = "java.nio.file.Paths" {
+    static fn get(first: String, more: [String]) -> JPath;
+}
+extern class JFiles2 = "java.nio.file.Files" {
+    static fn readString(p: JPath) -> String;
+}
+
+fn read_source_file(path: String) -> String {
+    let p = JPaths::get(path, ["x"; 0]);
+    return JFiles2::readString(p);
+}
+
+// A real, minimal prelude -- `Option<T>`/`Vec<T>`/`RegistryEntry<T>`/`Registry<T>` (plus
+// `vec_of<T>`/`registry_new<T>`), mirroring the REAL compiler's own auto-injected `Prelude.kt`
+// (already independently verified as its own program, `demo_program28.hcsrc`'s `Opt`/`Vec3`/
+// `RegEntry`/`Reg`, just renamed here to the real prelude names). A real, previously-undiscovered
+// LIMIT of this whole self-hosting effort found attempting to self-compile `Lexer.hotc`: real
+// `.hotc` source almost never declares `Vec`/`Option`/`Registry` itself (`Lexer.hotc`'s own
+// `self.keywords: Registry<TokType>` relies ENTIRELY on the real compiler's prelude injection) --
+// without this, the self-hosted compiler could only ever compile programs that happen to declare
+// every generic type they use themselves, which is essentially no real code at all. `nl`-joined
+// string-literal concatenation (not a raw multi-line literal) because this subset's own string
+// literals have no escape-sequence support at all (confirmed against the real `Lexer.kt` itself)
+// -- the same workaround `TestDriver.hotc`'s own test-source construction already uses.
+fn prelude_source() -> String {
+    let nl = codepoint_to_string(CP_NEWLINE);
+    return "enum Option<T> \{" + nl
+        + "Some \{ value: T \}," + nl
+        + "None \{\}," + nl
+        + "\}" + nl
+        // NOT mirroring the real prelude's own `Result<T, E>` here -- this subset's own generic
+        // struct/enum decl parsing (`Parser.hotc`'s `struct_decl`/`enum_decl`) only supports
+        // exactly ONE `<T>` type parameter (a real, disclosed scope cut, see `Ast.hc`'s own
+        // `StructDecl`/`EnumDecl` headers), so a two-param `Result<T, E>` would fail to parse --
+        // and since this whole string gets parsed unconditionally for EVERY target-program
+        // compile, that would break every demo, not just ones that use `Result`. A real follow-up
+        // (multi-type-param generics), not an oversight.
+        + "struct Vec<T> \{" + nl
+        + "data: [T]," + nl
+        + "len: Int," + nl
+        + "\}" + nl
+        + "impl Vec<T> \{" + nl
+        + "fn push(&mut self, value: T) \{" + nl
+        + "if self.len == self.data.length \{" + nl
+        + "var newCap = self.data.length * 2;" + nl
+        + "if newCap == 0 \{" + nl
+        + "newCap = 4;" + nl
+        + "\}" + nl
+        + "var newData = [value; newCap];" + nl
+        + "var i = 0;" + nl
+        + "while i < self.len \{" + nl
+        + "newData[i] = self.data[i];" + nl
+        + "i = i + 1;" + nl
+        + "\}" + nl
+        + "self.data = newData;" + nl
+        + "\}" + nl
+        + "self.data[self.len] = value;" + nl
+        + "self.len = self.len + 1;" + nl
+        + "\}" + nl
+        + "fn get(&self, i: Int) -> T \{" + nl
+        + "return self.data[i];" + nl
+        + "\}" + nl
+        + "fn set(&mut self, i: Int, value: T) \{" + nl
+        + "self.data[i] = value;" + nl
+        + "\}" + nl
+        + "fn length(&self) -> Int \{" + nl
+        + "return self.len;" + nl
+        + "\}" + nl
+        + "\}" + nl
+        + "fn vec_of<T>(first: T) -> Vec<T> \{" + nl
+        + "return Vec<T> \{ data: [first; 4], len: 1 \};" + nl
+        + "\}" + nl
+        + "struct RegistryEntry<T> \{" + nl
+        + "key: String," + nl
+        + "value: T," + nl
+        + "\}" + nl
+        + "struct Registry<T> \{" + nl
+        + "entries: Vec<RegistryEntry<T>>," + nl
+        + "\}" + nl
+        + "fn registry_new<T>(firstKey: String, firstValue: T) -> Registry<T> \{" + nl
+        + "return Registry<T> \{ entries: vec_of(RegistryEntry<T> \{ key: firstKey, value: firstValue \}) \};" + nl
+        + "\}" + nl
+        + "impl Registry<T> \{" + nl
+        // "Last write wins" -- mirrors the real compiler's own `Prelude.kt` bug fix (see that
+        // file's own `register` header): overwrites an existing entry in place if `key` is
+        // already registered, rather than always appending a stale duplicate underneath it that
+        // `get`'s own linear scan (finds the FIRST match) would never see again. This self-hosted
+        // mirror had drifted out of sync with the fix -- worth catching now since the self-hosted
+        // compiler's OWN `Registry<T>` usage (`Checker.hotc`'s `vars`/`fn_sigs`/etc.) needs this
+        // exact semantics to correctly re-register a shadowed local, the same real gap that
+        // motivated the real compiler's own fix in the first place.
+        + "fn register(&mut self, key: String, value: T) \{" + nl
+        + "var found_idx = -1;" + nl
+        + "var i = 0;" + nl
+        + "while i < self.entries.length() \{" + nl
+        + "let entry = self.entries.get(i);" + nl
+        + "if entry.key == key \{" + nl
+        + "found_idx = i;" + nl
+        + "\}" + nl
+        + "i = i + 1;" + nl
+        + "\}" + nl
+        + "if found_idx >= 0 \{" + nl
+        + "self.entries.set(found_idx, RegistryEntry<T> \{ key: key, value: value \});" + nl
+        + "\} else \{" + nl
+        + "self.entries.push(RegistryEntry<T> \{ key: key, value: value \});" + nl
+        + "\}" + nl
+        + "\}" + nl
+        + "fn get(&self, key: String) -> Option<T> \{" + nl
+        + "var i = 0;" + nl
+        + "while i < self.entries.length() \{" + nl
+        + "let entry = self.entries.get(i);" + nl
+        + "if entry.key == key \{" + nl
+        + "return Option<T>::Some \{ value: entry.value \};" + nl
+        + "\}" + nl
+        + "i = i + 1;" + nl
+        + "\}" + nl
+        + "return Option<T>::None \{\};" + nl
+        + "\}" + nl
+        + "fn length(&self) -> Int \{" + nl
+        + "return self.entries.length();" + nl
+        + "\}" + nl
+        + "\}" + nl;
+}
+
+fn merge_fns(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_structs(a: Vec<StructDecl>, b: Vec<StructDecl>) -> Vec<StructDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_impls(a: Vec<ImplDecl>, b: Vec<ImplDecl>) -> Vec<ImplDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_enums(a: Vec<EnumDecl>, b: Vec<EnumDecl>) -> Vec<EnumDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_externs(a: Vec<ExternClassDecl>, b: Vec<ExternClassDecl>) -> Vec<ExternClassDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_statics(a: Vec<StaticDecl>, b: Vec<StaticDecl>) -> Vec<StaticDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// Not named `main` -- `TestDriver.hotc` already owns this compile's entry point (directory-mode
+// merges every file into one program, and two top-level fns both named `main` would collide).
+// Called from `TestDriver.hotc`'s own `main(args: [String])` as this phase's final section,
+// forwarding real argv through.
+pub fn run_bootstrap_demo(path: String) {
+    print("--- bootstrap: compiling " + path + " ---");
+    let src = read_source_file(path);
+    var lex = lexer_new(src);
+    let toks = lex.tokenize();
+    var p = parser_new(toks);
+    let real_prog = p.parse_program();
+
+    var plex = lexer_new(prelude_source());
+    let ptoks = plex.tokenize();
+    var pp = parser_new(ptoks);
+    let prelude_prog = pp.parse_program();
+
+    let prog_fns = merge_fns(prelude_prog.fns, real_prog.fns);
+    let prog_structs = merge_structs(prelude_prog.structs, real_prog.structs);
+    let prog_impls = merge_impls(prelude_prog.impls, real_prog.impls);
+    let prog_enums = merge_enums(prelude_prog.enums, real_prog.enums);
+    let prog_externs = merge_externs(prelude_prog.externs, real_prog.externs);
+    let prog_statics = merge_statics(prelude_prog.statics, real_prog.statics);
+
+    print("parsed " + JString4::valueOf(prog_fns.length()) + " function(s), " + JString4::valueOf(prog_structs.length()) + " struct(s), " + JString4::valueOf(prog_impls.length()) + " impl(s), " + JString4::valueOf(prog_enums.length()) + " enum(s), " + JString4::valueOf(prog_externs.length()) + " extern(s), " + JString4::valueOf(prog_statics.length()) + " static(s) (prelude included)");
+
+    var args = vec_of(3);
+    args.push(4);
+    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class");
+    if report_errors(errors) {
+        print("wrote SelfhostDemoProgram.class (combo(3, 4) should print 18 when run)");
+    }
+}
+
+// Prints any real error and returns `true` when there were none -- single pass over `errs`
+// covering both "does anything need reporting" and "print it," since `errs` is move-only and a
+// separate check-then-print pair (like `TestDriver.hotc`'s own `print_errors`) would need it read
+// twice.
+fn report_errors(errs: Vec<String>) -> Bool {
+    var i = 0;
+    var clean = true;
+    while i < errs.length() {
+        let e = errs.get(i);
+        if e != "" {
+            print(e);
+            clean = false;
+        }
+        i = i + 1;
+    }
+    return clean;
+}
+
+extern class JString4 = "java.lang.String" {
+    static fn valueOf(v: Int) -> String;
+}
+
+// === Self-compilation probe: the actual fixed-point test ===
+//
+// Every `run_bootstrap_demo` call above compiles a SINGLE real `.hotc` source file (or, in
+// `TestDriver.hotc`'s multi-file cases, a single self-contained demo). Trying that same
+// single-file approach directly against the self-hosted compiler's OWN 6 real source files
+// (`ast/Ast.hotc`, `types/Types.hotc`, `lexer/Lexer.hotc`, `parser/Parser.hotc`,
+// `checker/Checker.hotc`, `codegen/Codegen.hotc`) fails immediately and UNINFORMATIVELY on every
+// file but `Ast.hotc`/`Lexer.hotc` -- not because of any real self-hosting gap, but simply because
+// each file references types/functions declared in ANOTHER one of the six (`Parser.hotc` uses
+// `FnDecl`/`StructDecl` from `Ast.hotc`, `Checker.hotc` uses `FnSig` from `Types.hotc`, etc.),
+// and a single-file compile never merges those in. This mirrors exactly the same problem the REAL
+// Kotlin compiler's own directory-mode compilation exists to solve (`Main.kt`'s own `parseEntry`
+// merging every `.hotc` file in a directory into one program) -- so the fix here is the same idea,
+// built from the merge helpers already sitting right above (`merge_fns`/`merge_structs`/etc.,
+// used so far only to merge the PRELUDE in) generalized to merge all SIX real files together too.
+fn parse_source_file(path: String) -> Program {
+    let src = read_source_file(path);
+    var lex = lexer_new(src);
+    let toks = lex.tokenize();
+    var p = parser_new(toks);
+    return p.parse_program();
+}
+
+fn parse_source_string(src: String) -> Program {
+    var lex = lexer_new(src);
+    let toks = lex.tokenize();
+    var p = parser_new(toks);
+    return p.parse_program();
+}
+
+fn merge_program(a: Program, b: Program) -> Program {
+    return Program {
+        fns: merge_fns(a.fns, b.fns),
+        structs: merge_structs(a.structs, b.structs),
+        impls: merge_impls(a.impls, b.impls),
+        enums: merge_enums(a.enums, b.enums),
+        externs: merge_externs(a.externs, b.externs),
+        statics: merge_statics(a.statics, b.statics),
+    };
+}
+
+// A tiny, synthetic `Int`-returning, zero-param function merged in alongside the real six files,
+// purely so `compile_program`'s own "no real `main` found" fallback (see `Codegen.hotc`'s own
+// `main(String[])` header) has something valid to wire its synthesized entry point to --
+// none of the six real files declare a zero-arg `Int`-returning top-level fn of their own (they're
+// pure library code with no entry point at all), and this probe cares only about whether
+// CHECKING + CODEGEN succeed for the whole merged compiler, not about running anything meaningful.
+fn probe_entry_source() -> String {
+    let nl = codepoint_to_string(CP_NEWLINE);
+    return "fn __selfcompile_probe_entry() -> Int \{" + nl + "return 42;" + nl + "\}" + nl;
+}
+
+pub fn run_selfcompile_probe() {
+    print("--- self-compilation probe: the self-hosted compiler compiling its OWN 6 source files ---");
+
+    var prog = parse_source_file("selfhost/ast/Ast.hotc");
+    prog = merge_program(prog, parse_source_file("selfhost/types/Types.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/lexer/Lexer.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/parser/Parser.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/checker/Checker.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/codegen/Codegen.hotc"));
+    prog = merge_program(prog, parse_source_string(probe_entry_source()));
+    prog = merge_program(parse_source_string(prelude_source()), prog);
+
+    print(
+        "parsed " + JString4::valueOf(prog.fns.length()) + " function(s), " + JString4::valueOf(prog.structs.length())
+        + " struct(s), " + JString4::valueOf(prog.impls.length()) + " impl(s), " + JString4::valueOf(prog.enums.length())
+        + " enum(s), " + JString4::valueOf(prog.externs.length()) + " extern(s), " + JString4::valueOf(prog.statics.length())
+        + " static(s) (prelude + all 6 real compiler source files)"
+    );
+
+    let empty_args = Vec { data: [0; 1], len: 0 };
+    let errors = compile_program(
+        prog.fns, prog.structs, prog.impls, prog.enums, prog.externs, prog.statics,
+        "SelfhostSelfCompileProbe", "__selfcompile_probe_entry", empty_args, "SelfhostSelfCompileProbe.class",
+    );
+    if report_errors(errors) {
+        print("SELF-HOSTING MILESTONE: the self-hosted compiler successfully checked+compiled its own full source (ast+types+lexer+parser+checker+codegen)!");
+    }
+}

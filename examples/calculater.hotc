@@ -1,0 +1,33 @@
+fn add(a: Int, b: Int) -> Int {
+    return a + b;
+}
+
+fn subtract(a: Int, b: Int) -> Int {
+    return a - b;
+}
+
+fn multiply(a: Int, b: Int) -> Int {
+    return a * b;
+}
+
+fn main() {
+    print("=== Hot Chocolate Calculator ===");
+
+    let x = 20;
+    let y = 5;
+
+    let sum_result = add(x, y);
+    let sub_result = subtract(x, y);
+    let mul_result = multiply(x, y);
+
+    print("Inputs: X = {x}, Y = {y}");
+    print("Addition result: {sum_result}");
+    print("Subtraction result: {sub_result}");
+    print("Multiplication result: {mul_result}");
+
+    if sum_result > 20 {
+        print("Status: The sum is greater than 20.");
+    } else {
+        print("Status: The sum is 20 or less.");
+    }
+}

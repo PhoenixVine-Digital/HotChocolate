@@ -1,0 +1,419 @@
+module hc.selfhost.lexer;
+
+// First self-hosting milestone: a real port of `Lexer.kt`/`Token.kt` to HC itself, driven by the
+// self-hosting readiness assessment (see IDEAS.md). Deliberately the FIRST piece ported, not the
+// parser/checker: it's the most self-contained (String in, `Vec<Token>` out, no cross-pass shared
+// mutation, no generics-heavy AST), so it validates the string-handling/collection story on its
+// own before anything harder depends on it.
+//
+// Two real, concrete gaps this file works around rather than waits for (both logged in IDEAS.md):
+// - No `Byte` type -- irrelevant here (pure text, no bytecode), noted only for context.
+// - No `Char` type or char literals at all. Every "current character" is a real Unicode
+//   *codepoint* (`Int`, via `String.codePointAt(Int) -> Int` -- a real, non-`char`-returning
+//   overload, sidestepping the documented `charAt`-returns-`char` gap entirely) compared against
+//   named `Int` constants below, not against `'x'`-style literals HC doesn't have. This is
+//   arguably the more "systems" choice anyway (a real Unicode codepoint, not a UTF-16 code unit)
+//   but it's a real, load-bearing workaround, not a style preference -- logged as its own
+//   candidate IDEAS.md entry if this gets uncomfortable at parser-scale.
+//
+// **Scope cut, disclosed, not hidden**: string interpolation (`"a{x}b"` recursively re-lexing the
+// `{x}` part with a fresh `Lexer`) is NOT ported yet -- everything else (keywords, identifiers,
+// numbers incl. hex/long/float/double suffixes, symbols incl. multi-char operators, doc comments,
+// escape sequences, ordinary non-interpolated strings) is. A real, separate follow-up, not an
+// oversight -- interpolation needs this same struct to construct a fresh instance of itself
+// recursively, which should work fine given everything else here does, just wasn't attempted yet.
+
+extern class JObject = "java.lang.Object" {}
+extern class JString = "java.lang.String" {
+    fn length(&self) -> Int;
+    fn codePointAt(&self, index: Int) -> Int;
+    fn substring(&self, start: Int, end: Int) -> String;
+    static fn valueOf(v: Int) -> String;
+}
+extern class JCharacter = "java.lang.Character" {
+    static fn isDigit(cp: Int) -> Bool;
+    static fn isLetter(cp: Int) -> Bool;
+    static fn isLetterOrDigit(cp: Int) -> Bool;
+    static fn isWhitespace(cp: Int) -> Bool;
+}
+extern class JLong = "java.lang.Long" {
+    static fn parseLong(s: String, radix: Int) -> Long;
+}
+// HC has no `panic`/`abort` builtin -- real JVM exceptions (`throw`/`try`/`catch`, going through
+// ASM's actual exception table) are the only error-signaling mechanism, matching how the real
+// Kotlin `LexError` this file is porting is itself just a `RuntimeException` subclass.
+extern class LexError = "java.lang.RuntimeException" {
+    fn new(msg: String) -> Self;
+}
+
+// Named codepoints, standing in for the char literals HC doesn't have -- every one of these is a
+// real ASCII value, spelled out instead of magic numbers scattered through the lexer body below.
+pub static CP_NEWLINE: Int = 10;
+pub static CP_SPACE: Int = 32;
+pub static CP_QUOTE: Int = 34;
+pub static CP_LPAREN: Int = 40;
+pub static CP_RPAREN: Int = 41;
+pub static CP_STAR: Int = 42;
+pub static CP_PLUS: Int = 43;
+pub static CP_COMMA: Int = 44;
+pub static CP_MINUS: Int = 45;
+pub static CP_DOT: Int = 46;
+pub static CP_SLASH: Int = 47;
+pub static CP_ZERO: Int = 48;
+pub static CP_COLON: Int = 58;
+pub static CP_SEMI: Int = 59;
+pub static CP_LT: Int = 60;
+pub static CP_EQ: Int = 61;
+pub static CP_GT: Int = 62;
+pub static CP_QUESTION: Int = 63;
+pub static CP_AT: Int = 64;
+pub static CP_UPPER_A: Int = 65;
+pub static CP_UPPER_F: Int = 70;
+pub static CP_UPPER_L: Int = 76;
+pub static CP_UPPER_X: Int = 88;
+pub static CP_LBRACKET: Int = 91;
+pub static CP_BACKSLASH: Int = 92;
+pub static CP_RBRACKET: Int = 93;
+pub static CP_UNDERSCORE: Int = 95;
+pub static CP_LOWER_A: Int = 97;
+pub static CP_LOWER_F: Int = 102;
+pub static CP_LOWER_L: Int = 108;
+pub static CP_LOWER_N: Int = 110;
+pub static CP_LOWER_T: Int = 116;
+pub static CP_LOWER_X: Int = 120;
+pub static CP_LBRACE: Int = 123;
+pub static CP_PIPE: Int = 124;
+pub static CP_RBRACE: Int = 125;
+pub static CP_BANG: Int = 33;
+pub static CP_PERCENT: Int = 37;
+pub static CP_AMP: Int = 38;
+
+pub enum TokType {
+    INT, LONG, FLOAT, DOUBLE, STRING, IDENT,
+    ISTRING_BEGIN, ISTRING_PART, ISTRING_END,
+    FN, STRUCT, LET, VAR, IF, ELSE, WHILE, FOR, IN, RETURN, TRUE, FALSE, IMPL, MUT, ARENA,
+    INTERFACE, DYN, ENUM, MATCH, BY, SEALED, EXTERN, CLASS, MODULE, PUB, OPEN, EXTEND, STATIC, AS,
+    TRY, CATCH, THROW, EXTENDS, OVERRIDE, NULL, IS,
+    BREAK, CONTINUE, DEV,
+    LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
+    PLUS, MINUS, STAR, SLASH, PERCENT,
+    EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
+    DOC_COMMENT,
+    EOF,
+}
+
+pub struct Token {
+    kind: TokType,
+    text: String,
+    line: Int,
+}
+
+fn build_keywords() -> Registry<TokType> {
+    var kw = registry_new("fn", FN);
+    kw.register("struct", STRUCT);
+    kw.register("let", LET);
+    kw.register("var", VAR);
+    kw.register("if", IF);
+    kw.register("else", ELSE);
+    kw.register("while", WHILE);
+    kw.register("for", FOR);
+    kw.register("in", IN);
+    kw.register("return", RETURN);
+    kw.register("true", TRUE);
+    kw.register("false", FALSE);
+    kw.register("impl", IMPL);
+    kw.register("mut", MUT);
+    kw.register("arena", ARENA);
+    kw.register("interface", INTERFACE);
+    kw.register("dyn", DYN);
+    kw.register("enum", ENUM);
+    kw.register("match", MATCH);
+    kw.register("by", BY);
+    kw.register("sealed", SEALED);
+    kw.register("extern", EXTERN);
+    kw.register("class", CLASS);
+    kw.register("module", MODULE);
+    kw.register("pub", PUB);
+    kw.register("open", OPEN);
+    kw.register("extend", EXTEND);
+    kw.register("static", STATIC);
+    kw.register("as", AS);
+    kw.register("try", TRY);
+    kw.register("catch", CATCH);
+    kw.register("throw", THROW);
+    kw.register("extends", EXTENDS);
+    kw.register("override", OVERRIDE);
+    kw.register("null", NULL);
+    kw.register("is", IS);
+    kw.register("break", BREAK);
+    kw.register("continue", CONTINUE);
+    kw.register("dev", DEV);
+    return kw;
+}
+
+pub struct Lexer {
+    src: String,
+    pos: Int,
+    line: Int,
+    keywords: Registry<TokType>,
+}
+
+pub fn lexer_new(src: String) -> Lexer {
+    return Lexer { src: src, pos: 0, line: 1, keywords: build_keywords() };
+}
+
+impl Lexer {
+    fn is_at_end(&self) -> Bool {
+        return self.pos >= self.src.length();
+    }
+
+    fn peek(&self) -> Int {
+        if self.is_at_end() { return CP_SPACE; }
+        return self.src.codePointAt(self.pos);
+    }
+
+    fn peek_next(&self) -> Int {
+        if self.pos + 1 >= self.src.length() { return CP_SPACE; }
+        return self.src.codePointAt(self.pos + 1);
+    }
+
+    fn peek_at(&self, offset: Int) -> Int {
+        if self.pos + offset >= self.src.length() { return CP_SPACE; }
+        return self.src.codePointAt(self.pos + offset);
+    }
+
+    fn advance(&mut self) -> Int {
+        let c = self.peek();
+        self.pos = self.pos + 1;
+        return c;
+    }
+
+    fn match_cp(&mut self, expected: Int) -> Bool {
+        if self.is_at_end() { return false; }
+        if self.src.codePointAt(self.pos) != expected { return false; }
+        self.pos = self.pos + 1;
+        return true;
+    }
+
+    fn skip_trivia(&mut self) {
+        while !self.is_at_end() {
+            let c = self.peek();
+            if c == CP_NEWLINE {
+                self.line = self.line + 1;
+                self.pos = self.pos + 1;
+            } else if JCharacter::isWhitespace(c) {
+                self.pos = self.pos + 1;
+            } else if c == CP_SLASH && self.peek_next() == CP_SLASH && self.peek_at(2) == CP_SLASH && self.peek_at(3) != CP_SLASH {
+                return; // `///` -- a real doc comment, tokenized in next_token, not trivia
+            } else if c == CP_SLASH && self.peek_next() == CP_SLASH {
+                while !self.is_at_end() && self.peek() != CP_NEWLINE {
+                    self.pos = self.pos + 1;
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn doc_comment(&mut self, start_line: Int) -> Token {
+        self.pos = self.pos + 2; // the two remaining '/' of '///'
+        if self.peek() == CP_SPACE { self.pos = self.pos + 1; }
+        let start = self.pos;
+        while !self.is_at_end() && self.peek() != CP_NEWLINE {
+            self.pos = self.pos + 1;
+        }
+        return Token { kind: DOC_COMMENT, text: self.src.substring(start, self.pos), line: start_line };
+    }
+
+    fn symbol(&mut self, c: Int, start_line: Int) -> Token {
+        if c == CP_LPAREN { return Token { kind: LPAREN, text: "(", line: start_line }; }
+        if c == CP_RPAREN { return Token { kind: RPAREN, text: ")", line: start_line }; }
+        if c == CP_LBRACE { return Token { kind: LBRACE, text: "\{", line: start_line }; }
+        if c == CP_RBRACE { return Token { kind: RBRACE, text: "\}", line: start_line }; }
+        if c == CP_LBRACKET { return Token { kind: LBRACKET, text: "[", line: start_line }; }
+        if c == CP_RBRACKET { return Token { kind: RBRACKET, text: "]", line: start_line }; }
+        if c == CP_COMMA { return Token { kind: COMMA, text: ",", line: start_line }; }
+        if c == CP_COLON {
+            if self.match_cp(CP_COLON) { return Token { kind: COLONCOLON, text: "::", line: start_line }; }
+            return Token { kind: COLON, text: ":", line: start_line };
+        }
+        if c == CP_SEMI { return Token { kind: SEMI, text: ";", line: start_line }; }
+        if c == CP_DOT {
+            if self.match_cp(CP_DOT) {
+                if self.match_cp(CP_EQ) { return Token { kind: DOTDOTEQ, text: "..=", line: start_line }; }
+                return Token { kind: DOTDOT, text: "..", line: start_line };
+            }
+            return Token { kind: DOT, text: ".", line: start_line };
+        }
+        if c == CP_PLUS { return Token { kind: PLUS, text: "+", line: start_line }; }
+        if c == CP_MINUS {
+            if self.match_cp(CP_GT) { return Token { kind: ARROW, text: "->", line: start_line }; }
+            return Token { kind: MINUS, text: "-", line: start_line };
+        }
+        if c == CP_STAR { return Token { kind: STAR, text: "*", line: start_line }; }
+        if c == CP_SLASH { return Token { kind: SLASH, text: "/", line: start_line }; }
+        if c == CP_PERCENT { return Token { kind: PERCENT, text: "%", line: start_line }; }
+        if c == CP_QUESTION { return Token { kind: QUESTION, text: "?", line: start_line }; }
+        if c == CP_AT { return Token { kind: AT, text: "@", line: start_line }; }
+        if c == CP_AMP {
+            if self.match_cp(CP_AMP) { return Token { kind: AMPAMP, text: "&&", line: start_line }; }
+            return Token { kind: AMP, text: "&", line: start_line };
+        }
+        if c == CP_PIPE {
+            if self.match_cp(CP_PIPE) { return Token { kind: PIPEPIPE, text: "||", line: start_line }; }
+            return Token { kind: PIPE, text: "|", line: start_line };
+        }
+        if c == CP_EQ {
+            if self.match_cp(CP_EQ) { return Token { kind: EQEQ, text: "==", line: start_line }; }
+            if self.match_cp(CP_GT) { return Token { kind: FATARROW, text: "=>", line: start_line }; }
+            return Token { kind: EQ, text: "=", line: start_line };
+        }
+        if c == CP_BANG {
+            if self.match_cp(CP_EQ) { return Token { kind: BANGEQ, text: "!=", line: start_line }; }
+            return Token { kind: BANG, text: "!", line: start_line };
+        }
+        if c == CP_LT {
+            if self.match_cp(CP_EQ) { return Token { kind: LTEQ, text: "<=", line: start_line }; }
+            return Token { kind: LT, text: "<", line: start_line };
+        }
+        if c == CP_GT {
+            if self.match_cp(CP_EQ) { return Token { kind: GTEQ, text: ">=", line: start_line }; }
+            return Token { kind: GT, text: ">", line: start_line };
+        }
+        throw LexError::new("Unexpected character (codepoint " + JString::valueOf(c) + ") at line " + JString::valueOf(start_line));
+    }
+
+    // `123` -> Int. `123L` -> Long. `1.5` -> Double. `1.5f`/`1.5F` -> Float. `0xABC` -> Int.
+    fn number(&mut self, c: Int, start_line: Int) -> Token {
+        let start = self.pos - 1;
+        if c == CP_ZERO && (self.peek() == CP_LOWER_X || self.peek() == CP_UPPER_X) {
+            self.pos = self.pos + 1; // consume 'x'
+            let hex_start = self.pos;
+            while !self.is_at_end() && self.is_hex_digit(self.peek()) {
+                self.pos = self.pos + 1;
+            }
+            let hex_text = self.src.substring(hex_start, self.pos);
+            let value = JLong::parseLong(hex_text, 16) as Int;
+            return Token { kind: INT, text: JString::valueOf(value), line: start_line };
+        }
+        while !self.is_at_end() && JCharacter::isDigit(self.peek()) {
+            self.pos = self.pos + 1;
+        }
+        if !self.is_at_end() && (self.peek() == CP_LOWER_L || self.peek() == CP_UPPER_L) {
+            let text = self.src.substring(start, self.pos);
+            self.pos = self.pos + 1; // consume 'l'/'L'
+            return Token { kind: LONG, text: text, line: start_line };
+        }
+        if !self.is_at_end() && self.peek() == CP_DOT && JCharacter::isDigit(self.peek_next()) {
+            self.pos = self.pos + 1; // consume '.'
+            while !self.is_at_end() && JCharacter::isDigit(self.peek()) {
+                self.pos = self.pos + 1;
+            }
+            if !self.is_at_end() && (self.peek() == CP_LOWER_F || self.peek() == CP_UPPER_F) {
+                let text = self.src.substring(start, self.pos);
+                self.pos = self.pos + 1; // consume the suffix
+                return Token { kind: FLOAT, text: text, line: start_line };
+            }
+            return Token { kind: DOUBLE, text: self.src.substring(start, self.pos), line: start_line };
+        }
+        return Token { kind: INT, text: self.src.substring(start, self.pos), line: start_line };
+    }
+
+    fn is_hex_digit(&self, cp: Int) -> Bool {
+        if JCharacter::isDigit(cp) { return true; }
+        if cp >= CP_LOWER_A && cp <= CP_LOWER_F { return true; }
+        if cp >= CP_UPPER_A && cp <= CP_UPPER_F { return true; }
+        return false;
+    }
+
+    fn identifier(&mut self, start_line: Int) -> Token {
+        let start = self.pos - 1;
+        while !self.is_at_end() && (JCharacter::isLetterOrDigit(self.peek()) || self.peek() == CP_UNDERSCORE) {
+            self.pos = self.pos + 1;
+        }
+        let text = self.src.substring(start, self.pos);
+        let found: Option<TokType> = self.keywords.get(text);
+        if let Some { value: kw } = found {
+            return Token { kind: kw, text: text, line: start_line };
+        }
+        return Token { kind: IDENT, text: text, line: start_line };
+    }
+
+    // Non-interpolated strings only for now -- see this file's own header comment for why
+    // interpolation (`"a{x}b"`) is a disclosed, separate follow-up rather than ported here.
+    fn string(&mut self, start_line: Int) -> Token {
+        var out = "";
+        while !self.is_at_end() && self.peek() != CP_QUOTE {
+            var ch_cp = self.advance();
+            if ch_cp == CP_BACKSLASH && !self.is_at_end() {
+                let esc = self.advance();
+                if esc == CP_LOWER_N { ch_cp = CP_NEWLINE; }
+                else if esc == CP_LOWER_T { ch_cp = 9; }
+                else if esc == CP_QUOTE { ch_cp = CP_QUOTE; }
+                else if esc == CP_BACKSLASH { ch_cp = CP_BACKSLASH; }
+                else if esc == CP_LBRACE { ch_cp = CP_LBRACE; }
+                else if esc == CP_RBRACE { ch_cp = CP_RBRACE; }
+                else { ch_cp = esc; }
+            }
+            out = out + codepoint_to_string(ch_cp);
+        }
+        if self.is_at_end() {
+            throw LexError::new("Unterminated string at line " + JString::valueOf(start_line));
+        }
+        self.advance(); // closing quote
+        return Token { kind: STRING, text: out, line: start_line };
+    }
+
+    fn next_token(&mut self) -> Token {
+        let start_line = self.line;
+        let c = self.advance();
+        if JCharacter::isDigit(c) { return self.number(c, start_line); }
+        if JCharacter::isLetter(c) || c == CP_UNDERSCORE { return self.identifier(start_line); }
+        if c == CP_QUOTE { return self.string(start_line); }
+        if c == CP_SLASH && self.peek() == CP_SLASH && self.peek_next() == CP_SLASH { return self.doc_comment(start_line); }
+        return self.symbol(c, start_line);
+    }
+
+    fn tokenize(&mut self) -> Vec<Token> {
+        self.skip_trivia();
+        if self.is_at_end() {
+            return vec_of(Token { kind: EOF, text: "", line: self.line });
+        }
+        var out = vec_of(self.next_token());
+        // Not `return out;` inside the loop body -- the checker's move-checking is conservative
+        // about loops by design ("a variable moved anywhere inside a while body counts as moved
+        // afterward," regardless of which branch), so returning `out` from inside an `if` here
+        // would poison every *later* line of the *same* loop body (the `else`-shaped `out.push`
+        // below) as "possibly already moved," even though that line is only ever reached on the
+        // branch that DIDN'T return it. A `done` flag with a single `return out;` after the loop
+        // sidesteps this cleanly -- `out` is never moved inside the loop at all.
+        var done = false;
+        while !done {
+            self.skip_trivia();
+            if self.is_at_end() {
+                out.push(Token { kind: EOF, text: "", line: self.line });
+                done = true;
+            } else {
+                out.push(self.next_token());
+            }
+        }
+        return out;
+    }
+}
+
+// `String.valueOf(int)` gives the DECIMAL representation of a codepoint, not the one-character
+// string it names -- need the real `Character.toChars`-equivalent bridge instead. `new
+// String(int[], int, int)` (the real "build a String from codepoints" constructor) is the
+// correct one; wrapping a single codepoint in a fresh one-element array each call is not free,
+// but this is only ever called per-character while unescaping a string literal, not per-token.
+extern class JStringCtor = "java.lang.String" {
+    fn new(codepoints: [Int], offset: Int, count: Int) -> Self;
+}
+pub fn codepoint_to_string(cp: Int) -> String {
+    return JStringCtor::new([cp], 0, 1) as String;
+}
+
+// The old standalone lexer smoke test that used to live here (tokenizing a snippet and printing
+// each token) moved into TestDriver.hc's own `main()` -- this file compiles as a library now,
+// exercised together with Parser.hc in one real multi-file, directory-mode compile (only one
+// `fn main()` is allowed per compile) rather than in isolation.

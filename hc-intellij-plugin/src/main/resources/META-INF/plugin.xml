@@ -1,0 +1,70 @@
+<idea-plugin>
+    <id>com.hotchocolate.intellij</id>
+    <name>HotChocolate</name>
+    <vendor>HotChocolate</vendor>
+    <description><![CDATA[
+        Syntax highlighting, brace-depth-based reformatting, hover/parameter-hint tooltips, and
+        real error checking (annotation/directive validation, break/continue-outside-loop,
+        duplicate top-level declarations) for the HotChocolate (.hotc) language.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.java</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileType name="HotChocolate" implementationClass="hc.intellij.HCFileType" fieldName="INSTANCE"
+                   language="HotChocolate" extensions="hotc"/>
+        <lang.parserDefinition language="HotChocolate" implementationClass="hc.intellij.HCParserDefinition"/>
+        <lang.syntaxHighlighterFactory language="HotChocolate" implementationClass="hc.intellij.HCSyntaxHighlighterFactory"/>
+        <lang.braceMatcher language="HotChocolate" implementationClass="hc.intellij.HCBraceMatcher"/>
+        <lang.commenter language="HotChocolate" implementationClass="hc.intellij.HCCommenter"/>
+        <lang.formatter language="HotChocolate" implementationClass="hc.intellij.HCFormattingModelBuilder"/>
+        <lang.foldingBuilder language="HotChocolate" implementationClass="hc.intellij.HCFoldingBuilder"/>
+        <liveTemplateContext implementation="hc.intellij.HCTemplateContextType"/>
+        <defaultLiveTemplates file="/liveTemplates/HotChocolate.xml"/>
+        <codeInsight.template.postfixTemplateProvider language="HotChocolate" implementationClass="hc.intellij.HCPostfixTemplateProvider"/>
+        <lang.surroundDescriptor language="HotChocolate" implementationClass="hc.intellij.HCSurroundDescriptor"/>
+        <quoteHandler fileType="HotChocolate" className="hc.intellij.HCQuoteHandler"/>
+        <enterHandlerDelegate implementation="hc.intellij.HCEnterHandlerDelegate"/>
+        <intentionAction>
+            <className>hc.intellij.HCExplainTypeIntention</className>
+            <category>HotChocolate</category>
+        </intentionAction>
+        <lang.documentationProvider language="HotChocolate" implementationClass="hc.intellij.HCDocumentationProvider"/>
+        <codeInsight.inlayProvider language="HotChocolate" implementationClass="hc.intellij.HCInlayHintsProvider"/>
+        <codeInsight.parameterInfo language="HotChocolate" implementationClass="hc.intellij.HCParameterInfoHandler"/>
+        <gotoSymbolContributor implementation="hc.intellij.HCGotoSymbolContributor"/>
+        <safeDeleteProcessorDelegate implementation="hc.intellij.HCSafeDeleteProcessorDelegate"/>
+        <lang.refactoringSupport language="HotChocolate" implementationClass="hc.intellij.HCRefactoringSupportProvider"/>
+        <refactoring.inlineHandler language="HotChocolate" implementationClass="hc.intellij.HCInlineHandler"/>
+        <refactoring.moveHandler implementation="hc.intellij.HCMoveDeclarationHandler"/>
+        <annotator language="HotChocolate" implementationClass="hc.intellij.HCAnnotator"/>
+        <psi.referenceContributor language="HotChocolate" implementation="hc.intellij.HCReferenceContributor"/>
+        <lang.findUsagesProvider language="HotChocolate" implementationClass="hc.intellij.HCFindUsagesProvider"/>
+        <findUsagesHandlerFactory implementation="hc.intellij.HCFindUsagesHandlerFactory"/>
+        <referencesSearch implementation="hc.intellij.HCReferencesSearcher"/>
+        <completion.contributor language="HotChocolate" implementationClass="hc.intellij.HCCompletionContributor"/>
+        <renamePsiElementProcessor implementation="hc.intellij.HCRenamePsiElementProcessor"/>
+        <lang.namesValidator language="HotChocolate" implementationClass="hc.intellij.HCNamesValidator"/>
+        <renameHandler implementation="hc.intellij.HCRenameHandler"/>
+        <colorSettingsPage implementation="hc.intellij.HCColorSettingsPage"/>
+        <breadcrumbsInfoProvider implementation="hc.intellij.HCBreadcrumbsProvider"/>
+        <lang.psiStructureViewFactory language="HotChocolate" implementationClass="hc.intellij.HCStructureViewFactory"/>
+        <targetElementEvaluator language="HotChocolate" implementationClass="hc.intellij.HCTargetElementEvaluator"/>
+        <configurationType implementation="hc.intellij.HCRunConfigurationType"/>
+        <runConfigurationProducer implementation="hc.intellij.HCRunConfigurationProducer"/>
+        <debugger.positionManagerFactory implementation="hc.intellij.HCPositionManagerFactory"/>
+        <sdkType implementation="hc.intellij.HCSdkType"/>
+    </extensions>
+
+    <actions>
+        <action id="HotChocolate.NewFile" class="hc.intellij.HCCreateFileAction" text="HotChocolate File"
+                description="Create a new HotChocolate source file">
+            <add-to-group group-id="NewGroup" anchor="after" relative-to-action="NewFile"/>
+        </action>
+        <action id="HotChocolate.NewProject" class="hc.intellij.HCNewProjectAction" text="New HotChocolate Project..."
+                description="Scaffold a new HotChocolate Gradle project">
+            <add-to-group group-id="FileMenu" anchor="first"/>
+        </action>
+    </actions>
+</idea-plugin>

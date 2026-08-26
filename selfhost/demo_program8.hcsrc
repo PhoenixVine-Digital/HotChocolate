@@ -1,0 +1,20 @@
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+fn manhattan(p: Point) -> Int {
+    return p.x + p.y;
+}
+
+fn shifted(p: Point, dx: Int) -> Point {
+    var q = Point { x: p.x + dx, y: p.y };
+    return q;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var p = Point { x: a, y: b };
+    var moved = shifted(p, 10);
+    moved.y = moved.y + 1;
+    return manhattan(moved);
+}

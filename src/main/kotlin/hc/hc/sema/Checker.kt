@@ -43,6 +43,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     }
     val structs = mutableMapOf<String, StructInfo>()
     val fns = mutableMapOf<String, FnSig>()
+
+    val mustUseFns = mutableSetOf<String>()
     val arenaLayouts = mutableMapOf<String, ArenaLayout>()
     val enums = mutableMapOf<String, EnumInfo>()
     private val enumVariantOwner = mutableMapOf<String, String>() 
@@ -77,16 +79,19 @@ class Checker(private val program: Program, private val classpathReflector: Clas
 
     private val dropScopeStack = ArrayDeque<MutableList<String>>()
 
+    private val loopDropFloors = ArrayDeque<Int>()
+
     private fun hasDrop(structName: String): Boolean = fns.containsKey("$structName\$drop")
 
     fun resolvedProgram(): Program = Program(
         structs = program.structs.filter { it.typeParams.isEmpty() && !it.isArena } + structInstances.values,
         fns = program.fns.filter { it.typeParams.isEmpty() } +
-                implFns.filter { it.typeParams.isEmpty() } +
-                fnInstances.values,
+            implFns.filter { it.typeParams.isEmpty() } +
+            fnInstances.values,
     )
 
     fun check() {
+        val duplicateStructNames = mutableSetOf<String>()
 
         for (ext in program.externs) {
             if (externClasses.containsKey(ext.name)) { errors += "Duplicate extern class '${ext.name}'"; continue }
@@ -96,6 +101,27 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (s.typeParams.isNotEmpty()) {
                 if (genericStructTemplates.containsKey(s.name)) errors += "Duplicate struct '${s.name}'"
                 genericStructTemplates[s.name] = s
+            }
+        }
+
+        for (e in program.enums) {
+            if (e.typeParams.isNotEmpty()) {
+                if (genericEnumTemplates.containsKey(e.name)) { errors += "Duplicate enum '${e.name}'"; continue }
+                genericEnumTemplates[e.name] = e
+            } else {
+                if (enums.containsKey(e.name)) { errors += "Duplicate enum '${e.name}'"; continue }
+                enums[e.name] = EnumInfo(e.name, emptyList(), e.moduleName, e.visible)
+            }
+        }
+
+        for (s in program.structs) {
+            if (s.typeParams.isEmpty() && !s.isArena) {
+                if (structs.containsKey(s.name) || genericStructTemplates.containsKey(s.name)) {
+                    errors += "Duplicate struct '${s.name}'"
+                    duplicateStructNames += s.name
+                    continue
+                }
+                structs[s.name] = StructInfo(s.name, emptyList())
             }
         }
         for (s in program.structs) {
@@ -116,15 +142,12 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             }
             arenaLayouts[s.name] = ArenaLayout(s.name, fields)
         }
-        for (s in program.structs.filter { it.typeParams.isEmpty() && !it.isArena }) {
-            if (structs.containsKey(s.name) || genericStructTemplates.containsKey(s.name) || arenaLayouts.containsKey(s.name)) {
-                errors += "Duplicate struct '${s.name}'"; continue
-            }
+        for (s in program.structs.filter { it.typeParams.isEmpty() && !it.isArena && it.name !in duplicateStructNames }) {
+            if (arenaLayouts.containsKey(s.name)) { errors += "Duplicate struct '${s.name}'"; continue }
             structs[s.name] = StructInfo(s.name, s.fields.map { it.name to resolveType(it.type) })
         }
 
         for (e in program.enums) {
-            if (enums.containsKey(e.name) || genericEnumTemplates.containsKey(e.name)) { errors += "Duplicate enum '${e.name}'"; continue }
             for (v in e.variants) {
                 if (structs.containsKey(v.name) || genericStructTemplates.containsKey(v.name) || enumVariantOwner.containsKey(v.name)) {
                     errors += "Duplicate variant/struct name '${v.name}' (enum variant names share a namespace with structs and must be globally unique)"
@@ -135,10 +158,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 }
                 enumVariantOwner[v.name] = e.name
             }
-            if (e.typeParams.isNotEmpty()) {
-                genericEnumTemplates[e.name] = e
-                continue
-            }
+            if (e.typeParams.isNotEmpty()) continue 
             val variants = e.variants.mapIndexed { tag, v -> EnumVariantInfo(v.name, tag, v.fields.map { it.name to resolveType(it.type) }) }
             enums[e.name] = EnumInfo(e.name, variants, e.moduleName, e.visible)
         }
@@ -194,7 +214,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                         paramIsRef = restParams.map { it.type.isRef },
                         paramIsMut = restParams.map { it.type.isMut },
                     )
-                }
+                }.also { verifyExternSignatures(ext.name, ext.binaryName, it) }
             }
             val fields = ext.fields.map { f -> ExternFieldInfo(f.name, resolveType(f.type), f.isStatic) }
             
@@ -309,7 +329,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (template != null) {
                 if (impl.typeParams.size != template.typeParams.size) {
                     errors += "'impl${if (impl.typeParams.isEmpty()) "" else "<...>"} ${impl.interfaceName} for ${impl.structName}': " +
-                            "expected ${template.typeParams.size} type param(s) to match '${impl.structName}', got ${impl.typeParams.size}"
+                        "expected ${template.typeParams.size} type param(s) to match '${impl.structName}', got ${impl.typeParams.size}"
                 }
                 genericInterfaceImpls.getOrPut(impl.structName) { mutableListOf() } += impl
                 continue
@@ -349,7 +369,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 val mangledName = if (m.params.firstOrNull()?.name == "self") "${impl.structName}\$${m.name}" else "${impl.structName}@${m.name}"
                 val newParams = m.params.map { Param(it.name, fixSelf(it.type)) }
                 val newRet = m.retType?.let { fixSelf(it) }
-                implFns += FnDecl(mangledName, newParams, newRet, m.body, m.line, impl.typeParams, moduleName = structModule, visible = true)
+                implFns += FnDecl(mangledName, newParams, newRet, m.body, m.line, impl.typeParams, moduleName = structModule, visible = true, mustUse = m.mustUse)
             }
         }
 
@@ -380,7 +400,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                     continue
                 }
                 val alreadyReal = iface?.methods?.containsKey(m.name) == true ||
-                        (isStruct && (fns.containsKey("${ext.targetName}\$${m.name}") || genericFnTemplates.containsKey("${ext.targetName}\$${m.name}")))
+                    (isStruct && (fns.containsKey("${ext.targetName}\$${m.name}") || genericFnTemplates.containsKey("${ext.targetName}\$${m.name}")))
                 if (alreadyReal) {
                     errors += "Line ${m.line}: 'extend ${ext.targetName}': '${m.name}' already exists as a real method -- extensions can add new methods, not override"
                     continue
@@ -410,10 +430,20 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             val paramTys = f.params.map { resolveType(it.type) }
             val ret = f.retType?.let { resolveType(it) } ?: Ty.Unit_
             fns[f.name] = FnSig(f.params, paramTys, ret)
+
+            if (f.mustUse) {
+                if (ret == Ty.Unit_) errors += "fn '${f.name}': '@must_use' on a Unit-returning fn has no return value to enforce using"
+                mustUseFns += f.name
+            }
         }
         if (fns.containsKey("main")) {
             val m = fns.getValue("main")
-            if (m.params.isNotEmpty()) errors += "fn main must take no parameters"
+
+            val isArgvParam = m.params.size == 1 && m.params[0].type.name == "Array" &&
+                m.params[0].type.typeArgs.singleOrNull()?.name == "String"
+            if (m.params.isNotEmpty() && !isArgvParam) {
+                errors += "fn main must take no parameters, or a single '[String]' parameter for argv"
+            }
         }
 
         for (s in program.statics) {
@@ -459,6 +489,8 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 checkFn(m.copy(name = "$structName@${m.name}"))
             }
         }
+
+        checkDocSees()
         if (errors.isNotEmpty()) throw SemaError(errors.joinToString("\n"))
     }
 
@@ -484,6 +516,52 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             out += found
         }
         return out
+    }
+
+    private fun verifyExternSignatures(aliasName: String, binaryName: String, declared: List<ExternMethodInfo>) {
+        val reflector = classpathReflector ?: return
+        if (!reflector.classExists(binaryName)) return 
+        for (m in declared) {
+            val realCandidates = reflector.resolveMembers(binaryName, m.name)
+            if (realCandidates.isEmpty()) {
+                errors += "extern class '$aliasName': no public member '${m.name}' found on '${binaryName.replace('/', '.')}' on the configured classpath"
+                continue
+            }
+            val declaredParamKeys = m.params.map { realTyKey(it) }
+            val declaredRetKey = if (m.isCtor) null else realTyKey(m.retType)
+
+            if (declaredParamKeys.any { it == null } || (!m.isCtor && declaredRetKey == null)) continue
+            val matches = realCandidates.any { real ->
+                real.isStatic == m.isStatic &&
+                    real.params.map { realTyKey(it) } == declaredParamKeys &&
+                    (m.isCtor || realTyKey(real.retType) == declaredRetKey)
+            }
+            if (!matches) {
+                fun ExternMethodInfo.describe() = "(${params.joinToString(", ")})" + (if (isCtor) "" else " -> $retType")
+                errors += "extern class '$aliasName': declared '${m.name}${m.describe()}' doesn't match any real overload of " +
+                    "'${binaryName.replace('/', '.')}.${m.name}' on the configured classpath -- found: " +
+                    realCandidates.joinToString("; ") { it.describe() }
+            }
+        }
+    }
+
+    private fun realTyKey(ty: Ty): String? = when (ty) {
+        Ty.Int_ -> "I"
+        Ty.Long_ -> "J"
+        Ty.Float_ -> "F"
+        Ty.Double_ -> "D"
+        Ty.Bool_ -> "Z"
+        Ty.Unit_ -> "V"
+        is Ty.Str_ -> "Ljava/lang/String;"
+        is Ty.JavaExtern -> "L${ty.binaryName};"
+        is Ty.Array -> realTyKey(ty.elem)?.let { "[$it" }
+        is Ty.Dyn -> externClasses[ty.interfaceName]?.binaryName?.let { "L$it;" }
+        else -> null 
+    }
+
+    private fun findExternAlias(binaryName: String, hasIt: (ExternClassInfo) -> Boolean): ExternClassInfo? {
+        val aliases = externClasses.values.filter { it.binaryName == binaryName }
+        return aliases.firstOrNull(hasIt) ?: aliases.firstOrNull()
     }
 
     private fun resolveExternMethods(ext: ExternClassInfo, memberName: String, line: Int): List<ExternMethodInfo> {
@@ -616,13 +694,17 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Stmt.Nested -> s.copy(block = substituteBlock(s.block, subst))
         is Stmt.Match -> s.copy(
             scrutinee = substituteExpr(s.scrutinee, subst),
-            arms = s.arms.map { it.copy(body = substituteBlock(it.body, subst)) },
+            arms = s.arms.map { it.copy(body = substituteBlock(it.body, subst), literal = it.literal?.let { lit -> substituteExpr(lit, subst) }) },
         )
         is Stmt.Try -> s.copy(
             tryBlock = substituteBlock(s.tryBlock, subst),
             catches = s.catches.map { it.copy(body = substituteBlock(it.body, subst)) },
         )
         is Stmt.Throw -> s.copy(expr = substituteExpr(s.expr, subst))
+
+        is Stmt.Break -> Stmt.Break(s.line)
+        is Stmt.Continue -> Stmt.Continue(s.line)
+        is Stmt.DevIf -> throw IllegalStateException("Stmt.DevIf reached substituteStmt -- Main.kt's stripDevCode should have already resolved every 'if dev { }' before generics were ever instantiated")
     }
 
     private fun substituteExpr(e: Expr, subst: Map<String, Ty>): Expr = when (e) {
@@ -644,7 +726,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Expr.Index -> Expr.Index(substituteExpr(e.arr, subst), substituteExpr(e.index, subst), e.line)
         is Expr.IndexAssign -> Expr.IndexAssign(substituteExpr(e.arr, subst), substituteExpr(e.index, subst), substituteExpr(e.value, subst), e.line)
         is Expr.ArenaNew -> Expr.ArenaNew(e.structName, substituteExpr(e.count, subst), e.line)
-        is Expr.Range -> Expr.Range(substituteExpr(e.start, subst), substituteExpr(e.end, subst), e.line)
+        is Expr.Range -> Expr.Range(substituteExpr(e.start, subst), substituteExpr(e.end, subst), e.line, e.inclusive)
         is Expr.StringInterp -> Expr.StringInterp(e.literals, e.exprs.map { substituteExpr(it, subst) }, e.line)
 
         is Expr.IntLit -> Expr.IntLit(e.value)
@@ -658,7 +740,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Expr.If -> Expr.If(substituteExpr(e.cond, subst), substituteBlock(e.thenB, subst), substituteBlock(e.elseB, subst), e.line)
         is Expr.Match -> Expr.Match(
             substituteExpr(e.scrutinee, subst),
-            e.arms.map { it.copy(body = substituteBlock(it.body, subst)) },
+            e.arms.map { it.copy(body = substituteBlock(it.body, subst), literal = it.literal?.let { lit -> substituteExpr(lit, subst) }) },
             e.line,
         )
         is Expr.Lambda -> Expr.Lambda(e.params, substituteExpr(e.body, subst), e.line)
@@ -833,7 +915,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         val retTy = m.retType?.let { resolveType(fixSelf(it)) } ?: Ty.Unit_
         if (restTys != em.params || retTy != em.retType) {
             errors += "Line ${m.line}: 'override fn ${m.name}' doesn't match '${superAlias}'s signature for this method " +
-                    "(expected (${em.params.joinToString(", ")}) -> ${em.retType})"
+                "(expected (${em.params.joinToString(", ")}) -> ${em.retType})"
         }
         val newDecl = FnDecl(m.name, m.params.map { Param(it.name, fixSelf(it.type)) }, m.retType?.let { fixSelf(it) }, m.body, m.line)
         superclassOverrideFns.getOrPut(structName) { mutableListOf() } += newDecl
@@ -1018,7 +1100,21 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             out[stmt.name] = false
             out
         }
-        is Stmt.ExprStmt -> checkExpr(stmt.expr, env, moved, consume = true).second
+        is Stmt.ExprStmt -> {
+            val e = stmt.expr
+            if (e is Expr.Call && e.callee in mustUseFns) {
+                errors += "Line ${e.line}: return value of '${e.callee}' must be used ('@must_use')"
+            }
+            val out = checkExpr(stmt.expr, env, moved, consume = true).second
+
+            if (e is Expr.MethodCall && e.resolvedName in mustUseFns) {
+                errors += "Line ${e.line}: return value of '${e.method}' must be used ('@must_use')"
+            }
+            if (e is Expr.StaticCall && e.resolvedName in mustUseFns) {
+                errors += "Line ${e.line}: return value of '${e.typeName}::${e.method}' must be used ('@must_use')"
+            }
+            out
+        }
         is Stmt.If -> {
             val (condTy, m0) = checkExpr(stmt.cond, env, moved, consume = true)
             if (condTy != Ty.Bool_) errors += "if condition must be Bool, got ${condTy}"
@@ -1043,7 +1139,9 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         is Stmt.While -> {
             val (condTy, m0) = checkExpr(stmt.cond, env, moved, consume = true)
             if (condTy != Ty.Bool_) errors += "while condition must be Bool, got ${condTy}"
+            loopDropFloors.addLast(dropScopeStack.size)
             val afterBody = checkBlock(stmt.body, env, m0, retTy)
+            loopDropFloors.removeLast()
             val merged = HashMap<String, Boolean>()
             for (k in m0.keys) merged[k] = (m0[k] ?: false) || (afterBody[k] ?: false)
             merged
@@ -1071,6 +1169,25 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             }
             m
         }
+        is Stmt.Break -> {
+            if (loopDropFloors.isEmpty()) {
+                errors += "Line ${stmt.line}: 'break' outside of a loop"
+            } else {
+                val skip = dropScopeStack.size - loopDropFloors.last()
+                stmt.varsToDropBeforeBreak = dropScopeStack.asReversed().take(skip).flatMap { it.asReversed().filter { n -> moved[n] != true } }
+            }
+            moved
+        }
+        is Stmt.Continue -> {
+            if (loopDropFloors.isEmpty()) {
+                errors += "Line ${stmt.line}: 'continue' outside of a loop"
+            } else {
+                val skip = dropScopeStack.size - loopDropFloors.last()
+                stmt.varsToDropBeforeContinue = dropScopeStack.asReversed().take(skip).flatMap { it.asReversed().filter { n -> moved[n] != true } }
+            }
+            moved
+        }
+        is Stmt.DevIf -> throw IllegalStateException("Stmt.DevIf reached checkStmt -- Main.kt's stripDevCode should have already resolved every 'if dev { }' before the checker ever ran")
     }
 
     private fun checkTry(stmt: Stmt.Try, env: Env, moved: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
@@ -1118,7 +1235,9 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         env.declare(stmt.varName, VarInfo(elemTy, mutable = false, canMutateFields = false))
         val bodyMovedIn = HashMap(m0)
         bodyMovedIn[stmt.varName] = false
+        loopDropFloors.addLast(dropScopeStack.size)
         val afterBody = checkBlock(stmt.body, env, bodyMovedIn, retTy)
+        loopDropFloors.removeLast()
         env.pop()
         val merged = HashMap<String, Boolean>()
         for (k in m0.keys) merged[k] = (m0[k] ?: false) || (afterBody[k] ?: false)
@@ -1128,8 +1247,11 @@ class Checker(private val program: Program, private val classpathReflector: Clas
     private fun checkMatch(scrutinee: Expr, arms: List<MatchArm>, line: Int, env: Env, moved: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
         val (scrutTy, m0) = checkExpr(scrutinee, env, moved, consume = true)
         if (scrutTy is Ty.Dyn) return checkSealedMatch(arms, line, scrutTy, env, m0, retTy)
+        if (scrutTy == Ty.Int_ || scrutTy == Ty.Long_ || scrutTy == Ty.Bool_ || scrutTy is Ty.Str_) {
+            return checkLiteralMatch(arms, line, scrutTy, env, m0, retTy)
+        }
         if (scrutTy !is Ty.Enum) {
-            errors += "Line ${line}: match requires an enum value or a &dyn sealed interface, got ${scrutTy}"
+            errors += "Line ${line}: match requires an enum value, a primitive (Int/Long/Bool/String), or a &dyn sealed interface, got ${scrutTy}"
             for (arm in arms) checkBlock(arm.body, env, m0, retTy)
             return m0
         }
@@ -1148,7 +1270,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             val qualified = arm.variantName.split("::")
             val baseName = qualified[0]
             val variantName = if (qualified.size > 1) qualified[1] else arm.variantName
-
+            
             val variant = enumInfo.variant(variantName)
             if (variant == null) {
                 errors += "Line ${arm.line}: '${variantName}' is not a variant of '${scrutTy.name}'"
@@ -1179,6 +1301,76 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         return merged
     }
 
+    private fun checkLiteralMatch(arms: List<MatchArm>, line: Int, scrutTy: Ty, env: Env, moved: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
+        val covered = mutableSetOf<Any>()
+        var hasWildcard = false
+        var m0 = moved
+        val armStates = mutableListOf<Map<String, Boolean>>()
+        for (arm in arms) {
+            if (hasWildcard) errors += "Line ${arm.line}: unreachable arm after wildcard '_'"
+            if (arm.variantName == null && arm.literal == null) {
+                hasWildcard = true
+                armStates += checkBlock(arm.body, env, m0, retTy)
+                continue
+            }
+            if (arm.variantName != null) {
+                errors += "Line ${arm.line}: '${arm.variantName}' is an enum-variant pattern, but this match is on a ${scrutTy} value"
+                armStates += checkBlock(arm.body, env, m0, retTy)
+                continue
+            }
+            val lit = arm.literal!!
+            val (litTy, m1) = checkExpr(lit, env, m0, consume = true)
+            m0 = m1
+            if (litTy != scrutTy && !(litTy is Ty.Str_ && scrutTy is Ty.Str_)) {
+                errors += "Line ${arm.line}: match arm literal is ${litTy}, but this match is on a ${scrutTy} value"
+            }
+            val litValue: Any = when (lit) {
+                is Expr.IntLit -> lit.value
+                is Expr.LongLit -> lit.value
+                is Expr.BoolLit -> lit.value
+                is Expr.StringLit -> lit.value
+                else -> continue 
+            }
+            if (!covered.add(litValue)) errors += "Line ${arm.line}: duplicate arm for ${litValue}"
+            armStates += checkBlock(arm.body, env, m0, retTy)
+        }
+        val boolExhaustive = scrutTy == Ty.Bool_ && covered.containsAll(setOf(true, false))
+        if (!hasWildcard && !boolExhaustive) {
+            errors += "Line ${line}: match on ${scrutTy} isn't exhaustive -- add a '_' wildcard arm" +
+                (if (scrutTy == Ty.Bool_) " (or cover both 'true' and 'false')" else "")
+        }
+        val merged = HashMap<String, Boolean>()
+        for (k in m0.keys) merged[k] = armStates.any { it[k] == true }
+        return merged
+    }
+
+    private fun checkDocSees() {
+        for (doc in program.fns.map { it.docComment } + program.structs.map { it.docComment }) {
+            if (doc == null) continue
+            for (see in doc.sees) {
+                see.resolved = resolveDocSeeTarget(see.target)
+                if (!see.resolved) {
+                    errors += "Line ${see.line}: '@see ${see.target}' doesn't resolve to anything in this program"
+                }
+            }
+        }
+    }
+
+    private fun resolveDocSeeTarget(target: String): Boolean {
+        val dot = target.indexOf('.')
+        if (dot < 0) {
+            return structs.containsKey(target) || fns.containsKey(target) || enums.containsKey(target) ||
+                interfaces.containsKey(target) || externClasses.containsKey(target)
+        }
+        val owner = target.substring(0, dot)
+        val member = target.substring(dot + 1)
+        structs[owner]?.let { return it.fields.any { f -> f.first == member } || fns.containsKey("$owner@$member") }
+        enums[owner]?.let { return it.variantNames.contains(member) }
+        interfaces[owner]?.let { return it.methods.containsKey(member) }
+        externClasses[owner]?.let { return it.methods.any { m -> m.name == member } || it.fields.any { f -> f.name == member } }
+        return false
+    }
+
     private fun checkSealedMatch(arms: List<MatchArm>, line: Int, scrutTy: Ty.Dyn, env: Env, m0: Map<String, Boolean>, retTy: Ty): Map<String, Boolean> {
         val iface = interfaces[scrutTy.interfaceName]
         if (iface == null || !iface.sealed) {
@@ -1199,7 +1391,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             }
             val qualified = arm.variantName.split("::")
             val structName = if (qualified.size > 1) qualified[1] else arm.variantName
-
+            
             if (structName !in iface.implementers) {
                 errors += "Line ${arm.line}: '${structName}' doesn't implement sealed interface '${scrutTy.interfaceName}'"
                 continue
@@ -1325,7 +1517,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                             Ty.Enum(info.name) to moved
                         } else {
                             errors += "Line ${expr.line}: cannot infer type argument(s) for generic unit variant '${expr.name}' " +
-                                    "-- use it somewhere the target type is already known (a typed 'let', or a function's declared return type)"
+                                "-- use it somewhere the target type is already known (a typed 'let', or a function's declared return type)"
                             Ty.Unit_ to moved
                         }
                     } else {
@@ -1540,6 +1732,12 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         val (recvTy, m0) = checkExpr(expr.recv, env, moved, consume = false)
         var m = m0
 
+        if (recvTy is Ty.Enum && expr.method == "ordinal") {
+            if (expr.args.isNotEmpty()) errors += "Line ${expr.line}: '.ordinal()' takes no arguments"
+            expr.isEnumOrdinal = true
+            return Ty.Int_ to m
+        }
+
         for (a in expr.args) if (a !is Expr.Lambda) m = checkExpr(a, env, m, consume = true).second
 
         val sig: FnSig
@@ -1572,9 +1770,9 @@ class Checker(private val program: Program, private val classpathReflector: Clas
 
             val overrideKey = "$concreteName@${expr.method}"
             val hasExplicitOverride = fns.containsKey(overrideKey) && (
-                    interfaceImplFns[concreteName]?.any { it.name == expr.method } == true ||
-                            superclassOverrideFns[concreteName]?.any { it.name == expr.method } == true
-                    )
+                interfaceImplFns[concreteName]?.any { it.name == expr.method } == true ||
+                superclassOverrideFns[concreteName]?.any { it.name == expr.method } == true
+            )
             val candidates = structInterfaces[concreteName].orEmpty()
                 .mapNotNull { ifaceName -> interfaces[ifaceName]?.methods?.get(expr.method)?.let { ifaceName to it } }
             if (hasExplicitOverride) {
@@ -1585,7 +1783,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             } else if (candidates.size > 1) {
 
                 errors += "Line ${expr.line}: call to '${expr.method}' on '${ownerTemplateName}' is ambiguous between interfaces " +
-                        "${candidates.map { it.first }} -- add an explicit override in an impl block to resolve it"
+                    "${candidates.map { it.first }} -- add an explicit override in an impl block to resolve it"
                 return Ty.Unit_ to m
             } else if (candidates.isNotEmpty()) {
                 val msig = candidates[0].second
@@ -1625,7 +1823,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (recvTy.nullable) {
                 errors += "Line ${expr.line}: cannot call '${expr.method}' on a possibly-null value -- check `== null`/`!= null` first"
             }
-            val ext = externClasses.values.firstOrNull { it.binaryName == recvTy.binaryName }
+            val ext = findExternAlias(recvTy.binaryName) { it.method(expr.method).isNotEmpty() }
             val candidates = ext?.let { resolveExternMethods(it, expr.method, expr.line) }?.filter { !it.isCtor }.orEmpty()
             if (ext == null || candidates.isEmpty()) {
 
@@ -1644,7 +1842,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (recvTy.nullable) {
                 errors += "Line ${expr.line}: cannot call '${expr.method}' on a possibly-null value -- check `== null`/`!= null` first"
             }
-            val ext = externClasses.values.firstOrNull { it.binaryName == "java/lang/String" }
+            val ext = findExternAlias("java/lang/String") { it.method(expr.method).isNotEmpty() }
             val candidates = ext?.let { resolveExternMethods(it, expr.method, expr.line) }?.filter { !it.isCtor }.orEmpty()
             if (ext == null || candidates.isEmpty()) {
                 errors += "Line ${expr.line}: 'String' has no method '${expr.method}' -- declare it on an 'extern class ... = \"java.lang.String\"' first"
@@ -1880,11 +2078,11 @@ class Checker(private val program: Program, private val classpathReflector: Clas
                 }
 
                 if (typeArgs == null) return Ty.Unit_ to m
-
+                
                 val given = expr.fields.map { it.first }.toSet()
                 val expected = templateVariant.fields.map { it.name }.toSet()
                 if (given != expected) errors += "Line ${expr.line}: variant '${variantName}' field mismatch, expected ${expected}"
-
+                
                 val info = getOrInstantiateEnum(genericTemplate_, typeArgs, expr.line)
                 val variant = info.variant(variantName)!!
                 for ((fname, fexpr) in expr.fields) {
@@ -2045,7 +2243,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (ty !in STRINGIFIABLE) {
 
                 errors += "Line ${expr.line}: cannot interpolate ${ty} into a string -- only Int/Long/Float/Double/Bool/String are supported" +
-                        if (ty is Ty.Str_ && ty.nullable) " (this String is possibly-null -- check `== null`/`!= null` first)" else ""
+                    if (ty is Ty.Str_ && ty.nullable) " (this String is possibly-null -- check `== null`/`!= null` first)" else ""
             }
             m = m2
         }
@@ -2127,7 +2325,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
             if (oty.nullable) {
                 errors += "Line ${expr.line}: cannot access field '${expr.field}' on a possibly-null value -- check `== null`/`!= null` first"
             }
-            val ext = externClasses.values.firstOrNull { it.binaryName == oty.binaryName }
+            val ext = findExternAlias(oty.binaryName) { it.field(expr.field) != null }
             val f = ext?.field(expr.field)
             if (ext == null || f == null) {
 
@@ -2254,6 +2452,55 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         }
         val (objTy, m0) = checkExpr(expr.obj, env, moved, consume = false)
         val (valTy, m1) = checkExpr(expr.value, env, m0, consume = true)
+
+        fun checkMutabilityRoot() {
+            val root = rootIdent(expr.obj)
+            if (root == null) {
+                errors += "Line ${expr.line}: left side of field assignment must be a variable or field path"
+            } else {
+                val info = env.lookup(root.name)
+                if (info != null && !info.canMutateFields) {
+                    errors += "Line ${expr.line}: cannot mutate field of '${root.name}': not declared 'var' and not received as '&mut'"
+                }
+            }
+        }
+
+        if (objTy is Ty.JavaExtern) {
+
+            if (objTy.nullable) {
+                errors += "Line ${expr.line}: cannot assign field '${expr.field}' on a possibly-null value -- check `== null`/`!= null` first"
+                return Ty.Unit_ to m1
+            }
+            val ext = findExternAlias(objTy.binaryName) { it.field(expr.field) != null }
+            val f = ext?.field(expr.field)
+            if (ext != null && f != null) {
+
+                if (f.isStatic) {
+                    errors += "Line ${expr.line}: '${expr.field}' is declared as a static field -- write it via '${ext.name}::${expr.field} = ...' instead"
+                } else if (f.type != valTy) {
+                    errors += "Line ${expr.line}: cannot assign ${valTy} to field '${expr.field}' of type ${f.type}"
+                }
+                expr.resolvedName = ext.binaryName
+                checkMutabilityRoot()
+                return Ty.Unit_ to m1
+            }
+
+            if (ext != null && !ext.lazy) {
+                val cap = expr.field.replaceFirstChar { it.uppercase() }
+                val setter = ext.method("set$cap").firstOrNull { !it.isCtor && !it.isStatic && it.params.size == 1 && it.params[0] == valTy }
+                if (setter != null) {
+                    expr.externSetterMethod = setter.name
+                    expr.externSetterRetTy = setter.retType
+                    expr.resolvedName = ext.binaryName
+                    checkMutabilityRoot()
+                    return Ty.Unit_ to m1
+                }
+            }
+            val cap = expr.field.replaceFirstChar { it.uppercase() }
+            errors += "Line ${expr.line}: '${objTy}' has no declared field '${expr.field}' (and no single-arg setter 'set$cap(${valTy})' to use as a property)"
+            return Ty.Unit_ to m1
+        }
+
         if (objTy !is Ty.Struct) {
             errors += "Line ${expr.line}: field assignment on non-struct type ${objTy}"
             return Ty.Unit_ to m1
@@ -2264,15 +2511,7 @@ class Checker(private val program: Program, private val classpathReflector: Clas
         } else if (fty != valTy) {
             errors += "Line ${expr.line}: cannot assign ${valTy} to field '${expr.field}' of type ${fty}"
         }
-        val root = rootIdent(expr.obj)
-        if (root == null) {
-            errors += "Line ${expr.line}: left side of field assignment must be a variable or field path"
-        } else {
-            val info = env.lookup(root.name)
-            if (info != null && !info.canMutateFields) {
-                errors += "Line ${expr.line}: cannot mutate field of '${root.name}': not declared 'var' and not received as '&mut'"
-            }
-        }
+        checkMutabilityRoot()
         return Ty.Unit_ to m1
     }
 }

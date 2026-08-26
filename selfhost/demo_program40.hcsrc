@@ -1,0 +1,63 @@
+// Exercises bare generic struct/enum-variant construction relying on the surrounding `return`
+// statement's own declared type to supply the missing type argument -- e.g. `return Vec { data:
+// v.data, len: 0 };` (no `<Arg>` at all), or `return Some { value: e };` / `return None;` for a
+// generic enum. Real gap found self-compiling `Parser.hotc`, whose own helper fns (`empty_*_vec`,
+// `some_expr`, bare `None`, etc) all follow exactly this idiom -- `Checker.hotc`'s own
+// `check_struct_lit`/`check_ident` and `Codegen.hotc`'s own `gen_expr` both needed a fallback
+// (`expected_mono`/`self.ret_ty`) for it. Also exercises 3 real follow-on bugs found getting this
+// working: (1) a per-variant field-type collision (`Ast.hc`'s own `Expr` enum reuses the field
+// name "value" at different types across variants -- `variant_field_info` had to be keyed
+// "OwnerName#VariantName", not bare variant name); (2) `Option<T>`'s "Some"/"None" constructed at
+// SEVERAL different `T`s in one program (`Option<Int>` and `Option<String>` here) -- a stale
+// `variant_owner` entry from whichever `T` monomorphized FIRST would otherwise silently hijack
+// every later bare construction site regardless of which `T` it actually needs
+// (`generic_variant_owner`, registered once at declaration time, fixes this); (3) a
+// `self.cur_ret_ty` reentrancy bug (checking a generic fn/method's own monomorphized body mid-way
+// through checking a DIFFERENT function clobbered the outer function's own return-type context --
+// needed the same save/restore `self.vars` already had for exactly this reason).
+fn empty_int_vec40() -> Vec<Int> {
+    var v = vec_of(0);
+    return Vec { data: v.data, len: 0 };
+}
+
+fn find_positive(v: Vec<Int>) -> Option<Int> {
+    var i = 0;
+    while i < v.length() {
+        if v.get(i) > 0 {
+            return Some { value: v.get(i) };
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+fn label_for(found: Bool) -> Option<String> {
+    if found {
+        return Some { value: "positive" };
+    }
+    return None;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var nums = empty_int_vec40();
+    nums.push(-3);
+    nums.push(-1);
+    nums.push(7);
+    var result = 0;
+    let p = find_positive(nums);
+    if let Some { value: v } = p {
+        result = v;
+    }
+    let lbl = label_for(true);
+    if let Some { value: s } = lbl {
+        if s == "positive" {
+            result = result + 100;
+        }
+    }
+    let none_lbl = label_for(false);
+    if let Some { value: s2 } = none_lbl {
+        result = result + 1000;
+    }
+    // result: found 7 (first positive) + 100 (label matched) + 0 (none_lbl stayed None) = 107.
+    return result + a + b;
+}

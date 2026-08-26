@@ -1,0 +1,16 @@
+// Exercises the dot-to-slash binary-name fix: this extern class deliberately uses a DOT-form
+// binary name ("java.lang.Integer") instead of the usual slash form, matching what the REAL
+// compiler accepts (via its own classpath reflection's dot-to-slash conversion) and what
+// `Lexer.hotc`'s own real extern declarations use. Before `dot_to_slash_cg`, this raw dotted
+// string was used AS-IS in NEW/INVOKESTATIC/descriptors, producing a real but invalid class file
+// that failed to LOAD in the JVM at all (`ClassFormatError: Illegal class name`) -- not caught by
+// ASM's own compile-time COMPUTE_FRAMES checks, so this only surfaces when the class is actually
+// run, which `TestDriver.hotc`'s `run_bootstrap_demo` chain does for every demo.
+extern class JIntegerDot = "java.lang.Integer" {
+    static fn parseInt(s: String) -> Int;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let parsed = JIntegerDot::parseInt("40");
+    return parsed + a + b - 7;
+}

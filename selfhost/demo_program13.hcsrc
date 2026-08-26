@@ -1,0 +1,29 @@
+pub struct Item {
+    name: String,
+    price: Int,
+}
+
+pub enum Result2 {
+    Ok2 { value: Int },
+    Err2 { msg: String },
+}
+
+pub fn safe_div(a: Int, b: Int) -> Result2 {
+    if b == 0 {
+        return Err2 { msg: "div by zero" };
+    }
+    return Ok2 { value: a / b };
+}
+
+fn describe(r: Result2) -> Int {
+    if let Ok2 { value } = r {
+        return value;
+    } else {
+        return -1;
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var r = safe_div(b, a);
+    return describe(r);
+}

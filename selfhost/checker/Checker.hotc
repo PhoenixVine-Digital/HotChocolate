@@ -1,0 +1,1885 @@
+module hc.selfhost.checker;
+
+// The self-hosted checker, phase 1 -- a genuine type checker (literal/operator/call/assignment
+// type rules, a flat function-scoped variable environment, accumulated error messages) walking
+// the `Expr`/`Stmt`/`FnDecl` AST `Parser.hotc` produces. Deliberately NOT attempting move/borrow
+// checking in this phase -- the real `Checker.kt`'s move-tracking (conservative branch merges,
+// capture analysis for lambdas, drop ordering) is a whole separate, much harder feature on top
+// of plain type checking, and type checking alone is already a real, self-contained milestone
+// worth proving out on its own first. Logged as its own follow-up, not silently skipped.
+//
+// **Structs now real types**: `Ty` gained a `TyStruct { name }` variant (its first *field-
+// carrying* variant -- everything else here is a plain unit tag), backed by a real `structs:
+// Registry<StructInfo>` field/type table. `register_struct` (called once per `StructDecl` by the
+// driver before any fn body is checked, mirroring how `fn_sigs` gets pre-registered) populates
+// it; `FieldAccess`/`FieldAssign`/`StructLit` all resolve against it for real instead of the old
+// unconditional `TyUnknown`. Any *other* unrecognized type name (a genuine typo, not a struct)
+// now also becomes a `TyStruct` tag rather than the old silently-trusted `TyUnknown` -- surfacing
+// it as a real mismatch wherever it's used inconsistently, which is strictly more correct, not a
+// scope cut.
+//
+// **Struct methods now real too**: a flat `methods: Registry<FnSig>` (keyed `"StructName#method"`)
+// backs `register_method`/`check_method` (called once per impl-block method, mirroring
+// `register_struct`) -- `check_method` binds `self` into the variable environment (the struct's
+// own type) before checking params/body. `check_method_call` resolves against this table first,
+// falling back to the old unconditional `TyUnknown` only for receivers with no registered method
+// by that name (covers `String`'s real built-in methods, resolved concretely only in
+// `Codegen.hotc`, and genuine typos alike -- a real, disclosed imprecision, not a false-negative
+// risk: it costs a missing error message on a typo, never rejects something that should compile).
+// Nested struct-typed fields and struct-typed fn params/return types both already work (verified
+// in `Codegen.hotc`, not a checker-side change -- `ty_from_name`'s `TyStruct` fallback and
+// `find_field_type`'s lookups are already fully general).
+//
+// **Scope cut, still disclosed**: no interface types. No block-scoping -- variables live in one
+// flat, whole-function table; a shadowed `let` inside an `if`/`while` silently reuses the same
+// slot rather than properly scoping, since `Registry<T>.get()` returns the *first* match, not the
+// most recent. (Enums and static `impl` methods are real now -- see below.)
+//
+// **Generic enums now real too** (`enum Option<T> { ... }`, mirroring generic structs'
+// `Base$Arg`-name on-demand monomorphization): `GenericEnumTemplate` parallels `GenericTemplate`,
+// `register_enum` gained a `type_param` param branching into it exactly like `register_struct`
+// does, and `ensure_instantiated` gained a second lookup (struct templates, then enum templates)
+// substituting `T` across every variant's fields. The one genuinely new problem generic enums
+// raise that generic structs don't: a *plain* generic struct's own concrete name already IS its
+// instantiation name (`Box<Int> { ... }` directly constructs `"Box$Int"`), but an enum variant's
+// bare name (`"Some"`) carries no such information -- two different concrete instantiations of the
+// same generic enum used in one program (`Option<Int>` and `Option<String>`) would silently
+// collide in the old bare-name-keyed `variant_owner` table (`Registry<T>.get()` returns the FIRST
+// match, no shadowing). Fixed two ways: (1) construction sites for a generic enum's variants must
+// use the explicit qualified form `Base<Arg>::Variant { ... }` (parsed into `Expr::StructLit`'s
+// new `generic_base` field, `Ast.hc`), which `check_struct_lit` resolves directly, bypassing
+// `variant_owner` entirely; (2) `check_match`'s variant-ownership check now consults a new
+// `variant_owner_q: Registry<Bool>` keyed `"Owner#Variant"` (populated for every enum, plain and
+// generic alike) instead of the bare table, since `match` already identifies the subject's own
+// concrete type name with no ambiguity. Real bug found building this: `check_match` never called
+// `ensure_instantiated` on its subject's type (unlike `check_field_access`/`check_method_call`,
+// which already did) -- a generic-enum-typed match subject in a function checked *before* any
+// function that actually constructs that instantiation failed every arm with a spurious "'Some' is
+// not a variant of 'Option$Int'", since nothing had monomorphized it yet. Fixed by adding the same
+// `ensure_instantiated` call `check_match` was missing. Bare unqualified construction (`Some {
+// ... }`) still resolves fine for a *non*-generic enum's variants, unchanged.
+//
+// **Real finding building this file**: `Ty` (an enum) isn't `Copy` -- comparing the SAME value
+// against multiple candidates (`if lt == TyInt ... else if lt == TyUnknown ...`) moves it on the
+// first comparison, making the second a compile error. The clean fix, used throughout below: call
+// `ty_name(t)` (returning a `String`, which IS `Copy`) exactly once per `Ty` value, then do every
+// subsequent comparison against that name instead of the enum value itself.
+
+// `Ty`/`FnSig`/`StructInfo`/`GenericTemplate`/`GenericEnumTemplate`/`ExternMethodInfo`, plus
+// `ty_from_name`/`ty_name`/`empty_ty_vec`/`param_types_of`, now all live in `Types.hotc` --
+// shared with `Codegen.hotc`, which needs this same vocabulary to re-derive a generic-fn
+// instantiation's own signature (see that file's own header). Split out for the same single-
+// responsibility reason `Ast.hotc`/`Lexer.hotc`/`Parser.hotc` are already their own files: this
+// file owns the type-CHECKING algorithm, not the definition of what a type IS.
+
+pub struct TyChecker {
+    fn_sigs: Registry<FnSig>,
+    vars: Registry<Ty>,
+    structs: Registry<StructInfo>,
+    // Keyed by "StructName#methodName" -- a flat map instead of a nested per-struct one, same
+    // simplification `find_field_type`'s linear scan makes for field lookups.
+    methods: Registry<FnSig>,
+    // variant name -> owning enum name. An enum's OWN field table is registered into `structs`
+    // under the enum's own name (the union of every variant's fields, see `register_enum`) --
+    // `structs` doesn't distinguish "real struct" from "enum, field-lookup purposes" at all, only
+    // this table does, and only for telling a `StructLit` construction site (`Name { ... }`)
+    // whether `Name` is a plain struct or an enum variant.
+    variant_owner: Registry<String>,
+    // "OwnerName#VariantName" -> existence, populated for EVERY enum (plain and generic mono
+    // instantiations alike) -- `check_match`'s own variant-ownership check uses this instead of
+    // `variant_owner` above, since `variant_owner` alone would collide across multiple concrete
+    // instantiations of the same generic enum (see `Ast.hc`'s own `EnumDecl` header).
+    variant_owner_q: Registry<Bool>,
+    generic_templates: Registry<GenericTemplate>,
+    generic_enum_templates: Registry<GenericEnumTemplate>,
+    // Every monomorphized instantiation name (`"Box$Int"`) actually constructed/accessed while
+    // checking the program, in first-use order -- `compile_program` reads this back afterward to
+    // know exactly which concrete classes `gen_struct` needs to emit (see `Codegen.hotc`'s own
+    // header), since nothing else records "which instantiations does this program really use."
+    mono_needed: Vec<String>,
+    // extern class alias name -> its real binary name (existence check only -- `Codegen.hotc`
+    // needs the actual binary name too, but rebuilds that table itself from the same original
+    // `externs: Vec<ExternClassDecl>` rather than reading it back from here, same pattern structs/
+    // methods/enums already use).
+    externs: Registry<String>,
+    // Keyed by "Alias#methodName" -- covers constructors and static methods (`Expr::StaticCall`)
+    // and instance methods (`Expr::MethodCall`) alike.
+    extern_methods: Registry<ExternMethodInfo>,
+    // Enum name -> its own variant names, declaration order -- `check_match` reads this to check
+    // exhaustiveness (every variant covered by name, or a `_` wildcard arm present).
+    enum_variants: Registry<Vec<String>>,
+    // Keyed by "StructName#methodName", same flat convention `methods` (instance) uses -- called
+    // via `Expr::StaticCall` (`StructName::method(args)`), extern classes checked first, this as
+    // the fallback -- see `check_static_call`.
+    static_methods: Registry<FnSig>,
+    // A generic top-level fn declaration (`fn identity<T>(x: T) -> T { ... }`), kept separate from
+    // `fn_sigs` (real, directly-callable signatures) until some call site's inferred type argument
+    // asks for a concrete instantiation -- mirrors `generic_templates`/`generic_enum_templates`,
+    // except the type argument is INFERRED at each call site rather than spelled out (see
+    // `check_call`'s own header).
+    generic_fn_templates: Registry<FnDecl>,
+    // Every monomorphized FUNCTION instantiation name (`"identity$Int"`) actually called while
+    // checking the program, in first-use order -- mirrors `mono_needed`, read back by
+    // `compile_program` afterward to know which concrete fn bodies `Codegen.hotc` needs to emit.
+    fn_mono_needed: Vec<String>,
+    // An instance method declared inside a GENERIC struct's own `impl` block (`impl Box<T> { fn
+    // get(&self) -> T { ... } }`), keyed "StructName#methodName" like `methods` above -- kept
+    // separate until some method-call site's RECEIVER (already a concrete `"Box$Int"`-shaped
+    // instantiation) asks for it. Unlike a generic top-level fn's own call-site inference (scanning
+    // params for one whose type is bare `T`), a generic method's `T` needs no scanning at all --
+    // the receiver's own mono name already names it directly (`mono_arg("Box$Int")` = `"Int"`), see
+    // `ensure_method_instantiated`. Scope cut, disclosed: only instance methods (`&self`/`&mut
+    // self`) get this treatment -- a `static fn` inside a generic struct's `impl` block is a rarer
+    // shape (the real prelude's own `Vec<T>`/`Registry<T>` don't use one) and stays unsupported.
+    generic_method_templates: Registry<FnDecl>,
+    // Every monomorphized METHOD instantiation key (`"Box$Int#get"`) actually called while checking
+    // the program -- mirrors `fn_mono_needed`, read back by `compile_program` afterward to know
+    // which concrete method bodies `Codegen.hotc` needs to emit onto their owning mono struct's own
+    // class file (not the main program class, unlike a plain generic fn -- see `Codegen.hotc`'s own
+    // header).
+    method_mono_needed: Vec<String>,
+    // Top-level `pub static NAME: Type = expr;` name -> declared type -- unlike `vars` (reset
+    // fresh per fn/method), this is registered once up front and stays visible everywhere, real
+    // global-constant semantics. `check_ident` checks `vars` first so a local can still shadow a
+    // same-named static.
+    statics: Registry<Ty>,
+    errors: Vec<String>,
+    // How many `while` bodies deep the checker currently is -- `Break`/`Continue` are only legal
+    // while this is > 0. Incremented/decremented around a `While`'s own body check; no stack of
+    // labels needed since this subset never needs to know WHICH enclosing loop, only whether one
+    // exists at all.
+    loop_depth: Int,
+    // The fn/method currently being checked own declared return type name (set fresh at the top
+    // of `check_fn`/`check_method`, mirrors `Codegen.hotc`'s own `ret_ty` field) -- read by
+    // `check_stmt`'s `Return` arm to supply `check_struct_lit`'s `expected_mono` hint for a bare
+    // generic struct literal (`return Vec { ... };`, see that fn's own header).
+    cur_ret_ty: String,
+    // Bare variant name -> THAT variant's own field table alone (not the enum-wide union
+    // `structs` registers it under). Real gap found self-compiling `Parser.hotc`/`Ast.hotc`:
+    // `structs.register(enumName, ...)` concatenates EVERY variant's fields into one flat table
+    // (disclosed already -- "field lookups... don't distinguish which variant a field actually
+    // belongs" -- this file's own header), so `find_field_type`'s linear scan returns the FIRST
+    // same-named field it finds across the WHOLE enum, regardless of which variant is actually
+    // being constructed. Harmless as long as no two variants reuse a field name at different
+    // types -- exactly what `Ast.hc`'s own `Expr` enum does (`IntLit.value: Int`, `Assign.value:
+    // Expr`, `StringLit.value: String`, ...), so every one of those was silently validated
+    // against `IntLit`'s `Int` (registered first) until this. `check_struct_lit` prefers this
+    // table over the enum-wide union whenever the name being constructed is a known variant.
+    variant_field_info: Registry<StructInfo>,
+    // Bare variant name -> owning GENERIC enum's own BASE name (e.g. "Some"/"None" -> "Option"),
+    // registered once at DECLARATION time (`register_enum`'s `is_generic` branch) -- unlike
+    // `variant_owner` (which only ever learns about a generic enum's variants AFTER some concrete
+    // instantiation happens, via `ensure_instantiated`'s own call back into `register_enum`), this
+    // is populated immediately, so a bare `Some { ... }`/`None` construction site (real
+    // `Parser.hotc` usage -- `none_expr`/`some_expr`-style helpers, all in return position) can
+    // resolve its OWNER even before anything has triggered the FIRST-EVER instantiation of
+    // `Option<T>` anywhere in the program. See `check_struct_lit`'s own header for how the actual
+    // type argument then gets filled in (from `expected_mono`).
+    generic_variant_owner: Registry<String>,
+}
+
+pub fn checker_new() -> TyChecker {
+    var sigs = registry_new("__init__", FnSig { param_types: empty_ty_vec(), ret_type: TyUnknown });
+    var vars = registry_new("__init__", TyUnknown);
+    var structs = registry_new("__init__", StructInfo { field_names: empty_str_vec2(), field_types: empty_str_vec2() });
+    var methods = registry_new("__init__", FnSig { param_types: empty_ty_vec(), ret_type: TyUnknown });
+    var variant_owner = registry_new("__init__", "__init__");
+    var variant_owner_q = registry_new("__init__", true);
+    var generic_templates = registry_new("__init__", GenericTemplate { type_param: "__init__", field_names: empty_str_vec2(), field_types: empty_str_vec2() });
+    var generic_enum_templates = registry_new("__init__", GenericEnumTemplate { type_param: "__init__", variants: empty_variant_vec3() });
+    var externs = registry_new("__init__", "__init__");
+    var extern_methods = registry_new("__init__", ExternMethodInfo { param_types: empty_str_vec2(), ret_type: "Unit", is_static: false, is_ctor: false });
+    var enum_variants = registry_new("__init__", empty_str_vec2());
+    var static_methods = registry_new("__init__", FnSig { param_types: empty_ty_vec(), ret_type: TyUnknown });
+    var generic_fn_templates = registry_new("__init__", FnDecl { name: "__init__", params: empty_param_vec3(), ret_type: none_string3(), body: empty_stmt_vec3(), type_param: none_string3() });
+    var generic_method_templates = registry_new("__init__", FnDecl { name: "__init__", params: empty_param_vec3(), ret_type: none_string3(), body: empty_stmt_vec3(), type_param: none_string3() });
+    var mono = vec_of("__init__");
+    var mono_needed = Vec { data: mono.data, len: 0 };
+    var fmono = vec_of("__init__");
+    var fn_mono_needed = Vec { data: fmono.data, len: 0 };
+    var mmono = vec_of("__init__");
+    var method_mono_needed = Vec { data: mmono.data, len: 0 };
+    var statics = registry_new("__init__", TyUnknown);
+    var errs = vec_of("__init__");
+    errs.set(0, "");
+    var variant_field_info = registry_new("__init__", StructInfo { field_names: empty_str_vec2(), field_types: empty_str_vec2() });
+    var generic_variant_owner = registry_new("__init__", "__init__");
+    return TyChecker { fn_sigs: sigs, vars: vars, structs: structs, methods: methods, variant_owner: variant_owner, variant_owner_q: variant_owner_q, generic_templates: generic_templates, generic_enum_templates: generic_enum_templates, mono_needed: mono_needed, externs: externs, extern_methods: extern_methods, enum_variants: enum_variants, static_methods: static_methods, generic_fn_templates: generic_fn_templates, fn_mono_needed: fn_mono_needed, generic_method_templates: generic_method_templates, method_mono_needed: method_mono_needed, statics: statics, errors: errs, loop_depth: 0, cur_ret_ty: "Unit", variant_field_info: variant_field_info, generic_variant_owner: generic_variant_owner };
+}
+
+fn empty_str_vec2() -> Vec<String> {
+    var v = vec_of("__init__");
+    return Vec { data: v.data, len: 0 };
+}
+
+fn param_type_names_of4(params: Vec<Param>) -> Vec<String> {
+    var out = empty_str_vec2();
+    var i = 0;
+    while i < params.length() {
+        out.push(params.get(i).type_name);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn opt_string_or2(o: Option<String>, default_val: String) -> String {
+    if let Some { value: v } = o {
+        return v;
+    }
+    return default_val;
+}
+
+// Linear scan for a field's declared type name, "?" if the struct has no such field -- mirrors
+// `Ty`'s own "?" sentinel for "unknown, don't error on it" so callers can reuse the same
+// `!= "?"` guard pattern already established throughout this file.
+fn find_field_type(info: StructInfo, field: String) -> String {
+    var i = 0;
+    while i < info.field_names.length() {
+        if info.field_names.get(i) == field {
+            return info.field_types.get(i);
+        }
+        i = i + 1;
+    }
+    return "?";
+}
+
+extern class JStringChk = "java.lang.String" {
+    fn length(&self) -> Int;
+    fn codePointAt(&self, index: Int) -> Int;
+    fn substring(&self, start: Int, end: Int) -> String;
+    fn indexOf(&self, s: String) -> Int;
+}
+
+// Monomorphized generic instantiations are named `"Base$Arg"` -- `$` specifically because it can
+// never appear in a real HC identifier (see `Parser.hotc`'s `type_name_ref` header), so this
+// split is unambiguous with any real user-written name.
+fn is_mono_name(name: String) -> Bool {
+    return name.indexOf("$") >= 0;
+}
+
+fn mono_base(name: String) -> String {
+    let idx = name.indexOf("$");
+    return name.substring(0, idx);
+}
+
+fn mono_arg(name: String) -> String {
+    let idx = name.indexOf("$");
+    return name.substring(idx + 1, name.length());
+}
+
+fn empty_param_vec3() -> Vec<Param> {
+    var v = vec_of(Param { name: "_", type_name: "_" });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_variant_vec3() -> Vec<EnumVariant> {
+    var v = vec_of(EnumVariant { name: "_", fields: empty_param_vec3() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn none_string3() -> Option<String> {
+    return None;
+}
+
+fn some_string3(s: String) -> Option<String> {
+    return Some { value: s };
+}
+
+fn empty_stmt_vec3() -> Vec<Stmt> {
+    var v = vec_of(ExprStmt { expr: IntLit { value: 0 } });
+    return Vec { data: v.data, len: 0 };
+}
+
+// Array types are represented as the plain string `"[ElemType]"` throughout this file (see
+// `Parser.hotc`'s own `type_name_ref` header) -- these two helpers are the only place that
+// convention actually gets parsed back apart.
+fn is_array_type_name(name: String) -> Bool {
+    if name.length() < 2 { return false; }
+    return name.codePointAt(0) == 91 && name.codePointAt(name.length() - 1) == 93; // '[' / ']'
+}
+
+fn array_elem_type_name(name: String) -> String {
+    return name.substring(1, name.length() - 1);
+}
+
+// Substitutes a generic template's type parameter into one declared field type -- handles the
+// plain exact-match case (`ftype == "T"` -> the concrete arg, e.g. `"Int"`), an array-of-the-type-
+// parameter (`ftype == "[T]"` -> `"[Int]"`, needed for `Vec<T> { data: [T], len: Int }`'s own
+// `data` field), AND, new this phase, a *different* generic instantiation naming the type
+// parameter as its own sole type argument (`ftype == "Vec$T"` -> `"Vec$Int"`, needed for
+// `Registry<T> { entries: Vec<T> }`'s own `entries` field -- see `ensure_instantiated`'s own
+// header for the cascading half of this: substituting the field type alone isn't enough, the
+// newly-produced nested name has to actually get monomorphized too). Scope cut, still disclosed:
+// no deeper nesting than one level (`[[T]]`, or a field type that names `T` somewhere inside a
+// *compound* type argument rather than as the argument in its entirety, e.g. a hypothetical
+// `Vec<Box<T>>`, isn't substituted here -- `type_name_ref`'s own single-bare-identifier-argument
+// scope cut means a generic type argument that's itself generic can't even be parsed yet, so this
+// case can't arise from real source today regardless).
+// Real bug found stress-testing this against a closer port of the real prelude's own
+// `Registry<T> { entries: Vec<RegistryEntry<T>> }`: the ORIGINAL version of this function only
+// substituted ONE level of mono-name nesting (`mono_arg(ftype) == type_param` required the entire
+// argument portion to be the bare type parameter) -- `"Vec$RegistryEntry$T"` (three levels: `T`
+// is the OUTER instantiation's argument's OWN argument) fell through completely unchanged, since
+// `mono_arg("Vec$RegistryEntry$T")` is `"RegistryEntry$T"`, not `"T"`. Fixed by recursing into a
+// mono-name's own argument portion instead of demanding an exact match there -- this strictly
+// generalizes the old single-level check (recursing on a bare `"T"` just hits the exact-match
+// branch immediately and returns `arg`, so every previously-working case behaves identically) while
+// correctly handling arbitrarily deep chains: `substitute_field_type("Vec$RegistryEntry$T", "T",
+// "Int")` now recurses into `"RegistryEntry$T"` -> `"RegistryEntry$Int"`, then wraps back into
+// `"Vec$RegistryEntry$Int"`.
+fn substitute_field_type(ftype: String, type_param: String, arg: String) -> String {
+    if ftype == type_param {
+        return arg;
+    }
+    if is_array_type_name(ftype) && array_elem_type_name(ftype) == type_param {
+        return "[" + arg + "]";
+    }
+    if is_mono_name(ftype) {
+        return mono_base(ftype) + "$" + substitute_field_type(mono_arg(ftype), type_param, arg);
+    }
+    return ftype;
+}
+
+// A substituted field type's own CASCADE target -- what `ensure_instantiated` should actually try
+// to instantiate next. Real bug found alongside the nested-mono-name one above: `is_mono_name`
+// just checks for `"$"` ANYWHERE in the string, so `"[RegistryEntry$Int]"` (an array-of-mono-name
+// field, e.g. `Vec<T> { data: [T] }`'s own `data` after `T` substitutes to a mono name) reads as a
+// mono name ITSELF -- feeding the whole bracketed string into `ensure_instantiated` would try to
+// `mono_base`/`mono_arg` split `"[RegistryEntry$Int]"` (garbage: `"[RegistryEntry"`/`"Int]"`),
+// silently no-op (neither `generic_templates` nor `generic_enum_templates` has an entry under that
+// garbage base), and never actually cascade into `"RegistryEntry$Int"` at all. Unwrapping one
+// array level first (the same "single array level" scope cut already disclosed elsewhere) fixes
+// it: an array field's cascade target is its ELEMENT type, not the bracketed string itself.
+fn cascade_target(ftype: String) -> String {
+    if is_array_type_name(ftype) {
+        return array_elem_type_name(ftype);
+    }
+    return ftype;
+}
+
+fn empty_expr_vec3() -> Vec<Expr> {
+    var v = vec_of(IntLit { value: 0 });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_matcharm_vec3() -> Vec<MatchArm> {
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec2(), bind_names: empty_str_vec2(), body: empty_stmt_vec3() });
+    return Vec { data: v.data, len: 0 };
+}
+
+// A real, whole-tree copy of `e`, substituting `type_param` for `arg` everywhere a TYPE NAME
+// STRING appears inside it -- the only two spots that happens in this AST are `StructLit`'s own
+// `name`/`generic_base` (`substitute_field_type` handles the same three shapes `ensure_fn_
+// instantiated`'s param/return substitution already does: bare `"T"`, `"[T]"`, or a *different*
+// generic instantiation naming `T` as its own sole argument, `"Vec$T"`) and `StaticCall`'s
+// `type_name` (a generic struct's own static method, `T::wrap(x)`-shaped, though this can't arise
+// from real source yet since only enum/struct construction sites currently support the qualified
+// `Base<Arg>` form -- included for completeness/robustness regardless). This is the piece that
+// closes the gap disclosed in `ensure_fn_instantiated`'s own header: a generic fn's body CAN now
+// reference its own still-abstract `T` inside a nested generic construction site (`vec_of<T>`'s
+// own `return Vec<T> { data: [first; 4], len: 1 };`, say) -- every other `Expr`/`Stmt` variant
+// here just recurses into its own sub-expressions unchanged, no type name of its own to fix up.
+fn subst_expr(e: Expr, type_param: String, arg: String) -> Expr {
+    match e {
+        IntLit { value } => { return IntLit { value: value }; }
+        StringLit { value } => { return StringLit { value: value }; }
+        BoolLit { value } => { return BoolLit { value: value }; }
+        Ident { name } => { return Ident { name: name }; }
+        Binary { op, left, right } => { return Binary { op: op, left: subst_expr(left, type_param, arg), right: subst_expr(right, type_param, arg) }; }
+        Unary { op, expr } => { return Unary { op: op, expr: subst_expr(expr, type_param, arg) }; }
+        Call { callee, args } => { return Call { callee: callee, args: subst_expr_list(args, type_param, arg) }; }
+        FieldAccess { obj, field } => { return FieldAccess { obj: subst_expr(obj, type_param, arg), field: field }; }
+        MethodCall { recv, method, args } => { return MethodCall { recv: subst_expr(recv, type_param, arg), method: method, args: subst_expr_list(args, type_param, arg) }; }
+        Assign { name, value } => { return Assign { name: name, value: subst_expr(value, type_param, arg) }; }
+        FieldAssign { obj, field, value } => { return FieldAssign { obj: subst_expr(obj, type_param, arg), field: field, value: subst_expr(value, type_param, arg) }; }
+        StructLit { name, field_names, field_values, generic_base } => {
+            let new_name = substitute_field_type(name, type_param, arg);
+            var new_gb = none_string3();
+            if let Some { value: gb } = generic_base {
+                new_gb = some_string3(substitute_field_type(gb, type_param, arg));
+            }
+            return StructLit { name: new_name, field_names: field_names, field_values: subst_expr_list(field_values, type_param, arg), generic_base: new_gb };
+        }
+        ArrayLit { elements } => { return ArrayLit { elements: subst_expr_list(elements, type_param, arg) }; }
+        ArrayRepeat { value, count } => { return ArrayRepeat { value: subst_expr(value, type_param, arg), count: subst_expr(count, type_param, arg) }; }
+        Index { arr, index } => { return Index { arr: subst_expr(arr, type_param, arg), index: subst_expr(index, type_param, arg) }; }
+        IndexAssign { arr, index, value } => { return IndexAssign { arr: subst_expr(arr, type_param, arg), index: subst_expr(index, type_param, arg), value: subst_expr(value, type_param, arg) }; }
+        StaticCall { type_name, method, args } => { return StaticCall { type_name: substitute_field_type(type_name, type_param, arg), method: method, args: subst_expr_list(args, type_param, arg) }; }
+        Cast { expr, target_type } => { return Cast { expr: subst_expr(expr, type_param, arg), target_type: target_type }; }
+    }
+}
+
+fn subst_expr_list(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Expr> {
+    var out = empty_expr_vec3();
+    var i = 0;
+    while i < es.length() {
+        out.push(subst_expr(es.get(i), type_param, arg));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn subst_stmt(s: Stmt, type_param: String, arg: String) -> Stmt {
+    match s {
+        Let { name, mutable, init } => { return Let { name: name, mutable: mutable, init: subst_expr(init, type_param, arg) }; }
+        ExprStmt { expr } => { return ExprStmt { expr: subst_expr(expr, type_param, arg) }; }
+        Return { value } => {
+            var new_val = none_expr3();
+            if let Some { value: v } = value { new_val = some_expr3(subst_expr(v, type_param, arg)); }
+            return Return { value: new_val };
+        }
+        If { cond, then_body, else_body } => {
+            var new_else = none_stmt_list3();
+            if let Some { value: eb } = else_body { new_else = some_stmt_list3(subst_stmt_list(eb, type_param, arg)); }
+            return If { cond: subst_expr(cond, type_param, arg), then_body: subst_stmt_list(then_body, type_param, arg), else_body: new_else };
+        }
+        While { cond, body } => { return While { cond: subst_expr(cond, type_param, arg), body: subst_stmt_list(body, type_param, arg) }; }
+        Match { subject, arms } => { return Match { subject: subst_expr(subject, type_param, arg), arms: subst_arm_list(arms, type_param, arg) }; }
+        Throw { value } => { return Throw { value: subst_expr(value, type_param, arg) }; }
+        Break {} => { return Break {}; }
+        Continue {} => { return Continue {}; }
+        Try { try_block, catch_var, catch_type, catch_block } => {
+            return Try { try_block: subst_stmt_list(try_block, type_param, arg), catch_var: catch_var, catch_type: catch_type, catch_block: subst_stmt_list(catch_block, type_param, arg) };
+        }
+    }
+}
+
+fn subst_stmt_list(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stmt> {
+    var out = empty_stmt_vec3();
+    var i = 0;
+    while i < ss.length() {
+        out.push(subst_stmt(ss.get(i), type_param, arg));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn subst_arm_list(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<MatchArm> {
+    var out = empty_matcharm_vec3();
+    var i = 0;
+    while i < arms.length() {
+        let a = arms.get(i);
+        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: subst_stmt_list(a.body, type_param, arg) });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn none_expr3() -> Option<Expr> {
+    return None;
+}
+
+fn some_expr3(e: Expr) -> Option<Expr> {
+    return Some { value: e };
+}
+
+fn none_stmt_list3() -> Option<Vec<Stmt>> {
+    return None;
+}
+
+fn some_stmt_list3(ss: Vec<Stmt>) -> Option<Vec<Stmt>> {
+    return Some { value: ss };
+}
+
+impl TyChecker {
+    fn error(&mut self, msg: String) {
+        self.errors.push(msg);
+    }
+
+    // === Expressions ===
+
+    fn check_expr(&mut self, e: Expr) -> Ty {
+        match e {
+            IntLit { value } => { return TyInt; }
+            StringLit { value } => { return TyStr; }
+            BoolLit { value } => { return TyBool; }
+            Ident { name } => { return self.check_ident(name); }
+            Binary { op, left, right } => { return self.check_binary(op, left, right); }
+            Unary { op, expr } => { return self.check_unary(op, expr); }
+            Call { callee, args } => { return self.check_call(callee, args); }
+            FieldAccess { obj, field } => { return self.check_field_access(obj, field); }
+            MethodCall { recv, method, args } => { return self.check_method_call(recv, method, args); }
+            Assign { name, value } => { return self.check_assign(name, value); }
+            FieldAssign { obj, field, value } => { return self.check_field_assign(obj, field, value); }
+            // `self.cur_ret_ty` is passed unconditionally as `expected_mono` -- `check_struct_lit`
+            // only ever CONSULTS it as a fallback when the bare struct name doesn't resolve on its
+            // own (a real, non-generic struct, or an already-mono generic name like "Vec$T"), so
+            // passing it here even for expressions that aren't actually in return position is
+            // harmless: it's simply ignored whenever it isn't needed. See that fn's own header --
+            // real gap found self-compiling `Parser.hotc`, whose own helper fns all write `return
+            // Vec { ... };` inside a `-> Vec<X>` fn.
+            StructLit { name, field_names, field_values, generic_base } => { return self.check_struct_lit(name, field_names, field_values, generic_base, some_string3(self.cur_ret_ty)); }
+            ArrayLit { elements } => { return self.check_array_lit(elements); }
+            ArrayRepeat { value, count } => { return self.check_array_repeat(value, count); }
+            Index { arr, index } => { return self.check_index(arr, index); }
+            IndexAssign { arr, index, value } => { return self.check_index_assign(arr, index, value); }
+            StaticCall { type_name, method, args } => { return self.check_static_call(type_name, method, args); }
+            Cast { expr, target_type } => { return self.check_cast(expr, target_type); }
+        }
+    }
+
+    // `expr as Type` -- `target_type` is trusted at face value, same "declared type is truth"
+    // honesty every other declared type already gets in this checker (see `Ast.hc`'s own `Cast`
+    // header for why cast-legality checking is out of scope this round). `expr` is still checked
+    // for real (its own errors, e.g. an unknown variable inside it, still surface).
+    fn check_cast(&mut self, expr: Expr, target_type: String) -> Ty {
+        self.check_expr(expr);
+        return ty_from_name(target_type);
+    }
+
+    fn check_static_call(&mut self, type_name: String, method: String, args: Vec<Expr>) -> Ty {
+        var arg_tys = self.check_arg_list(args);
+        let key = type_name + "#" + method;
+        let cls_found = self.externs.get(type_name);
+        var cls_known = false;
+        if let Some { value: b } = cls_found { cls_known = true; }
+        if cls_known {
+            let m_found = self.extern_methods.get(key);
+            if let Some { value: m } = m_found {
+                let expected_count = m.param_types.length();
+                let got_count = arg_tys.length();
+                if expected_count != got_count {
+                    self.error("'" + method + "' expects " + JString::valueOf(expected_count) + " args, got " + JString::valueOf(got_count));
+                } else {
+                    var i = 0;
+                    while i < got_count {
+                        let expected = m.param_types.get(i);
+                        let got = arg_tys.get(i);
+                        let gn = ty_name(got);
+                        if expected != "?" && gn != "?" && expected != gn {
+                            self.error("argument " + JString::valueOf(i + 1) + " to '" + method + "' expects " + expected + ", got " + gn);
+                        }
+                        i = i + 1;
+                    }
+                }
+                if m.is_ctor { return ty_from_name(type_name); }
+                if m.ret_type == "Self" { return ty_from_name(type_name); }
+                return ty_from_name(m.ret_type);
+            } else {
+                self.error("unknown method '" + method + "' on extern class '" + type_name + "'");
+                return TyUnknown;
+            }
+        }
+        // Not a known extern class -- fall back to a struct static method.
+        let sm_found = self.static_methods.get(key);
+        if let Some { value: sig } = sm_found {
+            let expected_count = sig.param_types.length();
+            let got_count = arg_tys.length();
+            if expected_count != got_count {
+                self.error("'" + method + "' expects " + JString::valueOf(expected_count) + " args, got " + JString::valueOf(got_count));
+            } else {
+                var i = 0;
+                while i < got_count {
+                    let expected = sig.param_types.get(i);
+                    let got = arg_tys.get(i);
+                    let en = ty_name(expected);
+                    let gn = ty_name(got);
+                    if en != "?" && gn != "?" && en != gn {
+                        self.error("argument " + JString::valueOf(i + 1) + " to '" + method + "' expects " + en + ", got " + gn);
+                    }
+                    i = i + 1;
+                }
+            }
+            return sig.ret_type;
+        }
+        self.error("unknown extern class or struct '" + type_name + "' (no static method '" + method + "')");
+        return TyUnknown;
+    }
+
+    fn check_array_lit(&mut self, elements: Vec<Expr>) -> Ty {
+        if elements.length() == 0 {
+            self.error("empty array literal not supported (element type can't be inferred)");
+            return TyUnknown;
+        }
+        let first_ty = self.check_expr(elements.get(0));
+        let first_name = ty_name(first_ty);
+        var i = 1;
+        while i < elements.length() {
+            let t = self.check_expr(elements.get(i));
+            let n = ty_name(t);
+            if n != "?" && first_name != "?" && n != first_name {
+                self.error("array elements must all have the same type, expected " + first_name + ", got " + n);
+            }
+            i = i + 1;
+        }
+        return TyStruct { name: "[" + first_name + "]" };
+    }
+
+    // `[value; count]` -- `count` must be `Int`, and the element type is just `value`'s own type
+    // (no same-type-as-siblings check needed, unlike `check_array_lit` -- there's only ever one
+    // value expression here, re-evaluated at runtime, not a list of distinct ones to compare).
+    fn check_array_repeat(&mut self, value: Expr, count: Expr) -> Ty {
+        let vt = self.check_expr(value);
+        let vn = ty_name(vt);
+        let ct = self.check_expr(count);
+        let cn = ty_name(ct);
+        if cn != "Int" && cn != "?" {
+            self.error("array repeat count must be Int, got " + cn);
+        }
+        return TyStruct { name: "[" + vn + "]" };
+    }
+
+    fn check_index(&mut self, arr: Expr, index: Expr) -> Ty {
+        let at = self.check_expr(arr);
+        let an = ty_name(at);
+        let it = self.check_expr(index);
+        let in_ = ty_name(it);
+        if in_ != "Int" && in_ != "?" {
+            self.error("array index must be Int, got " + in_);
+        }
+        if an == "?" { return TyUnknown; }
+        if !is_array_type_name(an) {
+            self.error("type '" + an + "' is not an array, can't index it");
+            return TyUnknown;
+        }
+        return ty_from_name(array_elem_type_name(an));
+    }
+
+    fn check_index_assign(&mut self, arr: Expr, index: Expr, value: Expr) -> Ty {
+        let at = self.check_expr(arr);
+        let an = ty_name(at);
+        let it = self.check_expr(index);
+        let in_ = ty_name(it);
+        if in_ != "Int" && in_ != "?" {
+            self.error("array index must be Int, got " + in_);
+        }
+        let vt = self.check_expr(value);
+        let vn = ty_name(vt);
+        if an == "?" { return ty_from_name(vn); }
+        if !is_array_type_name(an) {
+            self.error("type '" + an + "' is not an array, can't index it");
+            return ty_from_name(vn);
+        }
+        let elem = array_elem_type_name(an);
+        if vn != "?" && elem != vn {
+            self.error("cannot assign " + vn + " to array element of type " + elem);
+        }
+        return ty_from_name(vn);
+    }
+
+    fn check_field_access(&mut self, obj: Expr, field: String) -> Ty {
+        let ot = self.check_expr(obj);
+        let on = ty_name(ot);
+        if on == "?" { return TyUnknown; }
+        if is_array_type_name(on) {
+            if field == "length" { return TyInt; }
+            self.error("array has no field '" + field + "' (only 'length')");
+            return TyUnknown;
+        }
+        self.ensure_instantiated(on);
+        let found = self.structs.get(on);
+        if let Some { value: info } = found {
+            let ft = find_field_type(info, field);
+            if ft == "?" {
+                self.error("struct '" + on + "' has no field '" + field + "'");
+                return TyUnknown;
+            }
+            return ty_from_name(ft);
+        } else {
+            self.error("type '" + on + "' has no field '" + field + "'");
+            return TyUnknown;
+        }
+    }
+
+    fn check_field_assign(&mut self, obj: Expr, field: String, value: Expr) -> Ty {
+        let ot = self.check_expr(obj);
+        let on = ty_name(ot);
+        let vt = self.check_expr(value);
+        let vn = ty_name(vt);
+        if on == "?" { return ty_from_name(vn); }
+        self.ensure_instantiated(on);
+        let found = self.structs.get(on);
+        if let Some { value: info } = found {
+            let ft = find_field_type(info, field);
+            if ft == "?" {
+                self.error("struct '" + on + "' has no field '" + field + "'");
+            } else if vn != "?" && ft != vn {
+                self.error("cannot assign " + vn + " to field '" + field + "' of type " + ft);
+            }
+        } else {
+            self.error("type '" + on + "' has no field '" + field + "'");
+        }
+        return ty_from_name(vn);
+    }
+
+    // `name` may be a real struct's own name, or an enum variant's name -- resolved to whichever
+    // name the field table is actually registered under (the enum's own name for a variant, see
+    // `register_enum`) so the returned `Ty` is always the *constructible* type's real name.
+    fn check_struct_lit(&mut self, name: String, field_names: Vec<String>, field_values: Vec<Expr>, generic_base: Option<String>, expected_mono: Option<String>) -> Ty {
+        var type_name = name;
+        // An explicitly-qualified generic-enum-variant construction (`Option<Int>::Some { ... }`)
+        // already names its exact concrete instantiation -- skip the bare-name `variant_owner`
+        // lookup entirely (see `Ast.hc`'s own `EnumDecl` header for why that lookup alone can't
+        // disambiguate once a generic enum is used at more than one type argument).
+        var is_qualified = false;
+        if let Some { value: base } = generic_base {
+            type_name = base;
+            is_qualified = true;
+        }
+        if !is_qualified {
+            // A `variant_owner` entry is only trustworthy here when its OWNER is itself a
+            // non-mono name -- a real, hand-declared non-generic enum's own name never contains
+            // "$" (e.g. a program declaring its OWN `enum Opt2 { Some {...}, None {} }` alongside
+            // the always-injected prelude's `Option<T>`, real `demo_program34.hcsrc` usage: both
+            // enums use the SAME variant names "Some"/"None"). When the owner IS a mono name
+            // ("Option$Expr"), it's a SIDE EFFECT of whichever concrete instantiation happened to
+            // monomorphize FIRST (`ensure_instantiated` -> `register_enum(mono_name, ...)`, the
+            // same non-generic registration path a real one-shot enum uses) -- once that happens,
+            // every LATER bare `Some { ... }`/`None` site would silently resolve to that first
+            // instantiation's owner forever, regardless of what type argument this particular
+            // site actually needs (real gap found self-compiling `Parser.hotc`, which constructs
+            // `Option<T>` at several different `T`s: `Option<Expr>`, `Option<Vec<Stmt>>`,
+            // `Option<String>`) -- `generic_variant_owner` (registered once at DECLARATION time,
+            // never mutated) is checked instead in that case; `type_name` becomes the generic
+            // BASE ("Option"), resolved to the real mono name by the block right below. If
+            // NEITHER resolves cleanly, falls back to the (possibly stale) `variant_owner` entry
+            // anyway -- better than nothing, preserves this lookup's original behavior for
+            // whatever edge case neither table above was meant to cover.
+            var resolved = false;
+            let owner_found = self.variant_owner.get(name);
+            if let Some { value: owner } = owner_found {
+                if !is_mono_name(owner) {
+                    type_name = owner;
+                    resolved = true;
+                }
+            }
+            if !resolved {
+                let generic_owner_found = self.generic_variant_owner.get(name);
+                if let Some { value: gowner } = generic_owner_found {
+                    type_name = gowner;
+                    resolved = true;
+                }
+            }
+            if !resolved {
+                let owner_found2 = self.variant_owner.get(name);
+                if let Some { value: owner2 } = owner_found2 {
+                    type_name = owner2;
+                }
+            }
+        }
+        // A bare generic struct/enum literal ("Vec { ... }" / "Some { ... }", no "<Arg>") relying
+        // on the surrounding `return` statement's own declared return type to supply the missing
+        // type argument -- e.g. `return Vec { data: v.data, len: 0 };` inside a fn declared `->
+        // Vec<FnDecl>`, or `return Some { value: e };` inside a fn declared `-> Option<Expr>`. A
+        // real, disclosed-scope gap found self-compiling `Parser.hotc`, whose own helper fns
+        // (`empty_fn_decl_vec`, `some_expr`, etc) all follow exactly this idiom. Scope cut: ONLY
+        // return-position inference (the only shape any real self-hosted source actually needs,
+        // see `check_expr`'s own `StructLit` dispatch, which passes `self.cur_ret_ty`
+        // unconditionally as `expected_mono`) -- `let`/`var` still have no declared-type
+        // annotation to infer from at all (this subset's own `let`/`var` are always inferred from
+        // `init`, never stored).
+        if !is_qualified {
+            var is_generic_base = false;
+            let base_is_generic_struct = self.generic_templates.get(type_name);
+            if let Some { value: bs } = base_is_generic_struct { is_generic_base = true; }
+            let base_is_generic_enum = self.generic_enum_templates.get(type_name);
+            if let Some { value: be } = base_is_generic_enum { is_generic_base = true; }
+            if is_generic_base {
+                var resolved_via_mono = false;
+                if let Some { value: mono } = expected_mono {
+                    if is_mono_name(mono) && mono_base(mono) == type_name {
+                        type_name = mono;
+                        resolved_via_mono = true;
+                    }
+                }
+                // Fallback: the "Vec { data: someVar.data, len: 0 }" idiom -- an "empty, same-
+                // element-type Vec" built by reusing an ALREADY-typed local's own backing array,
+                // instead of via a dedicated `empty_*_vec`-style helper fn in return position
+                // (which the block above already handles). Real gap found self-compiling
+                // `Checker.hotc`'s own `checker_new`, which constructs several fields exactly this
+                // way (`var mono = vec_of("__init__"); var mono_needed = Vec { data: mono.data,
+                // len: 0 };`) -- a `var`/`let` binding has no declared-type annotation to infer
+                // from at all in this subset (see this fn's own header), so a "data" field whose
+                // value is LITERALLY `someIdent.data` is the next best signal: look up
+                // `someIdent`'s own already-known type directly (a registry read, not a
+                // `check_expr` call -- calling `check_expr` on the SAME sub-expression twice, once
+                // here and once in the normal per-field validation loop below, would risk a
+                // "use of moved value" on a non-Copy type, see this file's own header on that trap).
+                if !resolved_via_mono {
+                    var di = 0;
+                    while di < field_names.length() {
+                        if field_names.get(di) == "data" {
+                            let fv = field_values.get(di);
+                            match fv {
+                                FieldAccess { obj, field } => {
+                                    if field == "data" {
+                                        match obj {
+                                            Ident { name: oname } => {
+                                                let ovar = self.vars.get(oname);
+                                                if let Some { value: oty } = ovar {
+                                                    let on = ty_name(oty);
+                                                    if is_mono_name(on) && mono_base(on) == type_name {
+                                                        type_name = on;
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        di = di + 1;
+                    }
+                }
+            }
+        }
+        self.ensure_instantiated(type_name);
+        let found = self.structs.get(type_name);
+        if let Some { value: info } = found {
+            // Prefer the CONSTRUCTED VARIANT's own dedicated field table over the enum-wide union
+            // `info` (see `variant_field_info`'s own header) whenever `name` names a real variant
+            // -- falls back to `info` for a plain (non-enum) struct, where there's only ever one
+            // table anyway.
+            var field_info = info;
+            let variant_info = self.variant_field_info.get(type_name + "#" + name);
+            if let Some { value: vinfo } = variant_info {
+                field_info = vinfo;
+            }
+            var i = 0;
+            while i < field_values.length() {
+                let fname = field_names.get(i);
+                let fty = self.check_expr(field_values.get(i));
+                let fn_ = ty_name(fty);
+                let expected = find_field_type(field_info, fname);
+                if expected == "?" {
+                    self.error("'" + name + "' has no field '" + fname + "'");
+                } else if fn_ != "?" && expected != fn_ {
+                    self.error("field '" + fname + "' of '" + name + "' expects " + expected + ", got " + fn_);
+                }
+                i = i + 1;
+            }
+            return TyStruct { name: type_name };
+        } else {
+            self.error("unknown struct or enum variant '" + name + "'");
+            return TyUnknown;
+        }
+    }
+
+    // Called once per `StructDecl` (by the driver, before any fn body is checked -- mirrors
+    // `fn_sigs`' own forward-registration so field types resolve regardless of declaration
+    // order). Declared field types are trusted at face value the same way a fn param's declared
+    // type is -- see `ty_from_name`. A *generic* struct (`type_param` is `Some`) goes into
+    // `generic_templates` instead -- it isn't directly usable until `ensure_instantiated`
+    // monomorphizes some concrete `Base$Arg` name for it.
+    fn register_struct(&mut self, name: String, type_param: Option<String>, fields: Vec<Param>) {
+        var names = empty_str_vec2();
+        var types = empty_str_vec2();
+        var i = 0;
+        while i < fields.length() {
+            let f = fields.get(i);
+            names.push(f.name);
+            types.push(f.type_name);
+            i = i + 1;
+        }
+        if let Some { value: tp } = type_param {
+            self.generic_templates.register(name, GenericTemplate { type_param: tp, field_names: names, field_types: types });
+        } else {
+            self.structs.register(name, StructInfo { field_names: names, field_types: types });
+        }
+    }
+
+    // Called once per `ExternClassDecl` (mirrors `register_struct`/`register_enum`). Declared
+    // signatures are trusted at face value -- no real classpath reflection this phase (see
+    // `Ast.hc`'s own `ExternClassDecl` header), the same "declared type is truth" honesty every
+    // other declared type already gets in this checker.
+    fn register_extern(&mut self, name: String, binary_name: String, methods: Vec<ExternMethod>) {
+        self.externs.register(name, binary_name);
+        var i = 0;
+        while i < methods.length() {
+            let m = methods.get(i);
+            let key = name + "#" + m.name;
+            self.extern_methods.register(key, ExternMethodInfo { param_types: param_type_names_of4(m.params), ret_type: m.ret_type, is_static: m.is_static, is_ctor: m.is_ctor });
+            i = i + 1;
+        }
+    }
+
+    // Called once per `StaticDecl` (mirrors `register_struct`/`register_extern`'s own forward-
+    // registration, done before any fn body is checked so a static's declaration order relative to
+    // its uses never matters) -- the declared `type_name` is trusted at face value, same "declared
+    // type is truth" honesty every other declared type already gets in this checker (this file
+    // never actually evaluates `s.value` against it -- see `Ast.hc`'s own `StaticDecl` header).
+    fn register_static_decl(&mut self, s: StaticDecl) {
+        self.statics.register(s.name, ty_from_name(s.type_name));
+    }
+
+    // If `name` is a monomorphized instantiation (`"Box$Int"`) not yet concretely registered,
+    // substitutes its generic template's type parameter with the real argument and registers the
+    // result as an ordinary struct under `name` -- after this call, `name` behaves exactly like
+    // any real, non-generic struct everywhere else in this file. Idempotent (checks `self.structs`
+    // first) and records `name` into `mono_needed` on first instantiation only. Cascades: if a
+    // substituted field type is itself a *different* generic instantiation (`"Vec$Int"`, from a
+    // declared field like `Registry<T> { entries: Vec<T> }`), that nested instantiation gets
+    // `ensure_instantiated`'d right here too -- otherwise `"Vec$Int"` would sit in `Registry$Int`'s
+    // own field table naming a class that never actually got emitted, a real
+    // `NoClassDefFoundError` waiting to happen at runtime the moment the field was ever accessed
+    // by code this checker hadn't *also* happened to check some other way (see
+    // `substitute_field_type`'s own header for the plain substitution half of this).
+    fn ensure_instantiated(&mut self, name: String) {
+        if !is_mono_name(name) { return; }
+        let already = self.structs.get(name);
+        var exists = false;
+        if let Some { value: x } = already { exists = true; }
+        if exists { return; }
+        let base = mono_base(name);
+        let arg = mono_arg(name);
+        let tmpl_found = self.generic_templates.get(base);
+        if let Some { value: tmpl } = tmpl_found {
+            var fields = empty_param_vec3();
+            var i = 0;
+            while i < tmpl.field_names.length() {
+                let ftype = substitute_field_type(tmpl.field_types.get(i), tmpl.type_param, arg);
+                let ctarget = cascade_target(ftype);
+                if is_mono_name(ctarget) {
+                    self.ensure_instantiated(ctarget);
+                }
+                fields.push(Param { name: tmpl.field_names.get(i), type_name: ftype });
+                i = i + 1;
+            }
+            self.register_struct(name, none_string3(), fields);
+            self.mono_needed.push(name);
+            return;
+        }
+        let etmpl_found = self.generic_enum_templates.get(base);
+        if let Some { value: etmpl } = etmpl_found {
+            var new_variants = empty_variant_vec3();
+            var vi2 = 0;
+            while vi2 < etmpl.variants.length() {
+                let v = etmpl.variants.get(vi2);
+                var new_fields = empty_param_vec3();
+                var fi3 = 0;
+                while fi3 < v.fields.length() {
+                    let f = v.fields.get(fi3);
+                    let ftype2 = substitute_field_type(f.type_name, etmpl.type_param, arg);
+                    let ctarget2 = cascade_target(ftype2);
+                    if is_mono_name(ctarget2) {
+                        self.ensure_instantiated(ctarget2);
+                    }
+                    new_fields.push(Param { name: f.name, type_name: ftype2 });
+                    fi3 = fi3 + 1;
+                }
+                new_variants.push(EnumVariant { name: v.name, fields: new_fields });
+                vi2 = vi2 + 1;
+            }
+            self.register_enum(name, none_string3(), new_variants);
+            self.mono_needed.push(name);
+        }
+    }
+
+    // If `name` is a monomorphized FUNCTION instantiation (`"identity$Int"`) not yet concretely
+    // registered, substitutes its generic template's type parameter into every param's declared
+    // type (and the return type), registers the concrete signature under `name`, and re-checks a
+    // substituted-params-AND-BODY copy of the template's own body against `name` (reusing
+    // `check_fn` directly, same as a static impl method does) -- after this call, `name` behaves
+    // exactly like any real, non-generic fn everywhere else in this file (`check_call` looks it up
+    // in `fn_sigs`). Idempotent and records `name` into `fn_mono_needed` on first instantiation
+    // only, mirroring `ensure_instantiated`. The body itself is walked too now (`subst_stmt_list`,
+    // closing a gap disclosed earlier): a generic fn's body CAN reference its own still-abstract
+    // `T` inside a nested generic construction site (`vec_of<T>`'s own `return Vec<T> { data:
+    // [first; 4], len: 1 };`, say) -- that gets fixed up to the real concrete instantiation before
+    // this substituted copy is checked, so `check_struct_lit`'s own `ensure_instantiated` call
+    // cascades into the nested struct/enum instantiation exactly like it would for hand-written
+    // concrete source, no special-casing needed here beyond the fix-up itself.
+    fn ensure_fn_instantiated(&mut self, name: String) {
+        if !is_mono_name(name) { return; }
+        let already = self.fn_sigs.get(name);
+        var exists = false;
+        if let Some { value: s } = already { exists = true; }
+        if exists { return; }
+        let base = mono_base(name);
+        let arg = mono_arg(name);
+        let tmpl_found = self.generic_fn_templates.get(base);
+        if let Some { value: tmpl } = tmpl_found {
+            var found_tp = "";
+            if let Some { value: tp } = tmpl.type_param { found_tp = tp; }
+            // Builds `new_param_tys` alongside `new_params` in the same pass -- rather than
+            // deriving it afterward via `param_types_of(new_params)`, which would MOVE
+            // `new_params` (it takes `Vec<Param>` by value) before `mono_decl` below needs it
+            // again.
+            var new_params = empty_param_vec3();
+            var new_param_tys = empty_ty_vec();
+            var pi = 0;
+            while pi < tmpl.params.length() {
+                let p = tmpl.params.get(pi);
+                let pty = substitute_field_type(p.type_name, found_tp, arg);
+                new_params.push(Param { name: p.name, type_name: pty });
+                new_param_tys.push(ty_from_name(pty));
+                pi = pi + 1;
+            }
+            let ret_ty_str = opt_string_or2(tmpl.ret_type, "Int");
+            let new_ret = substitute_field_type(ret_ty_str, found_tp, arg);
+            self.fn_sigs.register(name, FnSig { param_types: new_param_tys, ret_type: ty_from_name(new_ret) });
+            self.fn_mono_needed.push(name);
+            let substituted_body = subst_stmt_list(tmpl.body, found_tp, arg);
+            var mono_decl = FnDecl { name: name, params: new_params, ret_type: some_string3(new_ret), body: substituted_body, type_param: none_string3() };
+            // Real bug found building this: `ensure_fn_instantiated` can fire from the MIDDLE of
+            // checking a totally different function's body (a call site inside it just triggered
+            // the first-ever use of this instantiation) -- but `check_fn` unconditionally resets
+            // `self.vars` to a fresh scope for whatever it's given, so calling it here without
+            // saving/restoring first would wipe out every local the *caller's* own function had
+            // already bound (a `let n = identity(37);` earlier in `combo`'s body, say), surfacing
+            // as spurious "unknown variable" errors for names that were very much still in scope.
+            // Save/restore around the nested check, same as any other re-entrant use of shared
+            // mutable state.
+            let saved_vars = self.vars;
+            let saved_ret_ty = self.cur_ret_ty;
+            self.check_fn(mono_decl);
+            self.vars = saved_vars;
+            self.cur_ret_ty = saved_ret_ty;
+        }
+    }
+
+    // Called once per `EnumDecl` (mirrors `register_struct`). Registers the *union* of every
+    // variant's fields under the enum's own name (a real, disclosed simplification -- field
+    // lookups and `StructLit` validation don't distinguish which variant a field actually belongs
+    // to, only whether it exists on *some* variant of this enum; see this file's own header), and
+    // records each variant name -> this enum's name in `variant_owner` (bare lookup, unqualified
+    // construction sites only) and `variant_owner_q` (qualified "Owner#Variant" existence check,
+    // `check_match` reads this one). A *generic* enum (`type_param` is `Some`) goes into
+    // `generic_enum_templates` instead, same as `register_struct`'s own generic branch -- it isn't
+    // directly usable until `ensure_instantiated` monomorphizes a concrete `Base$Arg` name for it.
+    fn register_enum(&mut self, name: String, type_param: Option<String>, variants: Vec<EnumVariant>) {
+        // A single `if let ... { move variants; return; }` followed by code that also uses
+        // `variants` trips the move-checker's conservative branch-merge behavior even though the
+        // early `return` makes the two paths genuinely exclusive (it doesn't reason about
+        // reachability past a `return`) -- restructured as one exhaustive `if`/`else`, each branch
+        // using `variants` exactly once, mirroring `register_struct`'s own shape.
+        var is_generic = false;
+        var tp_val = "";
+        if let Some { value: tp } = type_param {
+            is_generic = true;
+            tp_val = tp;
+        }
+        if is_generic {
+            var gvi = 0;
+            while gvi < variants.length() {
+                let gv = variants.get(gvi);
+                self.generic_variant_owner.register(gv.name, name);
+                gvi = gvi + 1;
+            }
+            self.generic_enum_templates.register(name, GenericEnumTemplate { type_param: tp_val, variants: variants });
+        } else {
+            var names = empty_str_vec2();
+            var types = empty_str_vec2();
+            var variant_names = empty_str_vec2();
+            var vi = 0;
+            while vi < variants.length() {
+                let v = variants.get(vi);
+                self.variant_owner.register(v.name, name);
+                self.variant_owner_q.register(name + "#" + v.name, true);
+                variant_names.push(v.name);
+                var v_names = empty_str_vec2();
+                var v_types = empty_str_vec2();
+                var fi = 0;
+                while fi < v.fields.length() {
+                    let f = v.fields.get(fi);
+                    names.push(f.name);
+                    types.push(f.type_name);
+                    v_names.push(f.name);
+                    v_types.push(f.type_name);
+                    fi = fi + 1;
+                }
+                // Keyed "OwnerName#VariantName" (mirrors `variant_owner_q`), NOT bare `v.name` --
+                // a bare key would collide across multiple concrete instantiations of the same
+                // GENERIC enum (`Option$Expr#Some`'s `value: Expr` vs `Option$String#Some`'s
+                // `value: String`, both registered under this same enum's own template, each via
+                // its own `ensure_instantiated` -> `register_enum(mono_name, ...)` call), the
+                // exact same collision already disclosed for `variant_owner` itself (see
+                // `build_program_info`'s own header in `Codegen.hotc`) -- found self-compiling
+                // `Parser.hotc`, whose real source constructs `Option<T>` at several different T's.
+                self.variant_field_info.register(name + "#" + v.name, StructInfo { field_names: v_names, field_types: v_types });
+                vi = vi + 1;
+            }
+            self.structs.register(name, StructInfo { field_names: names, field_types: types });
+            self.enum_variants.register(name, variant_names);
+        }
+    }
+
+    // A LOCAL (`self.vars`, reset fresh per fn/method) is checked first, so a local can still
+    // shadow a top-level `static` of the same name -- only falls back to `self.statics` (global,
+    // never reset) when there's no local by this name. See `Ast.hc`'s own `StaticDecl` header.
+    fn check_ident(&mut self, name: String) -> Ty {
+        let found = self.vars.get(name);
+        if let Some { value: t } = found {
+            return t;
+        }
+        let static_found = self.statics.get(name);
+        if let Some { value: st } = static_found {
+            return st;
+        }
+        // Neither a local nor a static -- a BARE fieldless-enum-variant reference used as an
+        // ordinary value expression (real `Lexer.hotc`/`Parser.hotc` usage: `Token { kind: FN }`,
+        // `kind == RETURN`, treating a fieldless enum's variants like plain named constants; also
+        // covers real `Parser.hotc`'s own bare `return None;`, a GENERIC fieldless variant --
+        // `self.cur_ret_ty` supplies the missing type argument, same as `check_expr`'s own
+        // `StructLit` dispatch). Delegates straight to `check_struct_lit` with empty field lists --
+        // exactly what `Name {}` would check, reusing that logic rather than duplicating it (and
+        // inheriting its existing, disclosed imprecision: neither path verifies every declared
+        // field was actually supplied, so this doesn't introduce a new gap, just extends an old
+        // one to a new syntax form).
+        let variant_found = self.variant_owner.get(name);
+        let generic_variant_found = self.generic_variant_owner.get(name);
+        var is_known_variant = false;
+        if let Some { value: owner } = variant_found { is_known_variant = true; }
+        if let Some { value: gowner } = generic_variant_found { is_known_variant = true; }
+        if is_known_variant {
+            return self.check_struct_lit(name, empty_str_vec2(), empty_expr_vec3(), none_string3(), some_string3(self.cur_ret_ty));
+        }
+        self.error("unknown variable '" + name + "'");
+        return TyUnknown;
+    }
+
+    fn check_binary(&mut self, op: String, left: Expr, right: Expr) -> Ty {
+        let lt = self.check_expr(left);
+        let rt = self.check_expr(right);
+        let ln = ty_name(lt);
+        let rn = ty_name(rt);
+        if op == "+" && ln == "String" && rn == "String" {
+            return TyStr;
+        } else if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+            if ln == "Int" && rn == "Int" {
+                return TyInt;
+            } else if ln == "Long" && rn == "Long" {
+                // Both operands must be `Long` -- no implicit `Int` -> `Long` widening this round
+                // (a real, disclosed scope cut; `Codegen.hotc`'s own `gen_binary` enforces the
+                // same restriction, since `LADD`/etc. need BOTH operands already category-2).
+                return TyLong;
+            } else if ln == "?" || rn == "?" {
+                return TyUnknown;
+            } else {
+                self.error("'" + op + "' needs Int or Long operands (both the same), got " + ln + " and " + rn);
+                return TyUnknown;
+            }
+        } else if op == "&&" || op == "||" {
+            if ln == "Bool" && rn == "Bool" {
+                return TyBool;
+            } else if ln == "?" || rn == "?" {
+                return TyUnknown;
+            } else {
+                self.error("'" + op + "' needs Bool operands, got " + ln + " and " + rn);
+                return TyUnknown;
+            }
+        } else if op == "<" || op == "<=" || op == ">" || op == ">=" {
+            if (ln == "Int" && rn == "Int") || (ln == "Long" && rn == "Long") || ln == "?" || rn == "?" {
+                return TyBool;
+            } else {
+                self.error("'" + op + "' needs Int or Long operands (both the same), got " + ln + " and " + rn);
+                return TyBool;
+            }
+        } else {
+            // "==" / "!=" -- always produce Bool; real structural-vs-reference-equality
+            // subtleties (see IDEAS.md) are left to codegen, not this checker's concern.
+            return TyBool;
+        }
+    }
+
+    fn check_unary(&mut self, op: String, inner: Expr) -> Ty {
+        let it = self.check_expr(inner);
+        let iname = ty_name(it);
+        if op == "!" {
+            if iname == "Bool" || iname == "?" {
+                return TyBool;
+            } else {
+                self.error("'!' needs a Bool operand, got " + iname);
+                return TyBool;
+            }
+        } else {
+            if iname == "Int" || iname == "?" {
+                return TyInt;
+            } else {
+                self.error("unary '-' needs an Int operand, got " + iname);
+                return TyInt;
+            }
+        }
+    }
+
+    fn check_call(&mut self, callee: String, args: Vec<Expr>) -> Ty {
+        var arg_tys = self.check_arg_list(args);
+        let found = self.fn_sigs.get(callee);
+        if let Some { value: sig } = found {
+            let expected_count = sig.param_types.length();
+            let got_count = arg_tys.length();
+            if expected_count != got_count {
+                self.error("'" + callee + "' expects " + JString::valueOf(expected_count) + " args, got " + JString::valueOf(got_count));
+            } else {
+                var i = 0;
+                while i < got_count {
+                    let expected = sig.param_types.get(i);
+                    let got = arg_tys.get(i);
+                    let en = ty_name(expected);
+                    let gn = ty_name(got);
+                    if en != "?" && gn != "?" && en != gn {
+                        self.error("argument " + JString::valueOf(i + 1) + " to '" + callee + "' expects " + en + ", got " + gn);
+                    }
+                    i = i + 1;
+                }
+            }
+            return sig.ret_type;
+        } else {
+            let gtmpl_found = self.generic_fn_templates.get(callee);
+            if let Some { value: gtmpl } = gtmpl_found {
+                return self.check_generic_call(callee, gtmpl, arg_tys);
+            }
+            // Unknown callee (e.g. a real builtin like `print` this phase's symbol table
+            // doesn't know about) -- trust it, same spirit as `extern class`'s own "no
+            // verification, trust the call site" honesty elsewhere in this compiler.
+            return TyUnknown;
+        }
+    }
+
+    // Infers a generic top-level fn's type argument from whichever argument's corresponding
+    // declared param type is EXACTLY the bare type parameter (`fn identity<T>(x: T)` -- `x`'s
+    // declared type is literally `"T"`, so the arg passed for `x` gives the concrete type
+    // directly) -- a real, disclosed scope cut: doesn't infer through `"[T]"` or a nested generic
+    // argument, only this one bare-match rule (see `Ast.hc`'s own `FnDecl` header). Builds the
+    // mono name (`"identity$Int"`), `ensure_fn_instantiated`s it, and returns its real (now-
+    // concrete) return type.
+    fn check_generic_call(&mut self, callee: String, gtmpl: FnDecl, arg_tys: Vec<Ty>) -> Ty {
+        var found_tp = "";
+        if let Some { value: tp } = gtmpl.type_param { found_tp = tp; }
+        var inferred = "";
+        var found_infer = false;
+        var i = 0;
+        while i < gtmpl.params.length() {
+            let p = gtmpl.params.get(i);
+            if p.type_name == found_tp && i < arg_tys.length() {
+                inferred = ty_name(arg_tys.get(i));
+                found_infer = true;
+            }
+            i = i + 1;
+        }
+        if !found_infer || inferred == "?" {
+            self.error("could not infer generic type argument for call to '" + callee + "'");
+            return TyUnknown;
+        }
+        let mono_name = callee + "$" + inferred;
+        self.ensure_fn_instantiated(mono_name);
+        let sig_found = self.fn_sigs.get(mono_name);
+        if let Some { value: sig } = sig_found {
+            return sig.ret_type;
+        }
+        return TyUnknown;
+    }
+
+    // If `rn` is a mono struct instantiation (`"Box$Int"`) and `method` names an instance method
+    // declared in the generic struct's own `impl` block (`generic_method_templates`, keyed by the
+    // BASE struct name -- `"Box#get"`) not yet concretely registered under `rn`'s own key, infers
+    // `T` directly from `rn` itself (`mono_arg("Box$Int")` = `"Int"` -- no scanning needed, unlike
+    // a generic top-level fn's own call-site inference, since a method's receiver already names
+    // its own concrete instantiation), substitutes params/return/body, registers the concrete
+    // `FnSig` under `rn + "#" + method`, and re-checks the substituted copy (`check_method`,
+    // save/restore `self.vars` around it -- same re-entrancy concern `ensure_fn_instantiated`'s own
+    // header explains). A no-op for anything that isn't this exact shape (a plain struct's own
+    // method, `String`'s built-ins, a genuine typo) -- `check_method_call`'s own existing lookup
+    // right after this call handles all of those unchanged.
+    fn ensure_method_instantiated(&mut self, owner: String, method: String) {
+        if !is_mono_name(owner) { return; }
+        let key = owner + "#" + method;
+        let already = self.methods.get(key);
+        var exists = false;
+        if let Some { value: s } = already { exists = true; }
+        if exists { return; }
+        let base = mono_base(owner);
+        let arg = mono_arg(owner);
+        let gm_found = self.generic_method_templates.get(base + "#" + method);
+        if let Some { value: gm } = gm_found {
+            var found_tp = "";
+            let tmpl_found = self.generic_templates.get(base);
+            if let Some { value: tmpl } = tmpl_found { found_tp = tmpl.type_param; }
+            var new_params = empty_param_vec3();
+            var new_param_tys = empty_ty_vec();
+            var pi = 0;
+            while pi < gm.params.length() {
+                let p = gm.params.get(pi);
+                let pty = substitute_field_type(p.type_name, found_tp, arg);
+                new_params.push(Param { name: p.name, type_name: pty });
+                new_param_tys.push(ty_from_name(pty));
+                pi = pi + 1;
+            }
+            let ret_ty_str = opt_string_or2(gm.ret_type, "Int");
+            let new_ret = substitute_field_type(ret_ty_str, found_tp, arg);
+            self.methods.register(key, FnSig { param_types: new_param_tys, ret_type: ty_from_name(new_ret) });
+            self.method_mono_needed.push(key);
+            let substituted_body = subst_stmt_list(gm.body, found_tp, arg);
+            var mono_decl = FnDecl { name: method, params: new_params, ret_type: some_string3(new_ret), body: substituted_body, type_param: none_string3() };
+            let saved_vars = self.vars;
+            let saved_ret_ty = self.cur_ret_ty;
+            self.check_method(owner, mono_decl);
+            self.vars = saved_vars;
+            self.cur_ret_ty = saved_ret_ty;
+        }
+    }
+
+    fn check_method_call(&mut self, recv: Expr, method: String, args: Vec<Expr>) -> Ty {
+        let rt = self.check_expr(recv);
+        let rn = ty_name(rt);
+        var arg_tys = self.check_arg_list(args);
+        if rn == "?" {
+            return TyUnknown;
+        }
+        self.ensure_instantiated(rn);
+        self.ensure_method_instantiated(rn, method);
+        let key = rn + "#" + method;
+        let extern_found = self.extern_methods.get(key);
+        if let Some { value: m } = extern_found {
+            let expected_count = m.param_types.length();
+            let got_count = arg_tys.length();
+            if expected_count != got_count {
+                self.error("'" + method + "' expects " + JString::valueOf(expected_count) + " args, got " + JString::valueOf(got_count));
+            } else {
+                var i = 0;
+                while i < got_count {
+                    let expected = m.param_types.get(i);
+                    let got = arg_tys.get(i);
+                    let gn = ty_name(got);
+                    if expected != "?" && gn != "?" && expected != gn {
+                        self.error("argument " + JString::valueOf(i + 1) + " to '" + method + "' expects " + expected + ", got " + gn);
+                    }
+                    i = i + 1;
+                }
+            }
+            if m.ret_type == "Self" { return ty_from_name(rn); }
+            return ty_from_name(m.ret_type);
+        }
+        let found = self.methods.get(key);
+        if let Some { value: sig } = found {
+            let expected_count = sig.param_types.length();
+            let got_count = arg_tys.length();
+            if expected_count != got_count {
+                self.error("'" + method + "' expects " + JString::valueOf(expected_count) + " args, got " + JString::valueOf(got_count));
+            } else {
+                var i = 0;
+                while i < got_count {
+                    let expected = sig.param_types.get(i);
+                    let got = arg_tys.get(i);
+                    let en = ty_name(expected);
+                    let gn = ty_name(got);
+                    if en != "?" && gn != "?" && en != gn {
+                        self.error("argument " + JString::valueOf(i + 1) + " to '" + method + "' expects " + en + ", got " + gn);
+                    }
+                    i = i + 1;
+                }
+            }
+            return sig.ret_type;
+        } else {
+            // No user-defined method by this name on this receiver type -- trust it (same
+            // "unknown, don't verify" spirit as `check_call`'s own unknown-callee case). Covers
+            // real receivers this checker has no method table for at all (`String`'s built-in
+            // methods, resolved for real only in `Codegen.hotc`) as well as genuine typos, which
+            // is a real, disclosed imprecision -- not distinguishing the two costs an error
+            // message on a typo, but doesn't reject anything that should compile.
+            return TyUnknown;
+        }
+    }
+
+    fn check_assign(&mut self, name: String, value: Expr) -> Ty {
+        let vt = self.check_expr(value);
+        let vn = ty_name(vt);
+        let existing = self.vars.get(name);
+        if let Some { value: et } = existing {
+            let en = ty_name(et);
+            if en != "?" && vn != "?" && en != vn {
+                self.error("cannot assign " + vn + " to '" + name + "' of type " + en);
+            }
+        } else {
+            self.error("unknown variable '" + name + "'");
+        }
+        // `vt` was already consumed by `ty_name(vt)` above -- reconstruct fresh from the name
+        // string instead of trying to reuse the (now-moved) original enum value.
+        return ty_from_name(vn);
+    }
+
+    // === Statements ===
+
+    fn check_stmt(&mut self, s: Stmt) {
+        match s {
+            Let { name, mutable, init } => {
+                let t = self.check_expr(init);
+                self.vars.register(name, t);
+            }
+            ExprStmt { expr } => {
+                self.check_expr(expr);
+            }
+            Return { value } => {
+                if let Some { value: v } = value {
+                    self.check_expr(v);
+                }
+            }
+            If { cond, then_body, else_body } => {
+                let ct = self.check_expr(cond);
+                let cn = ty_name(ct);
+                if cn != "Bool" && cn != "?" {
+                    self.error("if condition must be Bool, got " + cn);
+                }
+                self.check_block(then_body);
+                if let Some { value: eb } = else_body {
+                    self.check_block(eb);
+                }
+            }
+            While { cond, body } => {
+                let ct = self.check_expr(cond);
+                let cn = ty_name(ct);
+                if cn != "Bool" && cn != "?" {
+                    self.error("while condition must be Bool, got " + cn);
+                }
+                self.loop_depth = self.loop_depth + 1;
+                self.check_block(body);
+                self.loop_depth = self.loop_depth - 1;
+            }
+            Match { subject, arms } => {
+                self.check_match(subject, arms);
+            }
+            // `throw` now accepts either a plain `String` message (wrapped into a hardcoded
+            // `java.lang.RuntimeException` at codegen, unchanged) OR an already-constructed real
+            // exception object (`throw LexError::new(msg);` -- real `Lexer.hotc` usage, a genuine
+            // gap found self-compiling it, since `extern class` support didn't exist AT ALL when
+            // this restriction was first written) -- thrown directly via a real `ATHROW`, no
+            // wrapping. `Int`/`Bool` are the only types that can never be legitimately thrown
+            // either way; everything else (String, a struct, an extern-typed value) is trusted,
+            // matching this checker's existing "no real classpath reflection, trust declared
+            // types" honesty elsewhere (no verification that a non-String value is ACTUALLY a real
+            // `Throwable` under the hood).
+            Throw { value } => {
+                let vt = self.check_expr(value);
+                let vn = ty_name(vt);
+                if vn == "Int" || vn == "Bool" {
+                    self.error("throw needs a String message or a real exception value, got " + vn);
+                }
+            }
+            // No drop-list tracking (`varsToDropBeforeBreak`/`varsToDropBeforeContinue` in the
+            // real compiler) -- this subset has no `Drop`/RAII mechanism at all, so there's
+            // nothing to clean up on the way out. `self.loop_depth` (incremented/decremented
+            // around a `While`'s own body check, below) is the only thing that needs tracking.
+            Break {} => {
+                if self.loop_depth == 0 {
+                    self.error("'break' outside of a loop");
+                }
+            }
+            Continue {} => {
+                if self.loop_depth == 0 {
+                    self.error("'continue' outside of a loop");
+                }
+            }
+            // `catch_type` must name a real, known `extern class` -- there's no other way this
+            // subset has to name a real JVM exception type. `catch_var` is registered into
+            // `self.vars` the same way a match-arm binding is (this subset's own vars aren't
+            // block-scoped at all -- see this file's own header -- so it stays visible afterward
+            // too, same as every other binding here).
+            Try { try_block, catch_var, catch_type, catch_block } => {
+                self.check_block(try_block);
+                let ext_found = self.externs.get(catch_type);
+                var found_ext = false;
+                if let Some { value: bin } = ext_found { found_ext = true; }
+                if found_ext {
+                    self.vars.register(catch_var, TyStruct { name: catch_type });
+                } else {
+                    self.error("'catch' type '" + catch_type + "' is not a known extern class");
+                }
+                self.check_block(catch_block);
+            }
+        }
+    }
+
+    // No exhaustiveness checking this phase (a real, disclosed simplification -- the real
+    // checker's own exhaustiveness check is a substantially bigger feature than binding/type
+    // validation alone). Each arm's bound field names are validated against the *enum's* union
+    // field table (see `register_enum`'s own header), not the specific variant's own fields --
+    // same simplification `StructLit` construction already makes.
+    fn check_match(&mut self, subject: Expr, arms: Vec<MatchArm>) {
+        let st = self.check_expr(subject);
+        let sn = ty_name(st);
+        // A generic enum instantiation might only ever be *matched* in this particular function
+        // (constructed elsewhere, possibly checked later -- fn declaration order doesn't imply
+        // check order dependencies should exist at all), so unlike a plain enum's already-real
+        // `structs`/`enum_variants`/`variant_owner_q` entries, `sn` might not be registered yet.
+        // Real bug found building this: `check_field_access`/`check_method_call` already call
+        // `ensure_instantiated` on their receiver's type for exactly this reason -- `check_match`
+        // was missing the same call, so a generic-enum-typed match subject with no construction
+        // site checked earlier in the same run failed every arm with a spurious "'Some' is not a
+        // variant of 'Opt$Int'".
+        self.ensure_instantiated(sn);
+        var has_wildcard = false;
+        var covered = empty_str_vec2();
+        var i = 0;
+        while i < arms.length() {
+            let arm = arms.get(i);
+            if arm.variant_name == "_" {
+                has_wildcard = true;
+            } else {
+                covered.push(arm.variant_name);
+                // `variant_owner_q` (a qualified "Owner#Variant" existence table, populated for
+                // every enum -- plain and generic mono instantiations alike) rather than the bare
+                // `variant_owner` lookup, since the latter would collide across multiple concrete
+                // instantiations of the same generic enum (see `Ast.hc`'s own `EnumDecl` header).
+                let owner_q_found = self.variant_owner_q.get(sn + "#" + arm.variant_name);
+                var owner_ok = false;
+                if let Some { value: ok } = owner_q_found { owner_ok = true; }
+                if !owner_ok && sn != "?" {
+                    self.error("'" + arm.variant_name + "' is not a variant of '" + sn + "'");
+                }
+            }
+            var fj = 0;
+            while fj < arm.field_names.length() {
+                let fname = arm.field_names.get(fj);
+                let bname = arm.bind_names.get(fj);
+                var fty = "?";
+                // Prefer the ARM's OWN variant's dedicated field table (`variant_field_info`,
+                // keyed "OwnerName#VariantName") over the enum-wide union `self.structs.get(sn)`
+                // -- the same real gap `check_struct_lit` already had and fixed (see that fn's own
+                // `variant_field_info` header): `Ast.hc`'s own `Expr` enum reuses the field name
+                // "value" across many variants at DIFFERENT types (`IntLit.value: Int`,
+                // `StringLit.value: String`, ...), so the union table's first-match-wins linear
+                // scan always resolved every arm's "value" binding to whichever variant registered
+                // first (`IntLit`'s `Int`) -- a real bug found self-compiling `Checker.hotc`'s own
+                // `check_match`, silently mistyping every OTHER variant's bindings until this.
+                // Falls back to the union table when there's no per-variant entry (a plain,
+                // non-enum struct never being matched this way in practice, but harmless either
+                // way).
+                let variant_info_found = self.variant_field_info.get(sn + "#" + arm.variant_name);
+                if let Some { value: vinfo } = variant_info_found {
+                    fty = find_field_type(vinfo, fname);
+                } else {
+                    let info_found = self.structs.get(sn); // fresh every iteration -- see check_match's own header
+                    if let Some { value: info } = info_found {
+                        fty = find_field_type(info, fname);
+                    }
+                }
+                self.vars.register(bname, ty_from_name(fty));
+                fj = fj + 1;
+            }
+            self.check_block(arm.body);
+            i = i + 1;
+        }
+        if !has_wildcard && sn != "?" {
+            let variants_found = self.enum_variants.get(sn);
+            if let Some { value: variants } = variants_found {
+                var vi = 0;
+                while vi < variants.length() {
+                    let vname = variants.get(vi);
+                    var found_cov = false;
+                    var ci = 0;
+                    while ci < covered.length() {
+                        if covered.get(ci) == vname { found_cov = true; }
+                        ci = ci + 1;
+                    }
+                    if !found_cov {
+                        self.error("match on '" + sn + "' is not exhaustive, missing variant '" + vname + "'");
+                    }
+                    vi = vi + 1;
+                }
+            }
+        }
+    }
+
+    fn check_block(&mut self, stmts: Vec<Stmt>) {
+        var i = 0;
+        while i < stmts.length() {
+            self.check_stmt(stmts.get(i));
+            i = i + 1;
+        }
+    }
+
+    fn check_arg_list(&mut self, args: Vec<Expr>) -> Vec<Ty> {
+        if args.length() == 0 {
+            return empty_ty_vec();
+        }
+        var out = vec_of(self.check_expr(args.get(0)));
+        var i = 1;
+        while i < args.length() {
+            out.push(self.check_expr(args.get(i)));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // === Top level ===
+
+    // Called once per impl-block method (by the driver, before any fn/method body is checked --
+    // mirrors `fn_sigs`'/`register_struct`'s own forward-registration).
+    fn register_method(&mut self, struct_name: String, f: FnDecl) {
+        let key = struct_name + "#" + f.name;
+        self.methods.register(key, FnSig { param_types: param_types_of(f.params), ret_type: ty_from_name(opt_string_or2(f.ret_type, "Int")) });
+    }
+
+    // Same as `register_method`, but into `static_methods` -- no `self` to worry about, plain
+    // params like a top-level fn's own `fn_sigs` registration.
+    fn register_static_method(&mut self, struct_name: String, f: FnDecl) {
+        let key = struct_name + "#" + f.name;
+        self.static_methods.register(key, FnSig { param_types: param_types_of(f.params), ret_type: ty_from_name(opt_string_or2(f.ret_type, "Int")) });
+    }
+
+    // Like `check_fn`, but also binds `self` (the struct's own type) into the variable
+    // environment before checking params/body -- `self` isn't itself an entry in `f.params` (see
+    // `Ast.hc`'s `ImplDecl` header).
+    fn check_method(&mut self, struct_name: String, f: FnDecl) {
+        // Fresh scope per fn/method -- `Registry<T>.get()` returns the *first* match (see this
+        // file's own header), so without resetting here, a param name reused across two
+        // functions with *different* types (two different fns both taking a param called `b`,
+        // say) would silently resolve the second fn's own `b` to the first fn's leftover type.
+        // Real bug, caught by the generics demo -- `combo`'s own `b: Int` was shadowed by an
+        // earlier-checked fn's unrelated `b: Box$Int` until this fix.
+        self.vars = registry_new("__init__", TyUnknown);
+        self.vars.register("self", ty_from_name(struct_name));
+        self.cur_ret_ty = opt_string_or2(f.ret_type, "Unit");
+        var i = 0;
+        while i < f.params.length() {
+            let p = f.params.get(i);
+            self.vars.register(p.name, ty_from_name(p.type_name));
+            i = i + 1;
+        }
+        self.check_block(f.body);
+    }
+
+    fn check_fn(&mut self, f: FnDecl) {
+        self.vars = registry_new("__init__", TyUnknown); // fresh scope per fn -- see check_method's own comment
+        self.cur_ret_ty = opt_string_or2(f.ret_type, "Unit");
+        var i = 0;
+        while i < f.params.length() {
+            let p = f.params.get(i);
+            self.vars.register(p.name, ty_from_name(p.type_name));
+            i = i + 1;
+        }
+        self.check_block(f.body);
+    }
+
+    // Canonical "what real JVM type is this, for signature-matching purposes" key for a DECLARED
+    // (HC-level) type name -- mirrors the real compiler's own `realTyKey` (see `JavaReflect.kt`'s
+    // header comment for why this port exists: the self-hosted subset had NO real classpath
+    // reflection at all, only "trust the declared signature" honesty). `"?"` means
+    // "unrepresentable for this comparison" (an HC-native struct/enum, matching the real
+    // compiler's own `null` sentinel there) -- `verify_extern_signature` skips the whole check
+    // when it sees this, rather than risk a false-positive mismatch for a shape this port doesn't
+    // understand. `self.externs` binary names are stored EXACTLY as declared (dot or slash form
+    // alike -- only `Codegen.hotc`'s own `dot_to_slash_cg` normalizes them, at bytecode-emission
+    // time, not here), so this converts dot-to-slash itself before building the key, to compare
+    // correctly against `real_method_key`'s own always-slash-form (`Class.getName()` normalized).
+    fn declared_type_to_key(&mut self, type_name: String) -> String {
+        if type_name == "Int" { return "I"; }
+        if type_name == "Long" { return "J"; }
+        if type_name == "Bool" { return "Z"; }
+        if type_name == "Unit" { return "V"; }
+        if type_name == "String" { return "Ljava/lang/String;"; }
+        if is_array_type_name(type_name) {
+            return "[" + self.declared_type_to_key(array_elem_type_name(type_name));
+        }
+        let bin_found = self.externs.get(type_name);
+        if let Some { value: bin } = bin_found {
+            return "L" + dot_to_slash_reflect(bin) + ";";
+        }
+        return "?";
+    }
+
+    // Real gap found trying to give `Checker.hotc` real classpath reflection at all: an extern
+    // method's DECLARED signature was never checked against the real class it names -- a wrong
+    // return type or param type compiled clean and only surfaced as a runtime `NoSuchMethodError`.
+    // Deliberately narrower than the real compiler's own `verifyExternSignatures`: only the
+    // explicit-signature form (this subset's ONLY extern-method form -- no `use { ... }`, no lazy
+    // resolution, no `Ty.Dyn` bound-interface params) needs porting at all. NOT wired into
+    // `register_extern`'s own automatic flow (that would need a real `--classpath` threaded all
+    // the way from the CLI through `Driver.hotc`, which this subset's driver doesn't do yet) --
+    // callable directly wherever a caller already has a real classpath available.
+    fn verify_extern_signature(&mut self, alias_name: String, binary_name: String, method_name: String, param_type_names: Vec<String>, ret_type_name: String, is_static: Bool, is_ctor: Bool) {
+        if !class_exists_reflect(binary_name) { return; } // not on this classpath -- nothing to check against
+        let real_methods = resolve_real_methods(binary_name, method_name, is_ctor);
+        if real_methods.length() == 0 {
+            self.error("extern class '" + alias_name + "': no public member '" + method_name + "' found on '" + binary_name + "' on the configured classpath");
+            return;
+        }
+        var declared_keys = empty_str_vec2();
+        var any_unknown = false;
+        var i = 0;
+        while i < param_type_names.length() {
+            let k = self.declared_type_to_key(param_type_names.get(i));
+            if k == "?" { any_unknown = true; }
+            declared_keys.push(k);
+            i = i + 1;
+        }
+        var ret_key = "V";
+        if !is_ctor {
+            ret_key = self.declared_type_to_key(ret_type_name);
+            if ret_key == "?" { any_unknown = true; }
+        }
+        // Any unrepresentable type means this declaration could never correspond to a real Java
+        // member anyway -- skip rather than guess, same "degrade to no check" reasoning
+        // `declared_type_to_key`'s own header already uses.
+        if any_unknown { return; }
+        var matched = false;
+        var j = 0;
+        while j < real_methods.length() {
+            let rm = real_methods.get(j);
+            if rm.is_static == is_static && str_vec_eq_reflect(rm.param_keys, declared_keys) {
+                if is_ctor {
+                    matched = true;
+                } else if rm.ret_key == ret_key {
+                    matched = true;
+                }
+            }
+            j = j + 1;
+        }
+        if !matched {
+            self.error("extern class '" + alias_name + "': declared '" + method_name + "' doesn't match any real overload of '" + binary_name + "." + method_name + "' on the configured classpath");
+        }
+    }
+}
+
+// === Real classpath reflection, ported from `JavaReflect.kt`'s `ClasspathReflector` ===
+// The self-hosted subset had NO real classpath reflection at all before this -- `extern class`
+// declarations were pure "trust me" honesty, matching this file's own long-standing header.
+// `try`/`catch` (see `Ast.hc`'s own `Try` header) exists specifically to make this possible:
+// `Class.forName` genuinely throws for a missing class, and there's no other way to turn that
+// into "return false/empty" instead of crashing the whole compiler.
+
+extern class JClassRefX = "java.lang.Class" {
+    static fn forName(name: String) -> JClassRefX;
+    fn getName(&self) -> String;
+    fn isArray(&self) -> Bool;
+    fn isPrimitive(&self) -> Bool;
+    fn getComponentType(&self) -> JClassRefX;
+    fn getMethods(&self) -> [JMethodRefX];
+    fn getConstructors(&self) -> [JConstructorRefX];
+}
+extern class JMethodRefX = "java.lang.reflect.Method" {
+    fn getName(&self) -> String;
+    fn getParameterTypes(&self) -> [JClassRefX];
+    fn getReturnType(&self) -> JClassRefX;
+    fn getModifiers(&self) -> Int;
+}
+extern class JConstructorRefX = "java.lang.reflect.Constructor" {
+    fn getParameterTypes(&self) -> [JClassRefX];
+    fn getModifiers(&self) -> Int;
+}
+extern class JModifierRefX = "java.lang.reflect.Modifier" {
+    static fn isPublic(mod: Int) -> Bool;
+    static fn isStatic(mod: Int) -> Bool;
+}
+extern class JClassNotFoundRefX = "java.lang.ClassNotFoundException" {}
+
+// One real, reflected overload -- `param_keys`/`ret_key` already in the same canonical-key form
+// `declared_type_to_key` produces, so `verify_extern_signature` can compare them directly with a
+// plain string/vec equality check.
+pub struct ReflectedMethod {
+    is_static: Bool,
+    param_keys: Vec<String>,
+    ret_key: String,
+}
+
+fn class_exists_reflect(binary_name: String) -> Bool {
+    try {
+        let c = JClassRefX::forName(binary_name);
+        return true;
+    } catch (e: JClassNotFoundRefX) {
+        return false;
+    }
+}
+
+// Same duplicated-helper pattern `Codegen.hotc`'s own `dot_to_slash_cg` already established
+// (`_cg`-suffixed there to dodge the flat cross-module function namespace, `_reflect`-suffixed
+// here for the same reason) -- `self.externs`' own binary names are stored exactly as declared
+// (dot or slash form alike), but `real_method_key`'s own keys are always slash-form
+// (`Class.getName()`, normalized the same way), so `declared_type_to_key` needs this too.
+fn dot_to_slash_reflect(name: String) -> String {
+    var out = "";
+    var i = 0;
+    while i < name.length() {
+        let c = name.substring(i, i + 1);
+        if c == "." {
+            out = out + "/";
+        } else {
+            out = out + c;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn str_vec_eq_reflect(a: Vec<String>, b: Vec<String>) -> Bool {
+    if a.length() != b.length() { return false; }
+    var i = 0;
+    while i < a.length() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Mirrors the real compiler's own `javaClassToTyOrNull` + `realTyKey`, fused into one step since
+// this port skips the intermediate `Ty` reconstruction entirely (no `Float`/`Double` support in
+// this subset at all -- `isPrimitive()` without a name match below falls through to `"?"`,
+// matching the real compiler's own "unrepresentable, skip" treatment for exactly those, plus
+// `byte`/`short`/`char`). `Class.getName()` (not `==` against `Integer.TYPE`-style constants,
+// which would need real static-FIELD reflection this subset doesn't have) is the only signal
+// available for telling primitives apart -- it returns the primitive's own bare name ("int",
+// "long", ...) for exactly those, so string-comparing it is both simpler and sufficient.
+fn real_method_key(c: JClassRefX) -> String {
+    if c.isArray() {
+        let comp = c.getComponentType();
+        return "[" + real_method_key(comp);
+    }
+    let name = c.getName();
+    if name == "int" { return "I"; }
+    if name == "long" { return "J"; }
+    if name == "boolean" { return "Z"; }
+    if name == "void" { return "V"; }
+    if name == "java.lang.String" { return "Ljava/lang/String;"; }
+    if c.isPrimitive() { return "?"; }
+    return "L" + dot_to_slash_reflect(name) + ";";
+}
+
+fn empty_reflected_method_vec() -> Vec<ReflectedMethod> {
+    var v = vec_of(ReflectedMethod { is_static: false, param_keys: empty_str_vec2(), ret_key: "?" });
+    return Vec { data: v.data, len: 0 };
+}
+
+// `member_name` is ignored for a constructor lookup (`is_ctor`) -- every public constructor is a
+// candidate, same as the real compiler's own `memberName == "new"` branch. The lone `catch`
+// clause is never actually expected to fire here (`verify_extern_signature` already confirmed
+// `class_exists_reflect(binary_name)` before calling this), but `try` still requires at least
+// one -- same restriction this subset's own grammar puts on it, mirroring the real compiler's.
+fn resolve_real_methods(binary_name: String, member_name: String, is_ctor: Bool) -> Vec<ReflectedMethod> {
+    var out = empty_reflected_method_vec();
+    try {
+        let c = JClassRefX::forName(binary_name);
+        if is_ctor {
+            let ctors = c.getConstructors();
+            var i = 0;
+            while i < ctors.length {
+                let ctor = ctors[i];
+                let mods = ctor.getModifiers();
+                if JModifierRefX::isPublic(mods) {
+                    let ptypes = ctor.getParameterTypes();
+                    var pkeys = empty_str_vec2();
+                    var j = 0;
+                    while j < ptypes.length {
+                        pkeys.push(real_method_key(ptypes[j]));
+                        j = j + 1;
+                    }
+                    out.push(ReflectedMethod { is_static: false, param_keys: pkeys, ret_key: "V" });
+                }
+                i = i + 1;
+            }
+        } else {
+            let methods = c.getMethods();
+            var i2 = 0;
+            while i2 < methods.length {
+                let m = methods[i2];
+                let mods2 = m.getModifiers();
+                if m.getName() == member_name && JModifierRefX::isPublic(mods2) {
+                    let ptypes2 = m.getParameterTypes();
+                    var pkeys2 = empty_str_vec2();
+                    var j2 = 0;
+                    while j2 < ptypes2.length {
+                        pkeys2.push(real_method_key(ptypes2[j2]));
+                        j2 = j2 + 1;
+                    }
+                    let rkey = real_method_key(m.getReturnType());
+                    out.push(ReflectedMethod { is_static: JModifierRefX::isStatic(mods2), param_keys: pkeys2, ret_key: rkey });
+                }
+                i2 = i2 + 1;
+            }
+        }
+    } catch (e2: JClassNotFoundRefX) {
+    }
+    return out;
+}
+

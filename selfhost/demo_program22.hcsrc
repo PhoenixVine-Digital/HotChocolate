@@ -1,0 +1,27 @@
+fn make_and_sum(n: Int, fill: Int) -> Int {
+    var arr = [fill; n];
+    var total = 0;
+    var i = 0;
+    while i < arr.length {
+        total = total + arr[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn make_and_join(n: Int, fill: String) -> Int {
+    var arr = [fill; n];
+    var total = 0;
+    var i = 0;
+    while i < arr.length {
+        total = total + arr[i].length();
+        i = i + 1;
+    }
+    return total;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let s1 = make_and_sum(5, 7);
+    let s2 = make_and_join(3, "hi");
+    return s1 + s2 + a + b;
+}

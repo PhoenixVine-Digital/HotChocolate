@@ -3,7 +3,7 @@
 // taunt -- see enemies.hc), the self-hosted `Registry<T>` prelude (the enemy roster), real
 // Java interop (java.util.Random) for damage rolls, and `read_line()` for the player's name
 // -- spread across a multi-file directory compiled as one program (see enemies.hc /
-// player.hc). `./gradlew playBattle` runs this with stdin wired up.
+// player.hotc). `./gradlew playBattle` runs this with stdin wired up.
 
 extern class Random = "java.util.Random" {
     fn new() -> Self;

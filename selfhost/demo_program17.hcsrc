@@ -1,0 +1,9 @@
+module hc.demo.modtest;
+
+fn double_it(x: Int) -> Int {
+    return x * 2;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    return double_it(a) + double_it(b);
+}

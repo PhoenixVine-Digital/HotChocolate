@@ -1,0 +1,26 @@
+enum Shape {
+    Circle { radius: Int },
+    Rect { w: Int, h: Int },
+    Empty {},
+}
+
+fn area(s: Shape) -> Int {
+    match s {
+        Circle { radius } => {
+            return radius * radius * 3;
+        }
+        Rect { w, h } => {
+            return w * h;
+        }
+        Empty {} => {
+            return 0;
+        }
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var c = Circle { radius: a };
+    var r = Rect { w: a, h: b };
+    var e = Empty {};
+    return area(c) + area(r) + area(e);
+}

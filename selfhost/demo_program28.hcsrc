@@ -1,0 +1,117 @@
+// A faithful transcription of the real Kotlin compiler's own `Prelude.kt` (`Vec<T>`, `Option<T>`,
+// `RegistryEntry<T>`, `Registry<T>`) into this self-hosted subset's own legal syntax -- renamed
+// (Vec3/Opt/RegEntry/Reg) only to avoid colliding with the REAL compiler's own auto-injected
+// prelude names in this same compilation unit (this file is itself compiled BY the real compiler,
+// which injects its own `Vec`/`Option` automatically). Differences from the literal Prelude.kt
+// source are exactly the two still-disclosed scope cuts: bare fieldless variants (`None,`) become
+// `None {}`, and enum-variant construction needs the explicit `Opt<T>::Some { ... }` qualified form
+// rather than bare `Some { ... }`.
+enum Opt<T> {
+    Some { value: T },
+    None {},
+}
+
+struct Vec3<T> {
+    data: [T],
+    len: Int,
+}
+
+impl Vec3<T> {
+    fn push(&mut self, value: T) {
+        if self.len == self.data.length {
+            var newCap = self.data.length * 2;
+            if newCap == 0 {
+                newCap = 4;
+            }
+            var newData = [value; newCap];
+            var i = 0;
+            while i < self.len {
+                newData[i] = self.data[i];
+                i = i + 1;
+            }
+            self.data = newData;
+        }
+        self.data[self.len] = value;
+        self.len = self.len + 1;
+    }
+
+    fn get(&self, i: Int) -> T {
+        return self.data[i];
+    }
+
+    fn set(&mut self, i: Int, value: T) {
+        self.data[i] = value;
+    }
+
+    fn length(&self) -> Int {
+        return self.len;
+    }
+}
+
+fn vec3_of<T>(first: T) -> Vec3<T> {
+    return Vec3<T> { data: [first; 4], len: 1 };
+}
+
+struct RegEntry<T> {
+    key: String,
+    value: T,
+}
+
+struct Reg<T> {
+    entries: Vec3<RegEntry<T>>,
+}
+
+fn reg_new<T>(firstKey: String, firstValue: T) -> Reg<T> {
+    return Reg<T> { entries: vec3_of(RegEntry<T> { key: firstKey, value: firstValue }) };
+}
+
+impl Reg<T> {
+    fn register(&mut self, key: String, value: T) {
+        self.entries.push(RegEntry<T> { key: key, value: value });
+    }
+
+    fn get(&self, key: String) -> Opt<T> {
+        var i = 0;
+        while i < self.entries.length() {
+            let entry = self.entries.get(i);
+            if entry.key == key {
+                return Opt<T>::Some { value: entry.value };
+            }
+            i = i + 1;
+        }
+        return Opt<T>::None {};
+    }
+
+    fn length(&self) -> Int {
+        return self.entries.length();
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var r = reg_new("first", 100);
+    r.register("second", 200);
+    r.register("third", 300);
+    let found1 = r.get("first");
+    let found2 = r.get("second");
+    let found3 = r.get("third");
+    let missing = r.get("nope");
+    var total = 0;
+    match found1 {
+        Some { value } => { total = total + value; }
+        None {} => {}
+    }
+    match found2 {
+        Some { value } => { total = total + value; }
+        None {} => {}
+    }
+    match found3 {
+        Some { value } => { total = total + value; }
+        None {} => {}
+    }
+    var missing_flag = 0;
+    match missing {
+        Some { value } => { missing_flag = 1; }
+        None {} => { missing_flag = 0; }
+    }
+    return total + r.length() + missing_flag + a + b;
+}

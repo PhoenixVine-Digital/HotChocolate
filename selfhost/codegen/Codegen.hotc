@@ -1,0 +1,3232 @@
+module hc.selfhost.codegen;
+
+// The self-hosted codegen, phase 1 -- walks the checked `FnDecl`/`Stmt`/`Expr` AST and drives
+// real ASM (`ClassWriter`/`MethodVisitor`/`Label`) to emit a real, loadable, runnable `.class`
+// file. Builds directly on the ASM-interop spike from earlier this session (verified then: HC
+// calling into ASM's builder API works cleanly with zero new compiler features) and the same
+// `byte[]`-avoiding shim pattern that spike proved out for the one step HC genuinely can't do
+// itself (`ClassWriter.toByteArray()` -- see `IDEAS.md`'s `Byte` primitive entry).
+//
+// **String locals now supported**: since the simplified `Expr`/`Stmt` AST (`Ast.hc`) has no
+// mutable per-node `ty` field the way the real compiler's own `Expr.ty` does, `gen_expr`/
+// `gen_binary`/`gen_unary` now each *return* the "Int"/"Bool"/"String" type tag of whatever they
+// just pushed, computed inline during the same walk that emits bytecode -- mirroring exactly how
+// `Checker.hotc`'s own `check_expr` computes `Ty` in one pass. That tag drives `ALOAD`/`ASTORE`
+// vs `ILOAD`/`ISTORE` for locals, `String.concat` vs `IADD` for `+`, and `Object.equals` vs
+// `IF_ICMPEQ`/`NE` for `==`/`!=` -- all real bugs before this (String locals/comparisons/`+`
+// silently got Int-only bytecode).
+//
+// **Param/return types now respected too**: `gen_fn` builds each function's real JVM descriptor
+// from its *declared* param/return type names (`fn_descriptor`/`descriptor_of_type`) instead of
+// always assuming `Int`, seeds `var_types` for each param from its real declared type (not a
+// hardcoded default), and `Call` codegen now looks up the real callee descriptor from `fn_descs`
+// (built once per `compile_program` from every fn's real signature) instead of guessing
+// `(I...I)I` from the argument count -- so a `String`-param or `String`-returning function
+// (previously silently miscompiled) now generates correct bytecode. `known_fns` (a plain
+// membership set) was folded into `fn_descs` -- a callee not present there is exactly the "not
+// defined in the same generated class" case, same clear `CodegenError` as before.
+//
+// **`MethodCall` now supports built-in `String` methods**: `length`/`toUpperCase`/`toLowerCase`/
+// `trim`/`contains`/`indexOf` compile to real `INVOKEVIRTUAL java/lang/String.*` calls. Nothing
+// else -- there is no struct/class/method table in this AST subset at all (see `Ast.hc`'s own
+// header), so a small fixed set of real `String` methods is the only thing safely codegen-able;
+// anything else throws a clear `CodegenError`.
+//
+// **Structs now real**: each `StructDecl` becomes its own real, separate `.class` file
+// (`gen_struct`) -- public fields plus a constructor taking every field value in declared order
+// and `PUTFIELD`-ing each. `StructLit` codegen (`NEW`+`DUP`+push fields in *declared* order,
+// resolved by name from the literal's own possibly-different order+`INVOKESPECIAL <init>`),
+// `FieldAccess` (`GETFIELD`), and `FieldAssign` (`PUTFIELD`, `DUP_X1`-ing the value first so the
+// assignment still behaves as a value-producing expression like plain `Assign` does) all now
+// generate real bytecode. The `is_ref_type`/`ALOAD`/`ASTORE` local-variable dispatch that used to
+// special-case `String` now treats *any* non-`Int`/`Bool` type as a reference (struct instances
+// need `ALOAD`/`ASTORE` exactly like `String` does) -- one rule covers both instead of two.
+// `==`/`!=` between two struct-typed operands now compiles to `IF_ACMPEQ`/`NE` (reference
+// identity -- there is no per-field structural equality here, matching the real compiler's own
+// still-open structural-equality gap noted in `IDEAS.md`).
+//
+// **Nested struct-typed fields verified**: `Line { start: Point, end: Point }` compiled and ran
+// correctly with zero code changes needed -- the generic `descriptor_of_type` fallback
+// (`"L" + name + ";"` for anything not `Int`/`Bool`/`String`/`Unit`) and the general
+// `is_ref_type`-based `ALOAD`/`GETFIELD` dispatch already covered it, since a struct field is
+// handled the same way a fn param or local of that type is everywhere else in this file.
+//
+// **Struct methods / `impl` blocks now real**: `impl Name { fn method(self[, ...]) { ... } }`
+// becomes a real instance method (`ACC_PUBLIC`, not static) on the struct's own class --
+// `self`/`&self`/`&mut self` (parsed but not distinguished, see `Parser.hotc`'s own header) all
+// land in the always-implicit JVM local slot 0, exactly like any real instance method's receiver.
+// `MethodCall` codegen checks the user-defined method table (`struct_methods`, keyed
+// `"StructName#method"`) before falling back to the built-in `String` methods above -- so a
+// struct method and `String`'s own methods share the same call syntax and dispatch correctly.
+// `gen_fn`/`gen_method` now share their cross-function/cross-struct lookup setup via
+// `build_codegen`; `build_program_info` rebuilds a whole `ProgramInfo` fresh from the program's
+// real `fns`/`structs`/`impls` (passed *borrowed*, `&Vec<...>`, specifically so calling it many
+// times across a codegen loop -- once per fn, once per method -- never risks consuming them).
+//
+// **Enums / `match` now real**: each `EnumDecl` becomes one real `.class` file (`gen_enum`) with
+// a `tag: Int` field plus the *union* of every variant's fields (same simplification `Checker
+// .hotc`'s `register_enum` makes -- field lookups don't distinguish which variant a field
+// belongs to). Variant construction reuses `StructLit` codegen (`gen_expr` checks `variant_owner`
+// first): `NEW`+trivial `INVOKESPECIAL <init>`, then individual `PUTFIELD`s for `tag` and each
+// given field (not one big constructor call like a real struct -- different variants populate
+// different subsets of the enum's unioned fields). `match` codegen (`gen_stmt`) stores the
+// subject in a raw, unregistered local slot, then chains `GETFIELD tag` + `IF_ICMPNE` per arm,
+// binding each arm's fields via `GETFIELD` into fresh locals before its body.
+//
+// **Real bug found and fixed**: a fn/method body that returns on every path (the checker doesn't
+// verify this, but every demo here does) still left `end_label` (or `match`'s own end label) with
+// literally no instruction after it -- sitting exactly at the end of the method's bytecode. The
+// JVM verifier rejects that outright (a stack-map frame must describe a real instruction offset).
+// `gen_fallback_return` now unconditionally emits one dummy return after every real body -- dead
+// code whenever the body already returned everywhere, but a genuine instruction at that trailing
+// offset either way. Caught via a real `VerifyError`/`ClassFormatError` on `Shape`'s exhaustive
+// 3-arm `match`, not by inspection. (A related but separate bug fixed alongside it: several
+// `ClassWriter.visit`/`visitMethod`/`visitField` calls passed `""` for the *generic signature*
+// param instead of a real `null` -- HC's `null` literal can't be passed as a bare call argument,
+// so `CodegenShim` gained `visitClassHeader`/`visitMethodNoSig` shims for it. `""` there produces
+// a genuinely malformed Signature attribute per the JVM spec -- harmless to the real verifier,
+// which never reads Signature attributes, but it crashed `javap`.)
+//
+// **Generics now real**: a single-type-parameter generic struct (`struct Box<T> { value: T }`)
+// gets monomorphized *on demand* -- `Checker.hotc`'s `ensure_instantiated` substitutes the type
+// parameter the first time a concrete name like `"Box$Int"` is actually used and registers it as
+// an ordinary struct; `compile_program` reads the resulting list back (`checker.mono_needed`) and
+// emits one real `.class` file per distinct instantiation (`monomorphized_fields` redoes the same
+// substitution here, since this file doesn't share the checker's own `GenericTemplate`
+// representation, only the plain `structs: Vec<StructDecl>` both sides already have). Everywhere
+// else -- field access, `descriptor_of_type`, `is_ref_type` -- treats `"Box$Int"` exactly like any
+// other struct name, no special-casing needed beyond that one substitution step. Real bug found by
+// this, unrelated to generics but only surfaced by it: `Checker.hotc`'s `vars` was never reset
+// between checking different functions, so two functions sharing a param name with *different*
+// types had the second silently shadowed by the first's leftover type (fixed in `check_fn`/
+// `check_method`).
+//
+// **Generic enums now real too** (`enum Option<T> { ... }`, same `"Base$Arg"` monomorphization
+// convention as generic structs): a mono name might be a generic struct's OR a generic enum's
+// instantiation -- `is_generic_enum_mono` (searching `enums` for a `type_param: Some` decl whose
+// name matches the mono name's base) tells the two apart, routing `compile_program`'s emission
+// loop and `build_program_info`'s field-table building to `monomorphized_enum_variants`/`gen_enum`
+// (substituted variants, reusing `gen_enum` completely unchanged -- it already just takes a name
+// and a variant list) instead of `monomorphized_fields`/`gen_struct`. `gen_expr`'s own `StructLit`
+// codegen resolves a qualified construction site's owner class directly from `Expr::StructLit`'s
+// new `generic_base` field (set only for the explicit `Base<Arg>::Variant { ... }` form -- see
+// `Ast.hc`'s own `EnumDecl` header) rather than a bare-name `variant_owner` lookup, which would
+// otherwise collide across multiple concrete instantiations of the same generic enum used in one
+// program. `Match` codegen itself needed NO changes at all -- it already keys every lookup
+// (`variant_tags`, `field_type_of`) off the subject's own concrete runtime type name (`sty`), never
+// a bare variant name, so it was already correct for generic enum instances with zero new code.
+//
+// **`extern class` now real**: constructors and static methods (`Alias::new(...)`,
+// `Alias::method(...)`, parsed as `Expr::StaticCall`) and instance methods (plain
+// `Expr::MethodCall`, checked against the extern method table before falling through to struct
+// methods/`String` builtins) all compile to real `NEW`/`INVOKESPECIAL`/`INVOKESTATIC`/
+// `INVOKEVIRTUAL` against the class's real binary name. Scope cut, disclosed: extern *method*
+// params (the methods declared inside an `extern class` block itself) must still be
+// `Int`/`Bool`/`String`, a return type one of those, `Unit`, or the literal `Self` (mapped to the
+// real binary name's own descriptor) -- and `binary_name` must already be JVM-internal-slash form
+// (`"java/io/File"`, no dot-to-slash conversion). Verified with a real `java.lang.StringBuilder`
+// (constructor + fluent `Self`-returning instance methods) and a real static `java.lang.Math.max`
+// call.
+//
+// **Extern-typed struct fields and plain fn/method params/returns now real** (closes the gap
+// disclosed just above): a struct field, or a top-level fn/impl-method param or return type, may
+// now name an extern class alias (e.g. `struct Wrapper { sb: JSB, tag: Int }`,
+// `fn build_it(sb: JSB) -> Wrapper`) and resolves to the real binary name's descriptor
+// (`descriptor_of_type`/`fn_descriptor`, threaded a parallel `alias_names`/`alias_binaries` pair
+// built once per `build_program_info`/`gen_struct` call from `externs`; `gen_expr`'s own
+// `CodeGen`-method call sites use `self.resolve_descriptor`/`self.resolve_elem_class_name` instead,
+// resolving via `self.extern_binary: Registry<String>` since they don't have the parallel `Vec`s in
+// scope). Scope cut, still disclosed: enum fields do not support extern types this round (always
+// resolved with empty alias vecs in `gen_enum`), and extern *method* params/returns (see above)
+// stay restricted to `Int`/`Bool`/`String`/`Unit`/`Self`. Verified with a real
+// `java.lang.StringBuilder`-typed struct field, constructed via a fn taking that extern type as a
+// param, read back through a fn returning `String` from a method call on the extern-typed field.
+//
+// **Scope cut, still disclosed**: no static methods in `impl` blocks (every method needs a
+// `self`), no operator overloading, no trait/interface dispatch, no `match` exhaustiveness
+// checking (see `Checker.hotc`'s own header), no `module` declarations. The entry-point
+// `main(String[])` wrapper `compile_program` builds still assumes the designated entry fn takes
+// `Int` args and returns `Int` -- true of every demo program this phase, not touched since none of
+// them need it lifted.
+
+extern class JObject4 = "java.lang.Object" {}
+extern class Label = "org.objectweb.asm.Label" {
+    fn new() -> Self;
+}
+extern class MethodVisitor2 = "org.objectweb.asm.MethodVisitor" {
+    fn visitCode(&mut self);
+    fn visitVarInsn(&mut self, opcode: Int, varIndex: Int);
+    fn visitIntInsn(&mut self, opcode: Int, operand: Int);
+    fn visitInsn(&mut self, opcode: Int);
+    fn visitJumpInsn(&mut self, opcode: Int, label: &Label);
+    fn visitLabel(&mut self, label: &Label);
+    fn visitLdcInsn(&mut self, value: JObject4);
+    fn visitTypeInsn(&mut self, opcode: Int, type: String);
+    fn visitMethodInsn(&mut self, opcode: Int, owner: String, name: String, descriptor: String, isInterface: Bool);
+    fn visitFieldInsn(&mut self, opcode: Int, owner: String, name: String, descriptor: String);
+    fn visitMaxs(&mut self, maxStack: Int, maxLocals: Int);
+    fn visitEnd(&mut self);
+    // `type` is the exception's real JVM-internal (slash-form) binary name -- real `try`/`catch`
+    // support, added for classpath reflection's own `ClassNotFoundException` handling (see
+    // `Ast.hc`'s own `Try` header).
+    fn visitTryCatchBlock(&mut self, start: &Label, end: &Label, handler: &Label, type: String);
+}
+extern class ClassWriter2 = "org.objectweb.asm.ClassWriter" {
+    fn new(flags: Int) -> Self;
+    fn visit(&mut self, version: Int, access: Int, name: String, signature: String, superName: String, interfaces: [String]);
+    fn visitMethod(&mut self, access: Int, name: String, descriptor: String, signature: String, exceptions: [String]) -> MethodVisitor2;
+    fn visitEnd(&mut self);
+}
+extern class CodegenShim = "hc.selfhost.codegen.CodegenShim" {
+    fn writeClass(cw: ClassWriter2, path: String);
+    // See CodegenShim.java's own comment: HC's `null` literal can't be passed as a bare call
+    // argument (only against an already-known nullable expected type), so building a non-static
+    // field's `visitField` call (whose last param must be a real Java `null`) stays on the Java
+    // side entirely.
+    fn visitInstanceField(cw: &mut ClassWriter2, access: Int, name: String, descriptor: String);
+    fn visitClassHeader(cw: &mut ClassWriter2, version: Int, access: Int, name: String, superName: String, interfaces: [String]);
+    fn visitMethodNoSig(cw: &mut ClassWriter2, access: Int, name: String, descriptor: String, exceptions: [String]) -> MethodVisitor2;
+}
+
+// Whole-program metadata `gen_fn` needs beyond the one `FnDecl` it's currently emitting --
+// bundled into one struct (rather than several separate `Vec` params) purely to keep `gen_fn`'s
+// own signature from growing a new parameter every time codegen learns about one more kind of
+// cross-function/cross-struct lookup.
+pub struct ProgramInfo {
+    fn_names: Vec<String>,
+    fn_descs_list: Vec<String>,
+    fn_rettys_list: Vec<String>,
+    // A generic top-level fn's own name -> the index (into its `params`) of the ONE param whose
+    // declared type is exactly the bare type parameter (`fn identity<T>(x: T)` -- index 0) --
+    // `gen_expr`'s own `Call` codegen reads this to infer a concrete type argument at each call
+    // site (see `Checker.hotc`'s own `check_generic_call`, redone independently here since this
+    // file doesn't share the checker's own registries).
+    // Top-level `pub static NAME: Type = expr;` name -> declared type name -- `gen_expr`'s own
+    // `Ident` codegen checks this (after checking it's not a known LOCAL first, so a local can
+    // still shadow a static of the same name) to decide `GETSTATIC` vs `ILOAD`/`ALOAD`.
+    static_names: Vec<String>,
+    static_type_names: Vec<String>,
+    generic_fn_names: Vec<String>,
+    generic_fn_infer_idx: Vec<Int>,
+    // Every real enum's own name (plain AND generic mono instantiations alike) -- `struct_names`/
+    // `struct_field_*_list` don't distinguish "real struct" from "enum, field-lookup purposes" at
+    // all (same simplification `Checker.hotc`'s own `structs` registry already makes), but
+    // `gen_binary`'s own `==`/`!=` codegen needs to tell the two apart for real (an enum's `tag`
+    // field never gets recorded in `struct_field_*_list` at all -- it's a pure codegen-time detail
+    // added directly in `gen_enum`, so checking for "tag" among a type's registered fields can
+    // never work; this is the real signal instead). See `CodeGen`'s own `is_enum_type`.
+    enum_names: Vec<String>,
+    struct_names: Vec<String>,
+    struct_field_names_list: Vec<Vec<String>>,
+    struct_field_types_list: Vec<Vec<String>>,
+    // Keyed by "StructName#methodName" -- same flat-key simplification `Checker.hotc`'s own
+    // `methods` field makes.
+    method_keys: Vec<String>,
+    method_descs_list: Vec<String>,
+    method_rettys_list: Vec<String>,
+    // Variant name -> owning enum's own name (parallel arrays, same "name" -- "owner" shape as
+    // `Checker.hotc`'s `variant_owner`).
+    variant_owner_names: Vec<String>,
+    variant_owner_enums: Vec<String>,
+    // Keyed by "EnumName#VariantName" -> that variant's tag index (declaration order).
+    variant_tag_keys: Vec<String>,
+    variant_tag_list: Vec<Int>,
+    // extern class alias name -> its real binary (internal-slash) name.
+    extern_alias_names: Vec<String>,
+    extern_binary_names: Vec<String>,
+    // Keyed by "Alias#methodName" -- covers constructors, static methods, and instance methods
+    // alike (same flat-key convention `method_keys` above uses for struct methods).
+    extern_method_keys: Vec<String>,
+    extern_method_descs_list: Vec<String>,
+    extern_method_rettys_list: Vec<String>,
+    extern_method_static_list: Vec<Int>,
+    extern_method_ctor_list: Vec<Int>,
+    // Keyed by "EnumName#VariantName" -- that VARIANT's own field table alone, not the enum-wide
+    // union `struct_field_*_list` registers it under (see `field_type_of`'s own header/`Match`
+    // codegen's use of it). Real gap found self-compiling `Checker.hotc`: `Ast.hc`'s own `Expr`
+    // enum reuses the field name "value" across many variants at different types, so
+    // `field_type_of`'s linear scan over the UNIONED table always resolved a match arm's "value"
+    // binding to whichever variant registered first (`IntLit`'s `Int`), corrupting every OTHER
+    // variant's own field slots/descriptors -- mirrors `Checker.hotc`'s own `variant_field_info`
+    // fix for the exact same root cause, fixed independently here (a separate pass, not fed
+    // anything back from the checker's own run).
+    variant_field_keys: Vec<String>,
+    variant_field_names_list: Vec<Vec<String>>,
+    variant_field_types_list: Vec<Vec<String>>,
+}
+
+pub struct CodeGen {
+    mv: MethodVisitor2,
+    slots: Registry<Int>,
+    next_slot: Int,
+    owner: String,
+    fn_descs: Registry<String>,
+    fn_ret_tys: Registry<String>,
+    var_types: Registry<String>,
+    ret_ty: String,
+    struct_fields: Registry<Vec<String>>,
+    struct_ftypes: Registry<Vec<String>>,
+    struct_methods: Registry<String>,
+    struct_method_rettys: Registry<String>,
+    variant_owner: Registry<String>,
+    variant_tags: Registry<Int>,
+    extern_binary: Registry<String>,
+    extern_method_descs: Registry<String>,
+    extern_method_rettys: Registry<String>,
+    extern_method_static: Registry<Int>,
+    extern_method_ctor: Registry<Int>,
+    generic_fn_infer_idx: Registry<Int>,
+    static_types: Registry<String>,
+    enum_names: Registry<Bool>,
+    // The innermost enclosing `while`'s own start/end labels, for `Break`/`Continue` codegen (a
+    // plain GOTO to one or the other -- no drop-list to emit first, this subset has no `Drop`/RAII
+    // at all). Saved into locals and restored around a nested `While`'s own body codegen (mirroring
+    // the checker's `loop_depth` save/restore) rather than a real label STACK, since codegen only
+    // ever needs the CURRENT innermost loop's labels, never an outer one mid-nested-loop.
+    cur_loop_start: Label,
+    cur_loop_end: Label,
+    // Keyed "EnumName#VariantName" -- see `ProgramInfo`'s own matching field header.
+    variant_field_names: Registry<Vec<String>>,
+    variant_field_types: Registry<Vec<String>>,
+}
+
+impl CodeGen {
+    // `Long` is a real JVM category-2 primitive -- it occupies TWO consecutive local slots, not
+    // one, same as every other JVM-targeting compiler has to account for (the JVM spec itself
+    // requires this; it's not a convention this compiler invented). Every other type this subset
+    // knows about (`Int`/`Bool`/`String`/struct/enum references) is category-1, one slot.
+    fn alloc_slot(&mut self, name: String, ty: String) -> Int {
+        let slot = self.next_slot;
+        self.slots.register(name, slot);
+        if ty == "Long" {
+            self.next_slot = slot + 2;
+        } else {
+            self.next_slot = slot + 1;
+        }
+        return slot;
+    }
+
+    fn slot_of(&mut self, name: String) -> Int {
+        let found = self.slots.get(name);
+        if let Some { value: s } = found {
+            return s;
+        } else {
+            return 0;
+        }
+    }
+
+    fn type_of(&mut self, name: String) -> String {
+        let found = self.var_types.get(name);
+        if let Some { value: t } = found {
+            return t;
+        } else {
+            return "Int";
+        }
+    }
+
+    fn field_type_of(&mut self, struct_name: String, field: String) -> String {
+        let names_found = self.struct_fields.get(struct_name);
+        let types_found = self.struct_ftypes.get(struct_name);
+        if let Some { value: names } = names_found {
+            if let Some { value: types } = types_found {
+                var i = 0;
+                while i < names.length() {
+                    if names.get(i) == field {
+                        return types.get(i);
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        throw CodegenError::new("codegen: unknown field '" + field + "' on struct '" + struct_name + "'");
+    }
+
+    // `true` iff `type_name` is a real enum (plain or a generic mono instantiation) rather than a
+    // plain struct -- `struct_fields`/`struct_ftypes` don't distinguish the two at all (both
+    // register into the same table), and an enum's own real `tag: Int` field is a pure codegen-
+    // time detail (`gen_enum` adds it directly, never recorded in any field-name table), so
+    // checking for "tag" among a type's registered fields can never work. `ProgramInfo`'s own
+    // `enum_names` (built directly from `enums: Vec<EnumDecl>`, plain and generic-mono alike) is
+    // the real signal instead -- see `ProgramInfo`'s own header.
+    fn is_enum_type(&mut self, type_name: String) -> Bool {
+        let found = self.enum_names.get(type_name);
+        if let Some { value: v } = found {
+            return true;
+        }
+        return false;
+    }
+
+    // Same logic as the free `descriptor_of_type` function below, but resolving extern aliases
+    // via `self.extern_binary` (a `Registry`, built once per codegen unit -- see `build_codegen`)
+    // instead of the parallel-`Vec` form free functions without `&self` access have to use.
+    // Duplicated rather than shared for that reason, not an oversight.
+    fn resolve_descriptor(&mut self, name: String) -> String {
+        if name == "String" { return "Ljava/lang/String;"; }
+        if name == "Unit" { return "V"; }
+        if name == "Int" || name == "Bool" { return "I"; }
+        if name == "Long" { return "J"; } // see `descriptor_of_type`'s own header
+        if is_array_type_name_cg(name) {
+            let inner = array_elem_type_name_cg(name);
+            return "[" + self.resolve_descriptor(inner);
+        }
+        let found = self.extern_binary.get(name);
+        if let Some { value: b } = found {
+            return "L" + b + ";";
+        }
+        return "L" + name + ";";
+    }
+
+    // ANEWARRAY's operand is a bare internal class name (no `L`/`;`) -- mirrors `resolve_descriptor`
+    // but returns the bare form, resolving extern aliases via `self.extern_binary`.
+    fn resolve_elem_class_name(&mut self, ty: String) -> String {
+        if ty == "String" { return "java/lang/String"; }
+        if is_array_type_name_cg(ty) { return self.resolve_descriptor(ty); }
+        let found = self.extern_binary.get(ty);
+        if let Some { value: b } = found {
+            return b;
+        }
+        return ty;
+    }
+
+    // Enum variant construction (`VariantName { ... }`) -- extracted out of `gen_expr`'s own
+    // `StructLit` arm so a BARE variant name used as an ordinary value expression (`RETURN`, no
+    // braces at all -- real `Lexer.hotc`/`Parser.hotc` usage, e.g. `Token { kind: FN }`/`kind ==
+    // RETURN`, treating a fieldless enum's variants like plain named constants) can reuse the
+    // exact same construction bytecode via `gen_expr`'s own `Ident` arm, just with empty
+    // `field_names`/`field_values` -- see that arm's own header for why this doesn't need any new
+    // field-count tracking (`check_struct_lit`/this construction path already don't verify every
+    // declared field was actually supplied, an existing, disclosed imprecision this reuses as-is
+    // rather than introduces new). `vowner` is the enum's own real class name (already resolved by
+    // the caller, either from `generic_base` or a bare-name `variant_owner` lookup).
+    fn gen_variant_construct(&mut self, vowner: String, name: String, field_names: Vec<String>, field_values: Vec<Expr>) -> String {
+        // Real, disclosed limitation found self-compiling this very function: the self-hosted
+        // compiler's own `Match`/`if let` codegen (see `gen_stmt`'s own `Match` arm) only works
+        // correctly when the JVM operand stack is EMPTY at the point it runs -- it stores its
+        // subject into a fresh local slot and assumes returning to a zero-baseline afterward, an
+        // invariant every ORDINARY HC statement already satisfies (statements always leave the
+        // stack empty), but one this file's own manual `self.mv.visitInsn(89)` (`DUP`) calls
+        // violate: they push real, un-tracked values onto the JVM stack directly, outside the
+        // self-hosted compiler's own bookkeeping. Running an `if let Some { ... } = ... { ... }`
+        // lookup WHILE a DUP'd instance ref sits on the stack produced a genuine ASM
+        // `NegativeArraySizeException` in stack-frame merging (not caught by the self-hosted
+        // checker, only by ASM's own `COMPUTE_FRAMES` at codegen time). Fixed by doing EVERY
+        // `if`/`match`-requiring lookup (tag, per-field type resolution) UPFRONT, before any
+        // bytecode emission at all -- the bytecode-emission phase below then uses only plain,
+        // unconditional `visit*` calls, never interleaving control flow with a non-empty stack.
+        let tag_key = vowner + "#" + name;
+        var tag = 0;
+        let tag_found = self.variant_tags.get(tag_key);
+        if let Some { value: t } = tag_found {
+            tag = t;
+        }
+        // Prefer THIS variant's own dedicated field table over `field_type_of(vowner, ...)`'s
+        // enum-wide union (`Ast.hc`'s `Expr` enum reuses field names like "value" across variants
+        // at different types; constructing e.g. `StringLit { value: s }` via the union table could
+        // silently emit a `PUTFIELD` with the WRONG descriptor -- `IntLit`'s own `I`, say -- for a
+        // real `String` value, a genuine `VerifyError`/miscompile, not just a wrong-message compile
+        // error like the checker-side and `Match`-side versions of this bug were).
+        let vfn_key2 = vowner + "#" + name;
+        let vfn_found2 = self.variant_field_names.get(vfn_key2);
+        let vft_found2 = self.variant_field_types.get(vfn_key2);
+        var v2_fnames = empty_str_vec4();
+        var v2_ftypes = empty_str_vec4();
+        var has_v2_fields = false;
+        if let Some { value: vfn2 } = vfn_found2 {
+            if let Some { value: vft2 } = vft_found2 {
+                v2_fnames = vfn2;
+                v2_ftypes = vft2;
+                has_v2_fields = true;
+            }
+        }
+        var resolved_ftypes = empty_str_vec4();
+        var pk = 0;
+        while pk < field_names.length() {
+            let fname0 = field_names.get(pk);
+            var fty0 = self.field_type_of(vowner, fname0);
+            if has_v2_fields {
+                var v2i = 0;
+                while v2i < v2_fnames.length() {
+                    if v2_fnames.get(v2i) == fname0 {
+                        fty0 = v2_ftypes.get(v2i);
+                    }
+                    v2i = v2i + 1;
+                }
+            }
+            resolved_ftypes.push(fty0);
+            pk = pk + 1;
+        }
+        self.mv.visitTypeInsn(187, vowner); // NEW
+        self.mv.visitInsn(89); // DUP
+        self.mv.visitMethodInsn(183, vowner, "<init>", "()V", false); // INVOKESPECIAL -- stack: [instance]
+        self.mv.visitInsn(89); // DUP -- stack: [instance, instance]
+        self.mv.visitIntInsn(17, tag); // SIPUSH
+        self.mv.visitFieldInsn(181, vowner, "tag", "I"); // PUTFIELD -- stack: [instance]
+        var k = 0;
+        while k < field_names.length() {
+            let fname = field_names.get(k);
+            let fty = resolved_ftypes.get(k);
+            self.mv.visitInsn(89); // DUP
+            self.gen_expr(field_values.get(k));
+            self.mv.visitFieldInsn(181, vowner, name + "$" + fname, self.resolve_descriptor(fty)); // PUTFIELD -- mangled, see gen_enum's own header
+            k = k + 1;
+        }
+        return vowner;
+    }
+
+    // Emits the bytecode for `e` and returns the "Int"/"Bool"/"String" type tag of the value it
+    // just pushed -- see this file's own header for why this walk computes the tag inline instead
+    // of reading it off the (type-less) AST node itself.
+    fn gen_expr(&mut self, e: Expr) -> String {
+        match e {
+            // Real bug found stress-testing `Long` arithmetic (an unrelated literal like
+            // `300000` in the SAME expression): `SIPUSH`'s own operand is a SIGNED 16-BIT value
+            // (-32768..32767), but this arm used it UNCONDITIONALLY for every `Int` literal --
+            // anything outside that range silently wrapped (`300000` became `-27680`, no error,
+            // no warning). Latent all session since no earlier demo happened to use a literal that
+            // large. Fixed by falling back to a real `LDC` (via a host-side `Integer.valueOf`
+            // boxing call, see `JIntegerCg`'s own header) for anything `SIPUSH` can't represent.
+            IntLit { value } => {
+                if value >= -32768 && value <= 32767 {
+                    self.mv.visitIntInsn(17, value); // SIPUSH
+                } else {
+                    let boxed = JIntegerCg::valueOf(value);
+                    self.mv.visitLdcInsn(boxed as JObject4);
+                }
+                return "Int";
+            }
+            BoolLit { value } => {
+                if value { self.mv.visitInsn(4); } else { self.mv.visitInsn(3); } // ICONST_1 / ICONST_0
+                return "Bool";
+            }
+            StringLit { value } => { self.mv.visitLdcInsn(value as JObject4); return "String"; }
+            Ident { name } => {
+                // A LOCAL (`var_types` -- params, `let`/`var` bindings, match-arm field bindings)
+                // is checked first, so a local can still shadow a top-level `static` of the same
+                // name. Only when there's no local by this name do we check `static_types` and
+                // emit `GETSTATIC` instead -- see `Ast.hc`'s own `StaticDecl` header.
+                let local_found = self.var_types.get(name);
+                if let Some { value: lty } = local_found {
+                    let slot = self.slot_of(name);
+                    self.mv.visitVarInsn(load_opcode(lty), slot);
+                    return lty;
+                }
+                let static_found = self.static_types.get(name);
+                if let Some { value: sty } = static_found {
+                    self.mv.visitFieldInsn(178, self.owner, name, self.resolve_descriptor(sty)); // GETSTATIC
+                    return sty;
+                }
+                // Neither a local nor a static -- a BARE fieldless-enum-variant reference used as
+                // an ordinary value expression (`RETURN`, no `{}` at all -- real `Lexer.hotc`/
+                // `Parser.hotc` usage, e.g. `Token { kind: FN }`/`kind == RETURN`, treating a
+                // fieldless enum's variants like plain named constants). Only bare, non-generic
+                // variants resolve this way (`variant_owner`'s own bare-name table -- see `Ast.hc`'s
+                // own `EnumDecl` header for why a generic enum's variants can't use this form),
+                // reusing the exact same construction bytecode `StructLit`'s own variant-
+                // construction arm uses, just with no fields supplied (`gen_variant_construct`).
+                let variant_found = self.variant_owner.get(name);
+                if let Some { value: vowner2 } = variant_found {
+                    return self.gen_variant_construct(vowner2, name, empty_str_vec4(), empty_expr_vec_cg());
+                }
+                // A bare GENERIC-enum fieldless variant used as a value ("None", real
+                // `Parser.hotc` usage) -- mirrors `StructLit`'s own generic-variant fallback right
+                // above in this file, and `Checker.hotc`'s `check_ident`, same real gap.
+                if is_mono_name_cg(self.ret_ty) {
+                    // `self.variant_tags` is keyed by the FULL mono enum name ("Option$Expr#Some",
+                    // see `build_program_info`'s own `mono_names` loop) -- `self.ret_ty` already
+                    // IS that full mono name, so the key is just `self.ret_ty + "#" + name`
+                    // directly, no `mono_base_cg` involved (an earlier version of this fix wrongly
+                    // stripped it down to "Option#Some", which is never a real registered key --
+                    // caused a genuine ASM `Frame.pop` crash, found self-compiling `Parser.hotc`).
+                    let tag_key2 = self.ret_ty + "#" + name;
+                    let tag_found2 = self.variant_tags.get(tag_key2);
+                    if let Some { value: tag2 } = tag_found2 {
+                        return self.gen_variant_construct(self.ret_ty, name, empty_str_vec4(), empty_expr_vec_cg());
+                    }
+                }
+                let ty = self.type_of(name);
+                let slot = self.slot_of(name);
+                self.mv.visitVarInsn(load_opcode(ty), slot);
+                return ty;
+            }
+            Binary { op, left, right } => { return self.gen_binary(op, left, right); }
+            Unary { op, expr } => { return self.gen_unary(op, expr); }
+            Call { callee, args } => {
+                // Same-class static call only this phase -- every `FnDecl` this codegen ever
+                // sees was compiled into `self.owner` by `compile_program` below, so there's no
+                // cross-class or cross-package call target to resolve, unlike a real `extern
+                // class` call site. Anything else (a real builtin like `print`, which the checker
+                // happily accepts as `TyUnknown` -- see `Checker.hotc`'s own `check_call`) would
+                // previously silently emit an `INVOKESTATIC` to a method that doesn't exist,
+                // failing at class-verify time with a confusing `NoSuchMethodError`. Looking the
+                // callee up in `fn_descs` turns that into a clear, immediate compile-time error,
+                // and gives the *real* descriptor (built from the callee's actual declared
+                // param/return types -- see this file's own header) instead of guessing `Int` for
+                // everything.
+                let found = self.fn_descs.get(callee);
+                var known = false;
+                if let Some { value: d } = found {
+                    known = true;
+                }
+                // A callee not found directly might be a generic fn template's own name (`callee`
+                // was never registered into `fn_descs` -- see `build_program_info`'s own header)
+                // -- `generic_fn_infer_idx` names which of ITS params carries the inference (the
+                // one whose declared type is exactly the bare type parameter, see `Checker.hotc`'s
+                // own `check_generic_call`), read back here independently since this file doesn't
+                // share the checker's own registries. Args are evaluated in normal left-to-right
+                // order regardless (needed for the call either way); the inferred index's own
+                // return type (captured as `gen_expr` pushes it, not by peeking ahead) is what
+                // decides the concrete mono name -- no reordering needed, since which METHOD gets
+                // invoked is only decided at the final `INVOKESTATIC`, after every arg is already
+                // on the stack.
+                var infer_idx = -1;
+                var is_generic_call = false;
+                if !known {
+                    let idx_found = self.generic_fn_infer_idx.get(callee);
+                    if let Some { value: idx } = idx_found {
+                        infer_idx = idx;
+                        is_generic_call = true;
+                    }
+                }
+                if !known && !is_generic_call {
+                    throw CodegenError::new("codegen for 'Call' to '" + callee + "' not implemented this phase (only calls to functions defined in the same source file are supported)");
+                }
+                let argc = args.length();
+                var i = 0;
+                var inferred_type = "";
+                while i < argc {
+                    let at = self.gen_expr(args.get(i));
+                    if is_generic_call && i == infer_idx {
+                        inferred_type = at;
+                    }
+                    i = i + 1;
+                }
+                var target = callee;
+                if is_generic_call {
+                    if inferred_type == "" {
+                        throw CodegenError::new("codegen: could not infer generic type argument for call to '" + callee + "'");
+                    }
+                    target = callee + "$" + inferred_type;
+                }
+                let desc_found = self.fn_descs.get(target);
+                var desc = "";
+                if let Some { value: d2 } = desc_found { desc = d2; }
+                self.mv.visitMethodInsn(184, self.owner, target, desc, false); // INVOKESTATIC
+                let rt_found = self.fn_ret_tys.get(target);
+                if let Some { value: rt } = rt_found {
+                    return rt;
+                }
+                return "Int";
+            }
+            FieldAccess { obj, field } => {
+                let ot = self.gen_expr(obj); // pushes the struct/array ref
+                if is_array_type_name_cg(ot) {
+                    if field != "length" {
+                        throw CodegenError::new("array has no field '" + field + "' (only 'length')");
+                    }
+                    self.mv.visitInsn(190); // ARRAYLENGTH
+                    return "Int";
+                }
+                let fty = self.field_type_of(ot, field);
+                self.mv.visitFieldInsn(180, ot, field, self.resolve_descriptor(fty)); // GETFIELD
+                return fty;
+            }
+            MethodCall { recv, method, args } => {
+                let rt = self.gen_expr(recv);
+                // User-defined struct methods first (any receiver type might have one), built-in
+                // `String` methods as the other real, fixed target, anything else a clear error
+                // rather than a bogus INVOKEVIRTUAL.
+                let mkey = rt + "#" + method;
+                let mdesc_found = self.struct_methods.get(mkey);
+                if let Some { value: mdesc } = mdesc_found {
+                    var mi = 0;
+                    while mi < args.length() {
+                        self.gen_expr(args.get(mi));
+                        mi = mi + 1;
+                    }
+                    self.mv.visitMethodInsn(182, rt, method, mdesc, false); // INVOKEVIRTUAL
+                    let mret_found = self.struct_method_rettys.get(mkey);
+                    if let Some { value: mret } = mret_found {
+                        return mret;
+                    }
+                    return "Int";
+                }
+                let ebinary_found = self.extern_binary.get(rt);
+                if let Some { value: ebinary } = ebinary_found {
+                    let edesc_found = self.extern_method_descs.get(mkey);
+                    var edesc = "";
+                    var e_known = false;
+                    if let Some { value: d } = edesc_found {
+                        edesc = d;
+                        e_known = true;
+                    }
+                    if !e_known {
+                        throw CodegenError::new("codegen: unknown method '" + method + "' on extern class '" + rt + "'");
+                    }
+                    var ei = 0;
+                    while ei < args.length() {
+                        self.gen_expr(args.get(ei));
+                        ei = ei + 1;
+                    }
+                    self.mv.visitMethodInsn(182, ebinary, method, edesc, false); // INVOKEVIRTUAL
+                    let ert_found = self.extern_method_rettys.get(mkey);
+                    if let Some { value: ert } = ert_found {
+                        return ert;
+                    }
+                    return "Int";
+                }
+                if rt != "String" {
+                    throw CodegenError::new("codegen for 'MethodCall' to '" + method + "' not implemented this phase (receiver was " + rt + ", not String, and no user-defined method by that name exists on it)");
+                }
+                let argc = args.length();
+                if method == "length" {
+                    if argc != 0 { throw CodegenError::new("'length' takes no arguments"); }
+                    self.mv.visitMethodInsn(182, "java/lang/String", "length", "()I", false);
+                    return "Int";
+                } else if method == "toUpperCase" {
+                    if argc != 0 { throw CodegenError::new("'toUpperCase' takes no arguments"); }
+                    self.mv.visitMethodInsn(182, "java/lang/String", "toUpperCase", "()Ljava/lang/String;", false);
+                    return "String";
+                } else if method == "toLowerCase" {
+                    if argc != 0 { throw CodegenError::new("'toLowerCase' takes no arguments"); }
+                    self.mv.visitMethodInsn(182, "java/lang/String", "toLowerCase", "()Ljava/lang/String;", false);
+                    return "String";
+                } else if method == "trim" {
+                    if argc != 0 { throw CodegenError::new("'trim' takes no arguments"); }
+                    self.mv.visitMethodInsn(182, "java/lang/String", "trim", "()Ljava/lang/String;", false);
+                    return "String";
+                } else if method == "contains" {
+                    if argc != 1 { throw CodegenError::new("'contains' takes exactly one argument"); }
+                    self.gen_expr(args.get(0));
+                    self.mv.visitMethodInsn(182, "java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z", false);
+                    return "Bool";
+                } else if method == "indexOf" {
+                    if argc != 1 { throw CodegenError::new("'indexOf' takes exactly one argument"); }
+                    self.gen_expr(args.get(0));
+                    self.mv.visitMethodInsn(182, "java/lang/String", "indexOf", "(Ljava/lang/String;)I", false);
+                    return "Int";
+                } else if method == "codePointAt" {
+                    // Real gap found self-compiling `Lexer.hotc`, which reads its own source one
+                    // codepoint at a time this exact way -- same real `java.lang.String` method
+                    // this file's own `JStringCg`/`JStringChk` extern declarations already bind
+                    // for THEIR OWN internal use, just missing from this fallback dispatch table.
+                    if argc != 1 { throw CodegenError::new("'codePointAt' takes exactly one argument"); }
+                    self.gen_expr(args.get(0));
+                    self.mv.visitMethodInsn(182, "java/lang/String", "codePointAt", "(I)I", false);
+                    return "Int";
+                } else if method == "substring" {
+                    if argc != 2 { throw CodegenError::new("'substring' takes exactly two arguments"); }
+                    self.gen_expr(args.get(0));
+                    self.gen_expr(args.get(1));
+                    self.mv.visitMethodInsn(182, "java/lang/String", "substring", "(II)Ljava/lang/String;", false);
+                    return "String";
+                } else {
+                    throw CodegenError::new("codegen for String method '" + method + "' not implemented this phase");
+                }
+            }
+            Assign { name, value } => {
+                let ty = self.gen_expr(value);
+                let slot = self.slot_of(name);
+                self.mv.visitVarInsn(store_opcode(ty), slot);
+                self.mv.visitVarInsn(load_opcode(ty), slot); // push the stored value back so
+                // `Assign` behaves like every other value-producing expr (matching real
+                // assignment-as-expression semantics), letting `ExprStmt` codegen stay uniform
+                // below instead of needing to special-case Assign to know whether a value is on
+                // the stack to pop.
+                return ty;
+            }
+            FieldAssign { obj, field, value } => {
+                let ot = self.gen_expr(obj); // stack: [objref]
+                let fty = self.field_type_of(ot, field);
+                self.gen_expr(value); // stack: [objref, value]
+                self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value]
+                self.mv.visitFieldInsn(181, ot, field, self.resolve_descriptor(fty)); // PUTFIELD -- consumes [objref, value], leaves [value]
+                return fty;
+            }
+            StructLit { name, field_names, field_values, generic_base } => {
+                // Enum variant construction (`VariantName { ... }`) takes a different bytecode
+                // shape than a plain struct literal: the *enum's* class (not a per-variant one --
+                // there is only ever one real `.class` file per enum, see `gen_enum`) with a
+                // trivial no-arg constructor, `tag` and each field set via individual `PUTFIELD`s
+                // afterward rather than one big constructor call (different variant literals
+                // populate different subsets of the enum's unioned fields). An explicitly-qualified
+                // generic-enum-variant construction (`Option<Int>::Some { ... }`) already names its
+                // exact concrete instantiation via `generic_base` -- skip the bare-name
+                // `variant_owner` lookup entirely (it would collide across multiple concrete
+                // instantiations of the same generic enum; see `Ast.hc`'s own `EnumDecl` header).
+                var vowner = "";
+                var is_variant = false;
+                if let Some { value: gb } = generic_base {
+                    vowner = gb;
+                    is_variant = true;
+                } else {
+                    let owner_found = self.variant_owner.get(name);
+                    if let Some { value: o } = owner_found {
+                        vowner = o;
+                        is_variant = true;
+                    } else {
+                        // A bare GENERIC-enum variant ("Some { ... }" / "None", no `<Arg>` and no
+                        // owner registered -- `build_program_info`'s own header explains why a
+                        // mono generic enum instantiation deliberately skips `variant_owner_*`).
+                        // Falls back to `self.ret_ty` the same way the plain-struct branch below
+                        // does (mirrors `Checker.hotc`'s own `check_struct_lit` fix, same real gap
+                        // found self-compiling `Parser.hotc`'s `some_expr`/bare-`None` helpers):
+                        // if `name` is a real variant of the enum `self.ret_ty` names, that's it.
+                        if is_mono_name_cg(self.ret_ty) {
+                            // Keyed by the FULL mono enum name directly -- see the `Ident` arm's
+                            // own matching header above for why `mono_base_cg` doesn't belong here.
+                            let tag_key = self.ret_ty + "#" + name;
+                            let tag_found = self.variant_tags.get(tag_key);
+                            if let Some { value: tag } = tag_found {
+                                vowner = self.ret_ty;
+                                is_variant = true;
+                            }
+                        }
+                    }
+                }
+                if is_variant {
+                    return self.gen_variant_construct(vowner, name, field_names, field_values);
+                } else {
+                    // A bare generic struct literal ("Vec { ... }", no "<Arg>") -- an EXPLICIT one
+                    // (`Vec<T> { ... }`) already arrives here with `name` baked to the full mono
+                    // name by the parser itself (`Parser.hotc`'s `struct_lit` call sites), so this
+                    // fallback only matters for the bare form. Mirrors `Checker.hotc`'s own
+                    // `check_struct_lit` fix (same real gap, found self-compiling `Parser.hotc`,
+                    // fixed independently here since `Codegen.hotc` is a separate pass over a
+                    // freshly-parsed tree, not fed anything back from the checker's own run):
+                    // falls back to `self.ret_ty` when `name` doesn't resolve as its own concrete
+                    // struct and its mono base matches -- the only shape any real self-hosted
+                    // source needs (`return Vec { ... };` inside a `-> Vec<X>` fn).
+                    var resolved_name = name;
+                    if !is_mono_name_cg(name) {
+                        let dn_check = self.struct_fields.get(name);
+                        var found_concrete = false;
+                        if let Some { value: dv } = dn_check { found_concrete = true; }
+                        if !found_concrete {
+                            if is_mono_name_cg(self.ret_ty) && mono_base_cg(self.ret_ty) == name {
+                                resolved_name = self.ret_ty;
+                            } else {
+                                // The "Vec { data: someVar.data, len: 0 }" idiom (an "empty, same-
+                                // element-type Vec" built from an already-typed local's own
+                                // backing array) -- mirrors `Checker.hotc`'s own matching fallback
+                                // in `check_struct_lit`, same real gap found self-compiling
+                                // `Checker.hotc`'s own `checker_new`. `self.var_types` is a
+                                // registry read, not a `gen_expr` call -- calling `gen_expr` on the
+                                // SAME sub-expression twice (once here, once in the normal field
+                                // loop below) would emit the underlying bytecode twice.
+                                var di = 0;
+                                while di < field_names.length() {
+                                    if field_names.get(di) == "data" {
+                                        let fv = field_values.get(di);
+                                        match fv {
+                                            FieldAccess { obj, field } => {
+                                                if field == "data" {
+                                                    match obj {
+                                                        Ident { name: oname } => {
+                                                            let ovar = self.var_types.get(oname);
+                                                            if let Some { value: oty } = ovar {
+                                                                if is_mono_name_cg(oty) && mono_base_cg(oty) == name {
+                                                                    resolved_name = oty;
+                                                                }
+                                                            }
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    di = di + 1;
+                                }
+                            }
+                        }
+                    }
+                    self.mv.visitTypeInsn(187, resolved_name); // NEW
+                    self.mv.visitInsn(89); // DUP
+                    let dnames_found = self.struct_fields.get(resolved_name);
+                    let dtypes_found = self.struct_ftypes.get(resolved_name);
+                    var dnames = empty_str_vec4();
+                    var dtypes = empty_str_vec4();
+                    if let Some { value: nv } = dnames_found { dnames = nv; }
+                    if let Some { value: tv } = dtypes_found { dtypes = tv; }
+                    var ctor_desc = "(";
+                    var i = 0;
+                    while i < dnames.length() {
+                        let fname = dnames.get(i);
+                        let ftype = dtypes.get(i);
+                        ctor_desc = ctor_desc + self.resolve_descriptor(ftype);
+                        var found_idx = -1;
+                        var j = 0;
+                        while j < field_names.length() {
+                            if field_names.get(j) == fname {
+                                found_idx = j;
+                            }
+                            j = j + 1;
+                        }
+                        if found_idx < 0 {
+                            throw CodegenError::new("struct literal for '" + resolved_name + "' is missing field '" + fname + "'");
+                        }
+                        self.gen_expr(field_values.get(found_idx));
+                        i = i + 1;
+                    }
+                    ctor_desc = ctor_desc + ")V";
+                    self.mv.visitMethodInsn(183, resolved_name, "<init>", ctor_desc, false); // INVOKESPECIAL
+                    return resolved_name;
+                }
+            }
+            ArrayLit { elements } => {
+                // The first element has to be evaluated *before* `NEWARRAY`/`ANEWARRAY` can even
+                // be emitted (need its type to pick the opcode), but the array itself has to
+                // exist on the stack before any element can be stored into it -- a real ordering
+                // conflict `gen_expr`'s single stack-based evaluation can't resolve by reordering
+                // alone. Stashing the first element's already-computed value in a raw temp local
+                // (same "unregistered slot" trick `match`'s own subject uses) sidesteps it.
+                let n = elements.length();
+                let first_ty = self.gen_expr(elements.get(0));
+                let tmp_slot = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                if is_ref_type(first_ty) { self.mv.visitVarInsn(58, tmp_slot); } else { self.mv.visitVarInsn(54, tmp_slot); }
+                self.mv.visitIntInsn(17, n); // SIPUSH n
+                if first_ty == "Int" || first_ty == "Bool" {
+                    self.mv.visitIntInsn(188, 10); // NEWARRAY T_INT
+                } else {
+                    self.mv.visitTypeInsn(189, self.resolve_elem_class_name(first_ty)); // ANEWARRAY
+                }
+                self.mv.visitInsn(89); // DUP
+                self.mv.visitIntInsn(17, 0); // SIPUSH 0
+                if is_ref_type(first_ty) { self.mv.visitVarInsn(25, tmp_slot); } else { self.mv.visitVarInsn(21, tmp_slot); }
+                if is_ref_type(first_ty) { self.mv.visitInsn(83); } else { self.mv.visitInsn(79); } // AASTORE / IASTORE
+                var ai = 1;
+                while ai < n {
+                    self.mv.visitInsn(89); // DUP
+                    self.mv.visitIntInsn(17, ai); // SIPUSH ai
+                    self.gen_expr(elements.get(ai));
+                    if is_ref_type(first_ty) { self.mv.visitInsn(83); } else { self.mv.visitInsn(79); } // AASTORE / IASTORE
+                    ai = ai + 1;
+                }
+                return "[" + first_ty + "]";
+            }
+            ArrayRepeat { value, count } => {
+                // `[value; count]` -- `count` is a runtime expression (unlike `ArrayLit`'s
+                // compile-time-known element count), so `NEWARRAY`/`ANEWARRAY`'s size operand
+                // comes from evaluating it, and filling every slot needs a real runtime loop
+                // (`i` from `0` to `count`), not `ArrayLit`'s unrolled per-element stores. `value`
+                // is evaluated exactly once and the same stack value (or ref, for a ref type) is
+                // stored into every slot -- correct for both primitive ints and object refs (the
+                // prelude's own `Vec<T>`'s `[value; newCap]` relies on exactly this: the SAME `T`
+                // value repeated, not `newCap` freshly-constructed ones).
+                let vty = self.gen_expr(value); // stack: [value]
+                let val_slot = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                if is_ref_type(vty) { self.mv.visitVarInsn(58, val_slot); } else { self.mv.visitVarInsn(54, val_slot); } // ASTORE / ISTORE
+                self.gen_expr(count); // stack: [count]
+                let cnt_slot = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                self.mv.visitVarInsn(54, cnt_slot); // ISTORE count
+                self.mv.visitVarInsn(21, cnt_slot); // ILOAD count -- NEWARRAY/ANEWARRAY size operand
+                if vty == "Int" || vty == "Bool" {
+                    self.mv.visitIntInsn(188, 10); // NEWARRAY T_INT
+                } else {
+                    self.mv.visitTypeInsn(189, self.resolve_elem_class_name(vty)); // ANEWARRAY
+                }
+                let arr_slot = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                self.mv.visitVarInsn(58, arr_slot); // ASTORE array (the array itself is always a ref type)
+                let idx_slot = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                self.mv.visitIntInsn(17, 0); // SIPUSH 0
+                self.mv.visitVarInsn(54, idx_slot); // ISTORE i = 0
+                var loop_start = Label::new();
+                var loop_end = Label::new();
+                self.mv.visitLabel(&loop_start);
+                self.mv.visitVarInsn(21, idx_slot); // ILOAD i
+                self.mv.visitVarInsn(21, cnt_slot); // ILOAD count
+                self.mv.visitJumpInsn(162, &loop_end); // IF_ICMPGE -- i >= count -> done
+                self.mv.visitVarInsn(25, arr_slot); // ALOAD array
+                self.mv.visitVarInsn(21, idx_slot); // ILOAD i
+                if is_ref_type(vty) { self.mv.visitVarInsn(25, val_slot); } else { self.mv.visitVarInsn(21, val_slot); } // ALOAD / ILOAD value
+                if is_ref_type(vty) { self.mv.visitInsn(83); } else { self.mv.visitInsn(79); } // AASTORE / IASTORE
+                self.mv.visitVarInsn(21, idx_slot); // ILOAD i
+                self.mv.visitIntInsn(17, 1); // SIPUSH 1
+                self.mv.visitInsn(96); // IADD
+                self.mv.visitVarInsn(54, idx_slot); // ISTORE i
+                self.mv.visitJumpInsn(167, &loop_start); // GOTO loop_start
+                self.mv.visitLabel(&loop_end);
+                self.mv.visitVarInsn(25, arr_slot); // ALOAD array -- leaves the finished array as this expression's value
+                return "[" + vty + "]";
+            }
+            Index { arr, index } => {
+                let at = self.gen_expr(arr); // pushes array ref
+                self.gen_expr(index); // pushes Int index
+                if !is_array_type_name_cg(at) {
+                    throw CodegenError::new("codegen: cannot index non-array type '" + at + "'");
+                }
+                let elem = array_elem_type_name_cg(at);
+                if is_ref_type(elem) { self.mv.visitInsn(50); } else { self.mv.visitInsn(46); } // AALOAD / IALOAD
+                return elem;
+            }
+            IndexAssign { arr, index, value } => {
+                let at = self.gen_expr(arr); // stack: [arrayref]
+                if !is_array_type_name_cg(at) {
+                    throw CodegenError::new("codegen: cannot index non-array type '" + at + "'");
+                }
+                let elem = array_elem_type_name_cg(at);
+                self.gen_expr(index); // stack: [arrayref, index]
+                self.gen_expr(value); // stack: [arrayref, index, value]
+                self.mv.visitInsn(91); // DUP_X2 -- stack: [value, arrayref, index, value]
+                if is_ref_type(elem) { self.mv.visitInsn(83); } else { self.mv.visitInsn(79); } // AASTORE / IASTORE -- consumes [arrayref, index, value], leaves [value]
+                return elem;
+            }
+            StaticCall { type_name, method, args } => {
+                let key = type_name + "#" + method;
+                let binary_found = self.extern_binary.get(type_name);
+                var binary = "";
+                var cls_known = false;
+                if let Some { value: b } = binary_found {
+                    binary = b;
+                    cls_known = true;
+                }
+                if !cls_known {
+                    // Not a known extern class -- fall back to a struct static method, targeting
+                    // the struct's own class name directly (its binary name always equals its
+                    // declared name, see `gen_struct`'s own header).
+                    let sdesc_found = self.struct_methods.get(key);
+                    var sdesc = "";
+                    var s_known = false;
+                    if let Some { value: d } = sdesc_found {
+                        sdesc = d;
+                        s_known = true;
+                    }
+                    if !s_known {
+                        throw CodegenError::new("codegen: unknown extern class or struct static method '" + type_name + "::" + method + "'");
+                    }
+                    var si = 0;
+                    while si < args.length() {
+                        self.gen_expr(args.get(si));
+                        si = si + 1;
+                    }
+                    self.mv.visitMethodInsn(184, type_name, method, sdesc, false); // INVOKESTATIC
+                    let srt_found = self.struct_method_rettys.get(key);
+                    if let Some { value: srt } = srt_found {
+                        return srt;
+                    }
+                    return "Int";
+                }
+                let desc_found = self.extern_method_descs.get(key);
+                var desc = "";
+                var m_known = false;
+                if let Some { value: d } = desc_found {
+                    desc = d;
+                    m_known = true;
+                }
+                if !m_known {
+                    throw CodegenError::new("codegen: unknown extern method '" + method + "' on '" + type_name + "'");
+                }
+                var is_ctor = false;
+                let ctor_found = self.extern_method_ctor.get(key);
+                if let Some { value: c } = ctor_found {
+                    if c == 1 { is_ctor = true; }
+                }
+                if is_ctor {
+                    self.mv.visitTypeInsn(187, binary); // NEW
+                    self.mv.visitInsn(89); // DUP
+                }
+                var i = 0;
+                while i < args.length() {
+                    self.gen_expr(args.get(i));
+                    i = i + 1;
+                }
+                if is_ctor {
+                    self.mv.visitMethodInsn(183, binary, "<init>", desc, false); // INVOKESPECIAL
+                    return type_name; // the constructed value's type tag is the alias name
+                }
+                self.mv.visitMethodInsn(184, binary, method, desc, false); // INVOKESTATIC
+                let rt_found = self.extern_method_rettys.get(key);
+                if let Some { value: rt } = rt_found {
+                    return rt;
+                }
+                return "Int";
+            }
+            Cast { expr, target_type } => { return self.gen_cast(expr, target_type); }
+        }
+    }
+
+    // `expr as Type` -- `Long` (the only case that needs real conversion bytecode this phase --
+    // see `Ast.hc`'s own `Cast` header) is a JVM category-2 primitive (`J`), needing `L2I`/`I2L`
+    // between it and the ordinary category-1 `Int` (`I`); every other cast is a plain reference
+    // pass-through (no bytecode at all -- this subset doesn't emit `CHECKCAST` anywhere, matching
+    // its own loose, disclosed "trust declared types" philosophy elsewhere).
+    fn gen_cast(&mut self, expr: Expr, target_type: String) -> String {
+        let inner_ty = self.gen_expr(expr);
+        if inner_ty == "Long" && target_type == "Int" {
+            self.mv.visitInsn(136); // L2I
+            return "Int";
+        }
+        if inner_ty == "Int" && target_type == "Long" {
+            self.mv.visitInsn(133); // I2L
+            return "Long";
+        }
+        return target_type;
+    }
+
+    fn gen_binary(&mut self, op: String, left: Expr, right: Expr) -> String {
+        if op == "+" {
+            let lt = self.gen_expr(left);
+            let rt = self.gen_expr(right);
+            if lt == "String" || rt == "String" {
+                // Checker only allows String+String (see `Checker.hotc`'s `check_binary`), so
+                // both operands are guaranteed String here.
+                self.mv.visitMethodInsn(182, "java/lang/String", "concat", "(Ljava/lang/String;)Ljava/lang/String;", false); // INVOKEVIRTUAL
+                return "String";
+            }
+            // Both operands must be `Long` (no implicit `Int` -> `Long` widening this round -- a
+            // real, disclosed scope cut; `Checker.hotc`'s own `check_binary` enforces the same
+            // restriction, so a mixed Int/Long pair never reaches codegen at all in a program that
+            // passed checking).
+            if lt == "Long" && rt == "Long" {
+                self.mv.visitInsn(97); // LADD
+                return "Long";
+            }
+            self.mv.visitInsn(96); // IADD
+            return "Int";
+        } else if op == "-" {
+            let lt2 = self.gen_expr(left); let rt2 = self.gen_expr(right);
+            if lt2 == "Long" && rt2 == "Long" { self.mv.visitInsn(101); return "Long"; } // LSUB
+            self.mv.visitInsn(100); return "Int"; // ISUB
+        } else if op == "*" {
+            let lt3 = self.gen_expr(left); let rt3 = self.gen_expr(right);
+            if lt3 == "Long" && rt3 == "Long" { self.mv.visitInsn(105); return "Long"; } // LMUL
+            self.mv.visitInsn(104); return "Int"; // IMUL
+        } else if op == "/" {
+            let lt4 = self.gen_expr(left); let rt4 = self.gen_expr(right);
+            if lt4 == "Long" && rt4 == "Long" { self.mv.visitInsn(109); return "Long"; } // LDIV
+            self.mv.visitInsn(108); return "Int"; // IDIV
+        } else if op == "%" {
+            let lt5 = self.gen_expr(left); let rt5 = self.gen_expr(right);
+            if lt5 == "Long" && rt5 == "Long" { self.mv.visitInsn(113); return "Long"; } // LREM
+            self.mv.visitInsn(112); return "Int"; // IREM
+        } else if op == "&&" {
+            // Short-circuit: only evaluate `right` when `left` is true.
+            self.gen_expr(left);
+            var false_label = Label::new();
+            var end_label = Label::new();
+            self.mv.visitJumpInsn(153, &false_label); // IFEQ (left == 0/false) -> skip right
+            self.gen_expr(right);
+            self.mv.visitJumpInsn(167, &end_label); // GOTO
+            self.mv.visitLabel(&false_label);
+            self.mv.visitInsn(3); // ICONST_0
+            self.mv.visitLabel(&end_label);
+            return "Bool";
+        } else if op == "||" {
+            // Short-circuit: only evaluate `right` when `left` is false.
+            self.gen_expr(left);
+            var true_label = Label::new();
+            var end_label = Label::new();
+            self.mv.visitJumpInsn(154, &true_label); // IFNE (left != 0/true) -> skip right
+            self.gen_expr(right);
+            self.mv.visitJumpInsn(167, &end_label); // GOTO
+            self.mv.visitLabel(&true_label);
+            self.mv.visitInsn(4); // ICONST_1
+            self.mv.visitLabel(&end_label);
+            return "Bool";
+        } else {
+            let lt = self.gen_expr(left);
+            let rt = self.gen_expr(right);
+            if (op == "==" || op == "!=") && (lt == "String" || rt == "String") {
+                self.mv.visitMethodInsn(182, "java/lang/Object", "equals", "(Ljava/lang/Object;)Z", false); // INVOKEVIRTUAL
+                if op == "!=" {
+                    self.mv.visitIntInsn(17, 1);
+                    self.mv.visitInsn(130); // IXOR (negate)
+                }
+                return "Bool";
+            }
+            if lt == "Long" && rt == "Long" {
+                // The JVM has no two-operand `IF_LCMPxx` family the way it does for `Int`
+                // (`IF_ICMPxx`) -- `Long`/`Float`/`Double` comparisons always go through a
+                // dedicated compare-then-branch-on-zero shape instead: `LCMP` consumes both
+                // operands and pushes a real `-1`/`0`/`1` Int, then a single-operand `IFxx`
+                // (153-158, the same family the `while`/`if` condition machinery elsewhere in
+                // this file already uses) branches on THAT against zero.
+                self.mv.visitInsn(148); // LCMP
+                var true_label4 = Label::new();
+                var end_label4 = Label::new();
+                let scmp = single_cmp_opcode(op);
+                self.mv.visitJumpInsn(scmp, &true_label4);
+                self.mv.visitInsn(3); // ICONST_0 (false)
+                self.mv.visitJumpInsn(167, &end_label4); // GOTO
+                self.mv.visitLabel(&true_label4);
+                self.mv.visitInsn(4); // ICONST_1 (true)
+                self.mv.visitLabel(&end_label4);
+                return "Bool";
+            }
+            // Real bug found stress-testing bare enum-variant-as-value-expression comparisons
+            // (`kind == FN`, real `Lexer.hotc`/`Parser.hotc` usage): this branch used to treat
+            // `==`/`!=` on ANY ref type uniformly as reference-identity comparison, which is
+            // correct for plain structs (no per-field structural equality, a real, disclosed gap
+            // matching the real compiler's own) but WRONG for enums -- two separately-constructed
+            // instances of the same variant (`t1.kind` and a freshly-built `FN` value, say) are
+            // never the SAME object, so `if_acmpeq` was silently always false regardless of the
+            // real tag values. The REAL compiler's own `CodeGen.kt` already fixes this (tag
+            // comparison, not reference identity -- see `Parser.hotc`'s own header, a much earlier
+            // finding), but this self-hosted PORT never got the equivalent fix until now.
+            if (op == "==" || op == "!=") && (is_ref_type(lt) || is_ref_type(rt)) && self.is_enum_type(lt) {
+                self.mv.visitFieldInsn(180, rt, "tag", "I"); // GETFIELD rightRef.tag -- stack: [leftRef, rightTag]
+                self.mv.visitInsn(95); // SWAP -- stack: [rightTag, leftRef]
+                self.mv.visitFieldInsn(180, lt, "tag", "I"); // GETFIELD leftRef.tag -- stack: [rightTag, leftTag]
+                var true_label3 = Label::new();
+                var end_label3 = Label::new();
+                let icmp = comparison_opcode(op); // IF_ICMPEQ / IF_ICMPNE
+                self.mv.visitJumpInsn(icmp, &true_label3);
+                self.mv.visitInsn(3); // ICONST_0 (false)
+                self.mv.visitJumpInsn(167, &end_label3); // GOTO
+                self.mv.visitLabel(&true_label3);
+                self.mv.visitInsn(4); // ICONST_1 (true)
+                self.mv.visitLabel(&end_label3);
+                return "Bool";
+            }
+            if (op == "==" || op == "!=") && (is_ref_type(lt) || is_ref_type(rt)) {
+                // Struct reference-identity comparison -- no per-field structural equality (see
+                // this file's own header, matches the real compiler's own disclosed gap).
+                var true_label2 = Label::new();
+                var end_label2 = Label::new();
+                let acmp = ref_cmp_opcode(op);
+                self.mv.visitJumpInsn(acmp, &true_label2);
+                self.mv.visitInsn(3); // ICONST_0 (false)
+                self.mv.visitJumpInsn(167, &end_label2); // GOTO
+                self.mv.visitLabel(&true_label2);
+                self.mv.visitInsn(4); // ICONST_1 (true)
+                self.mv.visitLabel(&end_label2);
+                return "Bool";
+            }
+            var true_label = Label::new();
+            var end_label = Label::new();
+            let cmp_opcode = comparison_opcode(op);
+            self.mv.visitJumpInsn(cmp_opcode, &true_label);
+            self.mv.visitInsn(3); // ICONST_0 (false)
+            self.mv.visitJumpInsn(167, &end_label); // GOTO
+            self.mv.visitLabel(&true_label);
+            self.mv.visitInsn(4); // ICONST_1 (true)
+            self.mv.visitLabel(&end_label);
+            return "Bool";
+        }
+    }
+
+    fn gen_unary(&mut self, op: String, inner: Expr) -> String {
+        self.gen_expr(inner);
+        if op == "!" {
+            self.mv.visitIntInsn(17, 1);
+            self.mv.visitInsn(130); // IXOR (flip 0/1)
+            return "Bool";
+        } else {
+            self.mv.visitInsn(116); // INEG
+            return "Int";
+        }
+    }
+
+    fn gen_stmt(&mut self, s: Stmt) {
+        match s {
+            Let { name, mutable, init } => {
+                let ty = self.gen_expr(init);
+                let slot = self.alloc_slot(name, ty);
+                self.var_types.register(name, ty);
+                self.mv.visitVarInsn(store_opcode(ty), slot);
+            }
+            ExprStmt { expr } => {
+                let ety = self.gen_expr(expr);
+                // `POP` only pops ONE category-1 stack slot -- `Long` is category-2 (occupies two
+                // slots on the operand stack too, not just in locals) and needs `POP2` (88) instead,
+                // or the verifier rejects it as leaving a stray half-slot behind. A genuinely
+                // `Unit`-typed expression (a void extern-method call used as a bare statement --
+                // real `Codegen.hotc` usage: `self.mv.visitInsn(89);`) needs NO pop at all: real
+                // gap found self-compiling THIS very function (`gen_variant_construct`) -- a void
+                // `INVOKEVIRTUAL` genuinely pushes nothing onto the stack, but this arm used to POP
+                // unconditionally whenever `ety != "Long"`, silently popping a value that was never
+                // pushed. Harmless-looking in isolation (ASM's own `COMPUTE_FRAMES` doesn't catch a
+                // single stray `POP` immediately), but it desyncs this statement's own net stack
+                // effect from what surrounding code (a `while` loop's back-edge, say) expects,
+                // eventually surfacing as a real `NegativeArraySizeException` in stack-frame
+                // merging once enough code accumulates around it.
+                if ety == "Unit" {
+                    // no value was pushed -- nothing to pop
+                } else if ety == "Long" {
+                    self.mv.visitInsn(88); // POP2
+                } else {
+                    self.mv.visitInsn(87); // POP
+                }
+            }
+            Return { value } => {
+                if let Some { value: v } = value {
+                    self.gen_expr(v);
+                    if self.ret_ty == "Long" { self.mv.visitInsn(173); } // LRETURN
+                    else if is_ref_type(self.ret_ty) { self.mv.visitInsn(176); } // ARETURN
+                    else { self.mv.visitInsn(172); } // IRETURN
+                } else {
+                    self.mv.visitInsn(177); // RETURN
+                }
+            }
+            If { cond, then_body, else_body } => {
+                self.gen_expr(cond);
+                var else_label = Label::new();
+                var end_label = Label::new();
+                self.mv.visitJumpInsn(153, &else_label); // IFEQ -- cond==0 (false) -> else
+                self.gen_block(then_body);
+                self.mv.visitJumpInsn(167, &end_label); // GOTO
+                self.mv.visitLabel(&else_label);
+                if let Some { value: eb } = else_body {
+                    self.gen_block(eb);
+                }
+                self.mv.visitLabel(&end_label);
+            }
+            While { cond, body } => {
+                var start_label = Label::new();
+                var end_label = Label::new();
+                self.mv.visitLabel(&start_label);
+                self.gen_expr(cond);
+                self.mv.visitJumpInsn(153, &end_label); // IFEQ
+                // Save/restore around the (possibly nested) body -- matches `Checker.hotc`'s own
+                // `loop_depth` save/restore, and mirrors the real compiler's `loopLabels` stack
+                // except as plain locals: codegen only ever needs the CURRENT innermost loop's
+                // labels (a `Break`/`Continue` inside this body targets THIS loop, never an outer
+                // one), so there's nothing a real stack would give that save/restore doesn't.
+                let outer_start = self.cur_loop_start;
+                let outer_end = self.cur_loop_end;
+                self.cur_loop_start = start_label;
+                self.cur_loop_end = end_label;
+                self.gen_block(body);
+                // Read the labels back out of `self` (still ours -- nothing else has touched them
+                // yet) before restoring the outer ones, rather than reusing `start_label`/
+                // `end_label` directly -- `Label` is a real Java-object extern type, not `Copy`,
+                // so moving it into `self.cur_loop_start`/`self.cur_loop_end` above means the
+                // ORIGINAL locals can't be read again (real compiler's own move checker caught
+                // this while compiling this very file).
+                let my_start = self.cur_loop_start;
+                let my_end = self.cur_loop_end;
+                self.cur_loop_start = outer_start;
+                self.cur_loop_end = outer_end;
+                self.mv.visitJumpInsn(167, &my_start); // GOTO
+                self.mv.visitLabel(&my_end);
+            }
+            Match { subject, arms } => {
+                let sty = self.gen_expr(subject);
+                // A raw local slot, not routed through `alloc_slot`/`self.slots` -- the subject
+                // is never referenced by name later (unlike a `let`), only read back inside this
+                // same statement's own codegen below.
+                let subj_slot = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                if is_ref_type(sty) { self.mv.visitVarInsn(58, subj_slot); } else { self.mv.visitVarInsn(54, subj_slot); } // ASTORE / ISTORE
+                var end_label = Label::new();
+                var i = 0;
+                while i < arms.length() {
+                    let arm = arms.get(i);
+                    if arm.variant_name == "_" {
+                        self.gen_block(arm.body);
+                        self.mv.visitJumpInsn(167, &end_label); // GOTO
+                    } else {
+                        var next_label = Label::new();
+                        let tag_key = sty + "#" + arm.variant_name;
+                        var vtag = -1;
+                        let vtag_found = self.variant_tags.get(tag_key);
+                        if let Some { value: t } = vtag_found {
+                            vtag = t;
+                        }
+                        if is_ref_type(sty) { self.mv.visitVarInsn(25, subj_slot); } else { self.mv.visitVarInsn(21, subj_slot); }
+                        self.mv.visitFieldInsn(180, sty, "tag", "I"); // GETFIELD
+                        self.mv.visitIntInsn(17, vtag); // SIPUSH
+                        self.mv.visitJumpInsn(160, &next_label); // IF_ICMPNE -- tag mismatch -> next arm
+                        // Prefer the ARM's OWN variant's dedicated field table (`variant_field_
+                        // names`/`variant_field_types`, keyed "EnumName#VariantName") over
+                        // `field_type_of(sty, ...)`'s enum-wide union -- same real gap
+                        // `Checker.hotc`'s own `check_match` had (see `ProgramInfo`'s own
+                        // `variant_field_keys` header): `Ast.hc`'s `Expr` enum reuses the field
+                        // name "value" across variants at different types, so the union's linear
+                        // scan always resolved to whichever variant registered first.
+                        let vfn_key = sty + "#" + arm.variant_name;
+                        let vfn_found = self.variant_field_names.get(vfn_key);
+                        let vft_found = self.variant_field_types.get(vfn_key);
+                        var variant_fnames = empty_str_vec4();
+                        var variant_ftypes = empty_str_vec4();
+                        var has_variant_fields = false;
+                        if let Some { value: vfn } = vfn_found {
+                            if let Some { value: vft } = vft_found {
+                                variant_fnames = vfn;
+                                variant_ftypes = vft;
+                                has_variant_fields = true;
+                            }
+                        }
+                        var fj = 0;
+                        while fj < arm.field_names.length() {
+                            let fname = arm.field_names.get(fj);
+                            let bname = arm.bind_names.get(fj);
+                            var fty = self.field_type_of(sty, fname);
+                            if has_variant_fields {
+                                var vfi2 = 0;
+                                while vfi2 < variant_fnames.length() {
+                                    if variant_fnames.get(vfi2) == fname {
+                                        fty = variant_ftypes.get(vfi2);
+                                    }
+                                    vfi2 = vfi2 + 1;
+                                }
+                            }
+                            let fslot = self.alloc_slot(bname, fty);
+                            self.var_types.register(bname, fty);
+                            if is_ref_type(sty) { self.mv.visitVarInsn(25, subj_slot); } else { self.mv.visitVarInsn(21, subj_slot); }
+                            self.mv.visitFieldInsn(180, sty, arm.variant_name + "$" + fname, self.resolve_descriptor(fty)); // GETFIELD -- mangled, see gen_enum's own header
+                            self.mv.visitVarInsn(store_opcode(fty), fslot);
+                            fj = fj + 1;
+                        }
+                        self.gen_block(arm.body);
+                        self.mv.visitJumpInsn(167, &end_label); // GOTO
+                        self.mv.visitLabel(&next_label);
+                    }
+                    i = i + 1;
+                }
+                self.mv.visitLabel(&end_label);
+            }
+            // A `String` value still wraps into a hardcoded `java.lang.RuntimeException` (unchanged
+            // -- codegen still doesn't know the message's own source line/context beyond that).
+            // Anything else is trusted to already be a real exception object (`LexError::new(msg)`
+            // -- real `Lexer.hotc` usage, a genuine gap closed now that `extern class` support
+            // exists) and `ATHROW`n directly, no wrapping. `value` has to be evaluated BEFORE its
+            // type is known (same real ordering conflict `ArrayLit`'s own codegen already
+            // describes: `NEW`/`DUP` for the wrapping case would need to come BEFORE the message
+            // is pushed, but the message has to be evaluated first to know whether wrapping is
+            // even needed at all) -- stashed in a raw temp slot, same "unregistered slot" trick
+            // `ArrayLit`/`Match`'s own subject already use.
+            Throw { value } => {
+                let vty = self.gen_expr(value);
+                let tmp_slot = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                if is_ref_type(vty) { self.mv.visitVarInsn(58, tmp_slot); } else { self.mv.visitVarInsn(54, tmp_slot); } // ASTORE / ISTORE
+                if vty == "String" {
+                    self.mv.visitTypeInsn(187, "java/lang/RuntimeException"); // NEW
+                    self.mv.visitInsn(89); // DUP
+                    self.mv.visitVarInsn(25, tmp_slot); // ALOAD the message
+                    self.mv.visitMethodInsn(183, "java/lang/RuntimeException", "<init>", "(Ljava/lang/String;)V", false); // INVOKESPECIAL
+                    self.mv.visitInsn(191); // ATHROW
+                } else {
+                    self.mv.visitVarInsn(25, tmp_slot); // ALOAD the already-real exception object
+                    self.mv.visitInsn(191); // ATHROW
+                }
+            }
+            // Plain unconditional jumps to the innermost enclosing loop's own labels -- nothing
+            // to clean up first (no `Drop`/RAII in this subset, see `Ast.hotc`'s `Break`/`Continue`
+            // header). `Checker.hotc`'s `loop_depth` already guarantees `self.in_loop` is true here
+            // for any program that passed the checker, so there's no fallback path to generate.
+            Break {} => {
+                let target = self.cur_loop_end;
+                self.mv.visitJumpInsn(167, &target); // GOTO loop end
+            }
+            Continue {} => {
+                let target = self.cur_loop_start;
+                self.mv.visitJumpInsn(167, &target); // GOTO loop start (re-checks cond, same as real compiler's plain `while`)
+            }
+            // `try { try_block } catch (catch_var: catch_type) { catch_block }` -- a real
+            // `visitTryCatchBlock` exception table entry over `try_block`'s own instruction range,
+            // handler catching into a fresh local slot. `Checker.hotc`'s own `Try` check already
+            // guarantees `catch_type` names a known extern class, so `self.extern_binary.get(...)`
+            // is trusted to succeed here.
+            Try { try_block, catch_var, catch_type, catch_block } => {
+                var try_start = Label::new();
+                var try_end = Label::new();
+                var handler = Label::new();
+                var end_label = Label::new();
+                var binary_name = catch_type;
+                let bin_found = self.extern_binary.get(catch_type);
+                if let Some { value: b } = bin_found {
+                    binary_name = b;
+                }
+                self.mv.visitTryCatchBlock(&try_start, &try_end, &handler, binary_name);
+                self.mv.visitLabel(&try_start);
+                self.gen_block(try_block);
+                self.mv.visitLabel(&try_end);
+                self.mv.visitJumpInsn(167, &end_label); // GOTO
+                self.mv.visitLabel(&handler);
+                let catch_slot = self.alloc_slot(catch_var, catch_type);
+                self.var_types.register(catch_var, catch_type);
+                self.mv.visitVarInsn(58, catch_slot); // ASTORE
+                self.gen_block(catch_block);
+                self.mv.visitLabel(&end_label);
+            }
+        }
+    }
+
+    fn gen_block(&mut self, stmts: Vec<Stmt>) {
+        var i = 0;
+        while i < stmts.length() {
+            self.gen_stmt(stmts.get(i));
+            i = i + 1;
+        }
+    }
+}
+
+fn comparison_opcode(op: String) -> Int {
+    if op == "==" { return 159; } // IF_ICMPEQ
+    if op == "!=" { return 160; } // IF_ICMPNE
+    if op == "<" { return 161; }  // IF_ICMPLT
+    if op == ">=" { return 162; } // IF_ICMPGE
+    if op == ">" { return 163; }  // IF_ICMPGT
+    return 164; // IF_ICMPLE ("<=", and the fallback)
+}
+
+// The single-operand `IFxx` family (branches on ONE int against zero) -- used after `LCMP` has
+// already reduced a `Long` comparison down to a real `-1`/`0`/`1` Int, unlike `comparison_opcode`
+// above (`IF_ICMPxx`, a two-operand family comparing two Ints directly -- the JVM has no `Long`
+// equivalent of that).
+fn single_cmp_opcode(op: String) -> Int {
+    if op == "==" { return 153; } // IFEQ
+    if op == "!=" { return 154; } // IFNE
+    if op == "<" { return 155; }  // IFLT
+    if op == ">=" { return 156; } // IFGE
+    if op == ">" { return 157; }  // IFGT
+    return 158; // IFLE ("<=", and the fallback)
+}
+
+fn ref_cmp_opcode(op: String) -> Int {
+    if op == "==" { return 165; } // IF_ACMPEQ
+    return 166; // IF_ACMPNE
+}
+
+// Anything that isn't a plain JVM int on the operand stack (`Int`/`Bool`) is a reference type --
+// `String` and every struct instance alike -- and needs `ALOAD`/`ASTORE` instead of `ILOAD`/
+// `ISTORE`.
+fn is_ref_type(name: String) -> Bool {
+    return name != "Int" && name != "Bool" && name != "Long";
+}
+
+// The right JVM local-variable load/store opcode for a given type name -- `Long` needs `LLOAD`/
+// `LSTORE` (a real category-2 primitive, distinct from the `Int`/`Bool`/ref-type choice every
+// other type here already made), everything else keeps the existing `ALOAD`/`ASTORE` vs `ILOAD`/
+// `ISTORE` split. Centralized here instead of repeating the three-way branch at every call site.
+fn load_opcode(ty: String) -> Int {
+    if ty == "Long" { return 22; } // LLOAD
+    if is_ref_type(ty) { return 25; } // ALOAD
+    return 21; // ILOAD
+}
+
+fn store_opcode(ty: String) -> Int {
+    if ty == "Long" { return 55; } // LSTORE
+    if is_ref_type(ty) { return 58; } // ASTORE
+    return 54; // ISTORE
+}
+
+fn empty_str_vec4() -> Vec<String> {
+    var v = vec_of("__init__");
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_str_vec_vec() -> Vec<Vec<String>> {
+    var v = vec_of(empty_str_vec4());
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_int_vec() -> Vec<Int> {
+    var v = vec_of(0);
+    return Vec { data: v.data, len: 0 };
+}
+
+extern class CodegenError = "java.lang.RuntimeException" {
+    fn new(msg: String) -> Self;
+}
+
+// One method per `FnDecl`. Static, `ACC_PUBLIC | ACC_STATIC` (9) -- this simplified AST has no
+// notion of `self`/instance methods at all yet. `fn_names`/`fn_descs_list`/`fn_rettys_list` are
+// three parallel `Vec`s (one entry per function in the whole program) rebuilt into two fresh
+// `Registry`s here every call -- see `compile_program`'s own comment on why they're passed as
+// plain `Vec`s and rebuilt per-call rather than a single shared `Registry` reused across its
+// codegen loop.
+// Shared by `gen_fn` and `gen_method` -- rebuilds all the cross-function/cross-struct lookup
+// tables from `info` fresh (see `ProgramInfo`'s own header for why: reused across a `compile_
+// program` codegen loop that rebuilds `info` itself fresh every iteration).
+fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info: ProgramInfo) -> CodeGen {
+    var descs = registry_new("__init__", "");
+    var rettys = registry_new("__init__", "");
+    var ki = 0;
+    while ki < info.fn_names.length() {
+        descs.register(info.fn_names.get(ki), info.fn_descs_list.get(ki));
+        rettys.register(info.fn_names.get(ki), info.fn_rettys_list.get(ki));
+        ki = ki + 1;
+    }
+    var sfields = registry_new("__init__", empty_str_vec4());
+    var sftypes = registry_new("__init__", empty_str_vec4());
+    var si = 0;
+    while si < info.struct_names.length() {
+        sfields.register(info.struct_names.get(si), info.struct_field_names_list.get(si));
+        sftypes.register(info.struct_names.get(si), info.struct_field_types_list.get(si));
+        si = si + 1;
+    }
+    var smethods = registry_new("__init__", "");
+    var smethod_rettys = registry_new("__init__", "");
+    var mi = 0;
+    while mi < info.method_keys.length() {
+        smethods.register(info.method_keys.get(mi), info.method_descs_list.get(mi));
+        smethod_rettys.register(info.method_keys.get(mi), info.method_rettys_list.get(mi));
+        mi = mi + 1;
+    }
+    var vowner = registry_new("__init__", "");
+    var vi = 0;
+    while vi < info.variant_owner_names.length() {
+        vowner.register(info.variant_owner_names.get(vi), info.variant_owner_enums.get(vi));
+        vi = vi + 1;
+    }
+    var vtags = registry_new("__init__", -1);
+    var vti = 0;
+    while vti < info.variant_tag_keys.length() {
+        vtags.register(info.variant_tag_keys.get(vti), info.variant_tag_list.get(vti));
+        vti = vti + 1;
+    }
+    var ebinary = registry_new("__init__", "");
+    var ebi = 0;
+    while ebi < info.extern_alias_names.length() {
+        ebinary.register(info.extern_alias_names.get(ebi), info.extern_binary_names.get(ebi));
+        ebi = ebi + 1;
+    }
+    var emdescs = registry_new("__init__", "");
+    var emrettys = registry_new("__init__", "");
+    var emstatic = registry_new("__init__", 0);
+    var emctor = registry_new("__init__", 0);
+    var emi = 0;
+    while emi < info.extern_method_keys.length() {
+        emdescs.register(info.extern_method_keys.get(emi), info.extern_method_descs_list.get(emi));
+        emrettys.register(info.extern_method_keys.get(emi), info.extern_method_rettys_list.get(emi));
+        emstatic.register(info.extern_method_keys.get(emi), info.extern_method_static_list.get(emi));
+        emctor.register(info.extern_method_keys.get(emi), info.extern_method_ctor_list.get(emi));
+        emi = emi + 1;
+    }
+    var ginfer = registry_new("__init__", -1);
+    var gfi = 0;
+    while gfi < info.generic_fn_names.length() {
+        ginfer.register(info.generic_fn_names.get(gfi), info.generic_fn_infer_idx.get(gfi));
+        gfi = gfi + 1;
+    }
+    var static_types = registry_new("__init__", "");
+    var sti2 = 0;
+    while sti2 < info.static_names.length() {
+        static_types.register(info.static_names.get(sti2), info.static_type_names.get(sti2));
+        sti2 = sti2 + 1;
+    }
+    var enum_names_reg = registry_new("__init__", true);
+    var eni = 0;
+    while eni < info.enum_names.length() {
+        enum_names_reg.register(info.enum_names.get(eni), true);
+        eni = eni + 1;
+    }
+    var vfnames = registry_new("__init__", empty_str_vec4());
+    var vftypes = registry_new("__init__", empty_str_vec4());
+    var vfi = 0;
+    while vfi < info.variant_field_keys.length() {
+        vfnames.register(info.variant_field_keys.get(vfi), info.variant_field_names_list.get(vfi));
+        vftypes.register(info.variant_field_keys.get(vfi), info.variant_field_types_list.get(vfi));
+        vfi = vfi + 1;
+    }
+    return CodeGen { mv: mv, slots: registry_new("__init__", -1), next_slot: 0, owner: owner, fn_descs: descs, fn_ret_tys: rettys, var_types: registry_new("__init__", "Int"), ret_ty: ret_type_name, struct_fields: sfields, struct_ftypes: sftypes, struct_methods: smethods, struct_method_rettys: smethod_rettys, variant_owner: vowner, variant_tags: vtags, extern_binary: ebinary, extern_method_descs: emdescs, extern_method_rettys: emrettys, extern_method_static: emstatic, extern_method_ctor: emctor, generic_fn_infer_idx: ginfer, static_types: static_types, enum_names: enum_names_reg, cur_loop_start: Label::new(), cur_loop_end: Label::new(), variant_field_names: vfnames, variant_field_types: vftypes };
+}
+
+pub fn gen_fn(cw: &mut ClassWriter2, owner: String, name: String, param_names: Vec<String>, param_type_names: Vec<String>, ret_type_name: String, body: Vec<Stmt>, info: ProgramInfo) {
+    let param_count = param_names.length();
+    // Built inline (not via the standalone `fn_descriptor` helper) so `param_type_names` stays
+    // available afterward for the per-param `var_types` registration loop below -- passing the
+    // whole `Vec` into another function would move it, but repeated `.get()` calls on it here do
+    // not (same distinction `compile_program`'s own comments make elsewhere in this file).
+    var desc = "(";
+    var di = 0;
+    while di < param_type_names.length() {
+        desc = desc + descriptor_of_type(param_type_names.get(di), &info.extern_alias_names, &info.extern_binary_names);
+        di = di + 1;
+    }
+    desc = desc + ")" + descriptor_of_type(ret_type_name, &info.extern_alias_names, &info.extern_binary_names);
+    let mv0 = CodegenShim::visitMethodNoSig(&mut cw, 9, name, desc, ["x"; 0]); // ACC_PUBLIC | ACC_STATIC
+    var gen = build_codegen(mv0, owner, ret_type_name, info);
+    var i = 0;
+    while i < param_count {
+        gen.alloc_slot(param_names.get(i), param_type_names.get(i));
+        gen.var_types.register(param_names.get(i), param_type_names.get(i));
+        i = i + 1;
+    }
+    gen.mv.visitCode();
+    gen.gen_block(body);
+    gen_fallback_return(&mut gen, ret_type_name); // see its own header -- guards against a dangling trailing label
+    gen.mv.visitMaxs(0, 0); // COMPUTE_MAXS on the ClassWriter makes the real values irrelevant
+    gen.mv.visitEnd();
+}
+
+// Same shape as `gen_fn`, but an instance method (`ACC_PUBLIC` only, not `ACC_STATIC`) on the
+// struct's own class -- `self` lives in the always-implicit JVM local slot 0 (not part of the
+// method's own descriptor, which covers only the *other* declared params), matching how every
+// real JVM instance method receives its receiver.
+// A real `<clinit>` (`ACC_STATIC` only -- no `ACC_PUBLIC`, matching what a JVM static initializer
+// actually is) computing every top-level `pub static NAME: Type = expr;`'s real value and
+// `PUTSTATIC`-ing it into the field `compile_program` already declared for it. `gen_expr` already
+// knows how to emit ordinary literal/expression bytecode, so no separate constant-folding pass is
+// needed -- this just reuses it inside a real (if trivial) method body, same as `<init>` reuses
+// ordinary field-assignment codegen for a struct's own constructor.
+pub fn gen_static_init(cw: &mut ClassWriter2, owner: String, statics: &Vec<StaticDecl>, info: ProgramInfo) {
+    let mv0 = CodegenShim::visitMethodNoSig(&mut cw, 8, "<clinit>", "()V", ["x"; 0]); // ACC_STATIC
+    var gen = build_codegen(mv0, owner, "Unit", info);
+    gen.mv.visitCode();
+    var i = 0;
+    while i < statics.length() {
+        let s = statics.get(i);
+        let s2 = statics.get(i); // fresh copy -- `.value` is only safe to read once
+        gen.gen_expr(s2.value);
+        gen.mv.visitFieldInsn(179, gen.owner, s.name, gen.resolve_descriptor(s.type_name)); // PUTSTATIC
+        i = i + 1;
+    }
+    gen.mv.visitInsn(177); // RETURN
+    gen.mv.visitMaxs(0, 0);
+    gen.mv.visitEnd();
+}
+
+pub fn gen_method(cw: &mut ClassWriter2, binary_name: String, struct_name: String, name: String, param_names: Vec<String>, param_type_names: Vec<String>, ret_type_name: String, body: Vec<Stmt>, info: ProgramInfo) {
+    var desc = "(";
+    var di = 0;
+    while di < param_type_names.length() {
+        desc = desc + descriptor_of_type(param_type_names.get(di), &info.extern_alias_names, &info.extern_binary_names);
+        di = di + 1;
+    }
+    desc = desc + ")" + descriptor_of_type(ret_type_name, &info.extern_alias_names, &info.extern_binary_names);
+    let mv0 = CodegenShim::visitMethodNoSig(&mut cw, 1, name, desc, ["x"; 0]); // ACC_PUBLIC
+    // `owner` (used only for same-class *top-level function* calls -- see `gen_expr`'s `Call`
+    // arm) stays the main class, not this struct's class -- a method body calling an ordinary fn
+    // still targets the class functions actually live in.
+    var gen = build_codegen(mv0, binary_name, ret_type_name, info);
+    gen.alloc_slot("self", struct_name); // slot 0, matching the JVM's own implicit receiver convention
+    gen.var_types.register("self", struct_name);
+    var i = 0;
+    while i < param_names.length() {
+        gen.alloc_slot(param_names.get(i), param_type_names.get(i));
+        gen.var_types.register(param_names.get(i), param_type_names.get(i));
+        i = i + 1;
+    }
+    gen.mv.visitCode();
+    gen.gen_block(body);
+    gen_fallback_return(&mut gen, ret_type_name); // see its own header -- guards against a dangling trailing label
+    gen.mv.visitMaxs(0, 0);
+    gen.mv.visitEnd();
+}
+
+// A real fn/method body that provably returns on every path (the checker doesn't verify this,
+// but every demo this phase writes does) still leaves its *last* control-flow-join label (e.g.
+// `match`'s own `end_label`, when every arm ends in `return`) with no instruction after it --
+// the label sits exactly at the end of the method's bytecode, which the JVM verifier rejects
+// outright (a stack-map frame must describe a real instruction offset, not "one past the end").
+// Unconditionally emitting one dummy return after the real body -- dead code whenever the real
+// body already returned everywhere, but a genuine instruction at that trailing offset either way
+// -- sidesteps the whole class of "dangling final label" bug family (`match`, but potentially any
+// future construct with the same shape) without needing real reachability analysis.
+fn gen_fallback_return(gen: &mut CodeGen, ret_type_name: String) {
+    if ret_type_name == "Unit" {
+        gen.mv.visitInsn(177); // RETURN
+    } else if ret_type_name == "Long" {
+        gen.mv.visitInsn(9); // LCONST_0
+        gen.mv.visitInsn(173); // LRETURN
+    } else if is_ref_type(ret_type_name) {
+        gen.mv.visitInsn(1); // ACONST_NULL
+        gen.mv.visitInsn(176); // ARETURN
+    } else {
+        gen.mv.visitInsn(3); // ICONST_0
+        gen.mv.visitInsn(172); // IRETURN
+    }
+}
+
+// Rebuilds a `ProgramInfo` from the whole program's real, original `fns`/`structs`/`impls`
+// -- called fresh once per codegen unit (each top-level fn, each impl-block method), borrowed
+// rather than owned (`&Vec<...>`) specifically so calling it many times in a loop never risks the
+// "used after move inside a loop" problem `compile_program`'s own per-iteration rebuilding
+// comments describe elsewhere in this file -- a borrow never consumes what it points at, so the
+// same `fns`/`structs`/`impls` bindings stay usable across as many calls as needed.
+fn build_program_info(fns: &Vec<FnDecl>, structs: &Vec<StructDecl>, impls: &Vec<ImplDecl>, enums: &Vec<EnumDecl>, mono_names: &Vec<String>, fn_mono_names: &Vec<String>, method_mono_names: &Vec<String>, statics: &Vec<StaticDecl>, externs: &Vec<ExternClassDecl>) -> ProgramInfo {
+    // Built once, reused for every descriptor built below (fn/method params or return types
+    // naming an extern alias need the real binary name -- see `descriptor_of_type`'s own header).
+    let alias_names = extern_alias_list(&externs);
+    let alias_binaries = extern_binary_list(&externs);
+    var fn_names = empty_str_vec4();
+    var fn_descs_list = empty_str_vec4();
+    var fn_rettys_list = empty_str_vec4();
+    var static_names = empty_str_vec4();
+    var static_type_names = empty_str_vec4();
+    var sni = 0;
+    while sni < statics.length() {
+        let sd4 = statics.get(sni);
+        static_names.push(sd4.name);
+        static_type_names.push(sd4.type_name);
+        sni = sni + 1;
+    }
+    // A generic top-level fn declaration (`type_param` is `Some`) is never directly callable --
+    // skipped here entirely, same as a generic struct/enum declaration above/below -- only its
+    // concrete monomorphizations (the `fn_mono_names` loop further down) get real descriptor
+    // entries. `generic_fn_names`/`generic_fn_infer_idx` record enough about the template itself
+    // for `gen_expr`'s own `Call` codegen to infer a concrete instantiation at each call site (see
+    // `ProgramInfo`'s own header).
+    var generic_fn_names = empty_str_vec4();
+    var generic_fn_infer_idx = empty_int_vec();
+    var fi = 0;
+    while fi < fns.length() {
+        let g = fns.get(fi);
+        let g2 = fns.get(fi); // fresh copy -- `.params` is only safe to read once
+        var g_is_generic = false;
+        var g_tp = "";
+        if let Some { value: tp } = g.type_param { g_is_generic = true; g_tp = tp; }
+        if g_is_generic {
+            generic_fn_names.push(g.name);
+            var infer_idx = -1;
+            var pgi = 0;
+            while pgi < g2.params.length() {
+                if g2.params.get(pgi).type_name == g_tp && infer_idx < 0 {
+                    infer_idx = pgi;
+                }
+                pgi = pgi + 1;
+            }
+            generic_fn_infer_idx.push(infer_idx);
+        } else {
+            // `"Unit"`, not `"Int"` -- a real, pre-existing mismatch found self-hosting the new
+            // classpath-reflection module's own `verify_extern_signature` (the first `Unit`-
+            // returning method/fn anywhere in this codebase with an EXPLICIT bare `return;` mid-
+            // body, rather than only falling off the end). `Checker.hotc`'s own `opt_string_or2`
+            // default (`self.cur_ret_ty`, driving `Return`'s choice of opcode -- a bare `return;`
+            // ALWAYS emits a plain void `RETURN` regardless of what the descriptor claims) was
+            // already correctly `"Unit"`; every one of THIS file's own descriptor-building sites
+            // defaulted to `"Int"` instead, silently papered over until now by
+            // `gen_fallback_return` synthesizing a harmless dummy `ICONST_0`/`IRETURN` for any
+            // function that never explicitly returns a value at all (matching the WRONG "Int"
+            // descriptor well enough that nothing ever caught the mismatch) -- a real, explicit
+            // `return;` bypasses that fallback entirely and desyncs from the (wrongly `I`-typed)
+            // descriptor, a genuine `VerifyError: Method expects a return value`.
+            let g_ret = opt_string_or(g.ret_type, "Unit");
+            fn_names.push(g.name);
+            fn_descs_list.push(fn_descriptor(param_type_names_of(g2.params), g_ret, &alias_names, &alias_binaries));
+            fn_rettys_list.push(g_ret);
+        }
+        fi = fi + 1;
+    }
+    // Monomorphized generic FUNCTION instantiations (`"identity$Int"`) get their own descriptor
+    // entries too, same substitution `Checker.hotc`'s own `ensure_fn_instantiated` already
+    // performed once to decide this instantiation was needed at all -- mirrors the struct
+    // `mono_names` loop further down.
+    var fmn = 0;
+    while fmn < fn_mono_names.length() {
+        let fmono_name = fn_mono_names.get(fmn);
+        let mono_params = monomorphized_fn_params_cg(&fns, fmono_name);
+        let mono_ret = monomorphized_fn_retty_cg(&fns, fmono_name);
+        fn_names.push(fmono_name);
+        fn_descs_list.push(fn_descriptor(param_type_names_of(mono_params), mono_ret, &alias_names, &alias_binaries));
+        fn_rettys_list.push(mono_ret);
+        fmn = fmn + 1;
+    }
+    var enum_names = empty_str_vec4();
+    var struct_names = empty_str_vec4();
+    var struct_field_names_list = empty_str_vec_vec();
+    var struct_field_types_list = empty_str_vec_vec();
+    var si = 0;
+    while si < structs.length() {
+        let sd = structs.get(si);
+        let sd2 = structs.get(si); // fresh copy -- `.fields` is only safe to read once
+        var is_generic = false;
+        if let Some { value: tp } = sd.type_param { is_generic = true; }
+        if !is_generic {
+            struct_names.push(sd.name);
+            struct_field_names_list.push(param_names_of(sd.fields));
+            struct_field_types_list.push(param_type_names_of(sd2.fields));
+        }
+        si = si + 1;
+    }
+    var variant_owner_names = empty_str_vec4();
+    var variant_owner_enums = empty_str_vec4();
+    var variant_tag_keys = empty_str_vec4();
+    var variant_tag_list = empty_int_vec();
+    var variant_field_keys = empty_str_vec4();
+    var variant_field_names_list = empty_str_vec_vec();
+    var variant_field_types_list = empty_str_vec_vec();
+    // Monomorphized generic instantiations (`"Box$Int"`) get their own field table entries too --
+    // same substitution `Checker.hotc`'s `ensure_instantiated` and this file's own `gen_struct`
+    // emission loop both already perform, redone here so `FieldAccess`/`StructLit` codegen inside
+    // function/method bodies can resolve fields on them (see `monomorphized_fields`'s own header).
+    // A generic *enum* instantiation (`"Option$Int"`, `is_generic_enum_mono`) takes the enum-
+    // shaped path instead: its substituted variants' union of fields (mirroring the plain-enum
+    // loop just below) plus `variant_tag_*` entries -- deliberately NOT `variant_owner_*` (bare
+    // name -> owner), since that would collide across multiple concrete instantiations of the same
+    // generic enum; `gen_expr`'s own `StructLit` codegen resolves a qualified construction site's
+    // owner directly from `generic_base` instead, and `Match` codegen already keys everything off
+    // the subject's own concrete type name (`sty`), needing no bare-name lookup at all (see
+    // `Ast.hc`'s own `EnumDecl` header).
+    var mn = 0;
+    while mn < mono_names.length() {
+        let mono_name = mono_names.get(mn);
+        if is_generic_enum_mono(&enums, mono_name) {
+            let mono_variants = monomorphized_enum_variants(&enums, mono_name);
+            var eunion_names = empty_str_vec4();
+            var eunion_types = empty_str_vec4();
+            var evi = 0;
+            while evi < mono_variants.length() {
+                let ev = mono_variants.get(evi);
+                variant_tag_keys.push(mono_name + "#" + ev.name);
+                variant_tag_list.push(evi);
+                var v_field_names = empty_str_vec4();
+                var v_field_types = empty_str_vec4();
+                var efi = 0;
+                while efi < ev.fields.length() {
+                    let ef = ev.fields.get(efi);
+                    eunion_names.push(ef.name);
+                    eunion_types.push(ef.type_name);
+                    v_field_names.push(ef.name);
+                    v_field_types.push(ef.type_name);
+                    efi = efi + 1;
+                }
+                variant_field_keys.push(mono_name + "#" + ev.name);
+                variant_field_names_list.push(v_field_names);
+                variant_field_types_list.push(v_field_types);
+                evi = evi + 1;
+            }
+            struct_names.push(mono_name);
+            struct_field_names_list.push(eunion_names);
+            struct_field_types_list.push(eunion_types);
+            enum_names.push(mono_name);
+        } else {
+            struct_names.push(mono_name);
+            let mono_fields = monomorphized_fields(&structs, mono_name);
+            let mono_fields2 = monomorphized_fields(&structs, mono_name);
+            struct_field_names_list.push(param_names_of(mono_fields));
+            struct_field_types_list.push(param_type_names_of(mono_fields2));
+        }
+        mn = mn + 1;
+    }
+    var method_keys = empty_str_vec4();
+    var method_descs_list = empty_str_vec4();
+    var method_rettys_list = empty_str_vec4();
+    var ii = 0;
+    while ii < impls.length() {
+        let impl_decl = impls.get(ii);
+        // An instance method inside a GENERIC struct's own `impl` block is never directly
+        // callable -- skipped here (same as a generic struct/enum/fn declaration is skipped
+        // elsewhere in this file) -- only its concrete monomorphizations (the `method_mono_names`
+        // loop further down) get real descriptor entries. Static methods keep their existing
+        // unconditional behavior (a real, disclosed scope cut -- see `Checker.hotc`'s own
+        // `generic_method_templates` header).
+        var impl_is_generic = false;
+        let impl_tp = struct_type_param_cg(&structs, impl_decl.struct_name);
+        if impl_tp != "" { impl_is_generic = true; }
+        var mi = 0;
+        while mi < impl_decl.methods.length() {
+            let m = impl_decl.methods.get(mi);
+            if !impl_is_generic {
+                let m_ret = opt_string_or(m.ret_type, "Unit");
+                method_keys.push(impl_decl.struct_name + "#" + m.name);
+                method_descs_list.push(fn_descriptor(param_type_names_of(m.params), m_ret, &alias_names, &alias_binaries));
+                method_rettys_list.push(m_ret);
+            }
+            mi = mi + 1;
+        }
+        // Static methods share the same "StructName#method" table as instance methods --
+        // `Expr::StaticCall` and `Expr::MethodCall` are different enough syntactically that a
+        // struct is never expected to declare both a static and an instance method of the same
+        // name, so reusing one flat table here (rather than a separate one) is safe and simpler.
+        var smi = 0;
+        while smi < impl_decl.static_methods.length() {
+            let sm = impl_decl.static_methods.get(smi);
+            let sm_ret = opt_string_or(sm.ret_type, "Unit");
+            method_keys.push(impl_decl.struct_name + "#" + sm.name);
+            method_descs_list.push(fn_descriptor(param_type_names_of(sm.params), sm_ret, &alias_names, &alias_binaries));
+            method_rettys_list.push(sm_ret);
+            smi = smi + 1;
+        }
+        ii = ii + 1;
+    }
+    // Monomorphized generic METHOD instantiations (`"Box$Int#get"`) get their own descriptor
+    // entries too, same substitution `Checker.hotc`'s own `ensure_method_instantiated` already
+    // performed once to decide this instantiation was needed at all -- mirrors the `fn_mono_names`
+    // loop above. `gen_expr`'s own `MethodCall` codegen needs NO changes for this at all: it
+    // already looks up `rn + "#" + method` directly (`rn` being the receiver's own concrete mono
+    // type), which is EXACTLY this key shape -- the only piece that needed building was this
+    // table entry existing at all.
+    var mmn = 0;
+    while mmn < method_mono_names.length() {
+        let mkey = method_mono_names.get(mmn);
+        let midx = mkey.indexOf("#");
+        let mowner = mkey.substring(0, midx);
+        let mmethod = mkey.substring(midx + 1, mkey.length());
+        let mono_mparams = monomorphized_method_params_cg(&impls, &structs, mowner, mmethod);
+        let mono_mret = monomorphized_method_retty_cg(&impls, &structs, mowner, mmethod);
+        method_keys.push(mkey);
+        method_descs_list.push(fn_descriptor(param_type_names_of(mono_mparams), mono_mret, &alias_names, &alias_binaries));
+        method_rettys_list.push(mono_mret);
+        mmn = mmn + 1;
+    }
+    // Each *non-generic* enum's *union* of variant fields is registered under the enum's own name
+    // into the same `struct_names`/`struct_field_*_list` arrays `gen_expr`'s `FieldAccess`/
+    // `StructLit` already read for real structs -- an enum instance's fields are looked up exactly
+    // the same way a struct's are (see `Checker.hotc`'s `register_enum`, same simplification
+    // mirrored here). `variant_owner_*`/`variant_tag_*` are the two pieces genuinely new to enums:
+    // which enum a variant name belongs to, and that variant's tag index. A *generic* enum
+    // declaration (`type_param` is `Some`) is skipped here entirely -- it's just a template, same
+    // as a generic struct declaration above; only its concrete monomorphizations (handled in the
+    // `mono_names` loop above) get real field-table entries.
+    var ei = 0;
+    while ei < enums.length() {
+        let ed = enums.get(ei);
+        var ed_is_generic = false;
+        if let Some { value: etp } = ed.type_param { ed_is_generic = true; }
+        if ed_is_generic {
+            ei = ei + 1;
+            continue;
+        }
+        var union_names = empty_str_vec4();
+        var union_types = empty_str_vec4();
+        var vi = 0;
+        while vi < ed.variants.length() {
+            let v = ed.variants.get(vi);
+            variant_owner_names.push(v.name);
+            variant_owner_enums.push(ed.name);
+            variant_tag_keys.push(ed.name + "#" + v.name);
+            variant_tag_list.push(vi);
+            var v_field_names2 = empty_str_vec4();
+            var v_field_types2 = empty_str_vec4();
+            var fi2 = 0;
+            while fi2 < v.fields.length() {
+                let f = v.fields.get(fi2);
+                union_names.push(f.name);
+                union_types.push(f.type_name);
+                v_field_names2.push(f.name);
+                v_field_types2.push(f.type_name);
+                fi2 = fi2 + 1;
+            }
+            variant_field_keys.push(ed.name + "#" + v.name);
+            variant_field_names_list.push(v_field_names2);
+            variant_field_types_list.push(v_field_types2);
+            vi = vi + 1;
+        }
+        struct_names.push(ed.name);
+        struct_field_names_list.push(union_names);
+        struct_field_types_list.push(union_types);
+        enum_names.push(ed.name);
+        ei = ei + 1;
+    }
+    // Built as its own FIRST pass over every extern, complete before any method descriptor is
+    // built -- an extern method's own param/return type can itself be ANOTHER extern-class alias
+    // (real `Codegen.hotc` usage: `CodegenShim`'s methods take `ClassWriter2`/`MethodVisitor2`
+    // params), possibly one declared LATER in the source than the extern whose method references
+    // it. Building the alias table incrementally, interleaved with the method-descriptor loop
+    // below (as this used to), would miss a genuine forward reference; this way the table is
+    // always complete by the time any descriptor is resolved against it.
+    var extern_alias_names = empty_str_vec4();
+    var extern_binary_names = empty_str_vec4();
+    var xai = 0;
+    while xai < externs.length() {
+        let xda = externs.get(xai);
+        extern_alias_names.push(xda.name);
+        extern_binary_names.push(dot_to_slash_cg(xda.binary_name));
+        xai = xai + 1;
+    }
+    var extern_method_keys = empty_str_vec4();
+    var extern_method_descs_list = empty_str_vec4();
+    var extern_method_rettys_list = empty_str_vec4();
+    var extern_method_static_list = empty_int_vec();
+    var extern_method_ctor_list = empty_int_vec();
+    var xi = 0;
+    while xi < externs.length() {
+        let xd = externs.get(xi);
+        var xmi = 0;
+        while xmi < xd.methods.length() {
+            let xm = xd.methods.get(xmi);
+            let key = xd.name + "#" + xm.name;
+            extern_method_keys.push(key);
+            if xm.is_ctor {
+                extern_method_descs_list.push(extern_ctor_descriptor(param_type_names_of(xm.params), &extern_alias_names, &extern_binary_names));
+                extern_method_rettys_list.push(xd.name);
+            } else {
+                extern_method_descs_list.push(extern_method_descriptor(param_type_names_of(xm.params), xm.ret_type, dot_to_slash_cg(xd.binary_name), &extern_alias_names, &extern_binary_names));
+                if xm.ret_type == "Self" {
+                    extern_method_rettys_list.push(xd.name);
+                } else {
+                    extern_method_rettys_list.push(xm.ret_type);
+                }
+            }
+            if xm.is_static { extern_method_static_list.push(1); } else { extern_method_static_list.push(0); }
+            if xm.is_ctor { extern_method_ctor_list.push(1); } else { extern_method_ctor_list.push(0); }
+            xmi = xmi + 1;
+        }
+        xi = xi + 1;
+    }
+    return ProgramInfo { fn_names: fn_names, fn_descs_list: fn_descs_list, fn_rettys_list: fn_rettys_list, static_names: static_names, static_type_names: static_type_names, generic_fn_names: generic_fn_names, generic_fn_infer_idx: generic_fn_infer_idx, enum_names: enum_names, struct_names: struct_names, struct_field_names_list: struct_field_names_list, struct_field_types_list: struct_field_types_list, method_keys: method_keys, method_descs_list: method_descs_list, method_rettys_list: method_rettys_list, variant_owner_names: variant_owner_names, variant_owner_enums: variant_owner_enums, variant_tag_keys: variant_tag_keys, variant_tag_list: variant_tag_list, extern_alias_names: extern_alias_names, extern_binary_names: extern_binary_names, extern_method_keys: extern_method_keys, extern_method_descs_list: extern_method_descs_list, extern_method_rettys_list: extern_method_rettys_list, extern_method_static_list: extern_method_static_list, extern_method_ctor_list: extern_method_ctor_list, variant_field_keys: variant_field_keys, variant_field_names_list: variant_field_names_list, variant_field_types_list: variant_field_types_list };
+}
+
+// "Self" -> the real binary name's own descriptor (`"L<binary>;"`), anything else -> the usual
+// `descriptor_of_type`. Real gap found self-compiling `Codegen.hotc` itself: the original scope
+// cut here ("extern method params can't be extern-typed, only fields/plain fn params can be, so
+// no real alias table is ever needed") is violated by `Codegen.hotc`'s own `CodegenShim` extern
+// class, whose methods take `ClassWriter2`/`MethodVisitor2` params -- OTHER extern-class types,
+// not just `Int`/`Bool`/`String`. Passing empty alias tables meant `descriptor_of_type` fell
+// through to its "unknown name -> treat as a literal class reference" branch for these, emitting
+// a real but WRONG descriptor (`"LClassWriter2;"` instead of `"Lorg/objectweb/asm/ClassWriter;"`)
+// -- not caught by the checker (no real classpath reflection), not caught by ASM's own
+// `COMPUTE_FRAMES` either (a syntactically valid, just nonexistent, class name) -- only surfaced
+// as a genuine `NoClassDefFoundError` at JVM class-LOAD time. Now threads the real, accumulated
+// alias tables through from `build_program_info`'s own externs loop instead.
+// `"Bool"` -> `"Z"` here specifically, NOT the general `"I"` `descriptor_of_type` itself uses
+// (see that fn's own header -- this subset represents `Bool` as a plain JVM int for ITS OWN
+// struct fields/locals/params, harmless since only ITS OWN already-consistent bytecode ever reads
+// them back). An EXTERN method boundary is different: the METHOD DESCRIPTOR is what the JVM's own
+// linker matches a call site against, and a real JVM method genuinely declared `boolean` has
+// descriptor `"...)Z"`, not `"...)I"` -- these are different signatures as far as method
+// resolution is concerned. Real gap found giving `Checker.hotc` classpath reflection at all:
+// `java.lang.reflect.Modifier.isPublic(int)` genuinely returns `boolean`, and every PRIOR extern
+// declaration in this whole session either avoided `-> Bool` entirely or special-cased a literal
+// descriptor string directly (`MethodCall`'s own hardcoded `String.contains` -- see that arm) --
+// this is the first time the GENERIC extern-descriptor path was asked to build one, producing a
+// real `NoSuchMethodError` at call time (a syntactically valid but WRONG descriptor, same
+// "compiles clean, fails at link/run time" class of bug as `ClassWriter2`'s own alias mismatch).
+fn extern_descriptor_of_type(name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+    if name == "Bool" { return "Z"; }
+    return descriptor_of_type(name, &alias_names, &alias_binaries);
+}
+
+fn extern_ret_descriptor(ret_type: String, binary_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+    if ret_type == "Self" { return "L" + binary_name + ";"; }
+    return extern_descriptor_of_type(ret_type, &alias_names, &alias_binaries);
+}
+
+fn extern_method_descriptor(param_types: Vec<String>, ret_type: String, binary_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+    var d = "(";
+    var i = 0;
+    while i < param_types.length() {
+        d = d + extern_descriptor_of_type(param_types.get(i), &alias_names, &alias_binaries);
+        i = i + 1;
+    }
+    return d + ")" + extern_ret_descriptor(ret_type, binary_name, &alias_names, &alias_binaries);
+}
+
+// Constructors always return `void` at the real bytecode level regardless of the HC-level
+// `-> Self` annotation -- same real JVM convention `gen_struct`'s own constructor already follows.
+// Real alias tables threaded through, same fix as `extern_method_descriptor`'s own header.
+fn extern_ctor_descriptor(param_types: Vec<String>, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+    var d = "(";
+    var i = 0;
+    while i < param_types.length() {
+        d = d + extern_descriptor_of_type(param_types.get(i), &alias_names, &alias_binaries);
+        i = i + 1;
+    }
+    return d + ")V";
+}
+
+// One real `.class` file per `StructDecl`: public fields (declared order), a constructor taking
+// every field's value in that same order and `PUTFIELD`-ing each (the only way this phase's
+// `StructLit` codegen constructs an instance -- `INVOKESPECIAL <init>`, see `gen_expr`), and
+// every impl-block method declared for this struct (`gen_method`).
+pub fn gen_struct(name: String, fields: Vec<Param>, methods: Vec<FnDecl>, static_methods: Vec<FnDecl>, binary_name: String, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>, impls: &Vec<ImplDecl>, enums: &Vec<EnumDecl>, mono_names: &Vec<String>, fn_mono_names: &Vec<String>, method_mono_names: &Vec<String>, statics: &Vec<StaticDecl>, externs: &Vec<ExternClassDecl>) {
+    var cw = ClassWriter2::new(2); // COMPUTE_FRAMES (implies COMPUTE_MAXS; real ASM value is 2, not 4)
+    CodegenShim::visitClassHeader(&mut cw, 61, 33, name, "java/lang/Object", ["x"; 0]); // V17, ACC_PUBLIC | ACC_SUPER
+    let n = fields.length();
+    // A field naming an extern alias needs the real binary name -- see `descriptor_of_type`'s own
+    // header.
+    let alias_names = extern_alias_list(&externs);
+    let alias_binaries = extern_binary_list(&externs);
+
+    var fi = 0;
+    while fi < n {
+        let f = fields.get(fi);
+        let ftype = f.type_name;
+        CodegenShim::visitInstanceField(&mut cw, 1, f.name, descriptor_of_type(ftype, &alias_names, &alias_binaries)); // ACC_PUBLIC
+        fi = fi + 1;
+    }
+
+    var ctor_desc = "(";
+    var di = 0;
+    while di < n {
+        ctor_desc = ctor_desc + descriptor_of_type(fields.get(di).type_name, &alias_names, &alias_binaries);
+        di = di + 1;
+    }
+    ctor_desc = ctor_desc + ")V";
+    let ctor = CodegenShim::visitMethodNoSig(&mut cw, 1, "<init>", ctor_desc, ["x"; 0]);
+    ctor.visitCode();
+    ctor.visitVarInsn(25, 0); // ALOAD 0
+    ctor.visitMethodInsn(183, "java/lang/Object", "<init>", "()V", false); // INVOKESPECIAL
+    var slot = 1;
+    var ci = 0;
+    while ci < n {
+        let f2 = fields.get(ci);
+        let ftype2 = f2.type_name;
+        ctor.visitVarInsn(25, 0); // ALOAD 0
+        if is_ref_type(ftype2) { ctor.visitVarInsn(25, slot); } else { ctor.visitVarInsn(21, slot); } // ALOAD / ILOAD field value
+        ctor.visitFieldInsn(181, name, f2.name, descriptor_of_type(ftype2, &alias_names, &alias_binaries)); // PUTFIELD
+        slot = slot + 1;
+        ci = ci + 1;
+    }
+    ctor.visitInsn(177); // RETURN
+    ctor.visitMaxs(0, 0);
+    ctor.visitEnd();
+
+    var mi2 = 0;
+    while mi2 < methods.length() {
+        let m2 = methods.get(mi2);
+        let m2b = methods.get(mi2); // fresh copy -- `.params` is only safe to read once
+        let info = build_program_info(&fns, &structs, &impls, &enums, &mono_names, &fn_mono_names, &method_mono_names, &statics, &externs); // fresh every iteration, see build_program_info's own header
+        gen_method(&mut cw, binary_name, name, m2.name, param_names_of(m2.params), param_type_names_of(m2b.params), opt_string_or(m2.ret_type, "Unit"), m2.body, info);
+        mi2 = mi2 + 1;
+    }
+
+    // Static impl methods (no `self`) are structurally identical to a plain top-level fn --
+    // `ACC_STATIC`, no implicit receiver slot -- just emitted onto this struct's own `cw` instead
+    // of the main class's, so `gen_fn` is reused directly rather than needing a separate function.
+    var smi = 0;
+    while smi < static_methods.length() {
+        let sm = static_methods.get(smi);
+        let smb = static_methods.get(smi); // fresh copy -- `.params` is only safe to read once
+        let sinfo = build_program_info(&fns, &structs, &impls, &enums, &mono_names, &fn_mono_names, &method_mono_names, &statics, &externs); // fresh every iteration
+        gen_fn(&mut cw, binary_name, sm.name, param_names_of(sm.params), param_type_names_of(smb.params), opt_string_or(sm.ret_type, "Unit"), sm.body, sinfo);
+        smi = smi + 1;
+    }
+
+    cw.visitEnd();
+    CodegenShim::writeClass(cw, name + ".class");
+}
+
+// One real `.class` file per `EnumDecl` -- a `tag: Int` field (the variant index, declaration
+// order) plus the *union* of every variant's own fields (same simplification `Checker.hotc`'s
+// `register_enum` makes: field lookups don't distinguish which variant a field belongs to).
+// Unlike `gen_struct`'s constructor (which takes every field as a param, since a struct has only
+// one "shape"), this is a trivial no-arg constructor -- different variant literals populate
+// different subsets of fields, so `StructLit`-for-a-variant codegen (see `gen_expr`) sets `tag`
+// and each field via individual `PUTFIELD`s after construction instead.
+pub fn gen_enum(name: String, variants: Vec<EnumVariant>) {
+    var cw = ClassWriter2::new(2); // COMPUTE_FRAMES (implies COMPUTE_MAXS; real ASM value is 2, not 4)
+    CodegenShim::visitClassHeader(&mut cw, 61, 33, name, "java/lang/Object", ["x"; 0]); // V17, ACC_PUBLIC | ACC_SUPER
+
+    CodegenShim::visitInstanceField(&mut cw, 1, "tag", "I"); // ACC_PUBLIC
+
+    // Enum fields do not support extern-typed fields this round -- always pass empty alias vecs.
+    let enum_alias_names = empty_str_vec4();
+    let enum_alias_binaries = empty_str_vec4();
+    // Every field gets its OWN JVM field, mangled "VariantName$FieldName" -- NOT deduped/shared
+    // by bare field name across variants. Real bug found actually RUNNING (not just compiling+
+    // loading) a self-hosted-compiled program whose enum reuses a field name across variants at
+    // DIFFERENT types (`Ast.hc`'s own `Expr`: `IntLit.value: Int`, `StringLit.value: String`,
+    // `BoolLit.value: Bool`, ...): the old code declared exactly ONE shared "value" field, typed
+    // by whichever variant registered first -- every OTHER variant's `PUTFIELD`/`GETFIELD` used a
+    // descriptor that didn't match what the class actually declared, a real `NoSuchFieldError` at
+    // class-verify/link time (silent at compile time -- ASM's own `COMPUTE_FRAMES` doesn't check
+    // field existence against the class's own declared fields, only stack-shape consistency).
+    // `gen_variant_construct` and `Match` codegen's own field extraction were updated to use this
+    // same mangled name; direct `FieldAccess` on an un-matched enum value (already a disclosed,
+    // pre-existing imprecision -- see `Checker.hotc`'s own `check_field_access` header) is NOT
+    // mangling-aware and stays unsupported for a colliding field name specifically (no real self-
+    // hosted source does this -- every real access goes through a `match` arm's own binding).
+    var vi = 0;
+    while vi < variants.length() {
+        let v = variants.get(vi);
+        var fi = 0;
+        while fi < v.fields.length() {
+            let f = v.fields.get(fi);
+            CodegenShim::visitInstanceField(&mut cw, 1, v.name + "$" + f.name, descriptor_of_type(f.type_name, &enum_alias_names, &enum_alias_binaries)); // ACC_PUBLIC
+            fi = fi + 1;
+        }
+        vi = vi + 1;
+    }
+
+    let ctor = CodegenShim::visitMethodNoSig(&mut cw, 1, "<init>", "()V", ["x"; 0]);
+    ctor.visitCode();
+    ctor.visitVarInsn(25, 0); // ALOAD 0
+    ctor.visitMethodInsn(183, "java/lang/Object", "<init>", "()V", false); // INVOKESPECIAL
+    ctor.visitInsn(177); // RETURN
+    ctor.visitMaxs(0, 0);
+    ctor.visitEnd();
+
+    cw.visitEnd();
+    CodegenShim::writeClass(cw, name + ".class");
+}
+
+fn int_descriptor(param_count: Int) -> String {
+    var d = "(";
+    var i = 0;
+    while i < param_count {
+        d = d + "I";
+        i = i + 1;
+    }
+    return d + ")I";
+}
+
+extern class JStringCg = "java.lang.String" {
+    fn length(&self) -> Int;
+    fn codePointAt(&self, index: Int) -> Int;
+    fn substring(&self, start: Int, end: Int) -> String;
+    fn indexOf(&self, s: String) -> Int;
+}
+
+// Real bug found self-compiling `Lexer.hotc`: its own `extern class` declarations use DOT-form
+// binary names (`"java.lang.String"`, matching what the REAL compiler accepts via real classpath
+// reflection's own dot-to-slash conversion), but this subset's own disclosed scope cut says
+// `binary_name` must already be JVM-internal-SLASH form -- no conversion. The old behavior wasn't
+// a compile error at all: the raw dotted string just got used AS-IS in `NEW`/`INVOKESTATIC`/field
+// descriptors, silently producing a real, invalid class file (`ClassFormatError: Illegal class
+// name` at JVM class-LOAD time, not caught by ASM's own `COMPUTE_FRAMES` at compile time either).
+// `dot_to_slash_cg` normalizes every extern binary name at the one place they're first read off
+// the AST, so every downstream use (`NEW`/`INVOKE*`/descriptors, all sourced from these same lists)
+// gets the correct form for free.
+// Manual codepoint scan instead of `String.replace` -- the real `java.lang.String.replace` only
+// has `(char, char)` and `(CharSequence, CharSequence)` overloads, no exact `(String, String)`
+// match, and this subset's extern-signature validator requires an EXACT nominal match against a
+// real classpath overload (no implicit String->CharSequence reference-supertype compatibility).
+// `substring`/`length` are already proven-working externs, so this sidesteps the mismatch entirely.
+fn dot_to_slash_cg(name: String) -> String {
+    var out = "";
+    var i = 0;
+    while i < name.length() {
+        let c = name.substring(i, i + 1);
+        if c == "." {
+            out = out + "/";
+        } else {
+            out = out + c;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// `Integer::valueOf` here is a HOST-SIDE call -- this compiler's OWN runtime boxing an `Int` value
+// so it can hand ASM's real `visitLdcInsn(Object)` a real Java object, telling ASM which constant-
+// pool entry variant to emit. It does NOT box anything in the TARGET program's own bytecode -- the
+// resulting `LDC` instruction pushes a genuine primitive `int`, not a reference to this boxed
+// object (see `IntLit`'s own header for why this is needed at all).
+extern class JIntegerCg = "java/lang/Integer" {
+    static fn valueOf(v: Int) -> JIntegerCg;
+}
+
+// Array types are represented as the plain string `"[ElemType]"` -- same convention (and same
+// duplicated-helper pattern, `_cg` suffix here only to dodge the flat cross-module function
+// namespace) as `Checker.hotc`'s own `is_array_type_name`/`array_elem_type_name`.
+fn is_array_type_name_cg(name: String) -> Bool {
+    if name.length() < 2 { return false; }
+    return name.codePointAt(0) == 91 && name.codePointAt(name.length() - 1) == 93; // '[' / ']'
+}
+
+fn array_elem_type_name_cg(name: String) -> String {
+    return name.substring(1, name.length() - 1);
+}
+
+// Codegen-side mirror of `Checker.hotc`'s own `substitute_field_type` (`_cg` suffix to dodge the
+// flat cross-module function namespace, same pattern every other duplicated helper in this file
+// already uses) -- exact match OR array-of-the-type-parameter (`"[T]"` -> `"[Int]"`, needed for
+// `Vec<T> { data: [T], len: Int }`'s own `data` field).
+fn substitute_field_type_cg(ftype: String, type_param: String, arg: String) -> String {
+    if ftype == type_param {
+        return arg;
+    }
+    if is_array_type_name_cg(ftype) && array_elem_type_name_cg(ftype) == type_param {
+        return "[" + arg + "]";
+    }
+    // A *different* generic instantiation naming the type parameter somewhere inside its own type
+    // argument (`"Vec$T"` -> `"Vec$Int"`, needed for `Registry<T> { entries: Vec<T> }`; recurses
+    // for arbitrarily deep chains -- `"Vec$RegistryEntry$T"` -> `"Vec$RegistryEntry$Int"` -- see
+    // `Checker.hotc`'s own `substitute_field_type` header for the real bug this generalization
+    // fixed) -- see that same header for the cascading half of this (making sure the nested
+    // instantiation actually gets emitted as a real class too, not just named in a field
+    // descriptor); that cascading already happened during the check pass (`mono_names` here is
+    // `checker.mono_needed`, read back after checking finished), so this file only needs to
+    // reproduce the same substitution, not the cascade itself.
+    if is_mono_name_cg(ftype) {
+        return mono_base_cg(ftype) + "$" + substitute_field_type_cg(mono_arg_cg(ftype), type_param, arg);
+    }
+    return ftype;
+}
+
+fn empty_expr_vec_cg() -> Vec<Expr> {
+    var v = vec_of(IntLit { value: 0 });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_matcharm_vec_cg() -> Vec<MatchArm> {
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec4(), bind_names: empty_str_vec4(), body: empty_stmt_vec2() });
+    return Vec { data: v.data, len: 0 };
+}
+
+// Codegen-side mirror of `Checker.hotc`'s own `subst_expr`/`subst_stmt` (`_cg` suffix to dodge the
+// flat cross-module function namespace, same pattern every other duplicated helper in this file
+// already uses) -- a real whole-tree copy of `e`, substituting `type_param` for `arg` everywhere a
+// type name string appears (`StructLit`'s `name`/`generic_base`, `StaticCall`'s `type_name`, via
+// `substitute_field_type_cg`), needed so a monomorphized generic fn's emitted body actually
+// constructs/calls the real concrete instantiation (`"Vec$Int"`) instead of the still-abstract
+// template name (`"Vec$T"`, which would emit `NEW`/`ANEWARRAY` against a class that was never
+// compiled). See `Checker.hotc`'s own header for why this pass exists at all.
+fn subst_expr_cg(e: Expr, type_param: String, arg: String) -> Expr {
+    match e {
+        IntLit { value } => { return IntLit { value: value }; }
+        StringLit { value } => { return StringLit { value: value }; }
+        BoolLit { value } => { return BoolLit { value: value }; }
+        Ident { name } => { return Ident { name: name }; }
+        Binary { op, left, right } => { return Binary { op: op, left: subst_expr_cg(left, type_param, arg), right: subst_expr_cg(right, type_param, arg) }; }
+        Unary { op, expr } => { return Unary { op: op, expr: subst_expr_cg(expr, type_param, arg) }; }
+        Call { callee, args } => { return Call { callee: callee, args: subst_expr_list_cg(args, type_param, arg) }; }
+        FieldAccess { obj, field } => { return FieldAccess { obj: subst_expr_cg(obj, type_param, arg), field: field }; }
+        MethodCall { recv, method, args } => { return MethodCall { recv: subst_expr_cg(recv, type_param, arg), method: method, args: subst_expr_list_cg(args, type_param, arg) }; }
+        Assign { name, value } => { return Assign { name: name, value: subst_expr_cg(value, type_param, arg) }; }
+        FieldAssign { obj, field, value } => { return FieldAssign { obj: subst_expr_cg(obj, type_param, arg), field: field, value: subst_expr_cg(value, type_param, arg) }; }
+        StructLit { name, field_names, field_values, generic_base } => {
+            let new_name = substitute_field_type_cg(name, type_param, arg);
+            var new_gb = none_string2();
+            if let Some { value: gb } = generic_base {
+                new_gb = some_string2(substitute_field_type_cg(gb, type_param, arg));
+            }
+            return StructLit { name: new_name, field_names: field_names, field_values: subst_expr_list_cg(field_values, type_param, arg), generic_base: new_gb };
+        }
+        ArrayLit { elements } => { return ArrayLit { elements: subst_expr_list_cg(elements, type_param, arg) }; }
+        ArrayRepeat { value, count } => { return ArrayRepeat { value: subst_expr_cg(value, type_param, arg), count: subst_expr_cg(count, type_param, arg) }; }
+        Index { arr, index } => { return Index { arr: subst_expr_cg(arr, type_param, arg), index: subst_expr_cg(index, type_param, arg) }; }
+        IndexAssign { arr, index, value } => { return IndexAssign { arr: subst_expr_cg(arr, type_param, arg), index: subst_expr_cg(index, type_param, arg), value: subst_expr_cg(value, type_param, arg) }; }
+        StaticCall { type_name, method, args } => { return StaticCall { type_name: substitute_field_type_cg(type_name, type_param, arg), method: method, args: subst_expr_list_cg(args, type_param, arg) }; }
+        Cast { expr, target_type } => { return Cast { expr: subst_expr_cg(expr, type_param, arg), target_type: target_type }; }
+    }
+}
+
+fn subst_expr_list_cg(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Expr> {
+    var out = empty_expr_vec_cg();
+    var i = 0;
+    while i < es.length() {
+        out.push(subst_expr_cg(es.get(i), type_param, arg));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn subst_stmt_cg(s: Stmt, type_param: String, arg: String) -> Stmt {
+    match s {
+        Let { name, mutable, init } => { return Let { name: name, mutable: mutable, init: subst_expr_cg(init, type_param, arg) }; }
+        ExprStmt { expr } => { return ExprStmt { expr: subst_expr_cg(expr, type_param, arg) }; }
+        Return { value } => {
+            var new_val = none_expr_cg();
+            if let Some { value: v } = value { new_val = some_expr_cg(subst_expr_cg(v, type_param, arg)); }
+            return Return { value: new_val };
+        }
+        If { cond, then_body, else_body } => {
+            var new_else = none_stmt_list_cg();
+            if let Some { value: eb } = else_body { new_else = some_stmt_list_cg(subst_stmt_list_cg(eb, type_param, arg)); }
+            return If { cond: subst_expr_cg(cond, type_param, arg), then_body: subst_stmt_list_cg(then_body, type_param, arg), else_body: new_else };
+        }
+        While { cond, body } => { return While { cond: subst_expr_cg(cond, type_param, arg), body: subst_stmt_list_cg(body, type_param, arg) }; }
+        Match { subject, arms } => { return Match { subject: subst_expr_cg(subject, type_param, arg), arms: subst_arm_list_cg(arms, type_param, arg) }; }
+        Throw { value } => { return Throw { value: subst_expr_cg(value, type_param, arg) }; }
+        Break {} => { return Break {}; }
+        Continue {} => { return Continue {}; }
+        Try { try_block, catch_var, catch_type, catch_block } => {
+            return Try { try_block: subst_stmt_list_cg(try_block, type_param, arg), catch_var: catch_var, catch_type: catch_type, catch_block: subst_stmt_list_cg(catch_block, type_param, arg) };
+        }
+    }
+}
+
+fn subst_stmt_list_cg(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stmt> {
+    var out = empty_stmt_vec2();
+    var i = 0;
+    while i < ss.length() {
+        out.push(subst_stmt_cg(ss.get(i), type_param, arg));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn subst_arm_list_cg(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<MatchArm> {
+    var out = empty_matcharm_vec_cg();
+    var i = 0;
+    while i < arms.length() {
+        let a = arms.get(i);
+        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: subst_stmt_list_cg(a.body, type_param, arg) });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn none_expr_cg() -> Option<Expr> {
+    return None;
+}
+
+fn some_expr_cg(e: Expr) -> Option<Expr> {
+    return Some { value: e };
+}
+
+fn none_stmt_list_cg() -> Option<Vec<Stmt>> {
+    return None;
+}
+
+fn some_stmt_list_cg(ss: Vec<Stmt>) -> Option<Vec<Stmt>> {
+    return Some { value: ss };
+}
+
+// Finds `method`'s own template `FnDecl` (params/ret/body, still un-substituted) declared inside
+// the generic struct `base`'s own `impl` block -- searched fresh each call (same "redo the search,
+// simplicity over caching" convention `monomorphized_fields`/`monomorphized_fn_params_cg` already
+// use), a sentinel empty `FnDecl` if nothing matches.
+fn find_template_method_cg(impls: &Vec<ImplDecl>, base: String, method: String) -> FnDecl {
+    var i = 0;
+    while i < impls.length() {
+        let im = impls.get(i);
+        if im.struct_name == base {
+            var j = 0;
+            while j < im.methods.length() {
+                let m = im.methods.get(j);
+                if m.name == method {
+                    return m;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2() };
+}
+
+// A generic struct declaration's own `type_param` string (`"T"` for `struct Box<T> { ... }`), `""`
+// if `base` isn't found or isn't generic -- `Codegen.hotc` doesn't share `Checker.hotc`'s own
+// `generic_templates` registry, so this is derived fresh from the plain `structs: Vec<StructDecl>`
+// every caller already has, same pattern the rest of this file's mono helpers use.
+fn struct_type_param_cg(structs: &Vec<StructDecl>, base: String) -> String {
+    var i = 0;
+    while i < structs.length() {
+        let sd = structs.get(i);
+        if sd.name == base {
+            var tp = "";
+            if let Some { value: t } = sd.type_param { tp = t; }
+            return tp;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// The method-shaped counterpart to `monomorphized_fn_params_cg`/`_retty_cg`/body substitution --
+// `owner` is the MONO struct name (`"Box$Int"`), `method` the bare method name (`"get"`); finds
+// the template via `find_template_method_cg` (base = `mono_base_cg(owner)`) and substitutes its
+// declared `T` (the OWNING STRUCT's own type parameter, found via `struct_type_param_cg` -- NOT
+// the method's own `type_param`, which is always `None`; a method isn't independently generic, it
+// just uses its struct's `T`) for `mono_arg_cg(owner)`.
+fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Param> {
+    let base = mono_base_cg(owner);
+    let arg = mono_arg_cg(owner);
+    let found_tp = struct_type_param_cg(&structs, base);
+    let tmpl = find_template_method_cg(&impls, base, method);
+    var out = empty_param_vec2();
+    var i = 0;
+    while i < tmpl.params.length() {
+        let p = tmpl.params.get(i);
+        let pty = substitute_field_type_cg(p.type_name, found_tp, arg);
+        out.push(Param { name: p.name, type_name: pty });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> String {
+    let base = mono_base_cg(owner);
+    let arg = mono_arg_cg(owner);
+    let found_tp = struct_type_param_cg(&structs, base);
+    let tmpl = find_template_method_cg(&impls, base, method);
+    let ret_str = opt_string_or(tmpl.ret_type, "Unit");
+    return substitute_field_type_cg(ret_str, found_tp, arg);
+}
+
+fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Stmt> {
+    let base = mono_base_cg(owner);
+    let arg = mono_arg_cg(owner);
+    let found_tp = struct_type_param_cg(&structs, base);
+    let tmpl = find_template_method_cg(&impls, base, method);
+    return subst_stmt_list_cg(tmpl.body, found_tp, arg);
+}
+
+// The full substituted `FnDecl` for one mono method instantiation, ready to hand to `gen_method`
+// exactly like a real, non-generic method's own declaration -- `gen_struct`'s own method-emission
+// loop needs no changes at all once it's handed one of these (see this file's own header).
+fn monomorphized_method_decl_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> FnDecl {
+    let params = monomorphized_method_params_cg(&impls, &structs, owner, method);
+    let ret = monomorphized_method_retty_cg(&impls, &structs, owner, method);
+    let body = monomorphized_method_body_cg(&impls, &structs, owner, method);
+    return FnDecl { name: method, params: params, ret_type: some_string2(ret), body: body, type_param: none_string2() };
+}
+
+// Every substituted method `checker.method_mono_needed` recorded for THIS particular mono struct
+// (`mono_name`, e.g. `"Box$Int"`) -- `gen_struct`'s own mono-instantiation call site passes this
+// as its `methods` argument instead of the empty `Vec` it used before this phase (see `Codegen.hc`'s
+// own header for why generic struct instance methods needed this whole new pathway).
+fn monomorphized_methods_for_struct_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, method_mono_names: &Vec<String>, mono_name: String) -> Vec<FnDecl> {
+    var out = empty_fn_decl_vec2();
+    var i = 0;
+    while i < method_mono_names.length() {
+        let key = method_mono_names.get(i);
+        let idx = key.indexOf("#");
+        let owner = key.substring(0, idx);
+        let method = key.substring(idx + 1, key.length());
+        if owner == mono_name {
+            out.push(monomorphized_method_decl_cg(&impls, &structs, owner, method));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// "Int"/"Bool" -> "I" (both are plain JVM ints, see this file's own header), "String" ->
+// "Ljava/lang/String;", "Unit" -> "V" (only valid in return position -- no HC param can be Unit),
+// "[X]" -> "[" + descriptor_of_type(X) (a real JVM array descriptor), an extern alias name ->
+// "L<real binary name>;" (looked up in the parallel `alias_names`/`alias_binaries` arrays --
+// closes the last disclosed extern-class gap: a struct field or fn param/return of extern type
+// now resolves to the real class, not "L<alias>;" nonsense), anything else -> "L<name>;"
+// (presumed a struct -- every struct's binary class name equals its declared name, see
+// `gen_struct`).
+fn descriptor_of_type(name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+    if name == "String" { return "Ljava/lang/String;"; }
+    if name == "Unit" { return "V"; }
+    if name == "Int" || name == "Bool" { return "I"; }
+    // `Long` is not a general first-class primitive in this subset (see `Ast.hc`'s own `Cast`
+    // header) -- this mapping exists only so an extern method's own declared `-> Long` return type
+    // (`JLong::parseLong`, real `Lexer.hotc` usage) builds the right JVM descriptor (`J`, a real
+    // category-2 primitive) rather than falling through to the "unknown name -> treat as a class
+    // reference" fallback below (`"LLong;"`, which names a nonexistent class).
+    if name == "Long" { return "J"; }
+    if is_array_type_name_cg(name) { return "[" + descriptor_of_type(array_elem_type_name_cg(name), &alias_names, &alias_binaries); }
+    var i = 0;
+    while i < alias_names.length() {
+        if alias_names.get(i) == name {
+            return "L" + alias_binaries.get(i) + ";";
+        }
+        i = i + 1;
+    }
+    return "L" + name + ";";
+}
+
+fn extern_alias_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
+    var out = empty_str_vec4();
+    var i = 0;
+    while i < externs.length() {
+        out.push(externs.get(i).name);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn extern_binary_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
+    var out = empty_str_vec4();
+    var i = 0;
+    while i < externs.length() {
+        out.push(dot_to_slash_cg(externs.get(i).binary_name));
+        i = i + 1;
+    }
+    return out;
+}
+
+// Monomorphized generic instantiations are named `"Base$Arg"` -- same convention (and same
+// duplicated-helper-with-`_cg`-suffix pattern) as `Checker.hotc`'s own `is_mono_name`/
+// `mono_base`/`mono_arg`.
+fn is_mono_name_cg(name: String) -> Bool {
+    return name.indexOf("$") >= 0;
+}
+
+fn mono_base_cg(name: String) -> String {
+    let idx = name.indexOf("$");
+    return name.substring(0, idx);
+}
+
+fn mono_arg_cg(name: String) -> String {
+    let idx = name.indexOf("$");
+    return name.substring(idx + 1, name.length());
+}
+
+// Finds `mono_name`'s (`"Box$Int"`) generic template (`structs`' own `"Box"` declaration) and
+// substitutes its type parameter with the real argument, producing the concrete field list
+// `gen_struct` needs to emit a real class for it -- same substitution `Checker.hotc`'s own
+// `ensure_instantiated` already performed once to decide this instantiation was needed at all,
+// redone here on the codegen side since `Checker.hotc`'s own `GenericTemplate` isn't exposed
+// (only the plain `structs: Vec<StructDecl>` this file already has).
+fn monomorphized_fields(structs: &Vec<StructDecl>, mono_name: String) -> Vec<Param> {
+    let base = mono_base_cg(mono_name);
+    let arg = mono_arg_cg(mono_name);
+    var i = 0;
+    while i < structs.length() {
+        let sd = structs.get(i);
+        if sd.name == base {
+            var found_tp = "";
+            if let Some { value: tp } = sd.type_param {
+                found_tp = tp;
+            }
+            var out = empty_param_vec2();
+            var j = 0;
+            while j < sd.fields.length() {
+                let f = sd.fields.get(j);
+                let ftype3 = substitute_field_type_cg(f.type_name, found_tp, arg);
+                out.push(Param { name: f.name, type_name: ftype3 });
+                j = j + 1;
+            }
+            return out;
+        }
+        i = i + 1;
+    }
+    return empty_param_vec2();
+}
+
+// `mono_name`'s (`"identity$Int"`) generic FUNCTION template's own params, substituted -- the fn-
+// shaped counterpart to `monomorphized_fields` above (structs) and `monomorphized_enum_variants`
+// (enums). `fns` here is the WHOLE program's fn list (including generic templates, which never
+// made it into `fn_names`/`fn_descs_list` -- see `build_program_info`'s own header), searched
+// linearly for the one whose name matches `mono_name`'s base and whose `type_param` is `Some`.
+fn monomorphized_fn_params_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Param> {
+    let base = mono_base_cg(mono_name);
+    let arg = mono_arg_cg(mono_name);
+    var i = 0;
+    while i < fns.length() {
+        let f = fns.get(i);
+        var found_tp = "";
+        var is_generic = false;
+        if let Some { value: tp } = f.type_param { found_tp = tp; is_generic = true; }
+        if f.name == base && is_generic {
+            var out = empty_param_vec2();
+            var j = 0;
+            while j < f.params.length() {
+                let p = f.params.get(j);
+                let pty = substitute_field_type_cg(p.type_name, found_tp, arg);
+                out.push(Param { name: p.name, type_name: pty });
+                j = j + 1;
+            }
+            return out;
+        }
+        i = i + 1;
+    }
+    return empty_param_vec2();
+}
+
+// The return-type-shaped sibling of `monomorphized_fn_params_cg` above -- same linear search,
+// substituting the template's own declared return type instead of its params.
+fn monomorphized_fn_retty_cg(fns: &Vec<FnDecl>, mono_name: String) -> String {
+    let base = mono_base_cg(mono_name);
+    let arg = mono_arg_cg(mono_name);
+    var i = 0;
+    while i < fns.length() {
+        let f = fns.get(i);
+        var found_tp = "";
+        var is_generic = false;
+        if let Some { value: tp } = f.type_param { found_tp = tp; is_generic = true; }
+        if f.name == base && is_generic {
+            let ret_str = opt_string_or(f.ret_type, "Unit");
+            return substitute_field_type_cg(ret_str, found_tp, arg);
+        }
+        i = i + 1;
+    }
+    return "Int";
+}
+
+// The generic FUNCTION template's own body, substituted for this particular `mono_name`
+// (`subst_stmt_list_cg`, fixing up any nested generic construction site inside the body that
+// referenced the fn's own still-abstract `T` -- see `Checker.hotc`'s own `ensure_fn_instantiated`
+// header for why this substitution has to happen, not just on params/return types).
+fn fn_body_of_generic_template_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Stmt> {
+    let base = mono_base_cg(mono_name);
+    let arg = mono_arg_cg(mono_name);
+    var i = 0;
+    while i < fns.length() {
+        let f = fns.get(i);
+        var found_tp = "";
+        var is_generic = false;
+        if let Some { value: tp } = f.type_param { found_tp = tp; is_generic = true; }
+        if f.name == base && is_generic {
+            return subst_stmt_list_cg(f.body, found_tp, arg);
+        }
+        i = i + 1;
+    }
+    return empty_stmt_vec2();
+}
+
+fn empty_variant_vec_cg() -> Vec<EnumVariant> {
+    var v = vec_of(EnumVariant { name: "_", fields: empty_param_vec2() });
+    return Vec { data: v.data, len: 0 };
+}
+
+// `mono_name`'s (`"Option$Int"`) generic ENUM template (an `EnumDecl` in `enums` whose own
+// `type_param` is `Some`), variant field types substituted -- the enum-shaped counterpart to
+// `monomorphized_fields` above. Returns an empty `Vec` if `mono_name`'s base isn't a generic enum
+// at all (the caller falls back to `monomorphized_fields`/`gen_struct` in that case -- see
+// `compile_program`'s own mono-instantiation loop).
+fn monomorphized_enum_variants(enums: &Vec<EnumDecl>, mono_name: String) -> Vec<EnumVariant> {
+    let base = mono_base_cg(mono_name);
+    let arg = mono_arg_cg(mono_name);
+    var i = 0;
+    while i < enums.length() {
+        let ed = enums.get(i);
+        var found_tp = "";
+        var is_generic = false;
+        if let Some { value: tp } = ed.type_param {
+            found_tp = tp;
+            is_generic = true;
+        }
+        if ed.name == base && is_generic {
+            var out = empty_variant_vec_cg();
+            var vi = 0;
+            while vi < ed.variants.length() {
+                let v = ed.variants.get(vi);
+                var new_fields = empty_param_vec2();
+                var fj = 0;
+                while fj < v.fields.length() {
+                    let f = v.fields.get(fj);
+                    let ftype4 = substitute_field_type_cg(f.type_name, found_tp, arg);
+                    new_fields.push(Param { name: f.name, type_name: ftype4 });
+                    fj = fj + 1;
+                }
+                out.push(EnumVariant { name: v.name, fields: new_fields });
+                vi = vi + 1;
+            }
+            return out;
+        }
+        i = i + 1;
+    }
+    return empty_variant_vec_cg();
+}
+
+// `true` iff `mono_name`'s base names a generic ENUM template (as opposed to a generic struct) --
+// decides whether `compile_program`'s mono-instantiation loop and `build_program_info` route a
+// given `"Base$Arg"` name through the enum-shaped path (`monomorphized_enum_variants`/`gen_enum`)
+// or the struct-shaped one (`monomorphized_fields`/`gen_struct`).
+fn is_generic_enum_mono(enums: &Vec<EnumDecl>, mono_name: String) -> Bool {
+    let base = mono_base_cg(mono_name);
+    var i = 0;
+    while i < enums.length() {
+        let ed = enums.get(i);
+        var is_generic = false;
+        if let Some { value: tp } = ed.type_param { is_generic = true; }
+        if ed.name == base && is_generic { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn fn_descriptor(param_type_names: Vec<String>, ret_type_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+    var d = "(";
+    var i = 0;
+    while i < param_type_names.length() {
+        d = d + descriptor_of_type(param_type_names.get(i), &alias_names, &alias_binaries);
+        i = i + 1;
+    }
+    return d + ")" + descriptor_of_type(ret_type_name, &alias_names, &alias_binaries);
+}
+
+// Builds a full, real, loadable class: a default constructor, the target fn (`Int -> Int`, one
+// param, matching this phase's own test function), and a `main(String[])` that calls it with a
+// hardcoded test value and prints the result -- making the generated class directly runnable and
+// its correctness independently verifiable with a real `java` invocation, not just "it compiled."
+pub fn emit_and_write(fn_name: String, param_names: Vec<String>, body: Vec<Stmt>, class_name: String, binary_name: String, test_arg: Int, out_path: String) {
+    var cw = ClassWriter2::new(2); // COMPUTE_FRAMES (implies COMPUTE_MAXS; real ASM value is 2, not 4)
+    CodegenShim::visitClassHeader(&mut cw, 61, 33, binary_name, "java/lang/Object", ["x"; 0]); // V17, ACC_PUBLIC | ACC_SUPER
+
+    let ctor = CodegenShim::visitMethodNoSig(&mut cw, 1, "<init>", "()V", ["x"; 0]);
+    ctor.visitCode();
+    ctor.visitVarInsn(25, 0); // ALOAD 0
+    ctor.visitMethodInsn(183, "java/lang/Object", "<init>", "()V", false); // INVOKESPECIAL
+    ctor.visitInsn(177); // RETURN
+    ctor.visitMaxs(1, 1);
+    ctor.visitEnd();
+
+    let param_count = param_names.length();
+    var self_only_names = vec_of(fn_name); // supports self-recursive calls
+    var self_only_descs = vec_of(int_descriptor(param_count));
+    var self_only_rettys = vec_of("Int");
+    var int_types = all_int_types(param_count);
+    let info = ProgramInfo { fn_names: self_only_names, fn_descs_list: self_only_descs, fn_rettys_list: self_only_rettys, static_names: empty_str_vec4(), static_type_names: empty_str_vec4(), generic_fn_names: empty_str_vec4(), generic_fn_infer_idx: empty_int_vec(), enum_names: empty_str_vec4(), struct_names: empty_str_vec4(), struct_field_names_list: empty_str_vec_vec(), struct_field_types_list: empty_str_vec_vec(), method_keys: empty_str_vec4(), method_descs_list: empty_str_vec4(), method_rettys_list: empty_str_vec4(), variant_owner_names: empty_str_vec4(), variant_owner_enums: empty_str_vec4(), variant_tag_keys: empty_str_vec4(), variant_tag_list: empty_int_vec(), extern_alias_names: empty_str_vec4(), extern_binary_names: empty_str_vec4(), extern_method_keys: empty_str_vec4(), extern_method_descs_list: empty_str_vec4(), extern_method_rettys_list: empty_str_vec4(), extern_method_static_list: empty_int_vec(), extern_method_ctor_list: empty_int_vec(), variant_field_keys: empty_str_vec4(), variant_field_names_list: empty_str_vec_vec(), variant_field_types_list: empty_str_vec_vec() };
+    gen_fn(&mut cw, binary_name, fn_name, param_names, int_types, "Int", body, info);
+
+    let main_mv = CodegenShim::visitMethodNoSig(&mut cw, 9, "main", "([Ljava/lang/String;)V", ["x"; 0]);
+    main_mv.visitCode();
+    main_mv.visitFieldInsn(178, "java/lang/System", "out", "Ljava/io/PrintStream;"); // GETSTATIC
+    main_mv.visitIntInsn(17, test_arg); // SIPUSH test_arg
+    main_mv.visitMethodInsn(184, binary_name, fn_name, int_descriptor(param_count), false); // INVOKESTATIC
+    main_mv.visitMethodInsn(182, "java/io/PrintStream", "println", "(I)V", false); // INVOKEVIRTUAL
+    main_mv.visitInsn(177); // RETURN
+    main_mv.visitMaxs(2, 1);
+    main_mv.visitEnd();
+
+    cw.visitEnd();
+    CodegenShim::writeClass(cw, out_path);
+}
+
+// === Whole-program compilation: check every fn (forward signatures registered first, so calls
+// between functions resolve regardless of declaration order), then codegen every fn into one
+// shared class. Returns the checker's error list (index 0 is always "" -- see `Checker.hotc`'s
+// own `checker_new`) -- empty of anything else means "compiled clean." Bytecode is only written
+// when there are no real errors, matching a real compiler refusing to emit broken output.
+pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String) -> Vec<String> {
+    var checker = checker_new();
+    let sn = structs.length();
+    var si0 = 0;
+    while si0 < sn {
+        let sd = structs.get(si0);
+        checker.register_struct(sd.name, sd.type_param, sd.fields);
+        si0 = si0 + 1;
+    }
+    let en = enums.length();
+    var ei0 = 0;
+    while ei0 < en {
+        let ed0 = enums.get(ei0);
+        checker.register_enum(ed0.name, ed0.type_param, ed0.variants);
+        ei0 = ei0 + 1;
+    }
+    let xn = externs.length();
+    var xi0 = 0;
+    while xi0 < xn {
+        let xd = externs.get(xi0);
+        checker.register_extern(xd.name, xd.binary_name, xd.methods);
+        xi0 = xi0 + 1;
+    }
+    let stn = statics.length();
+    var sti0 = 0;
+    while sti0 < stn {
+        checker.register_static_decl(statics.get(sti0));
+        sti0 = sti0 + 1;
+    }
+    let n = fns.length();
+    var i = 0;
+    while i < n {
+        let f = fns.get(i);
+        // A generic top-level fn (`fn identity<T>(x: T) -> T { ... }`) goes into
+        // `generic_fn_templates` instead -- it isn't directly callable until some call site's
+        // inferred type argument monomorphizes a concrete `Base$Arg` name for it (see
+        // `Checker.hotc`'s own `ensure_fn_instantiated`/`check_generic_call`).
+        var is_generic_fn = false;
+        if let Some { value: tpx } = f.type_param { is_generic_fn = true; }
+        if is_generic_fn {
+            checker.generic_fn_templates.register(f.name, f);
+        } else {
+            checker.fn_sigs.register(f.name, FnSig { param_types: param_types_of(f.params), ret_type: ty_from_name(opt_string_or(f.ret_type, "Unit")) });
+        }
+        i = i + 1;
+    }
+    let inn = impls.length();
+    var i0 = 0;
+    while i0 < inn {
+        let im0 = impls.get(i0);
+        // An instance method declared inside a GENERIC struct's own `impl` block goes into
+        // `generic_method_templates` instead -- it isn't directly callable until some method-call
+        // site's receiver (already a concrete `"Box$Int"`-shaped instantiation) asks for it (see
+        // `Checker.hotc`'s own `ensure_method_instantiated`).
+        var im0_is_generic = false;
+        let gtmpl0_found = checker.generic_templates.get(im0.struct_name);
+        if let Some { value: gt0 } = gtmpl0_found { im0_is_generic = true; }
+        var mi0 = 0;
+        while mi0 < im0.methods.length() {
+            let m0 = im0.methods.get(mi0);
+            if im0_is_generic {
+                checker.generic_method_templates.register(im0.struct_name + "#" + m0.name, m0);
+            } else {
+                checker.register_method(im0.struct_name, m0);
+            }
+            mi0 = mi0 + 1;
+        }
+        var smi0 = 0;
+        while smi0 < im0.static_methods.length() {
+            checker.register_static_method(im0.struct_name, im0.static_methods.get(smi0));
+            smi0 = smi0 + 1;
+        }
+        i0 = i0 + 1;
+    }
+    var j = 0;
+    while j < n {
+        let fj = fns.get(j);
+        // A generic fn template's body is only checked per-instantiation (`ensure_fn_instantiated`,
+        // triggered lazily by whichever call site infers a concrete type argument for it) -- the
+        // template itself, with its still-abstract `T`, was never registered into `fn_sigs` above,
+        // so checking it directly here would be checking an uncallable declaration.
+        var is_generic_j = false;
+        if let Some { value: tpj } = fj.type_param { is_generic_j = true; }
+        if !is_generic_j {
+            checker.check_fn(fj);
+        }
+        j = j + 1;
+    }
+    var i1 = 0;
+    while i1 < inn {
+        let im1 = impls.get(i1);
+        // A generic struct's own impl-block method template is only checked per-instantiation
+        // (`ensure_method_instantiated`, triggered lazily by whichever method-call site's receiver
+        // is the first concrete use of it) -- same reasoning as the generic top-level fn loop
+        // above.
+        var im1_is_generic = false;
+        let gtmpl1_found = checker.generic_templates.get(im1.struct_name);
+        if let Some { value: gt1 } = gtmpl1_found { im1_is_generic = true; }
+        var mi1 = 0;
+        while mi1 < im1.methods.length() {
+            if !im1_is_generic {
+                checker.check_method(im1.struct_name, im1.methods.get(mi1));
+            }
+            mi1 = mi1 + 1;
+        }
+        // Static methods check exactly like a top-level fn (no `self` to bind) -- `check_fn`
+        // reused directly rather than needing a separate `check_static_method`.
+        var smi1 = 0;
+        while smi1 < im1.static_methods.length() {
+            checker.check_fn(im1.static_methods.get(smi1));
+            smi1 = smi1 + 1;
+        }
+        i1 = i1 + 1;
+    }
+    if has_real_errors(checker.errors) {
+        return checker.errors;
+    }
+
+    // Each struct is its own real, separate `.class` file (`gen_struct` calls `CodegenShim`
+    // itself, and emits its own impl-block methods too), written before the functions that
+    // construct/use instances of them. Enums the same way (`gen_enum` -- no methods on enums this
+    // phase, see `Ast.hc`'s own header). A *generic* struct declaration (`type_param` is `Some`)
+    // is never directly instantiable -- it's just a template, skipped here -- only its concrete
+    // monomorphizations (`checker.mono_needed`, populated during the check pass above by
+    // `ensure_instantiated` every time a `Box<Int>`-shaped name was actually used) get real
+    // classes, right after the plain structs.
+    var si1 = 0;
+    while si1 < sn {
+        let sd2 = structs.get(si1);
+        var is_generic = false;
+        if let Some { value: tp } = sd2.type_param { is_generic = true; }
+        if !is_generic {
+            gen_struct(sd2.name, sd2.fields, methods_for_struct(&impls, sd2.name), static_methods_for_struct(&impls, sd2.name), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs);
+        }
+        si1 = si1 + 1;
+    }
+    // A monomorphized name (`"Box$Int"`/`"Option$Int"`) might be a generic struct's or a generic
+    // enum's concrete instantiation -- `is_generic_enum_mono` tells the two apart and routes to
+    // `gen_enum` (substituted variants) or `gen_struct` (substituted fields) accordingly (see
+    // `monomorphized_enum_variants`'s own header).
+    var mi2 = 0;
+    while mi2 < checker.mono_needed.length() {
+        let mono_name = checker.mono_needed.get(mi2);
+        if is_generic_enum_mono(&enums, mono_name) {
+            let mono_variants = monomorphized_enum_variants(&enums, mono_name);
+            gen_enum(mono_name, mono_variants);
+        } else {
+            let mono_fields = monomorphized_fields(&structs, mono_name);
+            gen_struct(mono_name, mono_fields, monomorphized_methods_for_struct_cg(&impls, &structs, &checker.method_mono_needed, mono_name), empty_fn_decl_vec2(), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs);
+        }
+        mi2 = mi2 + 1;
+    }
+    var ei1 = 0;
+    while ei1 < en {
+        let ed1 = enums.get(ei1);
+        var ed1_is_generic = false;
+        if let Some { value: etp1 } = ed1.type_param { ed1_is_generic = true; }
+        if !ed1_is_generic {
+            gen_enum(ed1.name, ed1.variants);
+        }
+        ei1 = ei1 + 1;
+    }
+
+    var cw = ClassWriter2::new(2); // COMPUTE_FRAMES (implies COMPUTE_MAXS; real ASM value is 2, not 4)
+    CodegenShim::visitClassHeader(&mut cw, 61, 33, binary_name, "java/lang/Object", ["x"; 0]); // V17, ACC_PUBLIC | ACC_SUPER
+
+    let ctor = CodegenShim::visitMethodNoSig(&mut cw, 1, "<init>", "()V", ["x"; 0]);
+    ctor.visitCode();
+    ctor.visitVarInsn(25, 0); // ALOAD 0
+    ctor.visitMethodInsn(183, "java/lang/Object", "<init>", "()V", false); // INVOKESPECIAL
+    ctor.visitInsn(177); // RETURN
+    ctor.visitMaxs(1, 1);
+    ctor.visitEnd();
+
+    // `pub static NAME: Type = expr;` -- each becomes a real `static` field on the main class
+    // (`ACC_PUBLIC | ACC_STATIC` = 9, same access-flag convention `gen_fn`'s own top-level fns
+    // already use), initialized for real in a `<clinit>` static initializer (`gen_static_init`)
+    // rather than folded to a constant-value attribute -- simpler, and this subset's own `Ident`/
+    // `Assign` codegen already knows how to emit ordinary expression bytecode, no separate
+    // constant-folding machinery needed.
+    let static_alias_names = extern_alias_list(&externs);
+    let static_alias_binaries = extern_binary_list(&externs);
+    var sti = 0;
+    while sti < statics.length() {
+        let sd3 = statics.get(sti);
+        CodegenShim::visitInstanceField(&mut cw, 9, sd3.name, descriptor_of_type(sd3.type_name, &static_alias_names, &static_alias_binaries)); // ACC_PUBLIC | ACC_STATIC
+        sti = sti + 1;
+    }
+    if statics.length() > 0 {
+        let clinit_info = build_program_info(&fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs);
+        gen_static_init(&mut cw, binary_name, &statics, clinit_info);
+    }
+
+    // A generic fn declaration (`type_param` is `Some`) is never directly emitted -- it's just a
+    // template, skipped here (same as a generic struct/enum declaration above) -- only its
+    // concrete monomorphizations (`checker.fn_mono_needed`, populated during the check pass by
+    // `ensure_fn_instantiated` every time an inferred `identity$Int`-shaped call was actually
+    // made) get a real compiled method, right after the plain fns.
+    var k = 0;
+    while k < n {
+        let f = fns.get(k);
+        let f2 = fns.get(k); // fresh copy -- `.params` is only safe to read once
+        var f_is_generic = false;
+        if let Some { value: ftp } = f.type_param { f_is_generic = true; }
+        if !f_is_generic {
+            let info = build_program_info(&fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs); // fresh every iteration, see build_program_info's own header
+            gen_fn(&mut cw, binary_name, f.name, param_names_of(f.params), param_type_names_of(f2.params), opt_string_or(f.ret_type, "Unit"), f.body, info);
+        }
+        k = k + 1;
+    }
+    var fmk = 0;
+    while fmk < checker.fn_mono_needed.length() {
+        let fmono_name = checker.fn_mono_needed.get(fmk);
+        let mono_params = monomorphized_fn_params_cg(&fns, fmono_name);
+        let mono_params2 = monomorphized_fn_params_cg(&fns, fmono_name);
+        let mono_ret = monomorphized_fn_retty_cg(&fns, fmono_name);
+        let mono_body = fn_body_of_generic_template_cg(&fns, fmono_name);
+        let info2 = build_program_info(&fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs); // fresh every iteration
+        gen_fn(&mut cw, binary_name, fmono_name, param_names_of(mono_params), param_type_names_of(mono_params2), mono_ret, mono_body, info2);
+        fmk = fmk + 1;
+    }
+
+    // `main(String[])` -- three possible shapes, resolved in priority order right below: (1) a
+    // real `fn main(args: [String])` returning `Unit` (genuine argv passthrough, see the comment
+    // just below the detection loop); (2) a real, zero-param `fn main()` of any return type,
+    // called for real with its result printed only as a debugging convenience since this shape
+    // can't see argv at all; (3) neither -- falls back to the old test-harness convention (call
+    // `entry_name` with hardcoded `entry_args` and print the Int result) for demo/test files that
+    // define neither.
+    var has_real_main = false;
+    var has_argv_main = false;
+    var main_ret = "Unit";
+    var hm = 0;
+    while hm < n {
+        let fm = fns.get(hm);
+        if fm.name == "main" {
+            has_real_main = true;
+            main_ret = opt_string_or(fm.ret_type, "Unit");
+            if fm.params.length() == 1 && main_ret == "Unit" {
+                let p0 = fm.params.get(0);
+                if p0.type_name == "[String]" { has_argv_main = true; }
+            }
+        }
+        hm = hm + 1;
+    }
+    // A real `fn main(args: [String])` returning `Unit` is a genuine argv-passthrough entry --
+    // `[String]`'s own descriptor is ALREADY the exact JVM `main` shape (`descriptor_of_type`
+    // gives `[Ljava/lang/String;`), so the ordinary `gen_fn` compile of this fn (further up) under
+    // its own real name already produces a method identical in name+descriptor to what the JVM
+    // entry point itself needs (`main`, `ACC_PUBLIC | ACC_STATIC`, `([Ljava/lang/String;)V`). No
+    // synthetic wrapper is generated in this case at all -- the user's own compiled method
+    // directly IS the entry point (emitting a second `main` with the identical descriptor here
+    // would be a real duplicate-method class-format error, not just redundant). Real gap closed
+    // this session -- `Driver.hotc`'s own header used to disclose "this subset's own `main` can't
+    // take argv yet."
+    if !has_argv_main {
+        let main_mv = CodegenShim::visitMethodNoSig(&mut cw, 9, "main", "([Ljava/lang/String;)V", ["x"; 0]);
+        main_mv.visitCode();
+        if has_real_main {
+            if main_ret == "Unit" {
+                main_mv.visitMethodInsn(184, binary_name, "main", "()V", false); // INVOKESTATIC
+            } else if main_ret == "String" {
+                main_mv.visitFieldInsn(178, "java/lang/System", "out", "Ljava/io/PrintStream;"); // GETSTATIC
+                main_mv.visitMethodInsn(184, binary_name, "main", "()Ljava/lang/String;", false); // INVOKESTATIC
+                main_mv.visitMethodInsn(182, "java/io/PrintStream", "println", "(Ljava/lang/String;)V", false); // INVOKEVIRTUAL
+            } else {
+                main_mv.visitFieldInsn(178, "java/lang/System", "out", "Ljava/io/PrintStream;"); // GETSTATIC
+                main_mv.visitMethodInsn(184, binary_name, "main", "()I", false); // INVOKESTATIC
+                main_mv.visitMethodInsn(182, "java/io/PrintStream", "println", "(I)V", false); // INVOKEVIRTUAL
+            }
+        } else {
+            main_mv.visitFieldInsn(178, "java/lang/System", "out", "Ljava/io/PrintStream;"); // GETSTATIC
+            var a = 0;
+            while a < entry_args.length() {
+                main_mv.visitIntInsn(17, entry_args.get(a)); // SIPUSH
+                a = a + 1;
+            }
+            main_mv.visitMethodInsn(184, binary_name, entry_name, int_descriptor(entry_args.length()), false); // INVOKESTATIC
+            main_mv.visitMethodInsn(182, "java/io/PrintStream", "println", "(I)V", false); // INVOKEVIRTUAL
+        }
+        main_mv.visitInsn(177); // RETURN
+        main_mv.visitMaxs(0, 0); // COMPUTE_FRAMES makes explicit values irrelevant
+        main_mv.visitEnd();
+    }
+
+    cw.visitEnd();
+    CodegenShim::writeClass(cw, out_path);
+    return checker.errors;
+}
+
+fn methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<FnDecl> {
+    var i = 0;
+    while i < impls.length() {
+        let im = impls.get(i);
+        if im.struct_name == struct_name {
+            return im.methods;
+        }
+        i = i + 1;
+    }
+    return empty_fn_decl_vec2();
+}
+
+fn static_methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<FnDecl> {
+    var i = 0;
+    while i < impls.length() {
+        let im = impls.get(i);
+        if im.struct_name == struct_name {
+            return im.static_methods;
+        }
+        i = i + 1;
+    }
+    return empty_fn_decl_vec2();
+}
+
+fn empty_fn_decl_vec2() -> Vec<FnDecl> {
+    var v = vec_of(FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_param_vec2() -> Vec<Param> {
+    var v = vec_of(Param { name: "_", type_name: "_" });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn none_string2() -> Option<String> {
+    return None;
+}
+
+fn some_string2(s: String) -> Option<String> {
+    return Some { value: s };
+}
+
+fn empty_stmt_vec2() -> Vec<Stmt> {
+    var v = vec_of(ExprStmt { expr: IntLit { value: 0 } });
+    return Vec { data: v.data, len: 0 };
+}
+
+// `param_types_of` -- now shared with `Checker.hotc` via `Types.hotc` (used to be a near-
+// duplicate copy here; harmless under the flat bootstrap namespace, but genuine duplication).
+
+fn all_int_types(count: Int) -> Vec<String> {
+    var out = vec_of("__init__");
+    var real = Vec { data: out.data, len: 0 };
+    var i = 0;
+    while i < count {
+        real.push("Int");
+        i = i + 1;
+    }
+    return real;
+}
+
+fn param_type_names_of(params: Vec<Param>) -> Vec<String> {
+    var out = vec_of("__init__");
+    var real = Vec { data: out.data, len: 0 };
+    var i = 0;
+    while i < params.length() {
+        real.push(params.get(i).type_name);
+        i = i + 1;
+    }
+    return real;
+}
+
+fn param_names_of(params: Vec<Param>) -> Vec<String> {
+    var out = vec_of("__init__");
+    var real = Vec { data: out.data, len: 0 };
+    var i = 0;
+    while i < params.length() {
+        real.push(params.get(i).name);
+        i = i + 1;
+    }
+    return real;
+}
+
+fn opt_string_or(o: Option<String>, default_val: String) -> String {
+    if let Some { value: v } = o {
+        return v;
+    }
+    return default_val;
+}
+
+fn has_real_errors(errs: Vec<String>) -> Bool {
+    var i = 0;
+    while i < errs.length() {
+        if errs.get(i) != "" {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}

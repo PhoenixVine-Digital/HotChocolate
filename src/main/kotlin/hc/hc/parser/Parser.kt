@@ -22,7 +22,8 @@ class Parser(private val tokens: List<Token>) {
         val extends = mutableListOf<ExtendBlock>()
         val statics = mutableListOf<StaticDecl>()
         while (!check(TokType.EOF)) {
-            val (annotations, serializable, entry) = leadingMarkers()
+            val doc = docComment()
+            val (annotations, serializable, entry, mustUse, dev) = leadingMarkers()
             val pub = match(TokType.PUB)
             val open = match(TokType.OPEN)
             if (open && !check(TokType.INTERFACE) && !check(TokType.SEALED)) throw err("'open' can only be used on an 'interface'")
@@ -35,10 +36,19 @@ class Parser(private val tokens: List<Token>) {
             if (entry != null && !check(TokType.FN)) {
                 throw err("'@entry(...)' can only precede a top-level 'fn'")
             }
+            if (mustUse && !check(TokType.FN)) {
+                throw err("'@must_use' can only precede a top-level 'fn'")
+            }
+            if (dev && !check(TokType.FN)) {
+                throw err("'@dev' can only precede a top-level 'fn'")
+            }
+            if (doc != null && !check(TokType.STRUCT) && !check(TokType.FN)) {
+                throw err("a '///' doc comment can only precede a top-level 'struct' or 'fn'")
+            }
             when {
-                check(TokType.STRUCT) -> structs += structDecl(pub, annotations, serializable)
+                check(TokType.STRUCT) -> structs += structDecl(pub, annotations, serializable, doc)
                 check(TokType.ARENA) -> structs += arenaStructDecl(pub)
-                check(TokType.FN) -> fns += fnDecl(pub, annotations, entry)
+                check(TokType.FN) -> fns += fnDecl(pub, annotations, entry, mustUse, doc, dev)
                 check(TokType.STATIC) -> statics += staticDecl(pub)
                 check(TokType.IMPL) -> { if (pub) throw err("'pub' doesn't apply to 'impl' blocks -- mark the struct/interface itself 'pub'"); impls += implDecl() }
                 check(TokType.INTERFACE) -> interfaces += interfaceDecl(pub, open)
@@ -240,12 +250,21 @@ class Parser(private val tokens: List<Token>) {
         if (match(TokType.BY)) delegateField = expect(TokType.IDENT).text
         expect(TokType.LBRACE)
         val methods = mutableListOf<FnDecl>()
-        while (!check(TokType.RBRACE)) methods += fnDecl()
+        while (!check(TokType.RBRACE)) {
+
+            var mustUse = false
+            if (match(TokType.AT)) {
+                if (!(check(TokType.IDENT) && peek().text == "must_use")) throw err("only '@must_use' is supported before an impl method")
+                advance()
+                mustUse = true
+            }
+            methods += fnDecl(mustUse = mustUse)
+        }
         expect(TokType.RBRACE)
         return ImplBlock(structName, typeParams, methods, interfaceName, delegateField, bounds)
     }
 
-    private fun structDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList(), serializable: Boolean = false): StructDecl {
+    private fun structDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList(), serializable: Boolean = false, docComment: DocComment? = null): StructDecl {
         expect(TokType.STRUCT)
         val name = expect(TokType.IDENT).text
         val (typeParams, bounds) = typeParamListWithBounds()
@@ -261,15 +280,64 @@ class Parser(private val tokens: List<Token>) {
             if (!check(TokType.RBRACE)) expect(TokType.COMMA)
         }
         expect(TokType.RBRACE)
-        return StructDecl(name, fields, typeParams, typeParamBounds = bounds, moduleName = currentModule, visible = pub, superclass = superclass, annotations = annotations, serializable = serializable)
+        return StructDecl(name, fields, typeParams, typeParamBounds = bounds, moduleName = currentModule, visible = pub, superclass = superclass, annotations = annotations, serializable = serializable, docComment = docComment)
     }
 
-    private data class LeadingMarkers(val annotations: List<AnnotationUse>, val serializable: Boolean, val entry: EntryDirective?)
+    private data class LeadingMarkers(val annotations: List<AnnotationUse>, val serializable: Boolean, val entry: EntryDirective?, val mustUse: Boolean, val dev: Boolean)
+
+    private fun docComment(): DocComment? {
+        if (!check(TokType.DOC_COMMENT)) return null
+        val startLine = peek().line
+        val summary = StringBuilder()
+        val params = mutableListOf<Pair<String, String>>()
+        var returns: String? = null
+        val examples = mutableListOf<String>()
+        val warnings = mutableListOf<String>()
+        val sees = mutableListOf<DocSeeRef>()
+        var deprecated: String? = null
+        var section = "summary" 
+        fun tagBody(text: String, tag: String): String? {
+            if (!text.startsWith(tag)) return null
+            if (text.length > tag.length && !text[tag.length].isWhitespace()) return null 
+            return text.substring(tag.length).trim()
+        }
+        while (check(TokType.DOC_COMMENT)) {
+            val line = peek().line
+            val text = advance().text
+            val paramBody = tagBody(text, "@param")
+            when {
+                paramBody != null -> {
+                    val sp = paramBody.indexOfFirst { it.isWhitespace() }
+                    val pname = if (sp < 0) paramBody else paramBody.substring(0, sp)
+                    val ptext = if (sp < 0) "" else paramBody.substring(sp).trim()
+                    params += pname to ptext
+                    section = "param"
+                }
+                tagBody(text, "@returns") != null -> { returns = tagBody(text, "@returns"); section = "returns" }
+                tagBody(text, "@example") != null -> { examples += tagBody(text, "@example")!!; section = "example" }
+                tagBody(text, "@warning") != null -> { warnings += tagBody(text, "@warning")!!; section = "warning" }
+                tagBody(text, "@see") != null -> { sees += DocSeeRef(tagBody(text, "@see")!!, line); section = "see" }
+                tagBody(text, "@deprecated") != null -> { deprecated = tagBody(text, "@deprecated"); section = "deprecated" }
+                else -> when (section) {
+                    "summary" -> { if (summary.isNotEmpty()) summary.append(' '); summary.append(text) }
+                    "param" -> { val (n, t) = params.last(); params[params.size - 1] = n to (if (t.isEmpty()) text else "$t $text") }
+                    "returns" -> returns = if (returns.isNullOrEmpty()) text else "$returns $text"
+                    "example" -> examples[examples.size - 1] = "${examples.last()} $text".trim()
+                    "warning" -> warnings[warnings.size - 1] = "${warnings.last()} $text".trim()
+                    "deprecated" -> deprecated = if (deprecated.isNullOrEmpty()) text else "$deprecated $text"
+                    "see" -> {} 
+                }
+            }
+        }
+        return DocComment(summary.toString(), params, returns, examples, warnings, sees, deprecated, startLine)
+    }
 
     private fun leadingMarkers(): LeadingMarkers {
         val out = mutableListOf<AnnotationUse>()
         var serializable = false
         var entry: EntryDirective? = null
+        var mustUse = false
+        var dev = false
         while (check(TokType.AT)) {
             val line = expect(TokType.AT).line
             if (check(TokType.STRING)) {
@@ -288,6 +356,12 @@ class Parser(private val tokens: List<Token>) {
             } else if (check(TokType.IDENT) && peek().text == "serializable") {
                 advance()
                 serializable = true
+            } else if (check(TokType.IDENT) && peek().text == "must_use") {
+                advance()
+                mustUse = true
+            } else if (check(TokType.DEV)) {
+                advance()
+                dev = true
             } else if (check(TokType.IDENT) && peek().text == "entry") {
                 advance()
                 expect(TokType.LPAREN)
@@ -301,10 +375,10 @@ class Parser(private val tokens: List<Token>) {
                 expect(TokType.RPAREN)
                 entry = EntryDirective(target, entryArgs, line)
             } else {
-                throw err("expected a quoted annotation name (@\"binary.Name\") or a known compiler directive (@serializable, @entry(\"target\", ...)) after '@'")
+                throw err("expected a quoted annotation name (@\"binary.Name\") or a known compiler directive (@serializable, @must_use, @dev, @entry(\"target\", ...)) after '@'")
             }
         }
-        return LeadingMarkers(out, serializable, entry)
+        return LeadingMarkers(out, serializable, entry, mustUse, dev)
     }
 
     private fun annotationValue(): AnnotationValue {
@@ -366,7 +440,7 @@ class Parser(private val tokens: List<Token>) {
         return names to bounds
     }
 
-    private fun fnDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList(), entry: EntryDirective? = null): FnDecl {
+    private fun fnDecl(pub: Boolean = false, annotations: List<AnnotationUse> = emptyList(), entry: EntryDirective? = null, mustUse: Boolean = false, docComment: DocComment? = null, dev: Boolean = false): FnDecl {
         val isOverride = match(TokType.OVERRIDE)
         val line = peek().line
         expect(TokType.FN)
@@ -378,7 +452,7 @@ class Parser(private val tokens: List<Token>) {
             retType = typeRef()
         }
         val body = block()
-        return FnDecl(name, params, retType, body, line, typeParams, bounds, currentModule, pub, isOverride, annotations, entry = entry)
+        return FnDecl(name, params, retType, body, line, typeParams, bounds, currentModule, pub, isOverride, annotations, entry = entry, mustUse = mustUse, docComment = docComment, dev = dev)
     }
 
     private fun paramList(): List<Param> {
@@ -438,14 +512,19 @@ class Parser(private val tokens: List<Token>) {
         return Block(stmts)
     }
 
+    private fun blockOrSingleStmt(): Block =
+        if (check(TokType.LBRACE)) block() else Block(listOf(statement()))
+
     private fun statement(): Stmt {
         return when {
             check(TokType.LET) || check(TokType.VAR) -> letStmt()
-            check(TokType.IF) -> ifStmt()
+            check(TokType.IF) -> ifOrIfLetOrDevStmt()
             check(TokType.WHILE) -> whileStmt()
             check(TokType.FOR) -> forStmt()
             check(TokType.MATCH) -> matchStmt()
             check(TokType.RETURN) -> returnStmt()
+            check(TokType.BREAK) -> breakStmt()
+            check(TokType.CONTINUE) -> continueStmt()
             check(TokType.TRY) -> tryStmt()
             check(TokType.THROW) -> throwStmt()
             check(TokType.LBRACE) -> Stmt.Nested(block())
@@ -501,15 +580,96 @@ class Parser(private val tokens: List<Token>) {
         val thenB = block()
         var elseB: Block? = null
         if (match(TokType.ELSE)) {
-            elseB = if (check(TokType.IF)) Block(listOf(ifStmt())) else block()
+            elseB = if (check(TokType.IF)) Block(listOf(ifOrIfLetOrDevStmt())) else block()
         }
         return Stmt.If(cond, thenB, elseB)
+    }
+
+    private fun ifOrIfLetOrDevStmt(): Stmt = when (peekAt(1).type) {
+        TokType.LET -> ifLetStmt()
+        TokType.DEV -> devIfStmt()
+        else -> ifStmt()
+    }
+
+    private fun devIfStmt(): Stmt {
+        val line = expect(TokType.IF).line
+        expect(TokType.DEV)
+        val thenB = block()
+        var elseB: Block? = null
+        if (match(TokType.ELSE)) {
+            elseB = if (check(TokType.IF)) Block(listOf(ifOrIfLetOrDevStmt())) else block()
+        }
+        return Stmt.DevIf(thenB, elseB, line)
+    }
+
+    private fun ifLetStmt(): Stmt {
+        val line = expect(TokType.IF).line
+        expect(TokType.LET)
+        val (vname, bindings) = variantPattern()
+        expect(TokType.EQ)
+        val scrutinee = expression()
+        val thenB = block()
+        val elseArmBody = if (match(TokType.ELSE)) {
+            if (check(TokType.IF)) Block(listOf(ifOrIfLetOrDevStmt())) else block()
+        } else {
+            Block(emptyList())
+        }
+        val arms = listOf(
+            MatchArm(vname, bindings, thenB, line),
+            MatchArm(null, emptyList(), elseArmBody, line),
+        )
+        return Stmt.Match(scrutinee, arms, line)
+    }
+
+    private fun literalPattern(): Expr? {
+        val t = peek()
+        return when {
+            t.type == TokType.INT -> { advance(); Expr.IntLit(t.text.toInt()) }
+            t.type == TokType.LONG -> { advance(); Expr.LongLit(t.text.toLong()) }
+            t.type == TokType.STRING -> { advance(); Expr.StringLit(t.text) }
+            t.type == TokType.TRUE -> { advance(); Expr.BoolLit(true) }
+            t.type == TokType.FALSE -> { advance(); Expr.BoolLit(false) }
+            t.type == TokType.MINUS && peekAt(1).type == TokType.INT -> {
+                advance(); val n = advance(); Expr.IntLit(-n.text.toInt())
+            }
+            t.type == TokType.MINUS && peekAt(1).type == TokType.LONG -> {
+                advance(); val n = advance(); Expr.LongLit(-n.text.toLong())
+            }
+            else -> null
+        }
+    }
+
+    private fun variantPattern(): Pair<String?, List<String>> {
+        var vname: String? = null
+        if (match(TokType.IDENT)) {
+            vname = tokens[pos - 1].text
+            if (vname != "_" && match(TokType.COLONCOLON)) {
+                vname += "::" + expect(TokType.IDENT).text
+            }
+        } else {
+            throw err("Expected variant name or '_' in pattern")
+        }
+        val bindings = mutableListOf<String>()
+        if (match(TokType.LBRACE)) {
+            while (!check(TokType.RBRACE)) {
+                bindings += expect(TokType.IDENT).text
+                if (match(TokType.COLON)) {
+
+                    val bindingName = expect(TokType.IDENT).text
+                    bindings.removeAt(bindings.size - 1)
+                    bindings += bindingName
+                }
+                if (!check(TokType.RBRACE)) expect(TokType.COMMA)
+            }
+            expect(TokType.RBRACE)
+        }
+        return (if (vname == "_") null else vname) to bindings
     }
 
     private fun whileStmt(): Stmt {
         expect(TokType.WHILE)
         val cond = expression()
-        val body = block()
+        val body = blockOrSingleStmt()
         return Stmt.While(cond, body)
     }
 
@@ -520,32 +680,11 @@ class Parser(private val tokens: List<Token>) {
         val arms = mutableListOf<MatchArm>()
         while (!check(TokType.RBRACE)) {
             val armLine = peek().line
-            var vname: String? = null
-            if (match(TokType.IDENT)) {
-                vname = tokens[pos - 1].text
-                if (vname != "_" && match(TokType.COLONCOLON)) {
-                    vname += "::" + expect(TokType.IDENT).text
-                }
-            } else {
-                throw err("Expected variant name or '_' in match arm")
-            }
-            val bindings = mutableListOf<String>()
-            if (match(TokType.LBRACE)) {
-                while (!check(TokType.RBRACE)) {
-                    bindings += expect(TokType.IDENT).text
-                    if (match(TokType.COLON)) {
-
-                        val bindingName = expect(TokType.IDENT).text
-                        bindings.removeAt(bindings.size - 1)
-                        bindings += bindingName
-                    }
-                    if (!check(TokType.RBRACE)) expect(TokType.COMMA)
-                }
-                expect(TokType.RBRACE)
-            }
+            val lit = literalPattern()
+            val (vname, bindings) = if (lit != null) null to emptyList<String>() else variantPattern()
             expect(TokType.FATARROW)
             val body = block()
-            arms += MatchArm(if (vname == "_") null else vname, bindings, body, armLine)
+            arms += MatchArm(vname, bindings, body, armLine, literal = lit)
         }
         expect(TokType.RBRACE)
         return Stmt.Match(scrutinee, arms, line)
@@ -568,31 +707,11 @@ class Parser(private val tokens: List<Token>) {
         val arms = mutableListOf<MatchArm>()
         while (!check(TokType.RBRACE)) {
             val armLine = peek().line
-            var vname: String? = null
-            if (match(TokType.IDENT)) {
-                vname = tokens[pos - 1].text
-                if (vname != "_" && match(TokType.COLONCOLON)) {
-                    vname += "::" + expect(TokType.IDENT).text
-                }
-            } else {
-                throw err("Expected variant name or '_' in match arm")
-            }
-            val bindings = mutableListOf<String>()
-            if (match(TokType.LBRACE)) {
-                while (!check(TokType.RBRACE)) {
-                    bindings += expect(TokType.IDENT).text
-                    if (match(TokType.COLON)) {
-                        val bindingName = expect(TokType.IDENT).text
-                        bindings.removeAt(bindings.size - 1)
-                        bindings += bindingName
-                    }
-                    if (!check(TokType.RBRACE)) expect(TokType.COMMA)
-                }
-                expect(TokType.RBRACE)
-            }
+            val lit = literalPattern()
+            val (vname, bindings) = if (lit != null) null to emptyList<String>() else variantPattern()
             expect(TokType.FATARROW)
             val body = block()
-            arms += MatchArm(if (vname == "_") null else vname, bindings, body, armLine)
+            arms += MatchArm(vname, bindings, body, armLine, literal = lit)
         }
         expect(TokType.RBRACE)
         return Expr.Match(scrutinee, arms, line)
@@ -603,13 +722,12 @@ class Parser(private val tokens: List<Token>) {
         val varName = expect(TokType.IDENT).text
         expect(TokType.IN)
         val start = expression()
-        val iterable = if (match(TokType.DOTDOT)) {
-            val end = expression()
-            Expr.Range(start, end, line)
-        } else {
-            start
+        val iterable = when {
+            match(TokType.DOTDOT) -> Expr.Range(start, expression(), line, inclusive = false)
+            match(TokType.DOTDOTEQ) -> Expr.Range(start, expression(), line, inclusive = true)
+            else -> start
         }
-        val body = block()
+        val body = blockOrSingleStmt()
         return Stmt.For(varName, iterable, body, line)
     }
 
@@ -619,6 +737,18 @@ class Parser(private val tokens: List<Token>) {
         val e = if (check(TokType.SEMI)) null else expression()
         expect(TokType.SEMI)
         return Stmt.Return(e, line)
+    }
+
+    private fun breakStmt(): Stmt {
+        val line = expect(TokType.BREAK).line
+        expect(TokType.SEMI)
+        return Stmt.Break(line)
+    }
+
+    private fun continueStmt(): Stmt {
+        val line = expect(TokType.CONTINUE).line
+        expect(TokType.SEMI)
+        return Stmt.Continue(line)
     }
 
     private fun expression(): Expr = assignment()

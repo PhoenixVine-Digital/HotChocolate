@@ -1,0 +1,27 @@
+extern class JSB = "java/lang/StringBuilder" {
+    fn new() -> Self;
+    fn append(&mut self, s: String) -> Self;
+    fn toString(&self) -> String;
+}
+
+struct Wrapper {
+    sb: JSB,
+    tag: Int,
+}
+
+fn build_it(sb: JSB) -> Wrapper {
+    return Wrapper { sb: sb, tag: 7 };
+}
+
+fn describe(w: Wrapper) -> String {
+    return w.sb.toString();
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var sb = JSB::new();
+    sb = sb.append("count=");
+    let w = build_it(sb);
+    let tag = w.tag;
+    let s = describe(w);
+    return tag + s.length();
+}

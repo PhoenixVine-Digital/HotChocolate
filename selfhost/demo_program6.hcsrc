@@ -1,0 +1,16 @@
+fn greet(name: String) -> String {
+    return "hi " + name;
+}
+
+fn is_hi(msg: String) -> Bool {
+    return msg == "hi bob";
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var msg = greet("bob");
+    if is_hi(msg) {
+        return a + b;
+    } else {
+        return 0;
+    }
+}

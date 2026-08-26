@@ -52,6 +52,8 @@ private fun collectLambdasInStmt(s: Stmt, out: MutableList<Expr.Lambda>) {
         is Stmt.Match -> { collectLambdasInExpr(s.scrutinee, out); for (arm in s.arms) collectLambdasInBlock(arm.body, out) }
         is Stmt.Try -> { collectLambdasInBlock(s.tryBlock, out); for (c in s.catches) collectLambdasInBlock(c.body, out) }
         is Stmt.Throw -> collectLambdasInExpr(s.expr, out)
+        is Stmt.Break, is Stmt.Continue -> {} 
+        is Stmt.DevIf -> throw IllegalStateException("Stmt.DevIf reached collectLambdasInBlock -- Main.kt's stripDevCode should have already resolved every 'if dev { }' before codegen ever ran")
     }
 }
 private fun collectLambdasInExpr(e: Expr, out: MutableList<Expr.Lambda>) {
@@ -156,7 +158,9 @@ class CodeGen(
     private val unitFirstStructName: Map<Unit, String> = buildMap {
         for (s in program.structs) {
             val u = Unit(s.moduleName, s.sourceUnit)
-            if (u != entryUnit || !hasRealMain) putIfAbsent(u, s.name)
+
+            val sharesMainClassName = u == entryUnit && s.name == mainClassName
+            if (u != entryUnit || !hasRealMain || sharesMainClassName) putIfAbsent(u, s.name)
         }
     }
 
@@ -229,6 +233,7 @@ class CodeGen(
     private fun genLambdaClass(lambda: Expr.Lambda, qname: String): ByteArray {
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
         cw.visit(V17, ACC_FINAL, qname, null, "java/lang/Object", arrayOf(lambda.targetBinaryName!!))
+        cw.visitSource(sourceFileName(null), null)
         for (c in lambda.captures) {
             cw.visitField(ACC_PRIVATE or ACC_FINAL, "cap\$${c.name}", descOf(c.ty, moduleOf, externInterfaceBinaryNames), null, null).visitEnd()
         }
@@ -271,8 +276,8 @@ class CodeGen(
         genLambdaClasses(out)
         for (s in program.structs) {
             val unit = Unit(s.moduleName, s.sourceUnit)
-            val isEntryHolder = entryUnitFirstStructIsHolder && unit == entryUnit &&
-                program.structs.first { Unit(it.moduleName, it.sourceUnit) == entryUnit }.name == s.name
+
+            val isEntryHolder = unit == entryUnit && unitFirstStructName[unit] == s.name
             val isHolder = unitFirstStructName[unit] == s.name || isEntryHolder
 
             val structAnnotations = if (s.name == entryClassName && entryModid != null) {
@@ -286,6 +291,7 @@ class CodeGen(
                 if (isHolder) statics.values.filter { Unit(it.moduleName, it.sourceUnit) == unit } else emptyList(),
                 structAnnotations,
                 isEntryHolder,
+                s.sourceUnit,
             )
         }
         for (i in interfaceDecls.filter { it.externBinaryName == null }) out[qualify(i.name)] = genInterface(i)
@@ -308,6 +314,7 @@ class CodeGen(
     private fun genEnum(info: EnumInfo): ByteArray {
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
         cw.visit(V17, classAccess(info.name) or ACC_FINAL, qualify(info.name), null, "java/lang/Object", null)
+        cw.visitSource(sourceFileName(null), null)
         cw.visitField(ACC_PUBLIC, "tag", "I", null, null).visitEnd()
         for (v in info.variants) {
             for ((fname, fty) in v.fields) {
@@ -345,7 +352,10 @@ class CodeGen(
         }
     }
 
-    private fun genStruct(info: StructInfo, fnsForModule: List<FnDecl> = emptyList(), staticsForModule: List<StaticInfo> = emptyList(), annotations: List<AnnotationUse> = emptyList(), isEntry: Boolean = false): ByteArray {
+    private fun genStruct(
+        info: StructInfo, fnsForModule: List<FnDecl> = emptyList(), staticsForModule: List<StaticInfo> = emptyList(),
+        annotations: List<AnnotationUse> = emptyList(), isEntry: Boolean = false, sourceUnit: String? = null,
+    ): ByteArray {
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
         val ifaceNames = structInterfaces[info.name]?.map { jvmIfaceName(it, moduleOf, externInterfaceBinaryNames) }?.toTypedArray()
 
@@ -353,6 +363,7 @@ class CodeGen(
         val superExt = superAlias?.let { externClasses.getValue(it) }
         val superName = superExt?.binaryName ?: "java/lang/Object"
         cw.visit(V17, classAccess(info.name) or ACC_FINAL, qualify(info.name), null, superName, if (ifaceNames.isNullOrEmpty()) null else ifaceNames)
+        cw.visitSource(sourceFileName(sourceUnit), null)
         emitAnnotations(annotations) { desc, visible -> cw.visitAnnotation(desc, visible) }
 
         for ((fname, fty) in info.fields) {
@@ -450,8 +461,14 @@ class CodeGen(
             
             val mv = cw.visitMethod(ACC_PUBLIC or ACC_STATIC, "main", "([Ljava/lang/String;)V", null, null)
             mv.visitCode()
-            if (fnsForModule.any { it.name == "main" }) {
-                mv.visitMethodInsn(INVOKESTATIC, qualify(info.name), "main_", "()V", false)
+            val userMain = fnsForModule.find { it.name == "main" }
+            if (userMain != null) {
+                if (userMain.params.isNotEmpty()) {
+                    mv.visitVarInsn(ALOAD, 0)
+                    mv.visitMethodInsn(INVOKESTATIC, qualify(info.name), "main_", "([Ljava/lang/String;)V", false)
+                } else {
+                    mv.visitMethodInsn(INVOKESTATIC, qualify(info.name), "main_", "()V", false)
+                }
             }
             mv.visitInsn(RETURN)
             mv.visitMaxs(0, 0)
@@ -467,6 +484,7 @@ class CodeGen(
 
         val extends = decl.extends.map { qualify(it) }.toTypedArray()
         cw.visit(V17, classAccess(decl.name) or ACC_INTERFACE or ACC_ABSTRACT, qualify(decl.name), null, "java/lang/Object", if (extends.isEmpty()) null else extends)
+        cw.visitSource(sourceFileName(null), null)
         val sig = interfaceSigs.getValue(decl.name)
         for (m in decl.methods) {
             val msig = sig.methods.getValue(m.name)
@@ -500,6 +518,7 @@ class CodeGen(
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
         val qname = holderClassName(unit)
         cw.visit(V17, ACC_PUBLIC or ACC_FINAL, qname, null, "java/lang/Object", null)
+        cw.visitSource(sourceFileName(unit.sourceUnit), null)
         val isEntry = unit == entryUnit
 
         for (s in staticsForModule) {
@@ -544,8 +563,14 @@ class CodeGen(
             
             val mv = cw.visitMethod(ACC_PUBLIC or ACC_STATIC, "main", "([Ljava/lang/String;)V", null, null)
             mv.visitCode()
-            if (fnsForModule.any { it.name == "main" }) {
-                mv.visitMethodInsn(INVOKESTATIC, qname, "main_", "()V", false)
+            val userMain = fnsForModule.find { it.name == "main" }
+            if (userMain != null) {
+                if (userMain.params.isNotEmpty()) {
+                    mv.visitVarInsn(ALOAD, 0)
+                    mv.visitMethodInsn(INVOKESTATIC, qname, "main_", "([Ljava/lang/String;)V", false)
+                } else {
+                    mv.visitMethodInsn(INVOKESTATIC, qname, "main_", "()V", false)
+                }
             }
             mv.visitInsn(RETURN)
             mv.visitMaxs(0, 0)
@@ -589,6 +614,14 @@ class CodeGen(
         Ty.Double_ -> DLOAD
         else -> ALOAD
     }
+
+    // `visitSource` gives a compiled class's stack traces (and a JVM debugger, once it's attached
+    // via a source-position mapping on the IDE side) a real `.hotc` file name instead of none at
+    // all. `sourceUnit` (stamped per-declaration only in the multi-file/directory compile path --
+    // see `Main.kt`'s own `stampSourceUnit`) is the best available answer when present; a
+    // single-file compile never sets it, so `mainClassName` (already derived from that one file's
+    // own name) is the correct fallback, not a guess.
+    private fun sourceFileName(sourceUnit: String?): String = "${sourceUnit ?: mainClassName}.hotc"
 }
 
 private class FnCodeGen(
@@ -616,6 +649,8 @@ private class FnCodeGen(
     private fun staticDescOf(name: String) = descOf(staticTypes.getValue(name), moduleOf, externInterfaceBinaryNames)
     private val scopes = ArrayDeque<MutableMap<String, Pair<Int, Ty>>>()
     private var nextSlot = 0
+
+    private val loopLabels = ArrayDeque<Pair<Label, Label>>()
 
     fun pushScope() = scopes.addLast(mutableMapOf())
     fun popScope() { scopes.removeLast() }
@@ -672,7 +707,79 @@ private class FnCodeGen(
         mv.visitMethodInsn(INVOKESTATIC, fnOwnerClass.getValue(dropFn), dropFn, "(L${qualify(structName)};)V", false)
     }
 
+    // Debug-info emission (`LineNumberTable`), the piece a JVM debugger needs to map a bytecode
+    // offset back to a real `.hotc` source line -- without it, breakpoints/stepping have nothing
+    // to attach to at all, regardless of how correct the rest of codegen is. Marked once per
+    // DISTINCT line right before that statement's own bytecode (skipping a repeat of the same
+    // line, since ASM's `LineNumberTable` is keyed by bytecode offset, not by statement -- two
+    // statements sharing a line, e.g. after formatting collapses them, would otherwise emit two
+    // redundant entries for the identical line).
+    private var lastEmittedLine = -1
+
+    private fun markLine(line: Int?) {
+        if (line == null || line == lastEmittedLine) return
+        lastEmittedLine = line
+        val label = Label()
+        mv.visitLabel(label)
+        mv.visitLineNumber(line, label)
+    }
+
+    // Most `Stmt` variants carry their own `line` directly; the handful that don't (`ExprStmt`,
+    // `If`, `While`, `Nested`) either wrap an `Expr` that has one (delegated to `lineOf(Expr)`
+    // below) or, for `Nested`, have no single meaningful line of their own at all (its own
+    // sub-statements each mark their own line individually once `genBlock` reaches them).
+    private fun lineOf(stmt: Stmt): Int? = when (stmt) {
+        is Stmt.Let -> stmt.line
+        is Stmt.ExprStmt -> lineOf(stmt.expr)
+        is Stmt.If -> lineOf(stmt.cond)
+        is Stmt.DevIf -> stmt.line
+        is Stmt.While -> lineOf(stmt.cond)
+        is Stmt.For -> stmt.line
+        is Stmt.Return -> stmt.line
+        is Stmt.Break -> stmt.line
+        is Stmt.Continue -> stmt.line
+        is Stmt.Nested -> null
+        is Stmt.Match -> stmt.line
+        is Stmt.Try -> stmt.line
+        is Stmt.Throw -> stmt.line
+    }
+
+    // Every `Expr` variant carries its own `line` EXCEPT the bare literals (no meaningful
+    // sub-position to report) and `Borrow` (no `line` field of its own -- delegates to whatever
+    // it wraps, which does).
+    private fun lineOf(expr: Expr): Int? = when (expr) {
+        is Expr.IntLit, is Expr.LongLit, is Expr.FloatLit, is Expr.DoubleLit, is Expr.StringLit,
+        is Expr.BoolLit, is Expr.NullLit,
+        -> null
+        is Expr.Borrow -> lineOf(expr.inner)
+        is Expr.StringInterp -> expr.line
+        is Expr.Ident -> expr.line
+        is Expr.Binary -> expr.line
+        is Expr.Unary -> expr.line
+        is Expr.Cast -> expr.line
+        is Expr.InstanceOf -> expr.line
+        is Expr.Assign -> expr.line
+        is Expr.Call -> expr.line
+        is Expr.FieldAccess -> expr.line
+        is Expr.FieldAssign -> expr.line
+        is Expr.StructLit -> expr.line
+        is Expr.MethodCall -> expr.line
+        is Expr.StaticFieldGet -> expr.line
+        is Expr.StaticCall -> expr.line
+        is Expr.ArrayLit -> expr.line
+        is Expr.ArrayRepeat -> expr.line
+        is Expr.Index -> expr.line
+        is Expr.IndexAssign -> expr.line
+        is Expr.ArenaNew -> expr.line
+        is Expr.Range -> expr.line
+        is Expr.If -> expr.line
+        is Expr.Match -> expr.line
+        is Expr.Lambda -> expr.line
+        is Expr.ClassLit -> expr.line
+    }
+
     private fun genStmt(stmt: Stmt) {
+        markLine(lineOf(stmt))
         when (stmt) {
             is Stmt.Let -> {
                 val ty = stmt.init.ty!!
@@ -701,7 +808,9 @@ private class FnCodeGen(
                 mv.visitLabel(start)
                 genExpr(stmt.cond)
                 mv.visitJumpInsn(IFEQ, end)
+                loopLabels.addLast(start to end)
                 genBlock(stmt.body)
+                loopLabels.removeLast()
                 mv.visitJumpInsn(GOTO, start)
                 mv.visitLabel(end)
             }
@@ -723,6 +832,16 @@ private class FnCodeGen(
                 genExpr(stmt.expr)
                 mv.visitInsn(ATHROW)
             }
+
+            is Stmt.Break -> {
+                for (name in stmt.varsToDropBeforeBreak) genDropCall(name)
+                mv.visitJumpInsn(GOTO, loopLabels.last().second)
+            }
+            is Stmt.Continue -> {
+                for (name in stmt.varsToDropBeforeContinue) genDropCall(name)
+                mv.visitJumpInsn(GOTO, loopLabels.last().first)
+            }
+            is Stmt.DevIf -> throw IllegalStateException("Stmt.DevIf reached genStmt -- Main.kt's stripDevCode should have already resolved every 'if dev { }' before codegen ever ran")
         }
     }
 
@@ -830,6 +949,19 @@ private class FnCodeGen(
                 val idxObj = expr.obj as? Expr.Index
                 if (idxObj != null && idxObj.ty is Ty.Arena) {
                     genArenaFieldSet(idxObj, expr.field, expr.value)
+                } else if (expr.obj.ty is Ty.JavaExtern) {
+                    genExpr(expr.obj)
+                    genExpr(expr.value)
+                    val valueDesc = descOf(expr.value.ty!!, moduleOf, externInterfaceBinaryNames)
+                    val setter = expr.externSetterMethod
+                    if (setter != null) {
+
+                        val retTy = expr.externSetterRetTy!!
+                        mv.visitMethodInsn(INVOKEVIRTUAL, expr.resolvedName!!, setter, "($valueDesc)" + descOf(retTy, moduleOf, externInterfaceBinaryNames), false)
+                        if (retTy != Ty.Unit_) mv.visitInsn(if (isWide(retTy)) POP2 else POP)
+                    } else {
+                        mv.visitFieldInsn(PUTFIELD, expr.resolvedName!!, expr.field, valueDesc)
+                    }
                 } else {
                     genExpr(expr.obj)
                     genExpr(expr.value)
@@ -897,12 +1029,18 @@ private class FnCodeGen(
         mv.visitVarInsn(ISTORE, endSlot)
 
         val loopStart = Label()
+        val loopContinue = Label()
         val loopEnd = Label()
         mv.visitLabel(loopStart)
         mv.visitVarInsn(ILOAD, varSlot)
         mv.visitVarInsn(ILOAD, endSlot)
-        mv.visitJumpInsn(IF_ICMPGE, loopEnd)
+
+        mv.visitJumpInsn(if (range.inclusive) IF_ICMPGT else IF_ICMPGE, loopEnd)
+        loopLabels.addLast(loopContinue to loopEnd)
         genBlock(stmt.body)
+        loopLabels.removeLast()
+
+        mv.visitLabel(loopContinue)
         mv.visitIincInsn(varSlot, 1)
         mv.visitJumpInsn(GOTO, loopStart)
         mv.visitLabel(loopEnd)
@@ -926,6 +1064,7 @@ private class FnCodeGen(
         val varSlot = declareLocal(stmt.varName, elemTy)
 
         val loopStart = Label()
+        val loopContinue = Label()
         val loopEnd = Label()
         mv.visitLabel(loopStart)
         mv.visitVarInsn(ILOAD, idxSlot)
@@ -935,7 +1074,10 @@ private class FnCodeGen(
         mv.visitVarInsn(ILOAD, idxSlot)
         mv.visitInsn(arrayLoadOpcode(elemTy))
         mv.visitVarInsn(storeOpcode(elemTy), varSlot)
+        loopLabels.addLast(loopContinue to loopEnd)
         genBlock(stmt.body)
+        loopLabels.removeLast()
+        mv.visitLabel(loopContinue)
         mv.visitIincInsn(idxSlot, 1)
         mv.visitJumpInsn(GOTO, loopStart)
         mv.visitLabel(loopEnd)
@@ -1116,6 +1258,12 @@ private class FnCodeGen(
     private fun genMethodCall(expr: Expr.MethodCall) {
         genExpr(expr.recv)
         for (a in expr.args) genExpr(a)
+
+        if (expr.isEnumOrdinal) {
+            val qEnumName = qualify((expr.recv.ty as Ty.Enum).name)
+            mv.visitFieldInsn(GETFIELD, qEnumName, "tag", "I")
+            return
+        }
         val target = expr.resolvedName!!
         val dynOwner = expr.dynamicOwner
         val instOwner = expr.instanceOwner
@@ -1301,6 +1449,15 @@ private class FnCodeGen(
             return
         }
         if (expr.op == "==" || expr.op == "!=") {
+            if (lty is Ty.Enum) {
+
+                genExpr(expr.left)
+                mv.visitFieldInsn(GETFIELD, qualify(lty.name), "tag", "I")
+                genExpr(expr.right)
+                mv.visitFieldInsn(GETFIELD, qualify(lty.name), "tag", "I")
+                genBoolFromBranch(if (expr.op == "==") IF_ICMPEQ else IF_ICMPNE)
+                return
+            }
             if (lty is Ty.Str_) {
 
                 val rty = expr.right.ty!!
@@ -1434,6 +1591,7 @@ private class FnCodeGen(
 
     private fun genMatch(scrutinee: Expr, arms: List<MatchArm>, producesValue: Boolean = false, emitArm: (Block) -> Unit) {
         if (scrutinee.ty is Ty.Dyn) { genSealedMatch(scrutinee, arms, producesValue, emitArm); return }
+        if (scrutinee.ty !is Ty.Enum) { genLiteralMatch(scrutinee, arms, producesValue, emitArm); return }
         val enumName = (scrutinee.ty as Ty.Enum).name
         val qEnumName = qualify(enumName)
         val info = enums.getValue(enumName)
@@ -1464,6 +1622,49 @@ private class FnCodeGen(
             }
             emitArm(arm.body)
             popScope()
+            mv.visitJumpInsn(GOTO, endLabel)
+            mv.visitLabel(nextLabel)
+        }
+        if (wildcardArm != null) {
+            emitArm(wildcardArm.body)
+        } else if (producesValue) {
+            genTrap("non-exhaustive match")
+        }
+        mv.visitLabel(endLabel)
+    }
+
+    private fun genLiteralMatch(scrutinee: Expr, arms: List<MatchArm>, producesValue: Boolean, emitArm: (Block) -> Unit) {
+        val ty = scrutinee.ty!!
+        genExpr(scrutinee)
+        val scrutSlot = allocTemp()
+        mv.visitVarInsn(storeOpcode(ty), scrutSlot)
+
+        val endLabel = Label()
+        var wildcardArm: MatchArm? = null
+        for (arm in arms) {
+            val lit = arm.literal
+            if (lit == null) { wildcardArm = arm; continue }
+            val nextLabel = Label()
+            when (ty) {
+                Ty.Int_, Ty.Bool_ -> {
+                    mv.visitVarInsn(loadOpcode(ty), scrutSlot)
+                    genExpr(lit)
+                    mv.visitJumpInsn(IF_ICMPNE, nextLabel)
+                }
+                Ty.Long_ -> {
+                    mv.visitVarInsn(loadOpcode(ty), scrutSlot)
+                    genExpr(lit)
+                    mv.visitInsn(LCMP)
+                    mv.visitJumpInsn(IFNE, nextLabel)
+                }
+                else -> { 
+                    genExpr(lit)
+                    mv.visitVarInsn(loadOpcode(ty), scrutSlot)
+                    mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "equals", "(Ljava/lang/Object;)Z", false)
+                    mv.visitJumpInsn(IFEQ, nextLabel)
+                }
+            }
+            emitArm(arm.body)
             mv.visitJumpInsn(GOTO, endLabel)
             mv.visitLabel(nextLabel)
         }

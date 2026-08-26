@@ -1,0 +1,351 @@
+interface Renderable {
+    fn render(&self) -> String;
+}
+
+// ============================================================
+// 1. Interface implementation
+// ============================================================
+
+struct Screen {}
+
+impl Renderable for Screen {
+    // ERROR: missing required method `render`
+}
+
+
+// Wrong return type for interface method
+struct BrokenScreen {}
+
+impl Renderable for BrokenScreen {
+    fn render(&self) -> Int {
+        return 42;
+    }
+}
+
+
+// ============================================================
+// 2. Return type errors
+// ============================================================
+
+fn get_name(x: Int) -> String {
+    // ERROR: expected String, got Int
+    return x;
+}
+
+fn get_number() -> Int {
+    // ERROR: expected Int, got String
+    return "hello";
+}
+
+fn wrong_branch(x: Bool) -> Int {
+    if x {
+        return 42;
+    } else {
+        return "oops";
+    }
+}
+
+
+// ============================================================
+// 3. Enum matching
+// ============================================================
+
+enum Status {
+    Active,
+    Inactive,
+    Pending,
+}
+
+fn describe(status: Status) -> String {
+    // ERROR: non-exhaustive match
+    // Missing Inactive and Pending
+    match status {
+        Status::Active => {
+            return "active";
+        }
+    }
+}
+
+
+// Match something that isn't an enum
+fn bad_match(x: Int) -> String {
+    // ERROR: match requires an enum value
+    match x {
+        Status::Active => {
+            return "wat";
+        }
+    }
+}
+
+
+// Duplicate match arm
+fn duplicate_match(status: Status) -> String {
+    match status {
+        Status::Active => {
+            return "one";
+        }
+
+        Status::Active => {
+            return "two";
+        }
+
+        Status::Inactive => {
+            return "inactive";
+        }
+
+        Status::Pending => {
+            return "pending";
+        }
+    }
+}
+
+
+// ============================================================
+// 4. Struct construction
+// ============================================================
+
+struct Item {
+    id: Int,
+}
+
+fn bad_structs() {
+    // ERROR: missing required field
+    let missing = Item {};
+
+    // ERROR: wrong field type
+    let wrong_type = Item {
+        id: "hello",
+    };
+
+    // ERROR: unknown field
+    let extra_field = Item {
+        id: 42,
+        name: "Phoenix",
+    };
+}
+
+
+// ============================================================
+// 5. Ownership / moves
+// ============================================================
+
+fn ownership_test() {
+    let my_item = Item { id: 1 };
+
+    let moved_item = my_item;
+
+    // ERROR: use of moved value
+    print(my_item.id);
+
+    // ERROR: moved_item is moved again
+    let second_move = moved_item;
+
+    // ERROR: use of moved value
+    print(moved_item.id);
+
+    consume(second_move);
+
+    // ERROR: use of moved value
+    print(second_move.id);
+}
+
+fn consume(item: Item) {
+    print(item.id);
+}
+
+
+// ============================================================
+// 6. Multiple immutable references / basic borrowing
+// ============================================================
+
+fn borrow_test() {
+    let item = Item { id: 10 };
+
+    let first = &item;
+    let second = &item;
+
+    print(first.id);
+    print(second.id);
+}
+
+
+// ============================================================
+// 7. Invalid field access
+// ============================================================
+
+fn field_errors() {
+    let item = Item { id: 42 };
+
+    // ERROR: field does not exist
+    print(item.name);
+
+    // ERROR: field does not exist
+    let x = item.does_not_exist;
+}
+
+
+// ============================================================
+// 8. Function call errors
+// ============================================================
+
+fn add(a: Int, b: Int) -> Int {
+    return a + b;
+}
+
+fn call_errors() {
+    // ERROR: too few arguments
+    add(1);
+
+    // ERROR: too many arguments
+    add(1, 2, 3);
+
+    // ERROR: wrong argument types
+    add("hello", "world");
+
+    // ERROR: unknown function
+    unknown_function();
+}
+
+
+// ============================================================
+// 9. Arithmetic type errors
+// ============================================================
+
+fn arithmetic_errors() {
+    let number = 42;
+    let text = "hello";
+
+    // ERROR: invalid operands
+    let a = number + text;
+
+    // ERROR: invalid operands
+    let b = number * text;
+
+    // ERROR: invalid operands
+    let c = number - true;
+}
+
+
+// ============================================================
+// 10. Invalid conditions
+// ============================================================
+
+fn condition_errors() {
+    // ERROR: condition must be Bool
+    if 42 {
+        print("what");
+    }
+
+    // ERROR: condition must be Bool
+    if "hello" {
+        print("also what");
+    }
+
+    // ERROR: condition must be Bool
+    while 123 {
+        print("please stop");
+    }
+}
+
+
+// ============================================================
+// 11. Variable reassignment/type consistency
+// ============================================================
+
+fn variable_errors() {
+    let x = 42;
+
+    // If HC permits reassignment:
+    // ERROR: cannot assign String to Int variable
+    x = "hello";
+
+    // Unknown variable
+    y = 100;
+}
+
+
+// ============================================================
+// 12. Interface type errors
+// ============================================================
+
+fn interface_errors() {
+    let screen = Screen {};
+
+    // ERROR: Screen does not satisfy Renderable
+    let renderable: Renderable = screen;
+
+    // ERROR: Int does not implement Renderable
+    let definitely_not_renderable: Renderable = 42;
+}
+
+
+// ============================================================
+// 13. Enum type errors
+// ============================================================
+
+fn enum_errors() {
+    let status = Status::Active;
+
+    // ERROR: nonexistent enum value
+    let a = Status::Running;
+
+    // ERROR: enum value isn't an Int
+    let b: Int = Status::Active;
+
+    // ERROR: wrong enum type
+    let c: Status = 42;
+}
+
+
+// ============================================================
+// 14. Nasty nested type checking
+// ============================================================
+
+fn nested_errors(value: Status) -> String {
+    match value {
+        Status::Active => {
+            // ERROR: expected String
+            return 123;
+        }
+
+        Status::Inactive => {
+            if true {
+                // ERROR: expected String
+                return 456;
+            }
+
+            return "inactive";
+        }
+
+        // Pending intentionally missing
+    }
+}
+
+
+// ============================================================
+// 15. The "please catch everything" function
+// ============================================================
+
+fn disaster() -> String {
+    let item = Item { id: 42 };
+
+    let moved = item;
+
+    // ERROR: use after move
+    print(item.id);
+
+    // ERROR: nonexistent field
+    print(moved.name);
+
+    // ERROR: wrong type
+    let number: String = 123;
+
+    // ERROR: wrong function arguments
+    add("hello", 42);
+
+    // ERROR: unknown function
+    explode_the_compiler();
+
+    // ERROR: wrong return type
+    return false;
+}

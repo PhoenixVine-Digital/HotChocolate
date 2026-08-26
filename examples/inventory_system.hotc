@@ -1,0 +1,38 @@
+struct Item {
+    id: Int,
+    power: Int,
+    weight: Int,
+    rarity: Int,
+}
+
+fn calculate_rarity_multiplier(rarity: Int) -> Int {
+    let multipliers = [0, 1, 2, 4, 10];
+    return multipliers[rarity];
+}
+
+fn main() {
+    print("=== RPG Inventory & Stat System ===");
+
+    let base_strength = 50;
+
+    let sword = Item {
+        id: 1,
+        power: 25,
+        weight: 5,
+        rarity: 3,
+    };
+
+    let multiplier = calculate_rarity_multiplier(sword.rarity);
+    let final_sword_power = sword.power * multiplier;
+    let total_power = base_strength + final_sword_power;
+
+    print("Equipped Item ID: {sword.id}");
+    print("Item Final Power (with rarity bonus): {final_sword_power}");
+    print("Total Character Power: {total_power}");
+
+    if sword.weight > 10 {
+        print("Status: The item is quite heavy.");
+    } else {
+        print("Status: The item is light and easy to wield.");
+    }
+}

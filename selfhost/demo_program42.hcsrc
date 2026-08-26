@@ -1,0 +1,34 @@
+// Exercises a real, broadly-applicable codegen bug found finishing the self-compilation of
+// `Codegen.hotc` itself (not just a self-hosting curiosity -- this affects ANY real HC program):
+// a `Unit`-returning method/function call used as a BARE STATEMENT (its result discarded, not
+// assigned or returned) needs NO `POP` after it -- a void `INVOKEVIRTUAL`/`INVOKESTATIC` genuinely
+// pushes nothing onto the stack. `ExprStmt`'s own codegen used to POP unconditionally whenever the
+// expression's type wasn't `Long`, silently popping a value that was never pushed for a `Unit`
+// call specifically. Harmless-looking for a SINGLE such call (ASM's own `COMPUTE_FRAMES` doesn't
+// catch one stray `POP` immediately), but it desyncs the statement's own net stack effect from
+// what surrounding code expects -- a `while` loop whose body contains one, preceded by ANY other
+// statement, reliably produced a real ASM `NegativeArraySizeException` in stack-frame merging.
+// `bump`'s own `&mut self` receiver, called as a bare statement (`c.bump();`) both before AND
+// inside a loop, is exactly the shape that broke -- found via `gen_variant_construct`'s own
+// repeated bare `self.mv.visitInsn(...)` calls in `Codegen.hotc`.
+struct Counter {
+    total: Int,
+}
+
+impl Counter {
+    fn bump(&mut self) {
+        self.total = self.total + 1;
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var c = Counter { total: 0 };
+    c.bump();
+    var i = 0;
+    while i < 5 {
+        c.bump();
+        i = i + 1;
+    }
+    // c.bump() called once before the loop + 5 times inside it = 6.
+    return c.total + a + b;
+}

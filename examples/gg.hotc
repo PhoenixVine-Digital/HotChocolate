@@ -1,0 +1,5 @@
+struct Point { x: Int, y: Int, }
+impl Point {
+    fn dist(&self) -> Int { return self.x; }
+}
+enum Status { Active, Inactive, }

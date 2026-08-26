@@ -1,0 +1,24 @@
+struct Box<T> {
+    value: T,
+}
+
+struct Wrapper<T> {
+    inner: Box<T>,
+    tag: Int,
+}
+
+fn unwrap_int(w: Wrapper<Int>) -> Int {
+    return w.inner.value + w.tag;
+}
+
+fn make_wrapper_str(s: String) -> Wrapper<String> {
+    return Wrapper<String> { inner: Box<String> { value: s }, tag: 0 };
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let w = Wrapper<Int> { inner: Box<Int> { value: 90 }, tag: 9 };
+    let n = unwrap_int(w);
+    let ws = make_wrapper_str("hello");
+    let extra = ws.inner.value.length();
+    return n + extra + a + b;
+}

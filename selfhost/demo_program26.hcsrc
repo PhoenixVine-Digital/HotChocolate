@@ -1,0 +1,54 @@
+struct Vec2<T> {
+    data: [T],
+    len: Int,
+}
+
+impl Vec2<T> {
+    fn push(&mut self, value: T) {
+        if self.len == self.data.length {
+            var newCap = self.data.length * 2;
+            if newCap == 0 {
+                newCap = 4;
+            }
+            var newData = [value; newCap];
+            var i = 0;
+            while i < self.len {
+                newData[i] = self.data[i];
+                i = i + 1;
+            }
+            self.data = newData;
+        }
+        self.data[self.len] = value;
+        self.len = self.len + 1;
+    }
+
+    fn get(&self, i: Int) -> T {
+        return self.data[i];
+    }
+
+    fn length(&self) -> Int {
+        return self.len;
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var vi = Vec2<Int> { data: [0; 1], len: 0 };
+    vi.push(10);
+    vi.push(20);
+    vi.push(30);
+    vi.push(40);
+    vi.push(50);
+    var total = 0;
+    var i = 0;
+    while i < vi.length() {
+        total = total + vi.get(i);
+        i = i + 1;
+    }
+
+    var vs = Vec2<String> { data: ["_"; 1], len: 0 };
+    vs.push("ab");
+    vs.push("cde");
+    var slen = vs.get(0).length() + vs.get(1).length();
+
+    return total + slen + a + b;
+}

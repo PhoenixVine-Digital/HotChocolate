@@ -1,0 +1,243 @@
+module hc.selfhost.ast;
+
+// AST types for the self-hosted parser -- deliberately a REPRESENTATIVE SUBSET of the real
+// `Ast.kt`, not a full port. Verified structurally first (see the recursive-enum-variant spike
+// this file's own design depends on): `Expr.Binary { left: Expr, right: Expr }` self-referencing
+// its own enum works cleanly in HC, because HC enums/structs are always reference types under
+// the hood (a "recursive" field is just an ordinary object reference, fixed size regardless of
+// nesting depth) -- unlike Rust, where the same pattern needs an explicit `Box<T>` indirection
+// because Rust enums are value types by default. No such workaround needed here.
+//
+// **Scope cut, disclosed, not hidden**: this covers expressions (literals, identifiers, binary/
+// unary ops, calls, field access, method calls, assignment, struct literals) and a statement
+// layer (let, if, while, match, return, expression statements) -- enough to parse a real function
+// body end to end, plus three declaration forms beyond `fn`: `struct`s, `impl` blocks (methods
+// with a `self` receiver), and `enum`s (with field-carrying variants, matched via `match`). NOT
+// covered yet: interface/extern declarations, generics, lambdas, string interpolation tokens,
+// full `TypeRef` parsing (param/return/field types are bare names only, no arrays/refs/generics).
+// Each is a real, separate follow-up, not an oversight.
+
+pub enum Expr {
+    IntLit { value: Int },
+    StringLit { value: String },
+    BoolLit { value: Bool },
+    Ident { name: String },
+    Binary { op: String, left: Expr, right: Expr },
+    Unary { op: String, expr: Expr },
+    Call { callee: String, args: Vec<Expr> },
+    FieldAccess { obj: Expr, field: String },
+    MethodCall { recv: Expr, method: String, args: Vec<Expr> },
+    Assign { name: String, value: Expr },
+    FieldAssign { obj: Expr, field: String, value: Expr },
+    // `generic_base` is `None` for a plain struct/enum-variant literal (`Some { value: 5 }`,
+    // resolved via `variant_owner`'s bare-name lookup as before) and `Some("Option$Int")` for an
+    // explicitly-qualified generic-enum-variant construction site (`Option<Int>::Some { value: 5
+    // }` -- see `EnumDecl`'s own header for why bare `Some { ... }` alone can't disambiguate which
+    // concrete instantiation is meant once a generic enum is used at more than one type argument
+    // in the same program).
+    StructLit { name: String, field_names: Vec<String>, field_values: Vec<Expr>, generic_base: Option<String> },
+    // `[e1, e2, ...]` -- non-empty only (element type is inferred from the first element; an
+    // empty array literal would have nothing to infer from and isn't supported this phase).
+    ArrayLit { elements: Vec<Expr> },
+    // `[value; count]` -- a fixed-size array with every slot initialized to (a freshly re-
+    // evaluated copy of) the same `value` expression, `count` an `Int` expression. A distinct AST
+    // node from `ArrayLit` above rather than a special case of it -- genuinely different shape (one
+    // value expr + one count expr, not a list) and a different real bytecode pattern (`ANEWARRAY`/
+    // `NEWARRAY` sized by `count`'s runtime value, then a loop storing `value` into every slot,
+    // vs. `ArrayLit`'s fixed compile-time-known element count with each element evaluated once).
+    // The prelude's own `Vec<T>`'s `push`/`vec_of` (`[value; newCap]`, `[first; 4]`) are exactly
+    // why this exists -- real self-hosting needs it, not a hypothetical feature.
+    ArrayRepeat { value: Expr, count: Expr },
+    Index { arr: Expr, index: Expr },
+    IndexAssign { arr: Expr, index: Expr, value: Expr },
+    // `Alias::new(args)` (a constructor call) or `Alias::method(args)` (a real static method) --
+    // distinguished by name lookup (`method == "new"`) at check/codegen time, not by parsing, same
+    // as how `StructLit` doesn't distinguish plain-struct from enum-variant construction in the
+    // AST itself. See `ExternClassDecl`'s own header.
+    StaticCall { type_name: String, method: String, args: Vec<Expr> },
+    // `expr as Type` -- a real gap found self-compiling the compiler's OWN `Lexer.hotc`, which
+    // narrows a real `Long` (from `JLong::parseLong`, a native `java.lang.Long` extern method
+    // return) down to `Int` this exact way. Deliberately narrow scope: `target_type` is trusted at
+    // face value (no legality checking -- same "declared type is truth" honesty every other
+    // declared type already gets), and `Long` itself is NOT a general first-class primitive
+    // anywhere else in this subset (no `Long`-typed locals/params/fields, no `Long` arithmetic) --
+    // it only ever appears as a transient value between an extern call that returns one and an
+    // immediate `as Int`/`as Long` cast consuming it (see `Codegen.hotc`'s own `gen_cast`).
+    Cast { expr: Expr, target_type: String },
+}
+
+pub enum Stmt {
+    Let { name: String, mutable: Bool, init: Expr },
+    ExprStmt { expr: Expr },
+    Return { value: Option<Expr> },
+    If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>> },
+    While { cond: Expr, body: Vec<Stmt> },
+    Match { subject: Expr, arms: Vec<MatchArm> },
+    // `throw expr;` -- `expr` must be a `String` message (a real, disclosed simplification: this
+    // subset has no `extern class` support yet, so there's no real exception *type* to throw --
+    // codegen always targets a hardcoded `java.lang.RuntimeException`, see `Codegen.hotc`).
+    Throw { value: Expr },
+    // `break;` / `continue;` -- fieldless, only legal inside a `while` body (checker-enforced, see
+    // `Checker.hotc`'s `loop_depth`). Scope cut, disclosed: no drop-list tracking (this subset has
+    // no `Drop`/RAII mechanism at all, unlike the real compiler's `varsToDropBeforeBreak`), so
+    // codegen is a plain unconditional jump to the loop's end/start label -- nothing to clean up.
+    Break {},
+    Continue {},
+    // `try { try_block } catch (catch_var: catch_type) { catch_block }` -- SINGLE catch clause
+    // only (the real compiler supports a list of them; this subset only ever needs to catch one
+    // real exception type at a time so far -- classpath reflection's own `ClassNotFoundException`
+    // handling, see `Checker.hotc`'s own header). `catch_type` must name a known `extern class`
+    // (a real JVM exception type); `catch_var` is bound to it, in scope only within `catch_block`.
+    Try { try_block: Vec<Stmt>, catch_var: String, catch_type: String, catch_block: Vec<Stmt> },
+}
+
+// `VariantName { field1, field2 } => { body }`, or `_ => { body }` (`variant_name == "_"`, no
+// dedicated wildcard AST node). Bound field names must match the variant's own declared field
+// names exactly -- no renaming (`Checker.hotc`'s real `if let Some { value: v } = ...` pattern
+// syntax supports renaming; this subset's `match` doesn't, a real, disclosed simplification).
+// `field_names` are the variant's own DECLARED field names (used to `GETFIELD` the right value);
+// `bind_names` are the LOCAL variable names each one binds to inside `body` -- the same name by
+// default (`{ value }`), but a real gap found self-compiling `Lexer.hotc`/attempting the compiler's
+// own source more broadly (`if let Some { value: kw } = found { ... }` -- the compiler's OWN
+// established idiom, used pervasively throughout its own `Checker.hotc`/`Codegen.hotc`) lets a
+// pattern rename a field to a different local (`field: localName`), same real-language syntax
+// `if let`'s own real counterpart already supports. Always the same length as `field_names`,
+// index-paired.
+pub struct MatchArm {
+    variant_name: String,
+    field_names: Vec<String>,
+    bind_names: Vec<String>,
+    body: Vec<Stmt>,
+}
+
+pub struct Param {
+    name: String,
+    type_name: String,
+}
+
+// `type_param` mirrors `StructDecl`'s/`EnumDecl`'s own field (`Some("T")` for `fn identity<T>(x:
+// T) -> T { ... }`) -- same `"Base$Arg"` on-demand monomorphization convention, but inferred
+// rather than explicit: a call site (`identity(5)`) never spells out `<Int>` itself the way a
+// generic struct/enum construction site must -- the checker/codegen each independently infer the
+// concrete type argument from whichever argument's declared param type is exactly the bare type
+// parameter (see `Checker.hotc`'s own `infer_generic_fn_arg` header). Scope cut, disclosed: only
+// that one "some param's declared type is exactly `T`" inference rule is supported (not `[T]`, not
+// a nested generic argument), and a generic fn's own body may not itself reference its still-
+// abstract `T` inside a NESTED generic construction site (e.g. a bare `Vec { ... }` relying on the
+// enclosing fn's own `T` -- the real prelude's `vec_of<T>` does exactly this) -- that needs a real
+// body-rewriting substitution pass over the whole `Stmt`/`Expr` tree per instantiation, a further
+// follow-up beyond this phase's flat param/return-type substitution.
+pub struct FnDecl {
+    name: String,
+    params: Vec<Param>,
+    ret_type: Option<String>,
+    body: Vec<Stmt>,
+    type_param: Option<String>,
+}
+
+// `Param` doubles as a struct field decl (`name: type_name`) -- same shape, no separate type
+// needed. `type_param` is the generic type parameter's own name (e.g. `"T"` for `struct Box<T>`),
+// `None` for a plain, non-generic struct -- see `Codegen.hotc`'s own header for how a generic
+// struct's *uses* (`Box<Int>`, `Box<String>`, ...) get monomorphized into real, separate classes.
+// Scope cut, disclosed: exactly one type parameter, no generic functions/methods/enums this
+// phase -- only struct declarations.
+pub struct StructDecl {
+    name: String,
+    type_param: Option<String>,
+    fields: Vec<Param>,
+}
+
+// `impl Name { fn method(self[, params]) [-> Ret] { body } ... }` -- `self` (bare, `&self`, or
+// `&mut self`, the `&`/`mut` markers are parsed but not distinguished -- see `Parser.hotc`'s own
+// header) is required as the literal first token(s) of every method's param list and is NOT
+// itself present in `FnDecl.params`; codegen treats it as the always-implicit JVM local slot 0.
+// `static fn name(...) -> Ret { body }` methods (no `self`) go in `static_methods` -- called via
+// `StructName::method(args)`, the same `Expr::StaticCall` syntax `extern class` static methods
+// and constructors use (see `ExternClassDecl`'s own header) -- resolved by name lookup, extern
+// classes checked first, struct static methods as the fallback.
+pub struct ImplDecl {
+    struct_name: String,
+    methods: Vec<FnDecl>,
+    static_methods: Vec<FnDecl>,
+}
+
+// `enum Name { Variant1 { field: Type, ... }, Variant2 {}, ... }` -- every variant needs explicit
+// `{ }` even with no fields (a real, disclosed simplification: bare fieldless variants like the
+// real language's `TokType`'s own `EOF` would otherwise be ambiguous with a plain identifier
+// reference at parse time -- see `Parser.hotc`'s own header). Variant construction reuses
+// `Expr::StructLit` -- `VariantName { field: value, ... }` -- rather than a separate AST node;
+// `Checker.hotc`/`Codegen.hotc` tell struct-literal from enum-variant-literal apart by looking the
+// name up in a `variant_owner` table first.
+pub struct EnumVariant {
+    name: String,
+    fields: Vec<Param>,
+}
+
+// `type_param` mirrors `StructDecl`'s own field (`Some("T")` for `enum Option<T> { ... }`) --
+// same on-demand monomorphization mechanism (`"Base$Arg"` names, `Checker.hotc`'s
+// `ensure_instantiated`), except construction sites for a generic enum's variants must use the
+// explicit qualified form `Base<Arg>::Variant { ... }` (parsed into `Expr::StructLit`'s
+// `generic_base` field) rather than bare `Variant { ... }` -- a generic struct's own concrete name
+// IS its instantiation name already (`Box<Int> { ... }` directly names `"Box$Int"`), but an enum
+// variant's bare name (`"Some"`) carries no such information, and the checker's/codegen's
+// `variant_owner` tables are both flat, bare-name-keyed maps that would silently collide (last
+// registration wins, no shadowing -- a real quirk of `Registry<T>.get()`) if two different
+// concrete instantiations of the same generic enum (`Option<Int>` and `Option<String>`) were both
+// used in one program and both tried to register a bare `"Some"` owner. Scope cut, disclosed: bare
+// unqualified variant construction only resolves for a *non*-generic enum's variants, same as
+// today.
+pub struct EnumDecl {
+    name: String,
+    variants: Vec<EnumVariant>,
+    type_param: Option<String>,
+}
+
+// `extern class Alias = "binary/internal/Name" { fn new(...) -> Self; fn method(&self, ...) ->
+// Ret; static fn other(...) -> Ret; }` -- a real, disclosed deviation from the actual language:
+// `binary_name` must already be JVM-internal-slash form (`"java/io/File"`, not
+// `"java.io.File"`); there's no dot-to-slash conversion this phase. `is_ctor` (`name == "new"`)
+// and `is_static` (the `static` keyword) distinguish the three call shapes -- constructors and
+// static methods both parse as `Expr::StaticCall` at use sites (`Alias::new(...)`,
+// `Alias::method(...)`), instance methods reuse plain `Expr::MethodCall` like a struct method or
+// `String` builtin does. Scope cut, disclosed: every `ExternMethod` param (a method declared
+// inside an `extern class` block itself) must be `Int`/`Bool`/`String`, and its return type is
+// either one of those, `Unit`, or the literal `Self` (mapped to the real binary name's own
+// descriptor) -- extern classes cannot appear as params/returns of *other* extern methods. Plain
+// struct fields and top-level fn/impl-method params/returns may now name an extern class alias
+// (see `Codegen.hotc`'s own header). No `interface`/`use { ... }` reflected form either -- every
+// member is spelled out explicitly.
+pub struct ExternMethod {
+    name: String,
+    params: Vec<Param>,
+    ret_type: String,
+    is_static: Bool,
+    is_ctor: Bool,
+}
+
+pub struct ExternClassDecl {
+    name: String,
+    binary_name: String,
+    methods: Vec<ExternMethod>,
+}
+
+// `pub static NAME: Type = expr;` at the top level -- a real gap found attempting to self-compile
+// the compiler's OWN `Lexer.hotc`, which uses dozens of these as named codepoint constants
+// (`pub static CP_NEWLINE: Int = 10;`) standing in for char literals HC doesn't have. A real,
+// disclosed simplification versus the actual language: `value` is trusted to be a genuine constant
+// expression (an int/bool/string literal, or something equivalent) -- nothing here validates that,
+// since real `hc` doesn't require const-evaluation for this subset's own purposes either (every
+// static this compiler's own source declares is a literal).
+pub struct StaticDecl {
+    name: String,
+    type_name: String,
+    value: Expr,
+}
+
+pub struct Program {
+    fns: Vec<FnDecl>,
+    structs: Vec<StructDecl>,
+    impls: Vec<ImplDecl>,
+    enums: Vec<EnumDecl>,
+    externs: Vec<ExternClassDecl>,
+    statics: Vec<StaticDecl>,
+}

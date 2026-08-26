@@ -1,0 +1,10 @@
+fn combo(a: Int, b: Int) -> Int {
+    var s = "hello world";
+    var upper = s.toUpperCase();
+    var n = s.length();
+    if upper.contains("WORLD") {
+        return n + a + b;
+    } else {
+        return 0;
+    }
+}

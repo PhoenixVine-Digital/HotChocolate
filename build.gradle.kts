@@ -46,6 +46,15 @@ tasks.register<JavaExec>("playBattle") {
     standardInput = System.`in`
 }
 
+tasks.register<JavaExec>("calc") {
+    group = "application"
+    description = "Runs the hotc calculator."
+    mainClass.set("hc.MainKt")
+    classpath = sourceSets.main.get().runtimeClasspath
+    args = listOf("run", "examples/calc")
+    standardInput = System.`in`
+}
+
 tasks.test {
     useJUnitPlatform()
 }

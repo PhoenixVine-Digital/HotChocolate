@@ -1,0 +1,23 @@
+struct Counter2 {
+    value: Int,
+}
+
+impl Counter2 {
+    static fn zero() -> Counter2 {
+        return Counter2 { value: 0 };
+    }
+
+    static fn make(n: Int) -> Counter2 {
+        return Counter2 { value: n };
+    }
+
+    fn get(self) -> Int {
+        return self.value;
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var c1 = Counter2::zero();
+    var c2 = Counter2::make(a + b);
+    return c1.get() + c2.get();
+}

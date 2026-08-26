@@ -26,7 +26,7 @@ impl Enemy for Slime {
 }
 
 // `sealed` lets `match` dispatch by concrete type (instanceof chain), exhaustiveness-checked
-// against every implementer declared anywhere in this compiled directory -- see player.hc/main.hc.
+// against every implementer declared anywhere in this compiled directory -- see player.hotc/main.hotc.
 fn taunt(e: &dyn Enemy) -> String {
     match e {
         Goblin { } => { return "the goblin snickers."; }

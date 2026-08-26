@@ -11,8 +11,7 @@ pub enum Option<T> {
 // The HC-native counterpart to `try`/`catch`: `try`/`throw` are for real JVM exceptions
 // (extern-declared Throwable types, going through ASM's actual exception-table mechanism --
 // see the README's Error handling section), while `Result<T, E>` is for representing "this
-// HC-native operation can fail" as an ordinary matchable value, the same way `Option<T>`
-// represents "this can be absent" -- no exception, no special control flow, just an enum.
+
 pub enum Result<T, E> {
     Ok { value: T },
     Err { error: E },
@@ -73,8 +72,22 @@ pub fn registry_new<T>(firstKey: String, firstValue: T) -> Registry<T> {
 }
 
 impl<T> Registry<T> {
+
     fn register(&mut self, key: String, value: T) {
-        self.entries.push(RegistryEntry { key: key, value: value });
+        var found_idx = -1;
+        var i = 0;
+        while i < self.entries.length() {
+            let entry = self.entries.get(i);
+            if entry.key == key {
+                found_idx = i;
+            }
+            i = i + 1;
+        }
+        if found_idx >= 0 {
+            self.entries.set(found_idx, RegistryEntry { key: key, value: value });
+        } else {
+            self.entries.push(RegistryEntry { key: key, value: value });
+        }
     }
 
     fn get(&self, key: String) -> Option<T> {
@@ -92,5 +105,44 @@ impl<T> Registry<T> {
     fn length(&self) -> Int {
         return self.entries.length();
     }
+}
+
+extern class __PreludeJavaString = "java.lang.String" {
+    fn trim(self) -> String;
+    fn split(self, regex: String) -> [String];
+}
+
+extern class __PreludeInteger = "java.lang.Integer" {
+    fn parseInt(s: String) -> Int;
+}
+
+extern class __PreludeNumberFormatException = "java.lang.NumberFormatException" {}
+
+pub fn read_int() -> Option<Int> {
+    let line = read_line().trim();
+    try {
+        return Some { value: __PreludeInteger::parseInt(line) };
+    } catch (e: __PreludeNumberFormatException) {
+        return None;
+    }
+}
+
+pub fn read_string() -> String {
+    return read_line().trim();
+}
+
+pub fn read_ints() -> [Int] {
+    let parts = read_line().trim().split(" ");
+    var result = [0; parts.length];
+    var i = 0;
+    while i < parts.length {
+        result[i] = __PreludeInteger::parseInt(parts[i]);
+        i = i + 1;
+    }
+    return result;
+}
+
+pub fn read_strings() -> [String] {
+    return read_line().trim().split(" ");
 }
 """.trimIndent()

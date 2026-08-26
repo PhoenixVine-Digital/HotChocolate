@@ -1,0 +1,15 @@
+struct Box<T> {
+    value: T,
+}
+
+fn unwrap_int(b: Box<Int>) -> Int {
+    return b.value;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var bi = Box<Int> { value: a + b };
+    var bi2 = Box<Int> { value: a * b };
+    var bs = Box<String> { value: "hello" };
+    var n = bs.value.length();
+    return unwrap_int(bi) + unwrap_int(bi2) + n;
+}

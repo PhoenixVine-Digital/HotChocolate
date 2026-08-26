@@ -1,0 +1,12 @@
+extern class JLong = "java/lang/Long" {
+    static fn parseLong(s: String, radix: Int) -> Long;
+}
+
+fn parse_hex(s: String) -> Int {
+    return JLong::parseLong(s, 16) as Int;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let n = parse_hex("FF");
+    return n + a + b;
+}

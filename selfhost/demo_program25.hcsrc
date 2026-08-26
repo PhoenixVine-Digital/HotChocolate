@@ -1,0 +1,13 @@
+struct Box<T> {
+    value: T,
+}
+
+fn boxed<T>(v: T) -> Box<T> {
+    return Box<T> { value: v };
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let bi = boxed(42);
+    let bs = boxed("hey");
+    return bi.value + bs.value.length() + a + b;
+}

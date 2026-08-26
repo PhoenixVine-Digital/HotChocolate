@@ -1,0 +1,23 @@
+// Exercises the self-hosted `Codegen.hotc`'s own new real-argv `fn main(args: [String])` entry
+// point support (see that file's own header, right above its `has_argv_main` detection) -- a
+// target program compiled BY the self-hosted compiler can now declare a genuine JVM-shaped
+// `main(String[])` and receive real command-line arguments, not just the fixed baked-in Int args
+// every other demo's `combo(a, b)` convention uses. `args.length` (an ordinary array field access,
+// already-verified machinery) is forwarded straight into `System.exit`'s own real exit code, so
+// this is checked by invoking the compiled class with N extra command-line arguments and
+// confirming the process's own exit code equals N -- see the driver's own verification comment
+// for the exact command used.
+//
+// Note: `run_bootstrap_demo`'s own printed "combo(3, 4) should print 18 when run" message (shared
+// verbatim by every demo in this harness) does NOT apply here -- this file declares a real `main`,
+// which the self-hosted `compile_program`'s own entry-point detection always prefers over the
+// hardcoded `combo`/`entry_args` convention regardless of what `run_bootstrap_demo` requested, so
+// `combo` is never even called. The real verification is the separate `java ... SelfhostDemoProgram
+// a b c` invocation (exit code 3), not this demo's own compile-time print.
+extern class JSystemExit45 = "java.lang.System" {
+    static fn exit(code: Int) -> Unit;
+}
+
+fn main(args: [String]) {
+    JSystemExit45::exit(args.length);
+}

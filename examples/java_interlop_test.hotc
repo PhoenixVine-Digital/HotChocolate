@@ -1,0 +1,23 @@
+extern class Math = "java.lang.Math" {
+    static fn max(a: Int, b: Int) -> Int;
+    static fn abs(a: Int) -> Int;
+}
+
+extern class StringBuilder = "java.lang.StringBuilder" {
+    fn new() -> Self;
+    fn append(self, str: String) -> StringBuilder;
+    fn toString(&self) -> String;
+}
+
+fn main() {
+    let highest = Math::max(15, 42);
+    let absolute = Math::abs(-99);
+    print("Math result: max = {highest}, abs = {absolute}");
+
+    let builder = StringBuilder::new();
+    builder.append("Hot ");
+    builder.append("Chocolate!");
+
+    let result = builder.toString();
+    print("StringBuilder result: {result}");
+}

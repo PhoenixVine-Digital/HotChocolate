@@ -1,0 +1,6 @@
+fn combo(a: Int, b: Int) -> Int {
+    let s = "Hello";
+    let cp = s.codePointAt(0);
+    let sub = s.substring(1, 4);
+    return cp + sub.length() + a + b;
+}

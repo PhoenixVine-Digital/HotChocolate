@@ -1,0 +1,29 @@
+// Ensure the class string matches the real JVM class expected by Checker.kt
+extern class FriendlyByteBuf = "net.minecraft.network.FriendlyByteBuf" {
+    fn writeInt(self, value: Int) -> FriendlyByteBuf;
+    fn writeBoolean(self, value: Bool) -> FriendlyByteBuf;
+    fn writeUtf(self, value: String, maxLen: Int) -> FriendlyByteBuf;
+
+    fn readInt(self) -> Int;
+    fn readBoolean(self) -> Bool;
+    fn readUtf(self, maxLen: Int) -> String;
+}
+
+@serializable
+struct PlayerStats {
+    level: Int,
+    score: Int,
+    is_active: Bool,
+    name: String,
+}
+
+fn main() {
+    let original = PlayerStats {
+        level: 42,
+        score: 9950,
+        is_active: true,
+        name: "Rin",
+    };
+
+    print("Original Player: {original.name} (Level {original.level}, Score: {original.score})");
+}

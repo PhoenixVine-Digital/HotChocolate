@@ -1,0 +1,73 @@
+package hc.intellij
+
+import com.intellij.psi.tree.IElementType
+
+class HCElementType(debugName: String) : IElementType(debugName, HCLanguage)
+
+// Composite (non-leaf) node kinds the real parser (`HCPsiParser`) builds -- mirrors the real
+// compiler's own `Ast.kt` node shapes closely enough to navigate by, without being a 1:1 port
+// (see `HCPsiParser`'s own header for exactly what's simplified/deferred).
+object HCElementTypes {
+    val MODULE_DECL = HCElementType("MODULE_DECL")
+    val STRUCT_DECL = HCElementType("STRUCT_DECL")
+    val FN_DECL = HCElementType("FN_DECL")
+    val IMPL_DECL = HCElementType("IMPL_DECL")
+    val ENUM_DECL = HCElementType("ENUM_DECL")
+    val ENUM_VARIANT = HCElementType("ENUM_VARIANT")
+    val EXTERN_CLASS_DECL = HCElementType("EXTERN_CLASS_DECL")
+    val EXTERN_METHOD_DECL = HCElementType("EXTERN_METHOD_DECL")
+    val INTERFACE_DECL = HCElementType("INTERFACE_DECL")
+    val INTERFACE_METHOD_SIG = HCElementType("INTERFACE_METHOD_SIG")
+    val EXTEND_DECL = HCElementType("EXTEND_DECL")
+    val STATIC_DECL = HCElementType("STATIC_DECL")
+    val ANNOTATION = HCElementType("ANNOTATION")
+
+    val TYPE_PARAM_LIST = HCElementType("TYPE_PARAM_LIST")
+    val PARAM_LIST = HCElementType("PARAM_LIST")
+    val PARAM = HCElementType("PARAM")
+    val FIELD_DECL = HCElementType("FIELD_DECL")
+    val TYPE_REF = HCElementType("TYPE_REF")
+
+    val BLOCK = HCElementType("BLOCK")
+    val LET_STMT = HCElementType("LET_STMT")
+    val IF_STMT = HCElementType("IF_STMT")
+    val IF_LET_STMT = HCElementType("IF_LET_STMT")
+    val DEV_IF_STMT = HCElementType("DEV_IF_STMT")
+    val WHILE_STMT = HCElementType("WHILE_STMT")
+    val FOR_STMT = HCElementType("FOR_STMT")
+    val MATCH_STMT = HCElementType("MATCH_STMT")
+    val MATCH_ARM = HCElementType("MATCH_ARM")
+    val VARIANT_PATTERN = HCElementType("VARIANT_PATTERN")
+    val RETURN_STMT = HCElementType("RETURN_STMT")
+    val BREAK_STMT = HCElementType("BREAK_STMT")
+    val CONTINUE_STMT = HCElementType("CONTINUE_STMT")
+    val TRY_STMT = HCElementType("TRY_STMT")
+    val CATCH_CLAUSE = HCElementType("CATCH_CLAUSE")
+    val THROW_STMT = HCElementType("THROW_STMT")
+    val EXPR_STMT = HCElementType("EXPR_STMT")
+
+    val BINARY_EXPR = HCElementType("BINARY_EXPR")
+    val UNARY_EXPR = HCElementType("UNARY_EXPR")
+    val BORROW_EXPR = HCElementType("BORROW_EXPR")
+    val CAST_EXPR = HCElementType("CAST_EXPR")
+    val INSTANCE_OF_EXPR = HCElementType("INSTANCE_OF_EXPR")
+    val CALL_EXPR = HCElementType("CALL_EXPR")
+    val STATIC_CALL_EXPR = HCElementType("STATIC_CALL_EXPR")
+    val FIELD_ACCESS_EXPR = HCElementType("FIELD_ACCESS_EXPR")
+    val METHOD_CALL_EXPR = HCElementType("METHOD_CALL_EXPR")
+    val INDEX_EXPR = HCElementType("INDEX_EXPR")
+    val ASSIGN_EXPR = HCElementType("ASSIGN_EXPR")
+    val STRUCT_LIT_EXPR = HCElementType("STRUCT_LIT_EXPR")
+    val FIELD_INIT = HCElementType("FIELD_INIT")
+    val ARRAY_LIT_EXPR = HCElementType("ARRAY_LIT_EXPR")
+    val IF_EXPR = HCElementType("IF_EXPR")
+    val MATCH_EXPR = HCElementType("MATCH_EXPR")
+    val PAREN_EXPR = HCElementType("PAREN_EXPR")
+    val REF_EXPR = HCElementType("REF_EXPR")
+    val LITERAL_EXPR = HCElementType("LITERAL_EXPR")
+    val STRING_INTERP_EXPR = HCElementType("STRING_INTERP_EXPR")
+    val CLASS_LIT_EXPR = HCElementType("CLASS_LIT_EXPR")
+
+    val ARG_LIST = HCElementType("ARG_LIST")
+    val LAMBDA_EXPR = HCElementType("LAMBDA_EXPR")
+}

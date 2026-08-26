@@ -1,0 +1,109 @@
+module hc.selfhost.types;
+
+// The self-hosted subset's own type-model, pulled out of `Checker.hotc` into its own file --
+// mirrors the real compiler's own `Types.kt`/`sema/Types.kt` split from `Checker.kt`: the DATA
+// SHAPE of "what a type is" and "what a fn/struct/extern-method signature looks like" is a
+// separate concern from the ALGORITHM that walks the AST assigning and checking those types
+// (`Checker.hotc`'s own `TyChecker`), and both `Checker.hotc` and `Codegen.hotc` need this same
+// shared vocabulary (`Codegen.hotc` builds real `FnSig`/`Ty` values of its own when re-deriving a
+// generic-fn instantiation's signature, see that file's own header) -- previously each kept its
+// own near-duplicate copy of `Ty`/`FnSig`/`ty_from_name`/`empty_ty_vec`/`param_types_of` (harmless
+// under the flat bootstrap namespace, since the two copies never collided, but genuine duplication
+// all the same). One canonical copy here now, referenced by both.
+//
+// **Scope cut, disclosed, same as always**: this is NOT a full port of the real `Ty` sealed class
+// (no `Float`/`Double`/`Arena`/`Dyn`/`Enum`/`JavaExtern` variants -- see `Checker.hotc`'s own
+// long-standing header for why: no arena structs, no interface/dyn types, no Float/Double at all
+// in this subset). `TyStruct` is this subset's one field-carrying variant, and doubles as the
+// catch-all for both real structs AND enums (see `Checker.hotc`'s own comments on `variant_owner`)
+// -- there's no separate `TyEnum` tag the way the real `Ty.Enum` is distinct from `Ty.Struct`.
+
+pub enum Ty {
+    TyInt, TyBool, TyStr, TyUnit, TyUnknown, TyLong,
+    TyStruct { name: String },
+}
+
+pub struct FnSig {
+    param_types: Vec<Ty>,
+    ret_type: Ty,
+}
+
+// A struct's real field table -- `field_types` holds type *names* (not `Ty`) so it stays `Copy`-
+// friendly to store/compare, resolved to a real `Ty` via `ty_from_name` only where one is needed.
+pub struct StructInfo {
+    field_names: Vec<String>,
+    field_types: Vec<String>,
+}
+
+// A generic struct declaration (`struct Box<T> { ... }`), kept separate from a real, directly-
+// usable field table until something actually asks for a concrete instantiation -- see
+// `Checker.hotc`'s own `ensure_instantiated` header.
+pub struct GenericTemplate {
+    type_param: String,
+    field_names: Vec<String>,
+    field_types: Vec<String>,
+}
+
+// A generic enum declaration (`enum Option<T> { ... }`), mirroring `GenericTemplate` -- kept as
+// the raw `Vec<EnumVariant>` rather than pre-flattened, since `ensure_instantiated` needs to
+// substitute `T` inside each variant's own field list separately before re-registering the union
+// (see `Checker.hotc`'s own `register_enum` header). Depends on `EnumVariant` (`Ast.hotc`) --
+// fine under the flat bootstrap namespace every other cross-file reference here already relies on.
+pub struct GenericEnumTemplate {
+    type_param: String,
+    variants: Vec<EnumVariant>,
+}
+
+// A real `extern class` method's signature -- `param_types`/`ret_type` are type *names* (`"Self"`
+// as a real, literal `ret_type` value meaning "this extern class's own type"), same `Copy`-
+// friendly-string convention `FnSig`/`StructInfo` already use.
+pub struct ExternMethodInfo {
+    param_types: Vec<String>,
+    ret_type: String,
+    is_static: Bool,
+    is_ctor: Bool,
+}
+
+pub fn empty_ty_vec() -> Vec<Ty> {
+    var v = vec_of(TyUnknown);
+    return Vec { data: v.data, len: 0 };
+}
+
+pub fn ty_from_name(name: String) -> Ty {
+    if name == "Int" { return TyInt; }
+    if name == "Bool" { return TyBool; }
+    if name == "String" { return TyStr; }
+    if name == "Unit" { return TyUnit; }
+    if name == "Long" { return TyLong; }
+    return TyStruct { name: name };
+}
+
+// Called exactly once per `Ty` value at the top of whichever fn needs to compare it (`Ty` isn't
+// `Copy` -- comparing the SAME value against multiple candidates moves it on the first comparison,
+// making a second compile error) -- the string result IS `Copy`, safe to compare against as many
+// literals as needed afterward, unlike the `Ty` enum value itself. See `Checker.hotc`'s own
+// former header for the real bug this convention was established to work around.
+pub fn ty_name(t: Ty) -> String {
+    match t {
+        TyInt => { return "Int"; }
+        TyBool => { return "Bool"; }
+        TyStr => { return "String"; }
+        TyUnit => { return "Unit"; }
+        TyUnknown => { return "?"; }
+        TyLong => { return "Long"; }
+        TyStruct { name } => { return name; }
+    }
+}
+
+pub fn param_types_of(params: Vec<Param>) -> Vec<Ty> {
+    if params.length() == 0 {
+        return empty_ty_vec();
+    }
+    var out = vec_of(ty_from_name(params.get(0).type_name));
+    var i = 1;
+    while i < params.length() {
+        out.push(ty_from_name(params.get(i).type_name));
+        i = i + 1;
+    }
+    return out;
+}

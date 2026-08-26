@@ -1,0 +1,19 @@
+fn in_range(n: Int, lo: Int, hi: Int) -> Int {
+    if n >= lo && n <= hi {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+fn out_of_range(n: Int, lo: Int, hi: Int) -> Int {
+    if n < lo || n > hi {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    return in_range(a, 1, 5) + out_of_range(b, 1, 5);
+}

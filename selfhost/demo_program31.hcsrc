@@ -1,0 +1,35 @@
+// Mirrors real `Lexer.hotc`/`Parser.hotc` usage: a fieldless-variant enum used as a set of plain
+// named constants -- `kind: FN`, `t.kind == RETURN` -- not `FN {}` construction sites.
+enum TokKind {
+    FN,
+    RETURN,
+    IDENT,
+}
+
+struct Tok {
+    kind: TokKind,
+    text: String,
+}
+
+fn classify(kind: TokKind) -> Int {
+    if kind == FN {
+        return 1;
+    } else {
+        if kind == RETURN {
+            return 2;
+        } else {
+            return 3;
+        }
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let t1 = Tok { kind: FN, text: "fn" };
+    let t2 = Tok { kind: RETURN, text: "return" };
+    let t3 = Tok { kind: IDENT, text: "x" };
+    var total = classify(t1.kind) + classify(t2.kind) + classify(t3.kind);
+    if t1.kind == FN {
+        total = total + 10;
+    }
+    return total + a + b;
+}

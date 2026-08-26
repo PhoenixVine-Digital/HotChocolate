@@ -1,0 +1,11 @@
+fn double(x: Int) -> Int {
+    return x * 2;
+}
+
+fn triple(x: Int) -> Int {
+    return x * 3;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    return double(a) + triple(b);
+}

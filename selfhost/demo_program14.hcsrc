@@ -1,0 +1,15 @@
+fn sum_array(arr: [Int]) -> Int {
+    var total = 0;
+    var i = 0;
+    while i < arr.length {
+        total = total + arr[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var nums = [a, b, a + b, a * b];
+    nums[0] = nums[0] + 100;
+    return sum_array(nums);
+}

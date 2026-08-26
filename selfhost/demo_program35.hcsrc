@@ -1,0 +1,18 @@
+extern class LexErr = "java/lang/RuntimeException" {
+    fn new(msg: String) -> Self;
+}
+
+fn maybe_fail(n: Int) -> Int {
+    if n > 1000 {
+        throw LexErr::new("n too large: " + JStr9::valueOf(n));
+    }
+    return n * 2;
+}
+
+extern class JStr9 = "java/lang/String" {
+    static fn valueOf(v: Int) -> String;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    return maybe_fail(a) + maybe_fail(b);
+}

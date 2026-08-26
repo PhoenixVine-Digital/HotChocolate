@@ -1,0 +1,28 @@
+enum Opt<T> {
+    Some { value: T },
+    None {},
+}
+
+fn unwrap_or_int(o: Opt<Int>, fallback: Int) -> Int {
+    match o {
+        Some { value } => { return value; }
+        None {} => { return fallback; }
+    }
+}
+
+fn unwrap_or_str(o: Opt<String>, fallback: String) -> String {
+    match o {
+        Some { value } => { return value; }
+        None {} => { return fallback; }
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let some_int = Opt<Int>::Some { value: 41 };
+    let none_int = Opt<Int>::None {};
+    let some_str = Opt<String>::Some { value: "hi" };
+    let n1 = unwrap_or_int(some_int, -1);
+    let n2 = unwrap_or_int(none_int, -1);
+    let s1 = unwrap_or_str(some_str, "fallback");
+    return n1 + n2 + s1.length();
+}

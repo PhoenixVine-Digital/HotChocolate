@@ -1,0 +1,29 @@
+// Exercises real `break`/`continue` support: fieldless `Stmt::Break`/`Stmt::Continue` variants
+// (`Ast.hotc`), parsing (`Parser.hotc`'s `statement`), a `loop_depth` counter enforcing "only
+// inside a while" (`Checker.hotc`), and plain-GOTO codegen to the innermost enclosing loop's own
+// start/end labels (`Codegen.hotc`'s `cur_loop_start`/`cur_loop_end`, save/restored around a
+// nested loop the same way `loop_depth` is) -- no drop-list to emit first, this subset has no
+// `Drop`/RAII at all. `continue`'s target is the loop's own condition re-check (not the body's
+// start), matching the real compiler's own plain `while` codegen.
+fn sum_until_break(limit: Int) -> Int {
+    var total = 0;
+    var i = 0;
+    while i < 1000 {
+        i = i + 1;
+        if i % 2 == 0 {
+            continue;
+        }
+        if i > limit {
+            break;
+        }
+        total = total + i;
+    }
+    return total;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    // Odd numbers from 1 to 9 inclusive: 1+3+5+7+9 = 25 (evens skipped via `continue`, loop
+    // stops once i exceeds 9 via `break`).
+    let s = sum_until_break(9);
+    return s + a + b;
+}

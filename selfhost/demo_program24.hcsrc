@@ -1,0 +1,14 @@
+fn identity<T>(x: T) -> T {
+    return x;
+}
+
+fn pick_first<T>(a: T, b: T) -> T {
+    return a;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let n = identity(37);
+    let s = identity("hello");
+    let picked = pick_first(a + b, 999);
+    return n + s.length() + picked;
+}

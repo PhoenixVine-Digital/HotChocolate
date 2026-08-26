@@ -1,0 +1,66 @@
+// Exercises two real gaps found self-compiling `Checker.hotc`:
+//
+// (1) A match arm on a FIELDLESS variant matched BARE, no `{ }` at all (`Parser.hotc`'s own
+//     `match_arm`, real `Checker.hotc` usage: `match t { TyInt => {...} ... }`) -- this subset's
+//     parser previously REQUIRED `{ }` unconditionally (except for the `_` wildcard), unlike the
+//     real compiler's own `variantPattern`, which only consumes a binding list `if` a `{` is
+//     actually present.
+//
+// (2) A per-variant field-type collision: `Ast.hc`'s own `Expr` enum reuses the field name
+//     "value" across MANY variants at DIFFERENT types (`IntLit.value: Int`, `StringLit.value:
+//     String`, `BoolLit.value: Bool`, ...). The checker's `check_match` and codegen's own `Match`/
+//     `gen_variant_construct` all used to look field types up in the enum-WIDE union table, which
+//     always resolved to whichever variant registered "value" FIRST (`IntLit`'s `Int`) --
+//     mistyping every OTHER variant's own field, both at CHECK time (spurious "expects Int, got
+//     X" errors) and at CODEGEN time (a wrong `PUTFIELD`/`GETFIELD` descriptor -- a genuine
+//     `VerifyError` risk, not just a compile error). Fixed via a per-variant field table
+//     (`variant_field_info` in `Checker.hotc`, `variant_field_names`/`variant_field_types` in
+//     `Codegen.hotc`), keyed "OwnerName#VariantName" instead of bare variant name.
+enum Wrapped {
+    WInt { value: Int },
+    WStr { value: String },
+    WBool { value: Bool },
+}
+
+fn tag_of(w: Wrapped) -> Int {
+    match w {
+        // Bare, fieldless-STYLE match against variants that actually HAVE fields -- proves the
+        // parser fix (1) independently of proving fix (2): this only tests "no braces required",
+        // not field-type resolution (still uses `_` for those, deliberately not binding fields).
+        WInt => { return 1; }
+        WStr => { return 2; }
+        WBool => { return 3; }
+    }
+}
+
+fn unwrap_str(w: Wrapped) -> String {
+    match w {
+        WStr { value } => { return value; }
+        _ => { return "none"; }
+    }
+}
+
+fn unwrap_bool(w: Wrapped) -> Bool {
+    match w {
+        WBool { value } => { return value; }
+        _ => { return false; }
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let s = WStr { value: "hi" };
+    let bo = WBool { value: true };
+    let i = WInt { value: 99 };
+    var result = tag_of(i) + tag_of(s) + tag_of(bo);
+    // If field-type resolution were still broken, `unwrap_str`'s "value" binding would be
+    // (wrongly) typed `Int`, and comparing it to a `String` literal would be a real checker
+    // error -- this only compiles at all once fix (2) is in place.
+    if unwrap_str(s) == "hi" {
+        result = result + 10;
+    }
+    if unwrap_bool(bo) {
+        result = result + 100;
+    }
+    // result: 1(WInt tag) + 2(WStr tag) + 3(WBool tag) + 10 + 100 = 116.
+    return result + a + b;
+}

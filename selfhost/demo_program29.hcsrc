@@ -1,0 +1,21 @@
+pub static CP_A: Int = 65;
+pub static CP_Z: Int = 90;
+static GREETING: String = "hi";
+
+fn is_upper(cp: Int) -> Bool {
+    return cp >= CP_A && cp <= CP_Z;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var count = 0;
+    if is_upper(CP_A) {
+        count = count + 1;
+    }
+    if is_upper(CP_Z) {
+        count = count + 1;
+    }
+    if is_upper(97) {
+        count = count + 1;
+    }
+    return count + GREETING.length() + CP_A + a + b;
+}

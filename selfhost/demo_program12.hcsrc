@@ -1,0 +1,11 @@
+fn build_message(n: Int) -> String {
+    if n > 5 {
+        return "big";
+    } else {
+        return "small";
+    }
+}
+
+fn main() -> String {
+    return build_message(7);
+}

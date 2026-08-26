@@ -187,6 +187,12 @@ things you can write `for x in ...` over):
   ranges just count an int local.
 - A bare `a..b` outside a `for` header is a compile error — ranges aren't a
   general-purpose value in this language, only a loop header shape.
+- Braces are optional for a single-statement body, on both `for` and `while`
+  (deliberately not `if` — see "`if`/`match` as expressions" below for why a
+  one-liner conditional already has a better answer than a dangling
+  statement): `for x in arr print(x);` and `while cond do_thing();` both
+  work, and nest for free (`for x in xs for y in ys print(x, y);`) since a
+  brace-less body is just one more `statement()`, recursively.
 
 ### Destructors: `impl StructName { fn drop(&mut self) { } }`
 
@@ -1685,7 +1691,11 @@ fn main() {
   declare different modules; each top-level struct/interface/enum is
   qualified into its own declaring file's module, independently. A
   declaration with no `module` line lands in the default (unnamed)
-  module, exactly like a program that never declares one always has.
+  module, exactly like a program that never declares one always has. Harmless for a standalone `hc run`/`hc build` script, but if that
+  class is ever loaded by a real JPMS module system (e.g. embedded in a
+  Forge mod, which runs under a `ModuleClassLoader`), an unqualified
+  default-package class fails to load at all -- give every file meant to
+  be consumed that way a real `module` line.
 - **`pub`** — Rust-style, not Java's four-tier system: private by
   default, `pub` to export. For struct/interface/enum, this is real JVM
   enforcement, not just a checker opinion — a non-`pub` declaration

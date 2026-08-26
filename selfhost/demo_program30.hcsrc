@@ -1,0 +1,19 @@
+enum Color {
+    Red,
+    Green,
+    Blue {},
+    Custom { r: Int, g: Int, b: Int },
+}
+
+fn score(c: Color) -> Int {
+    match c {
+        Red {} => { return 1; }
+        Green {} => { return 2; }
+        Blue {} => { return 3; }
+        Custom { r, g, b } => { return r + g + b; }
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    return score(Red {}) + score(Green {}) + score(Blue {}) + score(Custom { r: 10, g: 20, b: 30 }) + a + b;
+}

@@ -1,0 +1,23 @@
+fn check_greeting(a: Int, b: Int) -> Int {
+    var s1 = "hello";
+    var s2 = "hel" + "lo";
+    if s1 == s2 {
+        return a + b;
+    } else {
+        return 0;
+    }
+}
+
+fn mismatch(a: Int) -> Int {
+    var s1 = "abc";
+    var s2 = "xyz";
+    if s1 != s2 {
+        return a;
+    } else {
+        return -1;
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    return check_greeting(a, b) + mismatch(a);
+}

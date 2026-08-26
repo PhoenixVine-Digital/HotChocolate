@@ -1,0 +1,1088 @@
+module hc.selfhost.parser;
+
+// The self-hosted parser, phase 1 -- see `Ast.hc`'s own header for the exact grammar subset this
+// covers (expressions with full precedence climbing, a minimal statement layer, one `fn`
+// declaration form). Consumes `Lexer.hc`'s `Vec<Token>` output directly (same directory-mode
+// compile, same flat global namespace -- no extern bridging needed between these two files, the
+// whole point of porting both natively).
+//
+// Real finding from building this file, not just the AST it consumes: `==`/`!=` on two `enum`
+// values used to compile as raw reference identity (`IF_ACMPEQ`), not tag/variant comparison --
+// `some_fn() == SomeVariant` was silently `false` even when `some_fn()` genuinely returned that
+// variant, since they're two separately-constructed objects. Fixed at the compiler level (tag
+// comparison, `CodeGen.genBinary`) rather than worked around here with `match`-based dispatch
+// everywhere `check(kind)` is called below -- this is a foundational operation for ANY parser-
+// shaped code (constantly comparing a just-read token's kind against an expected one), not
+// something worth papering over per call site.
+
+extern class JObject3 = "java.lang.Object" {}
+extern class ParseError = "java.lang.RuntimeException" {
+    fn new(msg: String) -> Self;
+}
+extern class JString3 = "java.lang.String" {
+    static fn valueOf(v: Int) -> String;
+}
+
+// Parser-internal only -- the return shape of `one_field_binding` (HC has no tuples). Not part of
+// the real AST.
+pub struct FieldBinding {
+    field: String,
+    bind: String,
+}
+
+pub struct Parser {
+    tokens: Vec<Token>,
+    pos: Int,
+    // Set while parsing an `if`/`while` condition -- disambiguates `if n { ... }` (bare Bool
+    // condition followed by the `then` block) from `if n { f: 1 }` (which would otherwise parse
+    // as a struct-literal condition swallowing the real block's own `{`). Same restriction real
+    // languages with this exact ambiguity (Rust, Go) apply; see `primary`'s own use of it.
+    no_struct_lit: Bool,
+}
+
+pub fn parser_new(tokens: Vec<Token>) -> Parser {
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false };
+}
+
+impl Parser {
+    fn peek(&self) -> Token {
+        return self.tokens.get(self.pos);
+    }
+
+    // Non-consuming 3-token lookahead from the current `LT` -- see `primary`'s own use of it for
+    // why this stays a bounded peek rather than real backtracking.
+    fn looks_like_generic_lit(&self) -> Bool {
+        if self.pos + 3 >= self.tokens.length() { return false; }
+        let t1 = self.tokens.get(self.pos + 1);
+        if t1.kind != IDENT { return false; }
+        let t2 = self.tokens.get(self.pos + 2);
+        if t2.kind != GT { return false; }
+        let t3 = self.tokens.get(self.pos + 3);
+        return t3.kind == LBRACE;
+    }
+
+    // Non-consuming 5-token lookahead from the current `LT`, for the explicitly-qualified generic-
+    // enum-variant construction form `Base<Arg>::Variant { ... }` (see `Ast.hc`'s own `EnumDecl`
+    // header) -- same bounded-peek approach `looks_like_generic_lit` uses, diverging from it only
+    // at token 3 (`COLONCOLON` here vs `LBRACE` there), so the two are mutually exclusive and
+    // either check can run first.
+    fn looks_like_generic_variant(&self) -> Bool {
+        if self.pos + 5 >= self.tokens.length() { return false; }
+        let t1 = self.tokens.get(self.pos + 1);
+        if t1.kind != IDENT { return false; }
+        let t2 = self.tokens.get(self.pos + 2);
+        if t2.kind != GT { return false; }
+        let t3 = self.tokens.get(self.pos + 3);
+        if t3.kind != COLONCOLON { return false; }
+        let t4 = self.tokens.get(self.pos + 4);
+        if t4.kind != IDENT { return false; }
+        let t5 = self.tokens.get(self.pos + 5);
+        return t5.kind == LBRACE;
+    }
+
+    fn peek_kind(&self) -> TokType {
+        let t = self.peek();
+        return t.kind;
+    }
+
+    fn check(&self, kind: TokType) -> Bool {
+        return self.peek_kind() == kind;
+    }
+
+    fn advance(&mut self) -> Token {
+        let t = self.peek();
+        self.pos = self.pos + 1;
+        return t;
+    }
+
+    fn match_kind(&mut self, kind: TokType) -> Bool {
+        if self.check(kind) {
+            self.advance();
+            return true;
+        }
+        return false;
+    }
+
+    fn expect(&mut self, kind: TokType) -> Token {
+        if self.check(kind) {
+            return self.advance();
+        }
+        let t = self.peek();
+        throw ParseError::new("Parse error at line " + JString3::valueOf(t.line) + ": unexpected token '" + t.text + "'");
+    }
+
+    // === Expressions, full precedence chain, weakest to strongest ===
+
+    fn expression(&mut self) -> Expr {
+        return self.assignment();
+    }
+
+    fn assignment(&mut self) -> Expr {
+        let expr = self.logical_or();
+        // `return expr;` lives inside the `else`, not after the whole `if`, deliberately -- the
+        // checker's move-checking is conservative about `if`/`else` by design (moved on either
+        // side counts as moved afterward), so a bare `return expr;` positioned AFTER this `if`
+        // would see `expr` as "possibly already moved" by the `if let` below, even on the branch
+        // that never reaches it. Same restructuring `Lexer.hotc`'s own `tokenize()` already
+        // needed for the same underlying reason, one level up (`if`, not `while`, this time).
+        if self.check(EQ) {
+            self.advance();
+            let value = self.assignment();
+            match expr {
+                Ident { name } => { return Assign { name: name, value: value }; }
+                FieldAccess { obj, field } => { return FieldAssign { obj: obj, field: field, value: value }; }
+                Index { arr, index } => { return IndexAssign { arr: arr, index: index, value: value }; }
+                _ => { throw ParseError::new("Invalid assignment target"); }
+            }
+        } else {
+            return expr;
+        }
+    }
+
+    fn logical_or(&mut self) -> Expr {
+        var expr = self.logical_and();
+        while self.check(PIPEPIPE) {
+            self.advance();
+            expr = Binary { op: "||", left: expr, right: self.logical_and() };
+        }
+        return expr;
+    }
+
+    fn logical_and(&mut self) -> Expr {
+        var expr = self.equality();
+        while self.check(AMPAMP) {
+            self.advance();
+            expr = Binary { op: "&&", left: expr, right: self.equality() };
+        }
+        return expr;
+    }
+
+    fn equality(&mut self) -> Expr {
+        var expr = self.comparison();
+        while self.check(EQEQ) || self.check(BANGEQ) {
+            let op = self.advance().text;
+            expr = Binary { op: op, left: expr, right: self.comparison() };
+        }
+        return expr;
+    }
+
+    fn comparison(&mut self) -> Expr {
+        var expr = self.term();
+        while self.check(LT) || self.check(LTEQ) || self.check(GT) || self.check(GTEQ) {
+            let op = self.advance().text;
+            expr = Binary { op: op, left: expr, right: self.term() };
+        }
+        return expr;
+    }
+
+    fn term(&mut self) -> Expr {
+        var expr = self.factor();
+        while self.check(PLUS) || self.check(MINUS) {
+            let op = self.advance().text;
+            expr = Binary { op: op, left: expr, right: self.factor() };
+        }
+        return expr;
+    }
+
+    fn factor(&mut self) -> Expr {
+        var expr = self.unary();
+        while self.check(STAR) || self.check(SLASH) || self.check(PERCENT) {
+            let op = self.advance().text;
+            expr = Binary { op: op, left: expr, right: self.unary() };
+        }
+        return expr;
+    }
+
+    fn unary(&mut self) -> Expr {
+        if self.check(BANG) || self.check(MINUS) {
+            let op = self.advance().text;
+            return Unary { op: op, expr: self.unary() };
+        }
+        // `&expr`/`&mut expr` (real `Codegen.hotc` usage: `self.mv.visitJumpInsn(153,
+        // &else_label)`, passing a local by reference to an extern method param declared `&Type`)
+        // -- a TRANSPARENT no-op wrapper, not a real tracked "reference" AST node the way the real
+        // compiler's own `Expr.Borrow` is: this subset has no borrow-checking at all (same
+        // "accepted but not distinguished" simplification `self_receiver`'s own `&`/`mut` handling
+        // already makes, and the exact same treatment `type_name_ref` now gives a PARAM's `&Type`
+        // annotation -- see that fn's own header). The JVM has no real notion of "reference to a
+        // reference" anyway -- a `Label` value already IS a reference, so `&expr` and `expr`
+        // compile to identical bytecode either way.
+        if self.check(AMP) {
+            self.advance();
+            if self.check(MUT) { self.advance(); }
+            return self.unary();
+        }
+        return self.cast();
+    }
+
+    // `expr as Type` -- a real gap found self-compiling `Lexer.hotc` (`JLong::parseLong(...) as
+    // Int`). Chains at the same precedence real Kotlin/HC give it -- tighter than arithmetic,
+    // looser than a bare primary/call/field-access chain, so `x as Int + 1` parses as `(x as Int)
+    // + 1`, not `x as (Int + 1)`. See `Ast.hc`'s own `Cast` header for the deliberately narrow
+    // scope (no cast-legality checking, `Long` not a general first-class primitive).
+    fn cast(&mut self) -> Expr {
+        var expr = self.call_or_primary();
+        while self.check(AS) {
+            self.advance();
+            let target_type = self.type_name_ref();
+            expr = Cast { expr: expr, target_type: target_type };
+        }
+        return expr;
+    }
+
+    // Scoped subset of the real `callOrPrimary`: a bare-identifier call (`name(args)`), field
+    // access (`.field`), and method calls (`.method(args)`) chain freely off any primary
+    // expression, left to right.
+    fn call_or_primary(&mut self) -> Expr {
+        var expr = self.primary();
+        while true {
+            if self.check(LPAREN) {
+                if let Ident { name } = expr {
+                    self.advance();
+                    let args = self.arg_list();
+                    expr = Call { callee: name, args: args };
+                } else {
+                    throw ParseError::new("Only named functions can be called");
+                }
+            } else if self.check(DOT) {
+                self.advance();
+                let field = self.expect(IDENT).text;
+                if self.check(LPAREN) {
+                    self.advance();
+                    let args = self.arg_list();
+                    expr = MethodCall { recv: expr, method: field, args: args };
+                } else {
+                    expr = FieldAccess { obj: expr, field: field };
+                }
+            } else if self.check(LBRACKET) {
+                self.advance();
+                let idx = self.expression();
+                self.expect(RBRACKET);
+                expr = Index { arr: expr, index: idx };
+            } else {
+                return expr;
+            }
+        }
+    }
+
+    fn arg_list(&mut self) -> Vec<Expr> {
+        if self.check(RPAREN) {
+            self.advance();
+            return empty_expr_vec();
+        }
+        var args = vec_of(self.expression());
+        while self.match_kind(COMMA) {
+            if self.check(RPAREN) { break; }
+            args.push(self.expression());
+        }
+        self.expect(RPAREN);
+        return args;
+    }
+
+    fn primary(&mut self) -> Expr {
+        if self.check(INT) {
+            let t = self.advance();
+            return IntLit { value: parse_int(t.text) };
+        }
+        if self.check(STRING) {
+            let t = self.advance();
+            return StringLit { value: t.text };
+        }
+        if self.check(TRUE) {
+            self.advance();
+            return BoolLit { value: true };
+        }
+        if self.check(FALSE) {
+            self.advance();
+            return BoolLit { value: false };
+        }
+        if self.check(LPAREN) {
+            self.advance();
+            let inner = self.expression();
+            self.expect(RPAREN);
+            return inner;
+        }
+        if self.check(IDENT) {
+            let t = self.advance();
+            // `Name<Arg> { ... }` -- a generic struct literal. Genuinely ambiguous with `Name <
+            // Arg > { ... }` (a less-than comparison whose result then gets... nothing, that's
+            // not even valid syntax after it, but the *parser* can't know that without deciding
+            // first) -- resolved with a bounded, non-consuming 3-token lookahead
+            // (`looks_like_generic_lit`) rather than true backtracking, so only the exact shape
+            // `< IDENT > {` commits to the generic-literal reading. Single type argument only,
+            // same scope cut `type_name_ref`'s own header discloses for type positions.
+            if self.check(LT) && !self.no_struct_lit && self.looks_like_generic_lit() {
+                self.advance(); // LT
+                let type_arg = self.expect(IDENT).text;
+                self.expect(GT);
+                return self.struct_lit(t.text + "$" + type_arg, none_string());
+            }
+            // `Base<Arg>::Variant { ... }` -- explicitly-qualified generic-enum-variant
+            // construction (see `Ast.hc`'s own `EnumDecl` header for why this can't just be bare
+            // `Variant { ... }` like a non-generic enum's variants). Checked before the plain
+            // `COLONCOLON` branch below so `Option<Int>::Some` doesn't get misread as a
+            // `StaticCall` with `type_name: "Option"` (the `<Int>` would be lost).
+            if self.check(LT) && !self.no_struct_lit && self.looks_like_generic_variant() {
+                self.advance(); // LT
+                let type_arg = self.expect(IDENT).text;
+                self.expect(GT);
+                self.expect(COLONCOLON);
+                let variant_name = self.expect(IDENT).text;
+                return self.struct_lit(variant_name, some_string(t.text + "$" + type_arg));
+            }
+            if self.check(LBRACE) && !self.no_struct_lit {
+                return self.struct_lit(t.text, none_string());
+            }
+            if self.check(COLONCOLON) {
+                self.advance();
+                let method = self.expect(IDENT).text;
+                self.expect(LPAREN);
+                let args = self.arg_list();
+                return StaticCall { type_name: t.text, method: method, args: args };
+            }
+            return Ident { name: t.text };
+        }
+        if self.check(LBRACKET) {
+            return self.array_lit();
+        }
+        let t = self.peek();
+        throw ParseError::new("Parse error at line " + JString3::valueOf(t.line) + ": unexpected token '" + t.text + "'");
+    }
+
+    // `[e1, e2, ...]` -- non-empty only, see `Ast.hc`'s own header.
+    fn array_lit(&mut self) -> Expr {
+        self.expect(LBRACKET);
+        let first = self.expression();
+        // `[value; count]` -- distinguished from `[e1, e2, ...]` by whether a `;` or a `,`/`]`
+        // follows the first expression (see `Ast.hc`'s own `ArrayRepeat` header). An early
+        // `return` inside the `if` here (rather than this exhaustive `if`/`else`) would trip the
+        // move-checker's conservative branch handling -- it doesn't reason about reachability past
+        // a `return`, so code after the `if` using `first` again would see it as still-possibly-
+        // moved even though the two paths are genuinely exclusive (the same trap hit and fixed in
+        // `Checker.hotc`'s own `register_enum`).
+        if self.check(SEMI) {
+            self.advance();
+            let count = self.expression();
+            self.expect(RBRACKET);
+            return ArrayRepeat { value: first, count: count };
+        } else {
+            var elements = vec_of(first);
+            while self.match_kind(COMMA) {
+                if self.check(RBRACKET) { break; }
+                elements.push(self.expression());
+            }
+            self.expect(RBRACKET);
+            return ArrayLit { elements: elements };
+        }
+    }
+
+    // `Name { field: expr, field: expr, ... }` -- `name` is already-consumed (the `IDENT` token
+    // text); called right after `primary` sees `IDENT` immediately followed by `LBRACE`.
+    // `generic_base` is `Some("Option$Int")` when this literal came from the explicitly-qualified
+    // `Base<Arg>::Variant { ... }` form (see `Ast.hc`'s own `EnumDecl` header); `None` otherwise.
+    fn struct_lit(&mut self, name: String, generic_base: Option<String>) -> Expr {
+        self.expect(LBRACE);
+        var field_names = empty_str_vec();
+        var field_values = empty_expr_vec();
+        if !self.check(RBRACE) {
+            let fname0 = self.expect(IDENT).text;
+            self.expect(COLON);
+            let fval0 = self.expression();
+            field_names.push(fname0);
+            field_values.push(fval0);
+            while self.match_kind(COMMA) {
+                if self.check(RBRACE) { break; }
+                let fname = self.expect(IDENT).text;
+                self.expect(COLON);
+                let fval = self.expression();
+                field_names.push(fname);
+                field_values.push(fval);
+            }
+        }
+        self.expect(RBRACE);
+        return StructLit { name: name, field_names: field_names, field_values: field_values, generic_base: generic_base };
+    }
+
+    // === Statements ===
+
+    fn block(&mut self) -> Vec<Stmt> {
+        self.expect(LBRACE);
+        if self.check(RBRACE) {
+            self.advance();
+            return empty_stmt_vec();
+        }
+        var stmts = vec_of(self.statement());
+        while !self.check(RBRACE) {
+            stmts.push(self.statement());
+        }
+        self.expect(RBRACE);
+        return stmts;
+    }
+
+    fn statement(&mut self) -> Stmt {
+        if self.check(LET) || self.check(VAR) {
+            let mutable = self.check(VAR);
+            self.advance();
+            let name = self.expect(IDENT).text;
+            // An explicit `: Type` annotation (`let found: Option<TokType> = ...;` -- a real gap
+            // found self-compiling `Lexer.hotc`) is parsed and discarded, not stored: `Stmt::Let`
+            // has no type field at all (this subset's own `let`/`var` are always inferred from
+            // `init`, see `Ast.hc`'s own header), and every real use of the annotation seen so far
+            // is redundant with what inference already produces on its own (`Registry<TokType>`'s
+            // own `.get()` already returns `Option<TokType>`) -- purely documentation from the
+            // checker's own point of view, same "accepted syntax, no semantic effect" treatment
+            // `pub`/`module` already get elsewhere in this file.
+            if self.check(COLON) {
+                self.advance();
+                self.type_name_ref();
+            }
+            self.expect(EQ);
+            let init = self.expression();
+            self.expect(SEMI);
+            return Let { name: name, mutable: mutable, init: init };
+        }
+        if self.check(RETURN) {
+            self.advance();
+            if self.check(SEMI) {
+                self.advance();
+                return Return { value: none_expr() };
+            }
+            let e = self.expression();
+            self.expect(SEMI);
+            return Return { value: some_expr(e) };
+        }
+        if self.check(IF) {
+            self.advance();
+            if self.check(LET) {
+                return self.if_let_stmt();
+            }
+            self.no_struct_lit = true;
+            let cond = self.expression();
+            self.no_struct_lit = false;
+            let then_body = self.block();
+            if self.match_kind(ELSE) {
+                // `else if ...` desugars to `else { if ... }` -- a one-statement block wrapping
+                // a recursively-parsed `if`, same shape any hand-rolled recursive-descent parser
+                // uses for this (no separate "else-if" AST node needed).
+                if self.check(IF) {
+                    let nested = self.statement();
+                    return If { cond: cond, then_body: then_body, else_body: some_stmt_vec(vec_of(nested)) };
+                } else {
+                    let else_body = self.block();
+                    return If { cond: cond, then_body: then_body, else_body: some_stmt_vec(else_body) };
+                }
+            } else {
+                return If { cond: cond, then_body: then_body, else_body: none_stmt_vec() };
+            }
+        }
+        if self.check(WHILE) {
+            self.advance();
+            self.no_struct_lit = true;
+            let cond = self.expression();
+            self.no_struct_lit = false;
+            let body = self.block();
+            return While { cond: cond, body: body };
+        }
+        if self.check(MATCH) {
+            return self.match_stmt();
+        }
+        if self.check(THROW) {
+            self.advance();
+            let e = self.expression();
+            self.expect(SEMI);
+            return Throw { value: e };
+        }
+        if self.check(BREAK) {
+            self.advance();
+            self.expect(SEMI);
+            return Break {};
+        }
+        if self.check(CONTINUE) {
+            self.advance();
+            self.expect(SEMI);
+            return Continue {};
+        }
+        if self.check(TRY) {
+            return self.try_stmt();
+        }
+        let e = self.expression();
+        self.expect(SEMI);
+        return ExprStmt { expr: e };
+    }
+
+    // `if let VariantName { field, ... } = subject { then_body } [else { else_body }]` --
+    // desugars directly to a two-arm `Match` (the variant arm, plus an implicit `_` wildcard arm
+    // holding `else_body`, or an empty one if there's no `else`) rather than needing its own
+    // separate AST node or Checker/Codegen support -- reuses everything `match` already has.
+    fn if_let_stmt(&mut self) -> Stmt {
+        self.expect(LET);
+        let variant_name = self.expect(IDENT).text;
+        self.expect(LBRACE);
+        var field_names = empty_str_vec();
+        var bind_names = empty_str_vec();
+        if !self.check(RBRACE) {
+            let fb0 = self.one_field_binding();
+            field_names.push(fb0.field);
+            bind_names.push(fb0.bind);
+            while self.match_kind(COMMA) {
+                if self.check(RBRACE) { break; }
+                let fb = self.one_field_binding();
+                field_names.push(fb.field);
+                bind_names.push(fb.bind);
+            }
+        }
+        self.expect(RBRACE);
+        self.expect(EQ);
+        self.no_struct_lit = true;
+        let subject = self.expression();
+        self.no_struct_lit = false;
+        let then_body = self.block();
+        var arms = empty_matcharm_vec();
+        arms.push(MatchArm { variant_name: variant_name, field_names: field_names, bind_names: bind_names, body: then_body });
+        if self.match_kind(ELSE) {
+            let else_body = self.block();
+            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: else_body });
+        } else {
+            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec() });
+        }
+        return Match { subject: subject, arms: arms };
+    }
+
+    // === `match subject { VariantName { field, ... } => { body } ... _ => { body } }` ===
+    fn match_stmt(&mut self) -> Stmt {
+        self.expect(MATCH);
+        self.no_struct_lit = true; // same reasoning as if/while's own condition parsing
+        let subject = self.expression();
+        self.no_struct_lit = false;
+        self.expect(LBRACE);
+        var arms = empty_matcharm_vec();
+        while !self.check(RBRACE) {
+            arms.push(self.match_arm());
+        }
+        self.expect(RBRACE);
+        return Match { subject: subject, arms: arms };
+    }
+
+    // `try { ... } catch (name: Type) { ... }` -- SINGLE catch clause only, see `Ast.hc`'s own
+    // `Try` header for why (the real compiler supports a list; this subset only ever needs to
+    // catch one real exception type at a time).
+    fn try_stmt(&mut self) -> Stmt {
+        self.expect(TRY);
+        let try_block = self.block();
+        self.expect(CATCH);
+        self.expect(LPAREN);
+        let catch_var = self.expect(IDENT).text;
+        self.expect(COLON);
+        let catch_type = self.type_name_ref();
+        self.expect(RPAREN);
+        let catch_block = self.block();
+        return Try { try_block: try_block, catch_var: catch_var, catch_type: catch_type, catch_block: catch_block };
+    }
+
+    // `field` or `field: localName` -- returns the declared field name and the local binding name
+    // (the rename target if given, else the same name). Shared by `match_arm` and `if_let_stmt`,
+    // both of which parse this exact same field-binding shape. See `Ast.hc`'s own `MatchArm`
+    // header. Returns a small struct rather than taking `&mut Vec<String>` out-params -- HC has no
+    // tuples, and this keeps the same "return a real value" shape every other parser helper in
+    // this file already uses, rather than introducing an untested mutable-out-param pattern.
+    fn one_field_binding(&mut self) -> FieldBinding {
+        let fname = self.expect(IDENT).text;
+        if self.match_kind(COLON) {
+            let bname = self.expect(IDENT).text;
+            return FieldBinding { field: fname, bind: bname };
+        } else {
+            return FieldBinding { field: fname, bind: fname };
+        }
+    }
+
+    fn match_arm(&mut self) -> MatchArm {
+        let head = self.expect(IDENT).text;
+        if head == "_" {
+            self.expect(FATARROW);
+            let body = self.block();
+            return MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body };
+        }
+        // The `{ ... }` field-binding list is OPTIONAL, not required -- a fieldless variant can be
+        // matched bare (`TyInt => { ... }`, no braces at all), real `Checker.hotc` usage
+        // (`ty_name`'s own match over `Ty`) found self-compiling it. Mirrors the real compiler's
+        // own `variantPattern` (`Parser.kt`), which only consumes bindings `if (match(LBRACE))` in
+        // the first place -- this subset had turned that "only if present" into "always required".
+        var field_names = empty_str_vec();
+        var bind_names = empty_str_vec();
+        if self.check(LBRACE) {
+            self.advance();
+            if !self.check(RBRACE) {
+                let fb0 = self.one_field_binding();
+                field_names.push(fb0.field);
+                bind_names.push(fb0.bind);
+                while self.match_kind(COMMA) {
+                    if self.check(RBRACE) { break; }
+                    let fb = self.one_field_binding();
+                    field_names.push(fb.field);
+                    bind_names.push(fb.bind);
+                }
+            }
+            self.expect(RBRACE);
+        }
+        self.expect(FATARROW);
+        let body = self.block();
+        return MatchArm { variant_name: head, field_names: field_names, bind_names: bind_names, body: body };
+    }
+
+    // === One `fn` declaration form: `fn name(params) [-> RetType] { block }` ===
+    // Bare type names only (no arrays/refs/generics) -- see this file's own header.
+
+    fn param_list(&mut self) -> Vec<Param> {
+        self.expect(LPAREN);
+        if self.check(RPAREN) {
+            self.advance();
+            return empty_param_vec();
+        }
+        var params = vec_of(self.one_param());
+        while self.match_kind(COMMA) {
+            if self.check(RPAREN) { break; }
+            params.push(self.one_param());
+        }
+        self.expect(RPAREN);
+        return params;
+    }
+
+    // Bare `Ident` type names, `[Ident]` for a (single-level, non-nested) array type, or
+    // `Name<Arg>` for a single-type-parameter generic instantiation -- all represented as plain
+    // strings throughout `Checker.hotc`/`Codegen.hotc`, the same "everything is a type-name
+    // string" convention every other type already uses. A generic instantiation's *own* string
+    // form is `"Base$Arg"` (`$` specifically because it can never appear in a real HC identifier
+    // -- see the lexer's own identifier rules -- so it's unambiguous with a real user-written
+    // name containing `_`, which `_` itself wouldn't be). Recursion here (`type_name_ref` calling
+    // itself for the type argument) supports nested generics fine in *this* position (`Vec<T>` as
+    // a field type, say) since there's no ambiguity with the `<`/`>` comparison operators the way
+    // there is in expression position -- see `primary`'s own, much more restricted, single-level
+    // handling of `Name<Arg> { ... }` construction syntax.
+    fn type_name_ref(&mut self) -> String {
+        // A leading `&`/`&mut` on a REGULAR (non-`self`) param's type (`label: &Label`, `cw: &mut
+        // ClassWriter2` -- real `Codegen.hotc` extern-method usage, a genuine gap found self-
+        // compiling it) is accepted but not distinguished, same as `self_receiver`'s own `&`/`mut`
+        // handling right above in this file (this subset has no borrow-checking at all either
+        // way).
+        if self.check(AMP) {
+            self.advance();
+            if self.check(MUT) { self.advance(); }
+        }
+        if self.check(LBRACKET) {
+            self.advance();
+            let inner = self.expect(IDENT).text;
+            self.expect(RBRACKET);
+            return "[" + inner + "]";
+        }
+        let base = self.expect(IDENT).text;
+        if self.check(LT) {
+            self.advance();
+            let arg = self.type_name_ref();
+            self.expect(GT);
+            return base + "$" + arg;
+        }
+        return base;
+    }
+
+    fn one_param(&mut self) -> Param {
+        let name = self.expect(IDENT).text;
+        self.expect(COLON);
+        let type_name = self.type_name_ref();
+        return Param { name: name, type_name: type_name };
+    }
+
+    fn fn_decl(&mut self) -> FnDecl {
+        self.expect(FN);
+        let name = self.expect(IDENT).text;
+        var type_param = none_string();
+        if self.match_kind(LT) {
+            let tp = self.expect(IDENT).text;
+            self.expect(GT);
+            type_param = some_string(tp);
+        }
+        let params = self.param_list();
+        var ret_type = none_string();
+        if self.match_kind(ARROW) {
+            ret_type = some_string(self.type_name_ref());
+        }
+        let body = self.block();
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: type_param };
+    }
+
+    // === One `struct` declaration form: `struct Name { field: Type, field: Type, ... }` ===
+    fn struct_fields(&mut self) -> Vec<Param> {
+        self.expect(LBRACE);
+        if self.check(RBRACE) {
+            self.advance();
+            return empty_param_vec();
+        }
+        var fields = vec_of(self.one_param());
+        while self.match_kind(COMMA) {
+            if self.check(RBRACE) { break; }
+            fields.push(self.one_param());
+        }
+        self.expect(RBRACE);
+        return fields;
+    }
+
+    fn struct_decl(&mut self) -> StructDecl {
+        self.expect(STRUCT);
+        let name = self.expect(IDENT).text;
+        var type_param = none_string();
+        if self.match_kind(LT) {
+            let tp = self.expect(IDENT).text;
+            self.expect(GT);
+            type_param = some_string(tp);
+        }
+        let fields = self.struct_fields();
+        return StructDecl { name: name, type_param: type_param, fields: fields };
+    }
+
+    // === `impl Name { fn method(self[, ...]) [-> Ret] { block } ... }` ===
+    // `self`/`&self`/`&mut self` -- the `&`/`mut` markers are accepted but not distinguished
+    // (this subset has no borrow-checking at all); required as the literal first parameter of
+    // every method, and NOT added to the returned `FnDecl.params` (see `Ast.hc`'s own header).
+    fn self_receiver(&mut self) {
+        if self.check(AMP) {
+            self.advance();
+            if self.check(MUT) { self.advance(); }
+        }
+        let t = self.expect(IDENT);
+        if t.text != "self" {
+            throw ParseError::new("expected 'self' as the first parameter of an impl method, got '" + t.text + "'");
+        }
+    }
+
+    fn method_decl(&mut self) -> FnDecl {
+        self.expect(FN);
+        let name = self.expect(IDENT).text;
+        self.expect(LPAREN);
+        self.self_receiver();
+        var params = empty_param_vec();
+        while self.match_kind(COMMA) {
+            if self.check(RPAREN) { break; }
+            params.push(self.one_param());
+        }
+        self.expect(RPAREN);
+        var ret_type = none_string();
+        if self.match_kind(ARROW) {
+            ret_type = some_string(self.type_name_ref());
+        }
+        let body = self.block();
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string() };
+    }
+
+    // `static fn name(...) -> Ret { body }` -- no `self`, plain params like a top-level `fn`.
+    fn static_method_decl(&mut self) -> FnDecl {
+        self.expect(STATIC);
+        self.expect(FN);
+        let name = self.expect(IDENT).text;
+        let params = self.param_list();
+        var ret_type = none_string();
+        if self.match_kind(ARROW) {
+            ret_type = some_string(self.type_name_ref());
+        }
+        let body = self.block();
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string() };
+    }
+
+    // `impl Box<T> { ... }` -- the `<T>` (matching the struct's own declared type parameter) is
+    // parsed and discarded, not stored on `ImplDecl` itself: the struct's own registered
+    // `type_param` (already known via `structs: Vec<StructDecl>`) is what governs what `T` means
+    // inside these methods, so there's nothing new to remember here beyond consuming the syntax
+    // (see `Checker.hotc`'s own `generic_method_templates` header).
+    fn impl_decl(&mut self) -> ImplDecl {
+        self.expect(IMPL);
+        let struct_name = self.expect(IDENT).text;
+        if self.match_kind(LT) {
+            self.expect(IDENT);
+            self.expect(GT);
+        }
+        self.expect(LBRACE);
+        var methods = empty_fn_decl_vec();
+        var static_methods = empty_fn_decl_vec();
+        while !self.check(RBRACE) {
+            if self.check(STATIC) {
+                static_methods.push(self.static_method_decl());
+            } else {
+                methods.push(self.method_decl());
+            }
+        }
+        self.expect(RBRACE);
+        return ImplDecl { struct_name: struct_name, methods: methods, static_methods: static_methods };
+    }
+
+    // === `enum Name { Variant1 { field: Type, ... }, Variant2 {}, ... }` ===
+    // Every variant needs explicit `{ }` even with no fields -- see `Ast.hc`'s own header.
+    // A bare fieldless variant (`Foo,` or a trailing `Foo` before `}`, no `{ }` at all) is now
+    // also accepted -- a real gap found attempting to self-compile the compiler's OWN `Lexer.hotc`,
+    // whose own `TokType` enum declares dozens of variants this exact bare way (`INT, LONG,
+    // FLOAT, ...`). Purely a parsing convenience: `EnumVariant.fields` was already an ordinary
+    // (possibly empty) `Vec<Param>` for the explicit `Foo {}` form, so nothing downstream
+    // (`Checker.hotc`/`Codegen.hotc`) needed any change at all -- an empty fields vec behaves
+    // identically either way.
+    fn enum_variant(&mut self) -> EnumVariant {
+        let name = self.expect(IDENT).text;
+        if self.check(LBRACE) {
+            let fields = self.struct_fields();
+            return EnumVariant { name: name, fields: fields };
+        } else {
+            return EnumVariant { name: name, fields: empty_param_vec() };
+        }
+    }
+
+    fn enum_decl(&mut self) -> EnumDecl {
+        self.expect(ENUM);
+        let name = self.expect(IDENT).text;
+        var type_param = none_string();
+        if self.match_kind(LT) {
+            let tp = self.expect(IDENT).text;
+            self.expect(GT);
+            type_param = some_string(tp);
+        }
+        self.expect(LBRACE);
+        var variants = empty_variant_vec();
+        if !self.check(RBRACE) {
+            variants.push(self.enum_variant());
+            while self.match_kind(COMMA) {
+                if self.check(RBRACE) { break; }
+                variants.push(self.enum_variant());
+            }
+        }
+        self.expect(RBRACE);
+        return EnumDecl { name: name, variants: variants, type_param: type_param };
+    }
+
+    // === `extern class Alias = "binary/Name" { fn new(...) -> Self; fn m(&self, ...) -> Ret;
+    // static fn s(...) -> Ret; } ===
+    // Lookahead-only (restores `self.pos` before returning either way) -- tells whether the
+    // UPCOMING tokens are a `self`/`&self`/`&mut self` receiver, without committing to consuming
+    // them. Needed because an extern method's `static` keyword is OPTIONAL, not required, for a
+    // method with no receiver at all (real `Codegen.hotc` usage: `CodegenShim`'s own methods,
+    // e.g. `fn visitInstanceField(cw: &mut ClassWriter2, ...);`, take a plain named first param,
+    // never `self`, and are never marked `static` either -- they're invoked via `Alias::method(
+    // args)` static-call syntax regardless, same as if `static` HAD been written). `extern_method`
+    // needs to know WHICH shape it's looking at before it can decide whether to call
+    // `self_receiver()` or just parse an ordinary param list.
+    fn looks_like_self_receiver(&mut self) -> Bool {
+        let saved_pos = self.pos;
+        if self.check(AMP) {
+            self.advance();
+            if self.check(MUT) { self.advance(); }
+        }
+        var is_self = false;
+        if self.check(IDENT) {
+            if self.peek().text == "self" { is_self = true; }
+        }
+        self.pos = saved_pos;
+        return is_self;
+    }
+
+    fn extern_method(&mut self) -> ExternMethod {
+        let is_static_kw = self.match_kind(STATIC);
+        self.expect(FN);
+        let name = self.expect(IDENT).text;
+        self.expect(LPAREN);
+        let is_ctor = name == "new";
+        var params = empty_param_vec();
+        var is_static = is_static_kw;
+        var takes_self = false;
+        if !is_static_kw && !is_ctor && self.looks_like_self_receiver() {
+            takes_self = true;
+        }
+        if takes_self {
+            self.self_receiver();
+            while self.match_kind(COMMA) {
+                if self.check(RPAREN) { break; }
+                params.push(self.one_param());
+            }
+        } else {
+            // No receiver at all -- implicitly static (callable via `Alias::method(args)`) even
+            // without the `static` keyword, UNLESS this is a constructor (`is_ctor` already
+            // dispatches through its own `NEW`/`INVOKESPECIAL` codegen path, not
+            // INVOKESTATIC/INVOKEVIRTUAL, so it isn't really "static" in that sense either way).
+            if !is_ctor { is_static = true; }
+            if !self.check(RPAREN) {
+                params.push(self.one_param());
+                while self.match_kind(COMMA) {
+                    if self.check(RPAREN) { break; }
+                    params.push(self.one_param());
+                }
+            }
+        }
+        self.expect(RPAREN);
+        var ret_type = "Unit";
+        if self.match_kind(ARROW) {
+            ret_type = self.type_name_ref(); // "Self" just reads as the literal string "Self"; no keyword needed
+        }
+        self.expect(SEMI);
+        return ExternMethod { name: name, params: params, ret_type: ret_type, is_static: is_static, is_ctor: is_ctor };
+    }
+
+    fn extern_class_decl(&mut self) -> ExternClassDecl {
+        self.expect(EXTERN);
+        self.expect(CLASS);
+        let name = self.expect(IDENT).text;
+        self.expect(EQ);
+        let binary_name = self.expect(STRING).text;
+        self.expect(LBRACE);
+        var methods = empty_extern_method_vec();
+        while !self.check(RBRACE) {
+            methods.push(self.extern_method());
+        }
+        self.expect(RBRACE);
+        return ExternClassDecl { name: name, binary_name: binary_name, methods: methods };
+    }
+
+    // === Top level: a whole source file is zero or more `fn`/`struct`/`impl`/`enum`/`extern`
+    // declarations ===
+    fn parse_program(&mut self) -> Program {
+        var fns = empty_fn_decl_vec();
+        var structs = empty_struct_decl_vec();
+        var impls = empty_impl_decl_vec();
+        var enums = empty_enum_decl_vec();
+        var externs = empty_extern_class_vec();
+        var statics = empty_static_decl_vec();
+        while !self.check(EOF) {
+            // Same "parsed, not enforced" treatment as `pub` -- this subset only ever compiles
+            // one file at a time, so there's no cross-module resolution for a `module` name to
+            // participate in. Consumes `module a.b.c;` (one or more dot-separated segments).
+            if self.check(MODULE) {
+                self.advance();
+                self.expect(IDENT);
+                while self.match_kind(DOT) {
+                    self.expect(IDENT);
+                }
+                self.expect(SEMI);
+                continue;
+            }
+            // Visibility isn't tracked or enforced at all this phase -- this subset only ever
+            // compiles one file at a time (no cross-module resolution to gate), so `pub` is
+            // parsed purely so real HC source that uses it doesn't fail to parse; consumed and
+            // otherwise ignored.
+            self.match_kind(PUB);
+            if self.check(STRUCT) {
+                structs.push(self.struct_decl());
+            } else if self.check(IMPL) {
+                impls.push(self.impl_decl());
+            } else if self.check(ENUM) {
+                enums.push(self.enum_decl());
+            } else if self.check(EXTERN) {
+                externs.push(self.extern_class_decl());
+            } else if self.check(STATIC) {
+                statics.push(self.static_decl());
+            } else {
+                fns.push(self.fn_decl());
+            }
+        }
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics };
+    }
+
+    // `pub static NAME: Type = expr;` -- see `Ast.hc`'s own `StaticDecl` header. Unambiguous with
+    // an impl block's own `static fn ...` (that `static` only ever appears immediately after
+    // `impl Name { ` or between two methods inside one, never at the top level of the program).
+    fn static_decl(&mut self) -> StaticDecl {
+        self.expect(STATIC);
+        let name = self.expect(IDENT).text;
+        self.expect(COLON);
+        let type_name = self.type_name_ref();
+        self.expect(EQ);
+        let value = self.expression();
+        self.expect(SEMI);
+        return StaticDecl { name: name, type_name: type_name, value: value };
+    }
+}
+
+fn empty_fn_decl_vec() -> Vec<FnDecl> {
+    var v = vec_of(FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_struct_decl_vec() -> Vec<StructDecl> {
+    var v = vec_of(StructDecl { name: "_", type_param: none_string(), fields: empty_param_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_impl_decl_vec() -> Vec<ImplDecl> {
+    var v = vec_of(ImplDecl { struct_name: "_", methods: empty_fn_decl_vec(), static_methods: empty_fn_decl_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_str_vec() -> Vec<String> {
+    var v = vec_of("__init__");
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_variant_vec() -> Vec<EnumVariant> {
+    var v = vec_of(EnumVariant { name: "_", fields: empty_param_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_enum_decl_vec() -> Vec<EnumDecl> {
+    var v = vec_of(EnumDecl { name: "_", variants: empty_variant_vec(), type_param: none_string() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_matcharm_vec() -> Vec<MatchArm> {
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_extern_method_vec() -> Vec<ExternMethod> {
+    var v = vec_of(ExternMethod { name: "_", params: empty_param_vec(), ret_type: "Unit", is_static: false, is_ctor: false });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_extern_class_vec() -> Vec<ExternClassDecl> {
+    var v = vec_of(ExternClassDecl { name: "_", binary_name: "_", methods: empty_extern_method_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_static_decl_vec() -> Vec<StaticDecl> {
+    var v = vec_of(StaticDecl { name: "_", type_name: "_", value: IntLit { value: 0 } });
+    return Vec { data: v.data, len: 0 };
+}
+
+// Small helpers standing in for real `[]`-empty-array-literal / generic-type-inference support
+// this phase doesn't need to solve -- `vec_of` needs a real first element to infer `T` from, so
+// an empty starting `Vec` needs its element pushed onto a throwaway one instead. `Option<T>`'s
+// `Some`/`None` constructors need `T` inferrable the same way -- these fns just give the checker
+// a call site with a concrete `T` already on hand.
+fn empty_expr_vec() -> Vec<Expr> {
+    var v = vec_of(IntLit { value: 0 });
+    return Vec { data: v.data, len: 0 };
+}
+fn empty_stmt_vec() -> Vec<Stmt> {
+    var v = vec_of(ExprStmt { expr: IntLit { value: 0 } });
+    return Vec { data: v.data, len: 0 };
+}
+fn empty_param_vec() -> Vec<Param> {
+    var v = vec_of(Param { name: "_", type_name: "_" });
+    return Vec { data: v.data, len: 0 };
+}
+fn none_expr() -> Option<Expr> {
+    var v = vec_of(Some { value: IntLit { value: 0 } });
+    return None;
+}
+fn some_expr(e: Expr) -> Option<Expr> {
+    return Some { value: e };
+}
+fn none_stmt_vec() -> Option<Vec<Stmt>> {
+    return None;
+}
+fn some_stmt_vec(v: Vec<Stmt>) -> Option<Vec<Stmt>> {
+    return Some { value: v };
+}
+fn none_string() -> Option<String> {
+    return None;
+}
+fn some_string(s: String) -> Option<String> {
+    return Some { value: s };
+}
+
+extern class JInt = "java.lang.Integer" {
+    static fn parseInt(s: String) -> Int;
+}
+fn parse_int(s: String) -> Int {
+    return JInt::parseInt(s);
+}

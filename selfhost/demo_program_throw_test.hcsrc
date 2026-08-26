@@ -1,0 +1,6 @@
+fn combo(a: Int, b: Int) -> Int {
+    if a > 0 {
+        throw "a was positive";
+    }
+    return 0;
+}

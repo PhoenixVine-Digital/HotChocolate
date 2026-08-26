@@ -1,0 +1,23 @@
+enum Opt2 {
+    Some { value: Int },
+    None {},
+}
+
+fn unwrap_or(o: Opt2, fallback: Int) -> Int {
+    var result = fallback;
+    if let Some { value: v } = o {
+        result = v;
+    }
+    return result;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let some_val = Some { value: 41 };
+    let none_val = None {};
+    var total = unwrap_or(some_val, -1) + unwrap_or(none_val, -1);
+    match some_val {
+        Some { value: v2 } => { total = total + v2; }
+        None {} => {}
+    }
+    return total + a + b;
+}

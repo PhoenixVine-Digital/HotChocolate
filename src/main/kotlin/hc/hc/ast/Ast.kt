@@ -67,11 +67,27 @@ data class StructDecl(
     val annotations: List<AnnotationUse> = emptyList(),
     val sourceUnit: String? = null,
     val serializable: Boolean = false,
+    val docComment: DocComment? = null,
 )
 
 data class AnnotationUse(val binaryName: String, val args: List<Pair<String, AnnotationValue>>, val line: Int)
 
 data class EntryDirective(val target: String, val args: List<Pair<String, AnnotationValue>>, val line: Int)
+
+data class DocComment(
+    val summary: String,
+    val params: List<Pair<String, String>>,
+    val returns: String?,
+    val examples: List<String>,
+    val warnings: List<String>,
+    val sees: List<DocSeeRef>,
+    val deprecated: String?,
+    val line: Int,
+)
+
+data class DocSeeRef(val target: String, val line: Int) {
+    var resolved: Boolean = false
+}
 sealed class AnnotationValue {
     data class Str(val value: String) : AnnotationValue()
 
@@ -96,6 +112,11 @@ data class FnDecl(
 
     val sourceUnit: String? = null,
     val entry: EntryDirective? = null,
+
+    val mustUse: Boolean = false,
+    val docComment: DocComment? = null,
+
+    val dev: Boolean = false,
 )
 data class Param(val name: String, val type: TypeRef)
 
@@ -118,12 +139,22 @@ sealed class Stmt {
     data class Let(val name: String, val mutable: Boolean, val declType: TypeRef?, val init: Expr, val line: Int) : Stmt()
     data class ExprStmt(val expr: Expr) : Stmt()
     data class If(val cond: Expr, val thenB: Block, val elseB: Block?) : Stmt()
+
+    data class DevIf(val thenB: Block, val elseB: Block?, val line: Int) : Stmt()
     data class While(val cond: Expr, val body: Block) : Stmt()
 
     data class For(val varName: String, val iterable: Expr, val body: Block, val line: Int) : Stmt()
     data class Return(val expr: Expr?, val line: Int) : Stmt() {
 
         var varsToDropBeforeReturn: List<String> = emptyList()
+    }
+
+    data class Break(val line: Int) : Stmt() {
+        var varsToDropBeforeBreak: List<String> = emptyList()
+    }
+
+    data class Continue(val line: Int) : Stmt() {
+        var varsToDropBeforeContinue: List<String> = emptyList()
     }
     data class Nested(val block: Block) : Stmt()
 
@@ -133,7 +164,8 @@ sealed class Stmt {
 
     data class Throw(val expr: Expr, val line: Int) : Stmt()
 }
-data class MatchArm(val variantName: String?, val bindings: List<String>, val body: Block, val line: Int)
+
+data class MatchArm(val variantName: String?, val bindings: List<String>, val body: Block, val line: Int, val literal: Expr? = null)
 
 data class CatchClause(val varName: String, val exceptionType: TypeRef, val body: Block, val line: Int) {
     var resolvedTy: Ty? = null
@@ -170,7 +202,12 @@ sealed class Expr {
 
         var externGetterMethod: String? = null
     }
-    data class FieldAssign(val obj: Expr, val field: String, val value: Expr, val line: Int) : Expr()
+    data class FieldAssign(val obj: Expr, val field: String, val value: Expr, val line: Int) : Expr() {
+
+        var externSetterMethod: String? = null
+
+        var externSetterRetTy: Ty? = null
+    }
 
     data class StructLit(val typeName: String, val fields: List<Pair<String, Expr>>, val line: Int) : Expr() {
         var enumVariant: String? = null
@@ -185,6 +222,7 @@ sealed class Expr {
         var isStaticExtern: Boolean = false
 
         var isExternInterface: Boolean = false
+        var isEnumOrdinal: Boolean = false
     }
 
     data class StaticFieldGet(val typeName: String, val field: String, val line: Int) : Expr()
@@ -199,8 +237,8 @@ sealed class Expr {
     data class IndexAssign(val arr: Expr, val index: Expr, val value: Expr, val line: Int) : Expr()
     
     data class ArenaNew(val structName: String, val count: Expr, val line: Int) : Expr()
-    
-    data class Range(val start: Expr, val end: Expr, val line: Int) : Expr()
+
+    data class Range(val start: Expr, val end: Expr, val line: Int, val inclusive: Boolean = false) : Expr()
 
     data class If(val cond: Expr, val thenB: Block, val elseB: Block, val line: Int) : Expr()
 

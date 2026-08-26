@@ -1,0 +1,51 @@
+module net.example.calculator;
+
+fn main() {
+    print("=== HC Calculator ===");
+    print("Type 'quit' as the operator any time to exit.");
+
+    var running = true;
+    while running {
+        print("");
+        print("Enter first number:\n");
+        let a_opt = read_int();
+
+        let _dummy1 = read_string();
+
+        if let Option::Some { value: a } = a_opt {
+            print("Enter operator (+, -, *, /, quit):");
+            let op = read_string();
+
+            if op == "quit" {
+                running = false;
+            } else {
+                print("Enter second number:");
+                let b_opt = read_int();
+
+                let _dummy2 = read_string();
+
+                if let Option::Some { value: b } = b_opt {
+                    match op {
+                        "+" => { print("= {a + b}"); }
+                        "-" => { print("= {a - b}"); }
+                        "*" => { print("= {a * b}"); }
+                        "/" => {
+                            if b == 0 {
+                                print("Error: division by zero.");
+                            } else {
+                                print("= {a / b}");
+                            }
+                        }
+                        _ => { print("Unknown operator '{op}' -- try +, -, *, or /."); }
+                    }
+                } else {
+                    print("That wasn't a valid number.");
+                }
+            }
+        } else {
+            print("That wasn't a valid number.");
+        }
+    }
+
+    print("Goodbye!");
+}

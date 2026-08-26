@@ -40,6 +40,9 @@ private val KEYWORDS = mapOf(
     "override" to TokType.OVERRIDE,
     "null" to TokType.NULL,
     "is" to TokType.IS,
+    "dev" to TokType.DEV,
+    "break" to TokType.BREAK,
+    "continue" to TokType.CONTINUE,
 )
 
 class Lexer(private val src: String) {
@@ -66,8 +69,17 @@ class Lexer(private val src: String) {
             c.isDigit() -> listOf(number(c, startLine))
             c.isLetter() || c == '_' -> listOf(identifier(startLine))
             c == '"' -> string(startLine)
+            c == '/' && peek() == '/' && peekNext() == '/' -> listOf(docComment(startLine))
             else -> listOf(symbol(c, startLine))
         }
+    }
+
+    private fun docComment(startLine: Int): Token {
+        pos += 2 
+        if (peek() == ' ') pos++
+        val start = pos
+        while (!isAtEnd() && peek() != '\n') pos++
+        return Token(TokType.DOC_COMMENT, src.substring(start, pos), startLine)
     }
 
     private fun skipTrivia() {
@@ -76,6 +88,7 @@ class Lexer(private val src: String) {
             when {
                 c == '\n' -> { line++; pos++ }
                 c.isWhitespace() -> pos++
+                c == '/' && peekNext() == '/' && peekAt(2) == '/' && peekAt(3) != '/' -> return 
                 c == '/' && peekNext() == '/' -> {
                     while (!isAtEnd() && peek() != '\n') pos++
                 }
@@ -96,7 +109,7 @@ class Lexer(private val src: String) {
             ',' -> tok(TokType.COMMA, ",")
             ':' -> if (match(':')) tok(TokType.COLONCOLON, "::") else tok(TokType.COLON, ":")
             ';' -> tok(TokType.SEMI, ";")
-            '.' -> if (match('.')) tok(TokType.DOTDOT, "..") else tok(TokType.DOT, ".")
+            '.' -> if (match('.')) (if (match('=')) tok(TokType.DOTDOTEQ, "..=") else tok(TokType.DOTDOT, "..")) else tok(TokType.DOT, ".")
             '+' -> tok(TokType.PLUS, "+")
             '-' -> if (match('>')) tok(TokType.ARROW, "->") else tok(TokType.MINUS, "-")
             '*' -> tok(TokType.STAR, "*")
@@ -228,6 +241,7 @@ class Lexer(private val src: String) {
     private fun isAtEnd() = pos >= src.length
     private fun peek() = if (isAtEnd()) ' ' else src[pos]
     private fun peekNext() = if (pos + 1 >= src.length) ' ' else src[pos + 1]
+    private fun peekAt(offset: Int) = if (pos + offset >= src.length) ' ' else src[pos + offset]
     private fun advance() = src[pos++]
     private fun match(expected: Char): Boolean {
         if (isAtEnd() || src[pos] != expected) return false

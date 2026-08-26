@@ -1,0 +1,74 @@
+struct Vec3<T> {
+    data: [T],
+    len: Int,
+}
+
+impl Vec3<T> {
+    fn push(&mut self, value: T) {
+        if self.len == self.data.length {
+            var newCap = self.data.length * 2;
+            if newCap == 0 {
+                newCap = 4;
+            }
+            var newData = [value; newCap];
+            var i = 0;
+            while i < self.len {
+                newData[i] = self.data[i];
+                i = i + 1;
+            }
+            self.data = newData;
+        }
+        self.data[self.len] = value;
+        self.len = self.len + 1;
+    }
+
+    fn get(&self, i: Int) -> T {
+        return self.data[i];
+    }
+
+    fn length(&self) -> Int {
+        return self.len;
+    }
+}
+
+// `vec3_of<T>` uses call-site INFERENCE (not explicit `<Arg>` syntax) specifically because a
+// generic construction site can't spell out a NESTED generic type argument directly
+// (`Vec3<RegEntry<Int>> { ... }` isn't parseable -- `type_name_ref`'s construction-site lookahead
+// only accepts a single bare identifier). Calling `vec3_of(some_reg_entry_int_value)` sidesteps
+// that entirely: `T` is inferred as `"RegEntry$Int"` straight from the argument's own already-
+// computed type, no source-level `<...>` syntax involved.
+fn vec3_of<T>(first: T) -> Vec3<T> {
+    return Vec3<T> { data: [first; 4], len: 1 };
+}
+
+struct RegEntry<T> {
+    key: String,
+    value: T,
+}
+
+// `entries: Vec3<RegEntry<T>>` -- a real 3-level nested generic type reference in a FIELD
+// declaration (`type_name_ref` is naturally recursive, so this parses fine even though
+// construction sites can't write the equivalent literal -- see `vec3_of`'s own header).
+struct Reg<T> {
+    entries: Vec3<RegEntry<T>>,
+}
+
+fn reg_get(r: Reg<Int>, key: String) -> Int {
+    var i = 0;
+    while i < r.entries.length() {
+        let e = r.entries.get(i);
+        if e.key == key {
+            return e.value;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    var v = vec3_of(RegEntry<Int> { key: "x", value: 10 });
+    v.push(RegEntry<Int> { key: "y", value: 20 });
+    v.push(RegEntry<Int> { key: "z", value: 30 });
+    let r = Reg<Int> { entries: v };
+    return reg_get(r, "x") + reg_get(r, "y") + reg_get(r, "z") + a + b;
+}

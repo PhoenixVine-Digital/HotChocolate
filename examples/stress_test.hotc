@@ -1,0 +1,65 @@
+struct Item {
+    id: Int,
+    base_price: Int,
+    quantity: Int,
+}
+
+fn recursive_multiplier(n: Int) -> Int {
+    if n <= 1 {
+        return 1;
+    } else {
+        return n * recursive_multiplier(n - 1);
+    }
+}
+
+fn main() {
+    print("=== HOT CHOCOLATE: FINAL BOSS TEST ===");
+    print("Initializing comprehensive multi-feature evaluation...");
+
+    // 1. Test Recursion & Call Stack (4! = 24)
+    let rec_input = 4;
+    let rec_result = recursive_multiplier(rec_input);
+    print("Recursion Test (Factorial 4): {rec_result}");
+
+    // 2. Test Loops, Mutability, and State Accumulation (Sum 1 to 5 = 15)
+    var accumulator = 0;
+    var counter = 1;
+    while counter <= 5 {
+        accumulator = accumulator + counter;
+        counter = counter + 1;
+    }
+    print("Loop Accumulator (Sum 1 to 5): {accumulator}");
+
+    // 3. Test Data Tables, Structs, and Array Indexing
+    let item1 = Item { id: 10, base_price: 100, quantity: 3 };
+    let item2 = Item { id: 20, base_price: 250, quantity: 2 };
+    let catalog = [item1, item2];
+
+    // 4. Test Nested Scoping, Shadowing, and Complex Branching
+    var total_inventory_value = 0;
+
+    {
+        // Block scope shadowing test
+        let bonus_multiplier = 2;
+        let val1 = (catalog[0].base_price * catalog[0].quantity) * bonus_multiplier;
+        let val2 = (catalog[1].base_price * catalog[1].quantity) * bonus_multiplier;
+        total_inventory_value = val1 + val2;
+    }
+
+    print("Catalog Total Value (with scope multiplier): {total_inventory_value}");
+
+    // 5. Final Multi-Tier Verification Logic
+    if rec_result == 24 {
+        if accumulator == 15 {
+            if total_inventory_value == 1600 {
+                print("BOSS TEST STATUS: ALL SYSTEMS OPERATIONAL!");
+            } else {
+                print("BOSS TEST STATUS: Inventory calculation mismatch.");
+            }
+        } else {
+            print("BOSS TEST STATUS: Loop accumulator mismatch.");
+        }
+    } else {
+        print("BOSS TEST STATUS: Recursion mismatch.");
+    }
+}

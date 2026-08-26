@@ -1,0 +1,19 @@
+// Exercises the self-hosted mirror prelude's `Registry<T>.register`'s "last write wins" fix
+// (`Driver.hotc`'s own `prelude_source()`), which had drifted out of sync with the real compiler's
+// own `Prelude.kt` bug fix -- the mirrored version used to always APPEND a new entry, leaving a
+// stale duplicate under the same key that `get`'s own linear scan (finds the FIRST match) would
+// never see again. Registering the same key twice with different values and reading it back
+// proves the SECOND value wins, not the first -- exactly the "always-append" bug's own failure
+// mode inverted.
+fn combo(a: Int, b: Int) -> Int {
+    var r = registry_new("x", 1);
+    r.register("x", 111);
+    var got = 0;
+    let found = r.get("x");
+    if let Some { value: v } = found {
+        got = v;
+    }
+    // `r.length()` must stay 1 -- re-registering "x" should overwrite in place, not append a
+    // second entry alongside the first.
+    return got + r.length() + a + b;
+}
