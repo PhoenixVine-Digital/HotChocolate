@@ -1,5 +1,12 @@
 # hotc-mc: a separated Minecraft/Forge library — ideas
 
+**Note**: this file cites files and "already working" behavior from
+`kubejs-aisle-tool`, a separate consumer project not present in this
+repo (`McBindings.hotc`, `CopyToolHudOverlay.hotc`, etc. don't exist
+here). Treat those claims as unverifiable from this repo alone —
+they're real motivation from an external project, not something a
+reader here can check.
+
 `kubejs-aisle-tool`'s own `McBindings.hotc` is already, unintentionally,
 step one of this: one file of shared `extern class` bindings + a couple
 of small wrapper structs, consumed by every other file in that one
@@ -181,11 +188,13 @@ silently assumed as part of "just write the library."
   `@Mod`-annotated constructor. Real, scoped, `@entry`-sized compiler
   feature; not a library concern.
 - **Typed NBT serialization** (`stack.read_nbt<Selection>("selection")`).
-  `@serializable` already generates exactly this shape of code — but the
+  `@serializable` generated exactly this shape of code in the now-retired
+  Kotlin compiler (it does not exist in `selfhost/`, which has no
+  annotation support at all yet — see IDEAS.md) — but the
   problem is worse than "scoped to one target": the string
-  `"FriendlyByteBuf"` is a literal name check hardcoded inside the
-  *general-purpose compiler's* `Checker.kt`, meaning Minecraft-specific
-  knowledge is baked directly into HC itself, not into a library. Adding
+  `"FriendlyByteBuf"` was a literal name check hardcoded inside the
+  *general-purpose compiler's* checker, meaning Minecraft-specific
+  knowledge was baked directly into HC itself, not into a library. Adding
   a *second* hardcoded name (`"CompoundTag"`) would double down on the
   same architectural smell instead of fixing it. The real fix:
   parameterize the target (`@serializable(target: "FriendlyByteBuf")` or

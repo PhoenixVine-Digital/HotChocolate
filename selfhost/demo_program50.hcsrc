@@ -1,0 +1,44 @@
+// Exercises real sealed-interface exhaustiveness checking end to end -- the newest self-hosting
+// port: `sealed interface Name { fn method(&self, ...) -> Ret; }`, `impl Name for StructName {
+// ... }` (both already real from the earlier `dyn`-dispatch phase), and now a real
+// `match subject { StructName { field, ... } => { ... } ... }` over a `&dyn Name`-typed value --
+// each arm names a STRUCT implementing the interface (not an enum variant), dispatched at runtime
+// via a real JVM `INSTANCEOF`/`CHECKCAST`, and checked at compile time for exhaustiveness against
+// `Shape3`'s real, closed set of implementors (`Circle3`, `Square3` -- both covered below, so this
+// compiles clean; leaving either arm out, with no `_` wildcard, is a real compile error).
+sealed interface Shape3 {
+    fn area(&self) -> Int;
+}
+
+struct Circle3 {
+    r: Int,
+}
+impl Shape3 for Circle3 {
+    fn area(&self) -> Int {
+        return self.r * self.r * 3;
+    }
+}
+
+struct Square3 {
+    side: Int,
+}
+impl Shape3 for Square3 {
+    fn area(&self) -> Int {
+        return self.side * self.side;
+    }
+}
+
+fn describe_shape(s: &dyn Shape3) -> Int {
+    match s {
+        Circle3 { r } => { return r * r * 3; }
+        Square3 { side } => { return side * side; }
+    }
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let c = Circle3 { r: 2 };
+    let sq = Square3 { side: 3 };
+    let cv = describe_shape(c); // 2*2*3 = 12
+    let sv = describe_shape(sq); // 3*3 = 9
+    return cv + sv + a + b;
+}

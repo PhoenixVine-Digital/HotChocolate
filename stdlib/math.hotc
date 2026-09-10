@@ -1,0 +1,392 @@
+// Math -- game math for 2D/3D (voxel-scale, not a general linear-algebra library). Opt-in via
+// `use math;` (see ARCHITECTURE.md's own "Standard library modules" section). No dependency on
+// any other stdlib topic.
+//
+// Two halves:
+// - `Math` -- a real, (mostly) 1:1 `extern class` wrapper over `java.lang.Math`'s own scalar
+//   functions, so the full JDK API is one `use math;` away, seamlessly, without reaching for a
+//   raw `extern class` binding by hand every time. See its own header below for the one real
+//   scope cut this makes (same-arity overloads).
+// - `Vec2`/`Vec3`/`Vec4`/`Mat4`/`Quaternion` -- real structs with real, monomorphized methods.
+//   Nothing here binds to an existing JDK class, because there isn't one: `java.lang.Math` has
+//   no notion of a vector or a matrix at all, so this is exactly the kind of small, portable,
+//   self-contained library this language is actually good at writing directly, rather than
+//   pulling in a third-party dependency (JOML, etc.) for it.
+//
+// **Real, disclosed scope cut**: `java.lang.Math`'s own `abs`/`min`/`max`/`round` are each
+// overloaded for `int`/`long`/`float`/`double` in real Java -- but this compiler's own extern
+// method registry keys a method by `"Alias#name#arity"`, NOT by parameter type (see `Checker
+// .hotc`'s own `register_extern` header), so declaring all four overloads of `abs` under ONE
+// `extern class Math` here would silently collide (only the last one declared would ever
+// resolve). `Math::abs`/`::min`/`::max`/`::round` below bind the `Double` overload specifically
+// (the one game/physics code actually wants almost always); `abs_int`/`min_int`/`max_int`/
+// `abs_float`/`min_float`/`max_float`/`abs_long`/`min_long`/`max_long` are ordinary, hand-written
+// HC functions instead (trivial to write directly, and sidestep the collision entirely -- no
+// `java.lang.Math` call needed for an `Int`/`Float`/`Long` comparison or negation) -- covering
+// every ONE of `abs`/`min`/`max`'s own four real Java overloads under some name, not just the
+// `Double` one `Math::` itself can bind.
+
+extern class Math = "java.lang.Math" {
+    static PI: Double;
+    static E: Double;
+    static fn sqrt(x: Double) -> Double;
+    static fn cbrt(x: Double) -> Double;
+    static fn pow(base: Double, exp: Double) -> Double;
+    static fn exp(x: Double) -> Double;
+    static fn log(x: Double) -> Double;
+    static fn log10(x: Double) -> Double;
+    static fn sin(x: Double) -> Double;
+    static fn cos(x: Double) -> Double;
+    static fn tan(x: Double) -> Double;
+    static fn asin(x: Double) -> Double;
+    static fn acos(x: Double) -> Double;
+    static fn atan(x: Double) -> Double;
+    static fn atan2(y: Double, x: Double) -> Double;
+    static fn sinh(x: Double) -> Double;
+    static fn cosh(x: Double) -> Double;
+    static fn tanh(x: Double) -> Double;
+    static fn floor(x: Double) -> Double;
+    static fn ceil(x: Double) -> Double;
+    static fn rint(x: Double) -> Double;
+    static fn round(x: Double) -> Long;
+    static fn abs(x: Double) -> Double;
+    static fn min(a: Double, b: Double) -> Double;
+    static fn max(a: Double, b: Double) -> Double;
+    static fn hypot(x: Double, y: Double) -> Double;
+    static fn signum(x: Double) -> Double;
+    static fn toDegrees(x: Double) -> Double;
+    static fn toRadians(x: Double) -> Double;
+    static fn random() -> Double;
+}
+
+// See this file's own header -- the `Int`/`Float`/`Long` siblings of `Math::abs`/`::min`/
+// `::max`, kept as ordinary HC functions rather than colliding `extern` overloads. `Float` in
+// particular matters here beyond just "completeness": `Vec2`/`Vec3`/`Vec4`/`Mat4`/`Quaternion`
+// below are all `Float`-based, so without these, clamping/comparing THEIR own components would
+// otherwise need a round-trip cast out to `Double` and back through `Math::abs`/`::min`/`::max`
+// just to negate or compare two numbers already in hand.
+fn abs_int(x: Int) -> Int { if x < 0 { return -x; } return x; }
+fn min_int(a: Int, b: Int) -> Int { if a < b { return a; } return b; }
+fn max_int(a: Int, b: Int) -> Int { if a > b { return a; } return b; }
+fn abs_float(x: Float) -> Float { if x < 0.0f { return -x; } return x; }
+fn min_float(a: Float, b: Float) -> Float { if a < b { return a; } return b; }
+fn max_float(a: Float, b: Float) -> Float { if a > b { return a; } return b; }
+fn abs_long(x: Long) -> Long { if x < (0 as Long) { return -x; } return x; }
+fn min_long(a: Long, b: Long) -> Long { if a < b { return a; } return b; }
+fn max_long(a: Long, b: Long) -> Long { if a > b { return a; } return b; }
+
+struct Vec2 {
+    x: Float,
+    y: Float,
+}
+
+impl Vec2 {
+    fn add(&self, o: &Vec2) -> Vec2 { return Vec2 { x: self.x + o.x, y: self.y + o.y }; }
+    fn sub(&self, o: &Vec2) -> Vec2 { return Vec2 { x: self.x - o.x, y: self.y - o.y }; }
+    fn scale(&self, s: Float) -> Vec2 { return Vec2 { x: self.x * s, y: self.y * s }; }
+    fn dot(&self, o: &Vec2) -> Float { return self.x * o.x + self.y * o.y; }
+    fn length_sq(&self) -> Float { return self.x * self.x + self.y * self.y; }
+    fn length(&self) -> Float { return Math::sqrt(self.length_sq() as Double) as Float; }
+    // A zero-length vector normalizes to itself -- there's no "correct" direction to pick for a
+    // true zero vector, and returning it unchanged (rather than dividing by zero into NaN) is
+    // the same disclosed, deliberate choice `Vec3`/`Vec4`'s own `normalize` make below.
+    fn normalize(&self) -> Vec2 {
+        let len = self.length();
+        if len == 0.0f { return Vec2 { x: self.x, y: self.y }; }
+        return self.scale(1.0f / len);
+    }
+    fn lerp(&self, o: &Vec2, t: Float) -> Vec2 {
+        return Vec2 { x: self.x + (o.x - self.x) * t, y: self.y + (o.y - self.y) * t };
+    }
+}
+
+struct Vec3 {
+    x: Float,
+    y: Float,
+    z: Float,
+}
+
+impl Vec3 {
+    fn add(&self, o: &Vec3) -> Vec3 { return Vec3 { x: self.x + o.x, y: self.y + o.y, z: self.z + o.z }; }
+    fn sub(&self, o: &Vec3) -> Vec3 { return Vec3 { x: self.x - o.x, y: self.y - o.y, z: self.z - o.z }; }
+    fn scale(&self, s: Float) -> Vec3 { return Vec3 { x: self.x * s, y: self.y * s, z: self.z * s }; }
+    fn dot(&self, o: &Vec3) -> Float { return self.x * o.x + self.y * o.y + self.z * o.z; }
+    fn cross(&self, o: &Vec3) -> Vec3 {
+        return Vec3 {
+            x: self.y * o.z - self.z * o.y,
+            y: self.z * o.x - self.x * o.z,
+            z: self.x * o.y - self.y * o.x,
+        };
+    }
+    fn length_sq(&self) -> Float { return self.x * self.x + self.y * self.y + self.z * self.z; }
+    fn length(&self) -> Float { return Math::sqrt(self.length_sq() as Double) as Float; }
+    fn normalize(&self) -> Vec3 {
+        let len = self.length();
+        if len == 0.0f { return Vec3 { x: self.x, y: self.y, z: self.z }; }
+        return self.scale(1.0f / len);
+    }
+    fn lerp(&self, o: &Vec3, t: Float) -> Vec3 {
+        return Vec3 { x: self.x + (o.x - self.x) * t, y: self.y + (o.y - self.y) * t, z: self.z + (o.z - self.z) * t };
+    }
+}
+
+struct Vec4 {
+    x: Float,
+    y: Float,
+    z: Float,
+    w: Float,
+}
+
+impl Vec4 {
+    fn add(&self, o: &Vec4) -> Vec4 { return Vec4 { x: self.x + o.x, y: self.y + o.y, z: self.z + o.z, w: self.w + o.w }; }
+    fn sub(&self, o: &Vec4) -> Vec4 { return Vec4 { x: self.x - o.x, y: self.y - o.y, z: self.z - o.z, w: self.w - o.w }; }
+    fn scale(&self, s: Float) -> Vec4 { return Vec4 { x: self.x * s, y: self.y * s, z: self.z * s, w: self.w * s }; }
+    fn dot(&self, o: &Vec4) -> Float { return self.x * o.x + self.y * o.y + self.z * o.z + self.w * o.w; }
+    fn length_sq(&self) -> Float { return self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w; }
+    fn length(&self) -> Float { return Math::sqrt(self.length_sq() as Double) as Float; }
+    fn normalize(&self) -> Vec4 {
+        let len = self.length();
+        if len == 0.0f { return Vec4 { x: self.x, y: self.y, z: self.z, w: self.w }; }
+        return self.scale(1.0f / len);
+    }
+    fn lerp(&self, o: &Vec4, t: Float) -> Vec4 {
+        return Vec4 { x: self.x + (o.x - self.x) * t, y: self.y + (o.y - self.y) * t, z: self.z + (o.z - self.z) * t, w: self.w + (o.w - self.w) * t };
+    }
+}
+
+// Row-major, 16 real named fields (`m<row><col>`) rather than a backing array -- a fixed,
+// mechanical field-per-cell layout matches every OTHER struct in this compiler (plain `GETFIELD`
+// per access, no bounds check, no indirection), and avoids depending on fixed-size-array-as-
+// struct-field support this file has no other reason to exercise. Column-vector convention
+// throughout (`v' = M * v`, same as OpenGL/GLM) -- `transform_vec3`/`transform_vec4` and every
+// `static fn` constructor below (`translation`/`scaling`/`rotation_*`/`perspective`/`look_at`)
+// all agree on this.
+struct Mat4 {
+    m00: Float, m01: Float, m02: Float, m03: Float,
+    m10: Float, m11: Float, m12: Float, m13: Float,
+    m20: Float, m21: Float, m22: Float, m23: Float,
+    m30: Float, m31: Float, m32: Float, m33: Float,
+}
+
+impl Mat4 {
+    static fn identity() -> Mat4 {
+        return Mat4 {
+            m00: 1.0f, m01: 0.0f, m02: 0.0f, m03: 0.0f,
+            m10: 0.0f, m11: 1.0f, m12: 0.0f, m13: 0.0f,
+            m20: 0.0f, m21: 0.0f, m22: 1.0f, m23: 0.0f,
+            m30: 0.0f, m31: 0.0f, m32: 0.0f, m33: 1.0f,
+        };
+    }
+
+    static fn translation(x: Float, y: Float, z: Float) -> Mat4 {
+        var m = Mat4::identity();
+        m.m03 = x;
+        m.m13 = y;
+        m.m23 = z;
+        return m;
+    }
+
+    static fn scaling(x: Float, y: Float, z: Float) -> Mat4 {
+        var m = Mat4::identity();
+        m.m00 = x;
+        m.m11 = y;
+        m.m22 = z;
+        return m;
+    }
+
+    static fn rotation_x(angle_rad: Float) -> Mat4 {
+        let c = Math::cos(angle_rad as Double) as Float;
+        let s = Math::sin(angle_rad as Double) as Float;
+        var m = Mat4::identity();
+        m.m11 = c; m.m12 = -s;
+        m.m21 = s; m.m22 = c;
+        return m;
+    }
+
+    static fn rotation_y(angle_rad: Float) -> Mat4 {
+        let c = Math::cos(angle_rad as Double) as Float;
+        let s = Math::sin(angle_rad as Double) as Float;
+        var m = Mat4::identity();
+        m.m00 = c; m.m02 = s;
+        m.m20 = -s; m.m22 = c;
+        return m;
+    }
+
+    static fn rotation_z(angle_rad: Float) -> Mat4 {
+        let c = Math::cos(angle_rad as Double) as Float;
+        let s = Math::sin(angle_rad as Double) as Float;
+        var m = Mat4::identity();
+        m.m00 = c; m.m01 = -s;
+        m.m10 = s; m.m11 = c;
+        return m;
+    }
+
+    // Right-handed, OpenGL-style depth range ([-1, 1] NDC z) -- the standard convention most
+    // JVM-accessible graphics bindings (LWJGL's own OpenGL bindings included) expect.
+    static fn perspective(fov_y_rad: Float, aspect: Float, near: Float, far: Float) -> Mat4 {
+        let f = 1.0f / (Math::tan((fov_y_rad as Double) / 2.0f) as Float);
+        var m = Mat4 {
+            m00: f / aspect, m01: 0.0f, m02: 0.0f, m03: 0.0f,
+            m10: 0.0f, m11: f, m12: 0.0f, m13: 0.0f,
+            m20: 0.0f, m21: 0.0f, m22: (far + near) / (near - far), m23: (2.0f * far * near) / (near - far),
+            m30: 0.0f, m31: 0.0f, m32: -1.0f, m33: 0.0f,
+        };
+        return m;
+    }
+
+    // Standard `glm::lookAt` construction: an orthonormal (right, up, forward) basis built from
+    // `eye`/`target`/`up`, then the view matrix is that basis's own inverse (a pure rotation's
+    // inverse is its transpose, expressed here as the basis vectors becoming ROWS instead of
+    // columns) composed with `-eye`'s own translation, folded into the last column directly via
+    // the dot products below rather than a separate matrix multiply.
+    static fn look_at(eye: &Vec3, target: &Vec3, up: &Vec3) -> Mat4 {
+        let f = target.sub(eye).normalize();
+        let s = f.cross(up).normalize();
+        let u = s.cross(&f);
+        return Mat4 {
+            m00: s.x, m01: s.y, m02: s.z, m03: -s.dot(eye),
+            m10: u.x, m11: u.y, m12: u.z, m13: -u.dot(eye),
+            m20: -f.x, m21: -f.y, m22: -f.z, m23: f.dot(eye),
+            m30: 0.0f, m31: 0.0f, m32: 0.0f, m33: 1.0f,
+        };
+    }
+
+    fn multiply(&self, o: &Mat4) -> Mat4 {
+        return Mat4 {
+            m00: self.m00 * o.m00 + self.m01 * o.m10 + self.m02 * o.m20 + self.m03 * o.m30,
+            m01: self.m00 * o.m01 + self.m01 * o.m11 + self.m02 * o.m21 + self.m03 * o.m31,
+            m02: self.m00 * o.m02 + self.m01 * o.m12 + self.m02 * o.m22 + self.m03 * o.m32,
+            m03: self.m00 * o.m03 + self.m01 * o.m13 + self.m02 * o.m23 + self.m03 * o.m33,
+            m10: self.m10 * o.m00 + self.m11 * o.m10 + self.m12 * o.m20 + self.m13 * o.m30,
+            m11: self.m10 * o.m01 + self.m11 * o.m11 + self.m12 * o.m21 + self.m13 * o.m31,
+            m12: self.m10 * o.m02 + self.m11 * o.m12 + self.m12 * o.m22 + self.m13 * o.m32,
+            m13: self.m10 * o.m03 + self.m11 * o.m13 + self.m12 * o.m23 + self.m13 * o.m33,
+            m20: self.m20 * o.m00 + self.m21 * o.m10 + self.m22 * o.m20 + self.m23 * o.m30,
+            m21: self.m20 * o.m01 + self.m21 * o.m11 + self.m22 * o.m21 + self.m23 * o.m31,
+            m22: self.m20 * o.m02 + self.m21 * o.m12 + self.m22 * o.m22 + self.m23 * o.m32,
+            m23: self.m20 * o.m03 + self.m21 * o.m13 + self.m22 * o.m23 + self.m23 * o.m33,
+            m30: self.m30 * o.m00 + self.m31 * o.m10 + self.m32 * o.m20 + self.m33 * o.m30,
+            m31: self.m30 * o.m01 + self.m31 * o.m11 + self.m32 * o.m21 + self.m33 * o.m31,
+            m32: self.m30 * o.m02 + self.m31 * o.m12 + self.m32 * o.m22 + self.m33 * o.m32,
+            m33: self.m30 * o.m03 + self.m31 * o.m13 + self.m32 * o.m23 + self.m33 * o.m33,
+        };
+    }
+
+    // Treats `v` as a POINT (implicit w = 1) -- the translation columns (`m03`/`m13`/`m23`) are
+    // applied. Use `transform_vec4` directly (with `w: 0`) for a DIRECTION, which should not be
+    // translated.
+    fn transform_vec3(&self, v: &Vec3) -> Vec3 {
+        return Vec3 {
+            x: self.m00 * v.x + self.m01 * v.y + self.m02 * v.z + self.m03,
+            y: self.m10 * v.x + self.m11 * v.y + self.m12 * v.z + self.m13,
+            z: self.m20 * v.x + self.m21 * v.y + self.m22 * v.z + self.m23,
+        };
+    }
+
+    fn transform_vec4(&self, v: &Vec4) -> Vec4 {
+        return Vec4 {
+            x: self.m00 * v.x + self.m01 * v.y + self.m02 * v.z + self.m03 * v.w,
+            y: self.m10 * v.x + self.m11 * v.y + self.m12 * v.z + self.m13 * v.w,
+            z: self.m20 * v.x + self.m21 * v.y + self.m22 * v.z + self.m23 * v.w,
+            w: self.m30 * v.x + self.m31 * v.y + self.m32 * v.z + self.m33 * v.w,
+        };
+    }
+}
+
+struct Quaternion {
+    x: Float,
+    y: Float,
+    z: Float,
+    w: Float,
+}
+
+impl Quaternion {
+    static fn identity() -> Quaternion { return Quaternion { x: 0.0f, y: 0.0f, z: 0.0f, w: 1.0f }; }
+
+    static fn from_axis_angle(axis: &Vec3, angle_rad: Float) -> Quaternion {
+        let a = axis.normalize();
+        let half = angle_rad / 2.0f;
+        let s = Math::sin(half as Double) as Float;
+        let c = Math::cos(half as Double) as Float;
+        return Quaternion { x: a.x * s, y: a.y * s, z: a.z * s, w: c };
+    }
+
+    // Hamilton product (`self` applied AFTER `o` -- `self.multiply(&o)` rotates by `o` first,
+    // then `self`, matching matrix-multiply composition order).
+    fn multiply(&self, o: &Quaternion) -> Quaternion {
+        return Quaternion {
+            w: self.w * o.w - self.x * o.x - self.y * o.y - self.z * o.z,
+            x: self.w * o.x + self.x * o.w + self.y * o.z - self.z * o.y,
+            y: self.w * o.y - self.x * o.z + self.y * o.w + self.z * o.x,
+            z: self.w * o.z + self.x * o.y - self.y * o.x + self.z * o.w,
+        };
+    }
+
+    fn length(&self) -> Float {
+        let len_sq = self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w;
+        return Math::sqrt(len_sq as Double) as Float;
+    }
+
+    // A zero quaternion (never a valid rotation to begin with) normalizes to the identity
+    // rotation rather than dividing by zero into NaN -- same "no correct answer, pick a safe
+    // one" choice `Vec2`/`Vec3`/`Vec4`'s own `normalize` make above.
+    fn normalize(&self) -> Quaternion {
+        let len = self.length();
+        if len == 0.0f { return Quaternion::identity(); }
+        let inv = 1.0f / len;
+        return Quaternion { x: self.x * inv, y: self.y * inv, z: self.z * inv, w: self.w * inv };
+    }
+
+    // Assumes `self` is already normalized (every constructor above produces one) -- standard
+    // quaternion-to-rotation-matrix formula.
+    fn to_mat4(&self) -> Mat4 {
+        let xx = self.x * self.x;
+        let yy = self.y * self.y;
+        let zz = self.z * self.z;
+        let xy = self.x * self.y;
+        let xz = self.x * self.z;
+        let yz = self.y * self.z;
+        let wx = self.w * self.x;
+        let wy = self.w * self.y;
+        let wz = self.w * self.z;
+        return Mat4 {
+            m00: 1.0f - 2.0f * (yy + zz), m01: 2.0f * (xy - wz), m02: 2.0f * (xz + wy), m03: 0.0f,
+            m10: 2.0f * (xy + wz), m11: 1.0f - 2.0f * (xx + zz), m12: 2.0f * (yz - wx), m13: 0.0f,
+            m20: 2.0f * (xz - wy), m21: 2.0f * (yz + wx), m22: 1.0f - 2.0f * (xx + yy), m23: 0.0f,
+            m30: 0.0f, m31: 0.0f, m32: 0.0f, m33: 1.0f,
+        };
+    }
+
+    // Spherical linear interpolation -- shortest-path (negates `o` when the raw dot product is
+    // negative, since `q` and `-q` represent the SAME rotation and interpolating through the
+    // long way around would visibly spin the wrong direction), with a linear-interpolation
+    // fallback (renormalized after) when the two rotations are close enough that `sin(theta)`
+    // would be too small to safely divide by -- the standard, disclosed `slerp` edge case.
+    fn slerp(&self, o: &Quaternion, t: Float) -> Quaternion {
+        var ox = o.x; var oy = o.y; var oz = o.z; var ow = o.w;
+        var d = self.x * ox + self.y * oy + self.z * oz + self.w * ow;
+        if d < 0.0f {
+            d = -d;
+            ox = -ox; oy = -oy; oz = -oz; ow = -ow;
+        }
+        if d > 0.9995f {
+            let lx = self.x + (ox - self.x) * t;
+            let ly = self.y + (oy - self.y) * t;
+            let lz = self.z + (oz - self.z) * t;
+            let lw = self.w + (ow - self.w) * t;
+            return Quaternion { x: lx, y: ly, z: lz, w: lw }.normalize();
+        }
+        let theta_0 = Math::acos(d as Double) as Float;
+        let theta = theta_0 * t;
+        let sin_theta_0 = Math::sin(theta_0 as Double) as Float;
+        let sin_theta = Math::sin(theta as Double) as Float;
+        let s0 = Math::cos(theta as Double) as Float - d * sin_theta / sin_theta_0;
+        let s1 = sin_theta / sin_theta_0;
+        return Quaternion {
+            x: s0 * self.x + s1 * ox,
+            y: s0 * self.y + s1 * oy,
+            z: s0 * self.z + s1 * oz,
+            w: s0 * self.w + s1 * ow,
+        };
+    }
+}

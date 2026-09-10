@@ -1,0 +1,19 @@
+// Exercises real off-heap `arena struct` support end to end: `arena Name[count]` allocation (a
+// real `java.lang.foreign.Arena.allocate` call, not a JVM object array), `buf[i].field = value`
+// writes, and `buf[i].field` reads -- both going through real `MemorySegment.set`/`.get` calls
+// against `ValueLayout.JAVA_INT`, at real, packed, sequential byte offsets (`Point`'s `x`/`y` are
+// both `Int`, 4 bytes each, so `buf[1].x` sits at byte offset 8: index(1) * elemSize(8) + fieldOffset(0)).
+arena struct Point {
+    x: Int,
+    y: Int,
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let buf = arena Point[3];
+    buf[0].x = 10;
+    buf[0].y = 20;
+    buf[1].x = 100;
+    buf[1].y = 200;
+    let sum = buf[0].x + buf[0].y + buf[1].x + buf[1].y;
+    return sum + a + b;
+}

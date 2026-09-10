@@ -1,5 +1,22 @@
 # Phoenix Flight: a concurrency library — ideas
 
+**Status, 2026-09-08: the "buildable today" half of this doc has
+shipped** — a real `PhoenixPool`/`spawn`/`join`/`rebirth`/`shutdown`
+wrapping `java.util.concurrent`, at `stdlib/phoenix.hotc`, opt-in via
+`use phoenix;`. See ARCHITECTURE.md's own "Phoenix Flight" section for the full
+design and `examples/phoenix_flight.hc` for a worked example. Also
+shipped, and NOT originally scoped in this doc: a real compile-time
+capture-safety check (`@sendable`) on `pool.spawn(...)`'s own lambda —
+see ARCHITECTURE.md's own "Compile-time concurrency safety" section. Not yet
+shipped, and still exactly the bigger, separate design this doc's own
+"Belongs to `IDEAS.md`'s ECS entry" section describes: `spawn_after`/
+dependency-graph chaining, and the full ownership-derived parallel
+scheduler (needs a real move/borrow checker first).
+
+**Note**: this file cites `ClipboardPacketHandler.hc` and similar files
+from `kubejs-aisle-tool`, a separate consumer project not present in
+this repo. Treat those references as unverifiable from this repo alone.
+
 A `hotc-mc`-shaped sibling, not a language feature: `IDEAS.md`'s own
 "Native concurrency primitives" entry already concluded a *new*
 compiler-level concurrency primitive isn't needed, because `extern

@@ -16,12 +16,11 @@ module hc.selfhost.lexer;
 //   but it's a real, load-bearing workaround, not a style preference -- logged as its own
 //   candidate IDEAS.md entry if this gets uncomfortable at parser-scale.
 //
-// **Scope cut, disclosed, not hidden**: string interpolation (`"a{x}b"` recursively re-lexing the
-// `{x}` part with a fresh `Lexer`) is NOT ported yet -- everything else (keywords, identifiers,
-// numbers incl. hex/long/float/double suffixes, symbols incl. multi-char operators, doc comments,
-// escape sequences, ordinary non-interpolated strings) is. A real, separate follow-up, not an
-// oversight -- interpolation needs this same struct to construct a fresh instance of itself
-// recursively, which should work fine given everything else here does, just wasn't attempted yet.
+// String interpolation (`"a{x}b"`) recursively re-lexes each `{...}` span with a fresh `Lexer`
+// instance (`string_tokens`, below) -- exactly the "construct a fresh instance of itself
+// recursively" approach this file's own header used to say hadn't been attempted yet. Ported once
+// `Parser.hotc`/`Checker.hotc`/`Codegen.hotc` all had a real `Expr::StringInterp` shape to hand the
+// resulting token stream to.
 
 extern class JObject = "java.lang.Object" {}
 extern class JString = "java.lang.String" {
@@ -93,8 +92,11 @@ pub enum TokType {
     ISTRING_BEGIN, ISTRING_PART, ISTRING_END,
     FN, STRUCT, LET, VAR, IF, ELSE, WHILE, FOR, IN, RETURN, TRUE, FALSE, IMPL, MUT, ARENA,
     INTERFACE, DYN, ENUM, MATCH, BY, SEALED, EXTERN, CLASS, MODULE, PUB, OPEN, EXTEND, STATIC, AS,
-    TRY, CATCH, THROW, EXTENDS, OVERRIDE, NULL, IS,
+    TRY, CATCH, THROW, EXTENDS, OVERRIDE, NULL, IS, USE,
     BREAK, CONTINUE, DEV,
+    // See `Ast.hc`'s own `ComponentDecl`/`SystemDecl` header -- `ECS_IDEAS.md`'s own design doc
+    // for the full feature these two keywords introduce.
+    COMPONENT, SYSTEM,
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
@@ -124,6 +126,8 @@ fn build_keywords() -> Registry<TokType> {
     kw.register("impl", IMPL);
     kw.register("mut", MUT);
     kw.register("arena", ARENA);
+    kw.register("component", COMPONENT);
+    kw.register("system", SYSTEM);
     kw.register("interface", INTERFACE);
     kw.register("dyn", DYN);
     kw.register("enum", ENUM);
@@ -136,6 +140,7 @@ fn build_keywords() -> Registry<TokType> {
     kw.register("pub", PUB);
     kw.register("open", OPEN);
     kw.register("extend", EXTEND);
+    kw.register("use", USE);
     kw.register("static", STATIC);
     kw.register("as", AS);
     kw.register("try", TRY);
@@ -339,39 +344,119 @@ impl Lexer {
         return Token { kind: IDENT, text: text, line: start_line };
     }
 
-    // Non-interpolated strings only for now -- see this file's own header comment for why
-    // interpolation (`"a{x}b"`) is a disclosed, separate follow-up rather than ported here.
-    fn string(&mut self, start_line: Int) -> Token {
-        var out = "";
-        while !self.is_at_end() && self.peek() != CP_QUOTE {
-            var ch_cp = self.advance();
-            if ch_cp == CP_BACKSLASH && !self.is_at_end() {
-                let esc = self.advance();
-                if esc == CP_LOWER_N { ch_cp = CP_NEWLINE; }
-                else if esc == CP_LOWER_T { ch_cp = 9; }
-                else if esc == CP_QUOTE { ch_cp = CP_QUOTE; }
-                else if esc == CP_BACKSLASH { ch_cp = CP_BACKSLASH; }
-                else if esc == CP_LBRACE { ch_cp = CP_LBRACE; }
-                else if esc == CP_RBRACE { ch_cp = CP_RBRACE; }
-                else { ch_cp = esc; }
+    // Scans a `{...}` interpolation span, tracking brace depth (a nested `{` inside the embedded
+    // expression, e.g. a struct literal, mustn't stop at IT) and nested STRING literals (so a `}`
+    // or `"` inside one of THOSE doesn't confuse the scan either) -- mirrors the real compiler's
+    // own `findMatchingBrace` exactly. Returns the position of the matching `}` (not consumed);
+    // `pos` is left sitting AFTER everything it scanned either way, matching every other lexer
+    // method's own "advance as you go" convention.
+    fn find_matching_brace(&mut self, start_line: Int) -> Int {
+        var depth = 1;
+        while !self.is_at_end() {
+            let p = self.peek();
+            if p == CP_LBRACE {
+                depth = depth + 1;
+                self.pos = self.pos + 1;
+            } else if p == CP_RBRACE {
+                depth = depth - 1;
+                self.pos = self.pos + 1;
+                if depth == 0 {
+                    return self.pos - 1;
+                }
+            } else if p == CP_QUOTE {
+                self.pos = self.pos + 1;
+                while !self.is_at_end() && self.peek() != CP_QUOTE {
+                    if self.peek() == CP_BACKSLASH { self.pos = self.pos + 1; }
+                    self.pos = self.pos + 1;
+                }
+                if self.is_at_end() {
+                    throw LexError::new("Unterminated string at line " + JString::valueOf(start_line));
+                }
+                self.pos = self.pos + 1;
+            } else if p == CP_NEWLINE {
+                self.line = self.line + 1;
+                self.pos = self.pos + 1;
+            } else {
+                self.pos = self.pos + 1;
             }
-            out = out + codepoint_to_string(ch_cp);
+        }
+        throw LexError::new("Unterminated '\{' interpolation at line " + JString::valueOf(start_line));
+    }
+
+    // A plain string (`"abc"`) still returns a single `STRING` token, unchanged. One containing
+    // `{...}` returns `ISTRING_BEGIN`, `ISTRING_PART`(literal), <the embedded expr's own real
+    // tokens, re-lexed from scratch via a fresh `Lexer` on just that substring>, `ISTRING_PART`,
+    // ..., `ISTRING_END` -- `Parser.hotc`'s own `istring_expr` consumes exactly this shape.
+    fn string_tokens(&mut self, start_line: Int) -> Vec<Token> {
+        // NOT seeded via `vec_of("")` -- a real bug found running this exact code: `vec_of(x)`
+        // creates a ONE-element `Vec` holding `x` (needed elsewhere in this codebase to infer a
+        // generic `Vec<T>`'s own `T` from a real first element, see `empty_str_vec_lex`'s own
+        // header), so seeding with `vec_of("")` here left a bogus leading `""` entry BEFORE any
+        // real segment ever got pushed -- every subsequent `parts.get(i)` read one index too far
+        // left (the very first real literal at index 0 was always this throwaway empty string,
+        // the real content silently pushed to index 1 and never read back for the plain,
+        // non-interpolated case at all).
+        var parts = empty_str_vec_lex();
+        var expr_srcs = empty_str_vec_lex();
+        var cur = "";
+        while !self.is_at_end() && self.peek() != CP_QUOTE {
+            if self.peek() == CP_LBRACE {
+                parts.push(cur);
+                cur = "";
+                self.pos = self.pos + 1; // consume '{'
+                let expr_start = self.pos;
+                let expr_end = self.find_matching_brace(start_line);
+                expr_srcs.push(self.src.substring(expr_start, expr_end));
+                self.pos = expr_end + 1; // consume '}'
+            } else {
+                var ch_cp = self.advance();
+                if ch_cp == CP_BACKSLASH && !self.is_at_end() {
+                    let esc = self.advance();
+                    if esc == CP_LOWER_N { ch_cp = CP_NEWLINE; }
+                    else if esc == CP_LOWER_T { ch_cp = 9; }
+                    else if esc == CP_QUOTE { ch_cp = CP_QUOTE; }
+                    else if esc == CP_BACKSLASH { ch_cp = CP_BACKSLASH; }
+                    else if esc == CP_LBRACE { ch_cp = CP_LBRACE; }
+                    else if esc == CP_RBRACE { ch_cp = CP_RBRACE; }
+                    else { ch_cp = esc; }
+                }
+                cur = cur + codepoint_to_string(ch_cp);
+            }
         }
         if self.is_at_end() {
             throw LexError::new("Unterminated string at line " + JString::valueOf(start_line));
         }
         self.advance(); // closing quote
-        return Token { kind: STRING, text: out, line: start_line };
+        parts.push(cur);
+        if expr_srcs.length() == 0 {
+            return vec_of(Token { kind: STRING, text: parts.get(0), line: start_line });
+        }
+        var out = vec_of(Token { kind: ISTRING_BEGIN, text: "", line: start_line });
+        out.push(Token { kind: ISTRING_PART, text: parts.get(0), line: start_line });
+        var i = 0;
+        while i < expr_srcs.length() {
+            var sub = lexer_new(expr_srcs.get(i));
+            let sub_toks = sub.tokenize(); // includes its own trailing EOF -- dropped below
+            var j = 0;
+            while j < sub_toks.length() - 1 {
+                out.push(sub_toks.get(j));
+                j = j + 1;
+            }
+            out.push(Token { kind: ISTRING_PART, text: parts.get(i + 1), line: start_line });
+            i = i + 1;
+        }
+        out.push(Token { kind: ISTRING_END, text: "", line: start_line });
+        return out;
     }
 
-    fn next_token(&mut self) -> Token {
+    fn next_token(&mut self) -> Vec<Token> {
         let start_line = self.line;
         let c = self.advance();
-        if JCharacter::isDigit(c) { return self.number(c, start_line); }
-        if JCharacter::isLetter(c) || c == CP_UNDERSCORE { return self.identifier(start_line); }
-        if c == CP_QUOTE { return self.string(start_line); }
-        if c == CP_SLASH && self.peek() == CP_SLASH && self.peek_next() == CP_SLASH { return self.doc_comment(start_line); }
-        return self.symbol(c, start_line);
+        if JCharacter::isDigit(c) { return vec_of(self.number(c, start_line)); }
+        if JCharacter::isLetter(c) || c == CP_UNDERSCORE { return vec_of(self.identifier(start_line)); }
+        if c == CP_QUOTE { return self.string_tokens(start_line); }
+        if c == CP_SLASH && self.peek() == CP_SLASH && self.peek_next() == CP_SLASH { return vec_of(self.doc_comment(start_line)); }
+        return vec_of(self.symbol(c, start_line));
     }
 
     fn tokenize(&mut self) -> Vec<Token> {
@@ -379,7 +464,7 @@ impl Lexer {
         if self.is_at_end() {
             return vec_of(Token { kind: EOF, text: "", line: self.line });
         }
-        var out = vec_of(self.next_token());
+        var out = self.next_token();
         // Not `return out;` inside the loop body -- the checker's move-checking is conservative
         // about loops by design ("a variable moved anywhere inside a while body counts as moved
         // afterward," regardless of which branch), so returning `out` from inside an `if` here
@@ -394,11 +479,21 @@ impl Lexer {
                 out.push(Token { kind: EOF, text: "", line: self.line });
                 done = true;
             } else {
-                out.push(self.next_token());
+                let toks = self.next_token();
+                var k = 0;
+                while k < toks.length() {
+                    out.push(toks.get(k));
+                    k = k + 1;
+                }
             }
         }
         return out;
     }
+}
+
+fn empty_str_vec_lex() -> Vec<String> {
+    var v = vec_of("__init__");
+    return Vec { data: v.data, len: 0 };
 }
 
 // `String.valueOf(int)` gives the DECIMAL representation of a codepoint, not the one-character

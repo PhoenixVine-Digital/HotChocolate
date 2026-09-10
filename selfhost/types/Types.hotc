@@ -12,14 +12,19 @@ module hc.selfhost.types;
 // all the same). One canonical copy here now, referenced by both.
 //
 // **Scope cut, disclosed, same as always**: this is NOT a full port of the real `Ty` sealed class
-// (no `Float`/`Double`/`Arena`/`Dyn`/`Enum`/`JavaExtern` variants -- see `Checker.hotc`'s own
-// long-standing header for why: no arena structs, no interface/dyn types, no Float/Double at all
-// in this subset). `TyStruct` is this subset's one field-carrying variant, and doubles as the
-// catch-all for both real structs AND enums (see `Checker.hotc`'s own comments on `variant_owner`)
-// -- there's no separate `TyEnum` tag the way the real `Ty.Enum` is distinct from `Ty.Struct`.
+// (no `Arena`/`Dyn`/`Enum`/`JavaExtern` variants -- see `Checker.hotc`'s own long-standing header
+// for why: no arena structs, no interface/dyn types). `Float`/`Double` used to be missing too (this
+// comment used to say so) -- ported the same scoped way `Long` already was: real arithmetic/
+// comparison/cast/slot support (see `Codegen.hotc`'s own `alloc_slot` header), but no literal
+// syntax -- `Parser.hotc`'s `primary()` never grew a case for the lexer's own pre-existing `FLOAT`/
+// `DOUBLE` token kinds, so a value only arrives via `as Float`/`as Double` casts or an extern call,
+// same as `Long` already did via `as Long`/`JLong::parseLong`. `TyStruct` is this subset's one
+// field-carrying variant, and doubles as the catch-all for both real structs AND enums (see
+// `Checker.hotc`'s own comments on `variant_owner`) -- there's no separate `TyEnum` tag the way the
+// real `Ty.Enum` is distinct from `Ty.Struct`.
 
 pub enum Ty {
-    TyInt, TyBool, TyStr, TyUnit, TyUnknown, TyLong,
+    TyInt, TyBool, TyStr, TyUnit, TyUnknown, TyLong, TyFloat, TyDouble,
     TyStruct { name: String },
 }
 
@@ -52,6 +57,8 @@ pub struct GenericTemplate {
 pub struct GenericEnumTemplate {
     type_param: String,
     variants: Vec<EnumVariant>,
+    // `enum Result<T, E> { ... }` -- see `Ast.hc`'s own `EnumDecl.type_param2` header.
+    type_param2: Option<String>,
 }
 
 // A real `extern class` method's signature -- `param_types`/`ret_type` are type *names* (`"Self"`
@@ -62,6 +69,11 @@ pub struct ExternMethodInfo {
     ret_type: String,
     is_static: Bool,
     is_ctor: Bool,
+}
+
+pub struct ExternFieldInfo {
+    type_name: String,
+    is_static: Bool,
 }
 
 pub fn empty_ty_vec() -> Vec<Ty> {
@@ -75,6 +87,8 @@ pub fn ty_from_name(name: String) -> Ty {
     if name == "String" { return TyStr; }
     if name == "Unit" { return TyUnit; }
     if name == "Long" { return TyLong; }
+    if name == "Float" { return TyFloat; }
+    if name == "Double" { return TyDouble; }
     return TyStruct { name: name };
 }
 
@@ -91,6 +105,8 @@ pub fn ty_name(t: Ty) -> String {
         TyUnit => { return "Unit"; }
         TyUnknown => { return "?"; }
         TyLong => { return "Long"; }
+        TyFloat => { return "Float"; }
+        TyDouble => { return "Double"; }
         TyStruct { name } => { return name; }
     }
 }
@@ -106,4 +122,31 @@ pub fn param_types_of(params: Vec<Param>) -> Vec<Ty> {
         i = i + 1;
     }
     return out;
+}
+
+// `Param.is_ref` per param, in order -- see that field's own header. Shared by `Checker.hotc`
+// (`fn_param_is_ref`/`method_param_is_ref`/`static_method_param_is_ref`) and `Codegen.hotc`'s own
+// top-level fn registration, mirroring `param_types_of`'s own "one fn, both files" split exactly.
+pub fn param_is_ref_of(params: Vec<Param>) -> Vec<Bool> {
+    var out = vec_of(true);
+    var real = Vec { data: out.data, len: 0 };
+    var i = 0;
+    while i < params.length() {
+        real.push(params.get(i).is_ref);
+        i = i + 1;
+    }
+    return real;
+}
+
+// `Param.is_mut_ref` per param, in order -- `param_is_ref_of`'s own exact shape, for Phase 3
+// borrow checking's shared/exclusive distinction.
+pub fn param_is_mut_ref_of(params: Vec<Param>) -> Vec<Bool> {
+    var out = vec_of(true);
+    var real = Vec { data: out.data, len: 0 };
+    var i = 0;
+    while i < params.length() {
+        real.push(params.get(i).is_mut_ref);
+        i = i + 1;
+    }
+    return real;
 }

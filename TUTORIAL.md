@@ -13,10 +13,20 @@ explains programming concepts themselves (variables, functions, types) as
 it goes, rather than assuming you already know them from another language.
 
 For the *design rationale* behind these features (why they're scoped the way
-they are, what's still missing, known limitations), see [README.md](README.md)
-— this document teaches you to write HC; the README explains why HC is built
-the way it is. When in doubt about an edge case, the README is the more
-exhaustive reference.
+they are, what's still missing, known limitations), see [ARCHITECTURE.md](ARCHITECTURE.md)
+— this document teaches you to write HC; ARCHITECTURE.md explains why HC is
+built the way it is. When in doubt about an edge case, ARCHITECTURE.md is
+the more exhaustive reference. (For the short "what is this and why" pitch,
+see [README.md](README.md) instead.)
+
+**Status note**: Hot Chocolate's compiler recently moved from a hand-written
+Kotlin implementation to a self-hosted one (written in HC itself, under
+`selfhost/`). The self-hosted compiler is an explicitly scoped-down subset —
+see the "Status" section near the top of [ARCHITECTURE.md](ARCHITECTURE.md)
+for the current list of what works and what doesn't. Several sections below
+(ownership enforcement, generics, `@serializable`) currently describe
+intended behavior that isn't fully working yet; each says so where
+that's the case.
 
 ## Table of contents
 
@@ -121,7 +131,7 @@ The built-in scalar types are:
 | `Bool`   | `boolean`       | `true`/`false` |
 | `String` | `java.lang.String` | HC's one built-in reference type — see section 15 for how it reaches real `String` methods |
 
-There's no `Char` type (a real, documented gap — see the README's Java
+There's no `Char` type (a real, documented gap — see ARCHITECTURE.md's Java
 interop section for the workaround: `.substring(i, i+1)` instead of
 `.charAt(i)`).
 
@@ -242,6 +252,17 @@ fn main() {
   magic happens at the bytecode level.
 
 ## 7. Ownership: moves and borrows
+
+**Not enforced by the compiler currently in this repo.** The
+self-hosted compiler's checker (`selfhost/checker/Checker.hotc`)
+explicitly does not implement move/borrow checking yet — verified
+directly: the "use after move" example below currently compiles and
+runs without the error it describes. `&`/`&mut` borrow syntax does
+parse and work mechanically (a `&mut` parameter really can mutate the
+caller's data), but none of the compile-time safety guarantees below
+are actually checked today. This is the single biggest gap between
+this document and the current compiler — see ARCHITECTURE.md's "Status"
+section.
 
 This is the one part of HC that's genuinely different from Java/Kotlin, so
 it's worth slowing down for. **Every non-`struct` value here is `Copy`**
@@ -431,6 +452,14 @@ fn area(s: Shape) -> Int {
 
 ## 11. Generics
 
+**One remaining gap against the compiler currently in this repo**:
+`impl<T> Box<T> { ... }` (generic `impl` blocks, used just below) fails
+to parse (`unexpected token '<'`) — a plain top-level
+`fn identity<T>(x: T) -> T` parses fine on its own. (A separate runtime
+bug — bare generic struct/enum literals like `Box { value: 42 }`
+failing with `unknown struct or enum variant` — was fixed 2026-09-02;
+see ARCHITECTURE.md's "Status" section.)
+
 Generics are monomorphized (like Rust, unlike Java) — every concrete
 instantiation gets its own specialized, zero-cost copy generated at compile
 time, not a single type-erased implementation:
@@ -466,7 +495,7 @@ struct Player { name: String, hp: Int }
 
 Type arguments are inferred from how you call/construct — you never write
 `identity<Int>(5)` yourself. You can also bound a type parameter to require
-an interface (`fn heal<T: Damageable>(x: &mut T)`) — see the README's
+an interface (`fn heal<T: Damageable>(x: &mut T)`) — see ARCHITECTURE.md's
 "Bounded generics" section once you need it.
 
 ## 12. Interfaces
@@ -507,7 +536,7 @@ fn main() {
 - A `sealed interface` additionally requires every implementer to be known
   at compile time (declared in the same compile), which unlocks matching
   `&dyn` values by concrete type with `match` the same way an enum's
-  variants are matched — see the README's "Sealed interfaces" section.
+  variants are matched — see the ARCHITECTURE.md's "Sealed interfaces" section.
 
 ## 13. Error handling
 
@@ -563,6 +592,10 @@ value, stringified inline. It's sugar over plain `String + String`
 concatenation, nothing more.)
 
 ## 14. Nullability
+
+**Not implemented in `selfhost/` today**: `Type?` fails to parse
+(`unexpected token '?'`) — verified via `examples/nullable.hc`. This
+section describes the design as built for the retired Kotlin compiler.
 
 HC-native values are never null — `Int`, `String`, `Player`, etc. can't be
 null, period. The one place null is a real fact of life is talking to
@@ -624,7 +657,10 @@ fn main() {
 - If a wrong signature is declared, it compiles fine and fails at *runtime*
   (`NoSuchMethodError`/similar) — same trust model as any FFI declaration
   file in any language. There's no checking against the real class.
-- **Property-style sugar**: if `recv.field` doesn't match a declared field,
+- **Property-style sugar** (unverified against the compiler currently in
+  this repo — no getter-fallback handling was found in
+  `selfhost/checker/Checker.hotc` during an audit of this doc; treat as
+  likely not ported): if `recv.field` doesn't match a declared field,
   the compiler falls back to trying `recv.getField()`/`recv.isField()` (a
   Java bean getter) before giving up — `enemy.health` instead of
   `enemy.getHealth()`. Read-only; a real declared field always wins if both
@@ -634,6 +670,11 @@ fn main() {
   see `examples/string_bridge.hc`.
 
 ## 16. `@serializable`
+
+**Not implemented in `selfhost/` today**: `@` doesn't parse as an
+annotation token at all yet — verified via `examples/test_serializable.hotc`,
+which fails with `unexpected token '@'`. This section describes the
+design as built for the retired Kotlin compiler.
 
 For a struct that just needs to read/write itself to a Forge-style
 `FriendlyByteBuf` (or anything else with matching `writeX`/`readX` method
@@ -707,20 +748,26 @@ called from module `b`), but no file needs to "import" another file to see
 its declarations.
 
 If you're building a real project (e.g. a Minecraft mod) rather than a
-one-off script, see the README's "Gradle plugin" section for wiring a
+one-off script, see ARCHITECTURE.md's "Gradle plugin" section for wiring a
 `sourceDir` into your build so `.hc` sources compile automatically
 alongside your Java.
 
 ## 18. Where to go next
 
-- **[README.md](README.md)** — the full reference. Every feature has a
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the full reference. Every feature has a
   dedicated section going deeper than this tutorial does, plus the design
   rationale behind each scope cut.
-- **[examples/](examples/)** — real, runnable `.hc` programs, one concept
-  per file, organized by feature (`generics.hc`, `interfaces.hc`,
-  `enums.hc`, `arrays.hc`, `error_handling.hc`, `nullable.hc`, ...). When
-  in doubt about exact syntax, find the matching example file and read it
-  — every one of them actually compiles and runs, unlike prose.
+- **[examples/](examples/)** — `.hc` programs, one concept per file,
+  organized by feature (`generics.hc`, `interfaces.hc`, `enums.hc`,
+  `arrays.hc`, `error_handling.hc`, `nullable.hc`, ...). When in doubt
+  about exact syntax, find the matching example file and read it. **Not
+  all of them currently compile and run** against the self-hosted
+  compiler in this repo — several exercise features called out
+  throughout this tutorial and in ARCHITECTURE.md's "Status" section; the
+  basics (`hello.hc`, `mut.hc`, `loops.hc`, control flow, plain
+  structs, `enums.hc`, `interfaces.hc`, `sealed.hc`, `generics.hc`,
+  `floats.hc`, multi-catch `try`/`catch`, directory/multi-file
+  compilation) do work.
 - **[examples/battle/](examples/battle/)** — a small interactive
   dungeon-crawl demo (`./gradlew playBattle`) that ties together structs,
   interfaces, `&dyn`, generics, and enums in one real program instead of
@@ -731,7 +778,7 @@ alongside your Java.
   already been thought through.
 
 Not covered in this tutorial (deliberately, to keep it beginner-focused —
-see the README when you need them): `arena struct`/off-heap buffers,
+see ARCHITECTURE.md when you need them): `arena struct`/off-heap buffers,
 subclassing a real Java class with `extends`, composition delegation
 (`by field`), bounded generics (`T: Trait`), `extern interface`, and
 global `static` state.

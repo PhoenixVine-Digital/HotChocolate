@@ -1,0 +1,40 @@
+// Exercises real dynamic dispatch end to end -- the newest self-hosting port: `interface Name {
+// fn method(&self, ...) -> Ret; }`, `impl Name for StructName { ... }`, and a `&dyn Name`-typed
+// param that calls `.method()` on whichever concrete struct is actually passed in, resolved via a
+// real JVM `INVOKEINTERFACE` at runtime, not a compile-time-known target. `Circle`/`Square` below
+// return DIFFERENT values from the SAME call site (`s.area()` inside `total_area`) depending on
+// which one was actually passed -- that's the real proof this is genuine polymorphism, not just
+// syntax that happens to parse.
+interface Shape {
+    fn area(&self) -> Int;
+}
+
+struct Circle {
+    r: Int,
+}
+impl Shape for Circle {
+    fn area(&self) -> Int {
+        return self.r * self.r * 3;
+    }
+}
+
+struct Square {
+    side: Int,
+}
+impl Shape for Square {
+    fn area(&self) -> Int {
+        return self.side * self.side;
+    }
+}
+
+fn total_area(s: &dyn Shape) -> Int {
+    return s.area();
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let c = Circle { r: 2 };
+    let sq = Square { side: 3 };
+    let ca = total_area(c); // 2*2*3 = 12
+    let sa = total_area(sq); // 3*3 = 9
+    return ca + sa + a + b;
+}

@@ -1,0 +1,56 @@
+// `Registry<T>` -- see README's own "Standard library modules" section. Depends on `vec` (its
+// own `entries` field, and reuses `vec_of`) and `option` (`get`'s own return type) -- `use
+// registry;` alone pulls both in automatically, see `Driver.hotc`'s own `resolve_stdlib_modules`.
+
+struct RegistryEntry<T> {
+    key: String,
+    value: T,
+}
+
+struct Registry<T> {
+    entries: Vec<RegistryEntry<T>>,
+}
+
+fn registry_new<T>(firstKey: String, firstValue: T) -> Registry<T> {
+    return Registry<T> { entries: vec_of(RegistryEntry<T> { key: firstKey, value: firstValue }) };
+}
+
+impl Registry<T> {
+    // "Last write wins" -- overwrites an existing entry in place if `key` is already registered,
+    // rather than always appending a stale duplicate underneath it that `get`'s own linear scan
+    // (finds the FIRST match) would never see again. The self-hosted compiler's OWN `Registry<T>`
+    // usage (`Checker.hotc`'s `vars`/`fn_sigs`/etc.) needs this exact semantics to correctly
+    // re-register a shadowed local.
+    fn register(&mut self, key: String, value: T) {
+        var found_idx = -1;
+        var i = 0;
+        while i < self.entries.length() {
+            let entry = self.entries.get(i);
+            if entry.key == key {
+                found_idx = i;
+            }
+            i = i + 1;
+        }
+        if found_idx >= 0 {
+            self.entries.set(found_idx, RegistryEntry<T> { key: key, value: value });
+        } else {
+            self.entries.push(RegistryEntry<T> { key: key, value: value });
+        }
+    }
+
+    fn get(&self, key: String) -> Option<T> {
+        var i = 0;
+        while i < self.entries.length() {
+            let entry = self.entries.get(i);
+            if entry.key == key {
+                return Option<T>::Some { value: entry.value };
+            }
+            i = i + 1;
+        }
+        return Option<T>::None {};
+    }
+
+    fn length(&self) -> Int {
+        return self.entries.length();
+    }
+}

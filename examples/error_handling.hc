@@ -52,9 +52,9 @@ fn validate(n: Int) {
 fn safe_parse(s: String) -> Result<Int, String> {
     try {
         let n = Integer::parseInt(s);
-        return Result::Ok { value: n };
+        return Result<Int, String>::Ok { value: n };
     } catch (e: NumberFormatException) {
-        return Result::Err { error: "bad number: " + s };
+        return Result<Int, String>::Err { error: "bad number: " + s };
     }
 }
 

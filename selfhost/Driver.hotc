@@ -11,7 +11,14 @@ module hc.selfhost.driver;
 // from real argv (falling back to the hardcoded demo path when none is given) instead of always
 // reading a compiled-in constant -- see `run_bootstrap_demo` below.
 
-extern class JPath = "java.nio.file.Path" interface {}
+// Plain `extern class` (no `interface` keyword) -- `extern class X = "..." interface {}` is a
+// DIFFERENT declaration form the real compiler supports (see `Parser.kt`'s own
+// `externClassOrInterfaceDecl`) that the self-hosted `Parser.hotc` doesn't parse at all (a real,
+// disclosed gap found running `run_selfcompile_stage2`: "unexpected token 'interface'" merging
+// this file in). `JPath` is only ever used as an opaque passthrough return/param type here (never
+// has a method called ON it directly), so the plain, method-less form works identically for this
+// file's own purposes and keeps `Driver.hotc` itself mergeable into a self-hosted compile.
+extern class JPath = "java.nio.file.Path" {}
 extern class JPaths = "java.nio.file.Paths" {
     static fn get(first: String, more: [String]) -> JPath;
 }
@@ -24,118 +31,553 @@ fn read_source_file(path: String) -> String {
     return JFiles2::readString(p);
 }
 
-// A real, minimal prelude -- `Option<T>`/`Vec<T>`/`RegistryEntry<T>`/`Registry<T>` (plus
-// `vec_of<T>`/`registry_new<T>`), mirroring the REAL compiler's own auto-injected `Prelude.kt`
-// (already independently verified as its own program, `demo_program28.hcsrc`'s `Opt`/`Vec3`/
-// `RegEntry`/`Reg`, just renamed here to the real prelude names). A real, previously-undiscovered
-// LIMIT of this whole self-hosting effort found attempting to self-compile `Lexer.hotc`: real
-// `.hotc` source almost never declares `Vec`/`Option`/`Registry` itself (`Lexer.hotc`'s own
-// `self.keywords: Registry<TokType>` relies ENTIRELY on the real compiler's prelude injection) --
-// without this, the self-hosted compiler could only ever compile programs that happen to declare
-// every generic type they use themselves, which is essentially no real code at all. `nl`-joined
-// string-literal concatenation (not a raw multi-line literal) because this subset's own string
-// literals have no escape-sequence support at all (confirmed against the real `Lexer.kt` itself)
-// -- the same workaround `TestDriver.hotc`'s own test-source construction already uses.
-fn prelude_source() -> String {
-    let nl = codepoint_to_string(CP_NEWLINE);
-    return "enum Option<T> \{" + nl
-        + "Some \{ value: T \}," + nl
-        + "None \{\}," + nl
-        + "\}" + nl
-        // NOT mirroring the real prelude's own `Result<T, E>` here -- this subset's own generic
-        // struct/enum decl parsing (`Parser.hotc`'s `struct_decl`/`enum_decl`) only supports
-        // exactly ONE `<T>` type parameter (a real, disclosed scope cut, see `Ast.hc`'s own
-        // `StructDecl`/`EnumDecl` headers), so a two-param `Result<T, E>` would fail to parse --
-        // and since this whole string gets parsed unconditionally for EVERY target-program
-        // compile, that would break every demo, not just ones that use `Result`. A real follow-up
-        // (multi-type-param generics), not an oversight.
-        + "struct Vec<T> \{" + nl
-        + "data: [T]," + nl
-        + "len: Int," + nl
-        + "\}" + nl
-        + "impl Vec<T> \{" + nl
-        + "fn push(&mut self, value: T) \{" + nl
-        + "if self.len == self.data.length \{" + nl
-        + "var newCap = self.data.length * 2;" + nl
-        + "if newCap == 0 \{" + nl
-        + "newCap = 4;" + nl
-        + "\}" + nl
-        + "var newData = [value; newCap];" + nl
-        + "var i = 0;" + nl
-        + "while i < self.len \{" + nl
-        + "newData[i] = self.data[i];" + nl
-        + "i = i + 1;" + nl
-        + "\}" + nl
-        + "self.data = newData;" + nl
-        + "\}" + nl
-        + "self.data[self.len] = value;" + nl
-        + "self.len = self.len + 1;" + nl
-        + "\}" + nl
-        + "fn get(&self, i: Int) -> T \{" + nl
-        + "return self.data[i];" + nl
-        + "\}" + nl
-        + "fn set(&mut self, i: Int, value: T) \{" + nl
-        + "self.data[i] = value;" + nl
-        + "\}" + nl
-        + "fn length(&self) -> Int \{" + nl
-        + "return self.len;" + nl
-        + "\}" + nl
-        + "\}" + nl
-        + "fn vec_of<T>(first: T) -> Vec<T> \{" + nl
-        + "return Vec<T> \{ data: [first; 4], len: 1 \};" + nl
-        + "\}" + nl
-        + "struct RegistryEntry<T> \{" + nl
-        + "key: String," + nl
-        + "value: T," + nl
-        + "\}" + nl
-        + "struct Registry<T> \{" + nl
-        + "entries: Vec<RegistryEntry<T>>," + nl
-        + "\}" + nl
-        + "fn registry_new<T>(firstKey: String, firstValue: T) -> Registry<T> \{" + nl
-        + "return Registry<T> \{ entries: vec_of(RegistryEntry<T> \{ key: firstKey, value: firstValue \}) \};" + nl
-        + "\}" + nl
-        + "impl Registry<T> \{" + nl
-        // "Last write wins" -- mirrors the real compiler's own `Prelude.kt` bug fix (see that
-        // file's own `register` header): overwrites an existing entry in place if `key` is
-        // already registered, rather than always appending a stale duplicate underneath it that
-        // `get`'s own linear scan (finds the FIRST match) would never see again. This self-hosted
-        // mirror had drifted out of sync with the fix -- worth catching now since the self-hosted
-        // compiler's OWN `Registry<T>` usage (`Checker.hotc`'s `vars`/`fn_sigs`/etc.) needs this
-        // exact semantics to correctly re-register a shadowed local, the same real gap that
-        // motivated the real compiler's own fix in the first place.
-        + "fn register(&mut self, key: String, value: T) \{" + nl
-        + "var found_idx = -1;" + nl
-        + "var i = 0;" + nl
-        + "while i < self.entries.length() \{" + nl
-        + "let entry = self.entries.get(i);" + nl
-        + "if entry.key == key \{" + nl
-        + "found_idx = i;" + nl
-        + "\}" + nl
-        + "i = i + 1;" + nl
-        + "\}" + nl
-        + "if found_idx >= 0 \{" + nl
-        + "self.entries.set(found_idx, RegistryEntry<T> \{ key: key, value: value \});" + nl
-        + "\} else \{" + nl
-        + "self.entries.push(RegistryEntry<T> \{ key: key, value: value \});" + nl
-        + "\}" + nl
-        + "\}" + nl
-        + "fn get(&self, key: String) -> Option<T> \{" + nl
-        + "var i = 0;" + nl
-        + "while i < self.entries.length() \{" + nl
-        + "let entry = self.entries.get(i);" + nl
-        + "if entry.key == key \{" + nl
-        + "return Option<T>::Some \{ value: entry.value \};" + nl
-        + "\}" + nl
-        + "i = i + 1;" + nl
-        + "\}" + nl
-        + "return Option<T>::None \{\};" + nl
-        + "\}" + nl
-        + "fn length(&self) -> Int \{" + nl
-        + "return self.entries.length();" + nl
-        + "\}" + nl
-        + "\}" + nl;
+// `hc doc`'s own Markdown output -- plain `java.io.FileWriter` rather than
+// `java.nio.file.Files.writeString` (which needs a varargs `OpenOption...` trailing param, real
+// friction for the same "no real array-of-arbitrary-length construction beyond a fixed literal"
+// reason `byte[]` itself is a known gap, see `IDEAS.md`'s own "A `Byte` primitive type" entry) --
+// no byte[]/varargs involved here at all, just a plain three-call `forName`/`write`/`close`. The
+// explicit `Charset` (Java 11's own `FileWriter(String, Charset)` overload, not the ancient
+// platform-default-encoding constructor) matters for real: a doc comment's own text is ordinary
+// user-authored prose, not guaranteed ASCII, and the platform-default constructor silently
+// mangled a real em dash into `?` on this very session's own first verification run on Windows.
+extern class JCharset = "java.nio.charset.Charset" {
+    static fn forName(name: String) -> Self;
+}
+extern class JFileWriter = "java.io.FileWriter" {
+    fn new(path: String, cs: JCharset) -> Self;
+    fn write(&self, s: String);
+    fn close(&self);
 }
 
+fn write_text_file(path: String, content: String) {
+    let cs = JCharset::forName("UTF-8");
+    var w = JFileWriter::new(path, cs);
+    w.write(content);
+    w.close();
+}
+
+// === Directory-mode CLI: mirrors the real compiler's own `Main.kt` `parseEntry` ===
+// Walks a directory collecting every `.hotc` file, sorted by path for determinism (matching the
+// real compiler's own `sortedBy { it.relativeTo(path).path }` -- merge order otherwise depends on
+// `File.listFiles()`'s unspecified OS-level ordering, which would make `hc run <dir>` produce a
+// different program from run to run of the exact same source), and merges them into one flat-
+// namespace `Program`, same as `hc run <dir>`/`hc build <dir>` do at the Kotlin level.
+extern class JFileCli = "java.io.File" {
+    fn new(path: String) -> Self;
+    fn listFiles(&self) -> [JFileCli];
+    fn isDirectory(&self) -> Bool;
+    fn isFile(&self) -> Bool;
+    fn getPath(&self) -> String;
+    fn getName(&self) -> String;
+}
+
+// `run_cli`'s own "run" mode (`SelfhostCLI run <path>`, mirroring `hc run`'s "compile AND
+// execute" contract, as opposed to the bare `SelfhostCLI <path> [outPath]` build-only form) needs
+// to actually EXECUTE the freshly-compiled class after writing it, with real stdin/stdout wired
+// through -- a genuine child `java` process (`ProcessBuilder`, `inheritIO()`) rather than
+// reflectively `Method.invoke`-ing `main` in-process, since invoking a real Java varargs method
+// (`Method.invoke(Object, Object...)`) would need building a real `Object[]` wrapping the `String[]`
+// args array, and this subset's arrays need a concrete element type inferred from a real first
+// element (see `Ast.hc`'s own `ArrayRepeat`/`ArrayLit` codegen) -- there's no "Object" reference
+// type to build one from. A child process sidesteps that entirely, and `inheritIO()` gets real
+// stdin/stdout/stderr connected for free, matching exactly what `examples/battle`'s own
+// `read_line()` call and `examples/calc`'s own `read_int()`/`read_string()` calls need.
+// `java.class.path` -- the RUNNING process's own classpath (however `SelfhostCLI` itself was
+// launched, `-cp "<jars>;."` per `selfhost/bootstrap/README.md`) -- is reused verbatim for the
+// child, so the freshly-written class (in the current working directory, already on that same
+// classpath) resolves the same way the parent process itself does.
+extern class JSystemCli = "java.lang.System" {
+    static fn getProperty(key: String) -> String;
+}
+// `--target 17|21|25` -- see `run_cli`'s own header. Only ever fed a value already validated to
+// be digits by the CALLER (no try/catch around this -- a genuinely malformed `--target` value is
+// a real, disclosed "crash with Java's own NumberFormatException" case for now, same trust-the-
+// caller convention `JInteger` is bound here for, not softened with a friendlier error yet).
+extern class JInteger = "java.lang.Integer" {
+    static fn parseInt(s: String) -> Int;
+}
+extern class JProcessBuilderCli = "java.lang.ProcessBuilder" {
+    fn new(cmd: [String]) -> Self;
+    fn inheritIO(&mut self) -> JProcessBuilderCli;
+    fn start(&self) -> JProcessCli;
+}
+extern class JProcessCli = "java.lang.Process" {
+    fn waitFor(&mut self) -> Int;
+}
+
+// Real bug found auditing directory-mode compilation: this only ever matched `.hotc`, the
+// extension this compiler's OWN self-hosted source uses (`selfhost/*.hotc`) -- but every real
+// example and mod project (`examples/multifile/`, the Gradle plugin's `sourceDir`) uses plain
+// `.hc`, same as single-file mode already accepts unconditionally (`base_name_no_ext`'s own
+// header: "NOT extension-gated at all" for a single-file target). Directory mode silently
+// collected zero files for any real `.hc` project -- `parse_directory`'s `files.get(0)` on that
+// empty result then read back stale backing-array data (`"__init__"`, this Vec's own placeholder
+// sentinel) instead of a real path, surfacing many steps later as a confusing
+// `NoSuchFileException: __init__` with no obvious connection to "wrong extension". Both
+// extensions are accepted now, matching single-file mode's own already-permissive behavior.
+fn ends_with_hotc(name: String) -> Bool {
+    return ends_with_suffix(name, ".hotc") || ends_with_suffix(name, ".hc");
+}
+
+fn ends_with_suffix(name: String, suffix: String) -> Bool {
+    let nlen = name.length();
+    let slen = suffix.length();
+    if nlen < slen { return false; }
+    return name.substring(nlen - slen, nlen) == suffix;
+}
+
+// No native `String` ordering operator in this subset (`<`/`>` are Int/Long-only, see
+// `Checker.hotc`'s own `check_binary`) -- a plain codepoint-by-codepoint comparison via
+// `codePointAt` is both simpler than porting a real collation and sufficient here, since this only
+// needs to match the real compiler's own plain-path-string `sortedBy` (not real locale collation).
+fn str_less_than(a: String, b: String) -> Bool {
+    var i = 0;
+    let alen = a.length();
+    let blen = b.length();
+    while i < alen && i < blen {
+        let ca = a.codePointAt(i);
+        let cb = b.codePointAt(i);
+        if ca < cb { return true; }
+        if ca > cb { return false; }
+        i = i + 1;
+    }
+    return alen < blen;
+}
+
+fn sort_str_vec(v: Vec<String>) -> Vec<String> {
+    var out = v;
+    var i = 1;
+    while i < out.length() {
+        let key = out.get(i);
+        var j = i - 1;
+        var placed = false;
+        while j >= 0 && !placed {
+            let cur = out.get(j);
+            if str_less_than(key, cur) {
+                out.set(j + 1, cur);
+                j = j - 1;
+            } else {
+                placed = true;
+            }
+        }
+        out.set(j + 1, key);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn collect_hotc_files(dir_path: String) -> Vec<String> {
+    var out = empty_str_vec2();
+    let dir = JFileCli::new(dir_path);
+    let entries = dir.listFiles();
+    var i = 0;
+    while i < entries.length {
+        let e = entries[i];
+        if e.isDirectory() {
+            let sub = collect_hotc_files(e.getPath());
+            var j = 0;
+            while j < sub.length() {
+                out.push(sub.get(j));
+                j = j + 1;
+            }
+        } else if e.isFile() && ends_with_hotc(e.getName()) {
+            out.push(e.getPath());
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn last_index_of_char(s: String, cp: Int) -> Int {
+    var idx = -1;
+    var i = 0;
+    while i < s.length() {
+        if s.codePointAt(i) == cp { idx = i; }
+        i = i + 1;
+    }
+    return idx;
+}
+
+// Derives a JVM-legal-ish binary name from a source path (`selfhost/ast/Ast.hotc` -> `Ast`,
+// `myproject` (a directory) -> `myproject`) -- real, disclosed scope cut: no sanitization of
+// characters that aren't already valid in a Java identifier (matching this whole codebase's
+// existing "trust the input, don't guess" convention), just enough to name the output class for a
+// normal project/file path.
+fn base_name_no_ext(path: String) -> String {
+    // A real gap found running this compiler on a Windows ABSOLUTE path
+    // (`C:\Users\...\CategoryDefinition.hotc`, real usage piloting Minecraft-modding on top of
+    // this compiler): `CP_SLASH` alone finds nothing in a backslash-separated path, so `name`
+    // stayed the WHOLE path (drive letter, every directory, backslashes and all) -- a real,
+    // invalid JVM class name. Whichever separator appears LAST wins (a mixed path, unlikely but
+    // possible, still resolves to its real last path segment either way).
+    let slash_idx1 = last_index_of_char(path, CP_SLASH);
+    let slash_idx2 = last_index_of_char(path, CP_BACKSLASH);
+    var slash_idx = slash_idx1;
+    if slash_idx2 > slash_idx1 {
+        slash_idx = slash_idx2;
+    }
+    var name = path;
+    if slash_idx >= 0 {
+        name = path.substring(slash_idx + 1, path.length());
+    }
+    // Strips whatever extension is actually present (`.hotc`, `.hcsrc`, ...), matching the real
+    // compiler's own `File.nameWithoutExtension` -- NOT hardcoded to `.hotc` specifically, since a
+    // single-file target (unlike directory-mode's own file COLLECTION) isn't extension-gated at all.
+    let dot_idx = last_index_of_char(name, CP_DOT);
+    if dot_idx > 0 {
+        name = name.substring(0, dot_idx);
+    }
+    return name;
+}
+
+// Does `name` (the file-derived program/entry-class name -- `base_name_no_ext`'s own result)
+// collide with a struct or enum the TARGET PROGRAM ITSELF declares? A real, found-by-actually-
+// piloting-a-real-mod gap: `compile_program`'s own `binary_name` param becomes the JVM class name
+// of the program's "entry holder" class (top-level fns/statics/the generated `main(String[])`) --
+// completely unrelated to the file's OWN declared structs, EXCEPT when one of them happens to
+// share the file's own name, an extremely natural pattern (`Player.hotc` declaring `struct
+// Player`) that silently corrupted the compiled output before this check existed: `gen_struct`
+// would overwrite the SAME "Player.class" the entry holder needed, with no `main` at all left in
+// it. See `run_cli`'s own header for the fix (mangling the entry class name, never the struct's).
+fn name_collides_with_decl(name: String, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>) -> Bool {
+    var i = 0;
+    while i < structs.length() {
+        if structs.get(i).name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    var j = 0;
+    while j < enums.length() {
+        if enums.get(j).name == name {
+            return true;
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+fn parse_directory(dir_path: String) -> Program {
+    var files = collect_hotc_files(dir_path);
+    files = sort_str_vec(files);
+    var prog = parse_source_file(files.get(0));
+    var i = 1;
+    while i < files.length() {
+        prog = merge_program(prog, parse_source_file(files.get(i)));
+        i = i + 1;
+    }
+    return prog;
+}
+
+// The real, general-purpose entry point this whole effort has been building toward: takes a single
+// real target path from argv (a `.hotc` file OR a project directory, exactly like `hc run`/`hc
+// build`'s own second positional arg), and compiles it -- no hardcoded demo file, no hardcoded
+// entry function, no hardcoded six-file list. `entry_name`/`entry_args` here are a harmless
+// placeholder (same convention `run_selfcompile_stage2`'s own `__selfcompile_probe_entry` already
+// uses): `compile_program`'s own priority logic prefers a REAL `main` in the target program itself
+// first, so a normal target program with its own `pub fn main() ...` never reaches this fallback at
+// all -- it only fires if the target defines neither, matching this subset's existing convention
+// (see `Codegen.hotc`'s own `compile_program` header) rather than inventing a new one here.
+// `hc doc <dir|file> [outFile]` -- the renderer half of structured `///` doc comments (the
+// attachment/`@see`-resolution half shipped 2026-09-03, see README's own "Structured doc
+// comments" section). One documented `struct`/`fn` per `###` heading, `@param`s as a bullet
+// list, `@warning` as a blockquote, `@see` targets backtick-quoted. Deliberately does NOT mark an
+// unresolved `@see` inline the way the retired Kotlin compiler's own version did -- `Checker.hotc`'s
+// own `check_doc_sees` already rejects a dead `@see` link as a real COMPILE ERROR (run by
+// `run_doc_cli`'s own `compile_program` call, right below, same as `build`/`run`), so rendering
+// only ever happens once every `@see` in the program is already known-valid -- there's no
+// "unresolved" case left by the time this runs at all.
+fn render_doc_section(title: String, names: Vec<String>, docs: Vec<DocComment>) -> String {
+    let nl = codepoint_to_string(CP_NEWLINE);
+    var out = "";
+    if names.length() == 0 { return out; }
+    out = out + "## " + title + nl + nl;
+    var i = 0;
+    while i < names.length() {
+        let name = names.get(i);
+        let d = docs.get(i);
+        out = out + "### `" + name + "`" + nl + nl;
+        if d.summary != "" {
+            out = out + d.summary + nl + nl;
+        }
+        if d.param_names.length() > 0 {
+            out = out + "**Parameters:**" + nl;
+            var pi = 0;
+            while pi < d.param_names.length() {
+                out = out + "- `" + d.param_names.get(pi) + "` -- " + d.param_texts.get(pi) + nl;
+                pi = pi + 1;
+            }
+            out = out + nl;
+        }
+        if d.returns_text != "" {
+            out = out + "**Returns:** " + d.returns_text + nl + nl;
+        }
+        if d.example_text != "" {
+            out = out + "**Example:** " + d.example_text + nl + nl;
+        }
+        if d.warning_text != "" {
+            out = out + "> **Warning:** " + d.warning_text + nl + nl;
+        }
+        if d.has_deprecated {
+            if d.deprecated_text != "" {
+                out = out + "**Deprecated:** " + d.deprecated_text + nl + nl;
+            } else {
+                out = out + "**Deprecated.**" + nl + nl;
+            }
+        }
+        if d.see_targets.length() > 0 {
+            out = out + "**See also:** ";
+            var si = 0;
+            while si < d.see_targets.length() {
+                if si > 0 { out = out + ", "; }
+                out = out + "`" + d.see_targets.get(si) + "`";
+                si = si + 1;
+            }
+            out = out + nl + nl;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn render_doc_markdown(struct_names: Vec<String>, struct_docs: Vec<DocComment>, fn_names: Vec<String>, fn_docs: Vec<DocComment>) -> String {
+    let nl = codepoint_to_string(CP_NEWLINE);
+    var out = "# API Documentation" + nl + nl;
+    out = out + render_doc_section("Structs", struct_names, struct_docs);
+    out = out + render_doc_section("Functions", fn_names, fn_docs);
+    return out;
+}
+
+// `SelfhostCLI doc <path> [outFile]` -- same parse/merge-prelude/compile pipeline `run_cli`'s own
+// build path uses (a real checker pass, `@see` resolution included, genuinely runs), then renders
+// `Program`'s own doc-comment side-channel to Markdown once that succeeds. Split out as its own
+// fn (rather than inlined into `run_cli` as one more branch) purely to keep its own local variable
+// names from colliding with `run_cli`'s identically-purposed ones (`path`/`prog`/`name`/...) in
+// the same function scope.
+// `off` -- how many leading argv slots `run_cli`'s own `--target` handling already consumed (0
+// if it wasn't present) -- every OTHERWISE-fixed-position `args[N]` access here shifts by it,
+// since `[String]` has no slicing operation to hand this fn a shorter view instead.
+fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool) {
+    let doc_path = args[off + 1];
+    var doc_out = "api.md";
+    if args.length > off + 2 { doc_out = args[off + 2]; }
+    let df = JFileCli::new(doc_path);
+    var dprog = parse_source_string("");
+    if df.isDirectory() {
+        dprog = parse_directory(doc_path);
+    } else {
+        dprog = parse_source_file(doc_path);
+    }
+    dprog = merge_program(resolve_stdlib_modules(dprog.uses, target), dprog);
+    let dname0 = base_name_no_ext(doc_path);
+    var dname = dname0;
+    if name_collides_with_decl(dname0, &dprog.structs, &dprog.enums) {
+        dname = dname0 + "$Program";
+    }
+    let dclass_out = dname + ".class";
+    let dempty_args = driver_empty_int_vec();
+    let derrors = compile_program(
+        dprog.fns, dprog.structs, dprog.impls, dprog.enums, dprog.externs, dprog.statics, dprog.interfaces,
+        dname, "__selfcompile_probe_entry", dempty_args, dclass_out,
+        dprog.struct_annotation_names, dprog.struct_annotation_data, dprog.fn_annotation_names, dprog.fn_annotation_data,
+        dprog.extend_decls, dprog.must_use_fn_names,
+        dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data, dprog.sendable_struct_names,
+        dprog.components, dprog.systems, target, explain_schedule,
+    );
+    if report_errors(derrors) {
+        let md = render_doc_markdown(dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data);
+        write_text_file(doc_out, md);
+        print("wrote " + doc_out);
+    }
+}
+
+pub fn run_cli(args: [String]) {
+    // `--target 17|21|25` -- a leading, optional flag PAIR recognized before every other
+    // dispatch below (see the compiler's own JDK-target design: Marshmallow at 25, MC 1.21.1
+    // mods at 21, MC 1.20.1 mods at 17 -- one compiler, target picked per invocation). Argv here
+    // is otherwise strictly positional (no general flag-scanning loop, see the "doc"/"run" check
+    // right below, which is the SAME convention) -- so recognizing this flag means shifting
+    // every subsequent FIXED-position `args[N]` access by `off` slots instead, since `[String]`
+    // has no slicing operation to build a shorter view without it. `target` itself isn't
+    // CONSUMED yet by anything past this point -- classfile-version emission and stdlib topic
+    // gating are their own, separate, not-yet-landed pieces (see the compiler's own target-
+    // support design) -- this is deliberately just the recognize-and-shift piece on its own.
+    var target = 17;
+    var off = 0;
+    if args[0] == "--target" {
+        target = JInteger::parseInt(args[1]);
+        if target != 17 && target != 21 && target != 25 {
+            throw ParseError::new("--target must be 17, 21, or 25, got " + JString4::valueOf(target));
+        }
+        off = 2;
+    }
+    // `--explain-schedule` -- a second, independently optional leading flag, recognized right
+    // after `--target` (stacking with it the same way, shifting `off` further) -- see `ECS_IDEAS
+    // .md`'s own "Resolved decisions" #6 and `Codegen.hotc`'s own `print_schedule_report_ecs` for
+    // the full design. Prints the REAL derived run order/parallel-groups for every `system` in
+    // the program being compiled; a no-op flag for a program with no `system` declarations at
+    // all.
+    var explain_schedule = false;
+    if args[off] == "--explain-schedule" {
+        explain_schedule = true;
+        off = off + 1;
+    }
+    if args[off] == "doc" {
+        run_doc_cli(args, off, target, explain_schedule);
+        return;
+    }
+    // `SelfhostCLI run <path>` (compile AND execute, mirroring `hc run` -- the shape
+    // `build.gradle.kts`'s own `run`/`playBattle`/`calc` tasks and the IntelliJ plugin's Run
+    // configuration all invoke) vs. plain `SelfhostCLI <path> [outPath]` (compile only,
+    // mirroring `hc build` -- the original, still-supported form). Real `args[off] == "run"`
+    // string comparison, not a separate subcommand type, keeping this a single flat `[String]`
+    // argv exactly like the real `hc` CLI's own argv shape (plus the optional `--target` prefix
+    // right above).
+    var path = args[off];
+    var execute = false;
+    var out_idx = off + 1;
+    if args[off] == "run" {
+        path = args[off + 1];
+        execute = true;
+        out_idx = off + 2;
+    }
+    let f = JFileCli::new(path);
+    // A cheap, filesystem-free dummy init (`parse_source_file` on a DIRECTORY path would try to
+    // read its bytes as a file and throw `AccessDeniedException` -- found running this against a
+    // real multi-file test project) -- immediately overwritten by whichever real branch applies.
+    var prog = parse_source_string("");
+    if f.isDirectory() {
+        prog = parse_directory(path);
+    } else {
+        prog = parse_source_file(path);
+    }
+    prog = merge_program(resolve_stdlib_modules(prog.uses, target), prog);
+
+    // See `name_collides_with_decl`'s own header, right above `parse_directory`: the entry class
+    // name is mangled -- ONLY when it would otherwise collide -- never a struct's own name (which
+    // is referenced by every `NEW`/construction site throughout the target program's own code,
+    // far too widely to safely rename).
+    let name0 = base_name_no_ext(path);
+    var name = name0;
+    if name_collides_with_decl(name0, &prog.structs, &prog.enums) {
+        name = name0 + "$Program";
+        print("note: '" + name0 + "' also names a struct/enum this program declares -- entry class renamed to '" + name + "' to avoid overwriting it");
+    }
+    var out_path = name + ".class";
+    if args.length > out_idx {
+        out_path = args[out_idx];
+    }
+
+    let empty_args = driver_empty_int_vec();
+    let errors = compile_program(
+        prog.fns, prog.structs, prog.impls, prog.enums, prog.externs, prog.statics, prog.interfaces,
+        name, "__selfcompile_probe_entry", empty_args, out_path,
+        prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
+        prog.extend_decls, prog.must_use_fn_names,
+        prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
+        prog.components, prog.systems, target, explain_schedule,
+    );
+    if report_errors(errors) {
+        print("wrote " + out_path);
+        if execute {
+            // `java.class.path` alone isn't enough: when `SelfhostCLI` itself is launched with an
+            // explicit, absolute-paths-only classpath (e.g. Gradle's own `JavaExec` -- it never
+            // puts the working directory "." on the classpath at all, unlike a typical manual
+            // `java -cp "<jars>;." ...` invocation), the freshly-written `out_path` -- always
+            // relative to the CURRENT working directory -- wouldn't be found by the child process
+            // otherwise. Prepending "." (not appending) matters: `java.class.path` here also
+            // carries `selfhost/bootstrap`, the compiler's own pre-compiled seed directory, which
+            // (as an accident of how it was generated) contains stray same-named classes from past
+            // demo/example compiles. With "." appended last, a freshly-compiled program whose name
+            // collides with one of those (e.g. `Shape`, `Box`, `Item`, `Circle`) silently loaded
+            // the STALE bootstrap version instead of the one just written -- real, reproduced
+            // failures: `InstantiationError` (a stale `Shape` compiled as an interface),
+            // `NoSuchFieldError`/`NoSuchMethodError` (stale `Circle`/`Item` with different
+            // fields/ctors). Putting "." first makes the JVM's own classloader resolve the
+            // just-written classes before anything else on the classpath, matching how a normal
+            // `java -cp ".;<jars>" ...` invocation would already behave.
+            let sep = JSystemCli::getProperty("path.separator");
+            let cp = "." + sep + JSystemCli::getProperty("java.class.path");
+            var cmd = ["java", "-cp", cp, name];
+            var pb = JProcessBuilderCli::new(cmd);
+            pb.inheritIO();
+            var proc = pb.start();
+            proc.waitFor();
+        }
+    }
+}
+
+fn cli_entry_source() -> String {
+    let nl = codepoint_to_string(CP_NEWLINE);
+    return "pub fn main(args: [String]) \{" + nl + "run_cli(args);" + nl + "\}" + nl;
+}
+
+// **Verified, not just compiled**: builds `SelfhostCLI.class`, a real standalone `hc`-replacement
+// entry point -- run it with `java -cp <asm jars>:<hotchocolate.jar>:. SelfhostCLI <file-or-dir>
+// [outPath]`, with NO Kotlin compiler involved. This is the last piece separating "the self-hosted
+// compiler proved it can bootstrap itself" (stage 2/3, above) from "the self-hosted compiler can be
+// pointed at an arbitrary real `.hotc` project the same way `hc` itself is."
+pub fn run_selfcompile_cli_prep() {
+    print("--- building the self-hosted CLI: a real hc-replacement entry point, no hardcoded target ---");
+
+    var prog = parse_source_file("selfhost/ast/Ast.hotc");
+    prog = merge_program(prog, parse_source_file("selfhost/types/Types.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/lexer/Lexer.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/parser/Parser.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/checker/Checker.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/codegen/Codegen.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/Driver.hotc"));
+    prog = merge_program(prog, parse_source_string(cli_entry_source()));
+    prog = merge_program(resolve_stdlib_modules(prog.uses, 17), prog); // internal bootstrap probe -- always resolved at the baseline target
+
+    print(
+        "parsed " + JString4::valueOf(prog.fns.length()) + " function(s), " + JString4::valueOf(prog.structs.length())
+        + " struct(s) for the self-hosted CLI"
+    );
+
+    let empty_args2 = driver_empty_int_vec();
+    let errors2 = compile_program(
+        prog.fns, prog.structs, prog.impls, prog.enums, prog.externs, prog.statics, prog.interfaces,
+        "SelfhostCLI", "__selfcompile_probe_entry", empty_args2, "SelfhostCLI.class",
+        prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
+        prog.extend_decls, prog.must_use_fn_names,
+        prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
+        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+    );
+    if report_errors(errors2) {
+        print("wrote SelfhostCLI.class -- run it standalone with a real target path to compile any .hotc file or project directory.");
+    }
+}
+
+// A real, minimal standard library -- `Option<T>`/`Result<T, E>`/`Vec<T>`/`RegistryEntry<T>`/
+// `Registry<T>` (plus `vec_of<T>`/`registry_new<T>`/`read_int`/`read_string`), mirroring the REAL
+// compiler's own auto-injected `Prelude.kt`. A real, previously-undiscovered LIMIT of this whole
+// self-hosting effort found attempting to self-compile `Lexer.hotc`: real `.hotc` source almost
+// never declares `Vec`/`Option`/`Registry` itself (`Lexer.hotc`'s own `self.keywords:
+// Registry<TokType>` relies ENTIRELY on the real compiler's prelude injection) -- without this,
+// the self-hosted compiler could only ever compile programs that happen to declare every generic
+// type they use themselves, which is essentially no real code at all.
+//
+// **Moved 2026-09-08 to real files under `stdlib/`** -- this used to be a ~125-line
+// `fn prelude_source() -> String` right here, built entirely out of escaped-brace string
+// concatenation (this language's own string literals have no escape-sequence support at all, so
+// every `{`/`}` needed writing as `\{`/`\}`, joined line by line with `+ nl +`). Genuinely
+// separates the standard library from the compiler's own source: real syntax, no escaping,
+// diffable/editable files instead of a string blob buried in `Driver.hotc`. `stdlib/` lives
+// OUTSIDE `selfhost/` specifically so `selfhost/`'s own directory-mode self-compile
+// (`./gradlew run --args="run selfhost"`) doesn't ALSO sweep it up as just another loose `.hotc`
+// tree, double-declaring everything in it on top of the explicit stdlib-merge below.
+//
+// **Split into topics, real opt-in via `use`, same day** -- what was one `stdlib/Prelude.hotc`
+// bundling everything is now five independent files (`stdlib/{option,result,vec,registry,io}.hotc`
+// -- see each one's own header for its own real dependencies on the others). A program naming
+// ANY of them via `use vec;`/`use registry;`/etc. gets ONLY those topics (plus their own
+// transitive deps) merged in -- real opt-in, not everything unconditionally. A program with NO
+// `use` line anywhere keeps the full legacy behavior (all five, unchanged) -- 100% backward
+// compatible with every `.hc`/`.hotc` file written before this feature existed, since none of
+// them could have written a `use` statement at all. See `resolve_stdlib_modules`'s own header,
+// right below `merge_program`, for the actual resolution logic, and README's own "Standard
+// library modules" section for the full design.
 fn merge_fns(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
     var out = a;
     var i = 0;
@@ -157,6 +599,26 @@ fn merge_structs(a: Vec<StructDecl>, b: Vec<StructDecl>) -> Vec<StructDecl> {
 }
 
 fn merge_impls(a: Vec<ImplDecl>, b: Vec<ImplDecl>) -> Vec<ImplDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_component_decl_vec(a: Vec<ComponentDecl>, b: Vec<ComponentDecl>) -> Vec<ComponentDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_system_decl_vec(a: Vec<SystemDecl>, b: Vec<SystemDecl>) -> Vec<SystemDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -208,10 +670,7 @@ pub fn run_bootstrap_demo(path: String) {
     var p = parser_new(toks);
     let real_prog = p.parse_program();
 
-    var plex = lexer_new(prelude_source());
-    let ptoks = plex.tokenize();
-    var pp = parser_new(ptoks);
-    let prelude_prog = pp.parse_program();
+    let prelude_prog = resolve_stdlib_modules(real_prog.uses, 17); // internal bootstrap probe -- always resolved at the baseline target
 
     let prog_fns = merge_fns(prelude_prog.fns, real_prog.fns);
     let prog_structs = merge_structs(prelude_prog.structs, real_prog.structs);
@@ -219,12 +678,23 @@ pub fn run_bootstrap_demo(path: String) {
     let prog_enums = merge_enums(prelude_prog.enums, real_prog.enums);
     let prog_externs = merge_externs(prelude_prog.externs, real_prog.externs);
     let prog_statics = merge_statics(prelude_prog.statics, real_prog.statics);
+    let prog_interfaces = merge_interfaces(prelude_prog.interfaces, real_prog.interfaces);
+    let prog_struct_ann_names = merge_str_vec(prelude_prog.struct_annotation_names, real_prog.struct_annotation_names);
+    let prog_struct_ann_data = merge_annotation_vec(prelude_prog.struct_annotation_data, real_prog.struct_annotation_data);
+    let prog_fn_ann_names = merge_str_vec(prelude_prog.fn_annotation_names, real_prog.fn_annotation_names);
+    let prog_fn_ann_data = merge_annotation_vec(prelude_prog.fn_annotation_data, real_prog.fn_annotation_data);
+    let prog_extend_decls = merge_extend_decl_vec(prelude_prog.extend_decls, real_prog.extend_decls);
+    let prog_must_use_fn_names = merge_str_vec(prelude_prog.must_use_fn_names, real_prog.must_use_fn_names);
+    let prog_struct_doc_names = merge_str_vec(prelude_prog.struct_doc_names, real_prog.struct_doc_names);
+    let prog_struct_doc_data = merge_doc_comment_vec(prelude_prog.struct_doc_data, real_prog.struct_doc_data);
+    let prog_fn_doc_names = merge_str_vec(prelude_prog.fn_doc_names, real_prog.fn_doc_names);
+    let prog_fn_doc_data = merge_doc_comment_vec(prelude_prog.fn_doc_data, real_prog.fn_doc_data);
 
     print("parsed " + JString4::valueOf(prog_fns.length()) + " function(s), " + JString4::valueOf(prog_structs.length()) + " struct(s), " + JString4::valueOf(prog_impls.length()) + " impl(s), " + JString4::valueOf(prog_enums.length()) + " enum(s), " + JString4::valueOf(prog_externs.length()) + " extern(s), " + JString4::valueOf(prog_statics.length()) + " static(s) (prelude included)");
 
     var args = vec_of(3);
     args.push(4);
-    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class");
+    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, prog_interfaces, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class", prog_struct_ann_names, prog_struct_ann_data, prog_fn_ann_names, prog_fn_ann_data, prog_extend_decls, prog_must_use_fn_names, prog_struct_doc_names, prog_struct_doc_data, prog_fn_doc_names, prog_fn_doc_data, merge_str_vec(prelude_prog.sendable_struct_names, real_prog.sendable_struct_names), merge_component_decl_vec(prelude_prog.components, real_prog.components), merge_system_decl_vec(prelude_prog.systems, real_prog.systems), 17, false); // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
     if report_errors(errors) {
         print("wrote SelfhostDemoProgram.class (combo(3, 4) should print 18 when run)");
     }
@@ -282,6 +752,69 @@ fn parse_source_string(src: String) -> Program {
     return p.parse_program();
 }
 
+// Bare generic struct construction (`Vec { ... }`, no explicit `<Arg>`) only infers its type
+// argument from the surrounding `return`'s OWN declared type (see `demo_program40.hcsrc`'s own
+// header on the real, disclosed scope of that inference) -- NOT from a `let` binding's init
+// expression, which is exactly the shape `let empty_args = Vec { data: [0; 1], len: 0 };` used to
+// be, and exactly why it failed the self-hosted checker with "unknown struct or enum variant
+// 'Vec'" merging this file into `run_selfcompile_stage2`'s own program. Routing the SAME
+// construction through a real `return` inside a small helper (matching every other bare-`Vec{}`
+// site already proven working across `Checker.hotc`/`Codegen.hotc`/`Parser.hotc`/`Types.hotc`,
+// e.g. their own pervasive `return Vec { data: v.data, len: 0 };`) fixes it.
+fn driver_empty_int_vec() -> Vec<Int> {
+    return Vec { data: [0; 1], len: 0 };
+}
+
+fn merge_interfaces(a: Vec<InterfaceDecl>, b: Vec<InterfaceDecl>) -> Vec<InterfaceDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_str_vec(a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_annotation_vec(a: Vec<Annotation>, b: Vec<Annotation>) -> Vec<Annotation> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_extend_decl_vec(a: Vec<ExtendDecl>, b: Vec<ExtendDecl>) -> Vec<ExtendDecl> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn merge_doc_comment_vec(a: Vec<DocComment>, b: Vec<DocComment>) -> Vec<DocComment> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
 fn merge_program(a: Program, b: Program) -> Program {
     return Program {
         fns: merge_fns(a.fns, b.fns),
@@ -290,7 +823,154 @@ fn merge_program(a: Program, b: Program) -> Program {
         enums: merge_enums(a.enums, b.enums),
         externs: merge_externs(a.externs, b.externs),
         statics: merge_statics(a.statics, b.statics),
+        interfaces: merge_interfaces(a.interfaces, b.interfaces),
+        struct_annotation_names: merge_str_vec(a.struct_annotation_names, b.struct_annotation_names),
+        struct_annotation_data: merge_annotation_vec(a.struct_annotation_data, b.struct_annotation_data),
+        fn_annotation_names: merge_str_vec(a.fn_annotation_names, b.fn_annotation_names),
+        fn_annotation_data: merge_annotation_vec(a.fn_annotation_data, b.fn_annotation_data),
+        extend_decls: merge_extend_decl_vec(a.extend_decls, b.extend_decls),
+        must_use_fn_names: merge_str_vec(a.must_use_fn_names, b.must_use_fn_names),
+        struct_doc_names: merge_str_vec(a.struct_doc_names, b.struct_doc_names),
+        struct_doc_data: merge_doc_comment_vec(a.struct_doc_data, b.struct_doc_data),
+        fn_doc_names: merge_str_vec(a.fn_doc_names, b.fn_doc_names),
+        fn_doc_data: merge_doc_comment_vec(a.fn_doc_data, b.fn_doc_data),
+        uses: merge_str_vec(a.uses, b.uses),
+        sendable_struct_names: merge_str_vec(a.sendable_struct_names, b.sendable_struct_names),
+        components: merge_component_decl_vec(a.components, b.components),
+        systems: merge_system_decl_vec(a.systems, b.systems),
     };
+}
+
+fn stdlib_topic_path(topic: String) -> String {
+    return "stdlib/" + topic + ".hotc";
+}
+
+fn str_vec_contains(v: &Vec<String>, s: String) -> Bool {
+    var i = 0;
+    while i < v.length() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Adds `topic` (and, transitively, everything IT depends on -- `registry` needs `vec`+`option`,
+// `io` needs `option`) to `wanted`, in dependency-before-dependent order, skipping anything
+// already present (so requesting the same topic twice, or two topics that share a dependency,
+// never double-adds it). Returns the updated list rather than mutating `wanted` in place through
+// a `&mut` param -- `Vec<T>` IS a reference type under the hood in this language (a mutation
+// through a method call like `.push()` already stays visible to every other reference to the
+// SAME object), but this fn deliberately doesn't rely on that: real move-checking isn't
+// implemented yet (see "Status" near the top of the README), and this is written to already be
+// correct the day it is, not just correct by accident of what isn't enforced yet.
+// The lowest `--target` a given stdlib topic is allowed to compile under -- every topic
+// currently shipped is plain, portable JDK-17-compatible code, so this is `17` across the
+// board today. The real point of this fn existing separately (rather than inlining a check
+// straight into `add_stdlib_topic_and_deps` below) is for the FIRST genuinely version-gated
+// topic (a virtual-thread `PhoenixPool` variant for Marshmallow/MC 1.21.1, say -- see the
+// compiler's own JDK-target design) to have exactly one place to declare its own minimum,
+// without touching the gating mechanism itself.
+fn min_target_for_topic(topic: String) -> Int {
+    if topic == "phoenix_virtual" {
+        return 21;
+    }
+    return 17;
+}
+
+fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) -> Vec<String> {
+    if str_vec_contains(&wanted, topic) {
+        return wanted;
+    }
+    // Checked on every real topic exactly once (the `str_vec_contains` guard right above
+    // already keeps a topic pulled in twice -- once directly, once as someone else's transitive
+    // dependency -- from reaching this a second time) -- and BEFORE this topic's own transitive
+    // deps get added below, so a topic that transitively pulls in something version-gated gets
+    // rejected with a message naming the ACTUAL topic that's too new, not whichever one the user
+    // literally wrote `use` for.
+    let min_target = min_target_for_topic(topic);
+    if target < min_target {
+        throw ParseError::new("module 'use " + topic + ";' requires --target " + JString4::valueOf(min_target) + " or higher, got --target " + JString4::valueOf(target));
+    }
+    var out = wanted;
+    if topic == "registry" {
+        out = add_stdlib_topic_and_deps("vec", out, target);
+        out = add_stdlib_topic_and_deps("option", out, target);
+    } else if topic == "io" {
+        out = add_stdlib_topic_and_deps("option", out, target);
+    } else if topic == "ecs" {
+        // `Codegen.hotc`'s own archetype-synthesis pass (see `ECS_IDEAS.md`) builds real
+        // `Vec$<Component>`-typed struct fields and emits real `Vec$<T>.push()`/`.get()` calls for
+        // `world.spawn(...)`/`world.run_all()` -- entirely independent of whether the user's own
+        // source ever literally writes `Vec` -- so `Vec<T>`'s own generic template must always be
+        // merged in for `use ecs;`, exactly like `registry`'s own transitive dependency right
+        // above. A real, previously-hit gap: without this, `ensure_method_instantiated` found no
+        // template at all for `Vec#push` (`self.generic_method_templates` never got Vec's own impl
+        // block merged in), and `gen_vec_push_ecs` handed ASM an empty method descriptor -- a real
+        // crash caught only once `world.spawn(...)` was finally exercised end-to-end.
+        out = add_stdlib_topic_and_deps("vec", out, target);
+        // Phase B (real parallel dispatch, see `ECS_IDEAS.md`) synthesizes a real `PhoenixPool`
+        // static and `pool.spawn(...)` calls whenever any two systems can run concurrently --
+        // again, independent of whether the user's own source ever writes `use phoenix;` itself.
+        out = add_stdlib_topic_and_deps("phoenix", out, target);
+    } else if topic == "phoenix" {
+        // `PhoenixPool::join_all_and_shutdown` (see `stdlib/phoenix.hotc`'s own header) takes a
+        // real `&Vec<PhoenixTask>` -- `Vec<T>`'s own generic template has to be merged in for
+        // THAT method's own body to type-check at all, same "codegen/stdlib-internal usage needs
+        // the dependency even when the user's own source never writes the word" reasoning `ecs`'s
+        // own `vec` dependency right above already established. A real, previously-hit gap: a
+        // program with `use phoenix;` alone (no `use ecs;`, which already pulls `vec` in for an
+        // unrelated reason) crashed compiling `join_all_and_shutdown` itself -- `ensure_method_
+        // instantiated` found no template for `Vec#length`/`Vec#get` (`self.generic_method_
+        // templates` never got Vec's own impl block merged in), corrupting the emitted method
+        // descriptor.
+        out = add_stdlib_topic_and_deps("vec", out, target);
+    } else if topic == "phoenix_virtual" {
+        // Virtual-thread `PhoenixPool` variant (see `stdlib/phoenix_virtual.hotc`'s own header) --
+        // a NEW, separate type from `PhoenixPool` itself, but it reuses `PhoenixTask`/
+        // `PhoenixCallable`/`PhoenixExecutorService` directly rather than re-declaring them, so
+        // `use phoenix_virtual;` alone (no `use phoenix;`) still needs `phoenix`'s own program
+        // merged in for those types to exist at all.
+        out = add_stdlib_topic_and_deps("phoenix", out, target);
+    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" {
+        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math");
+    }
+    out.push(topic);
+    return out;
+}
+
+// The real "which stdlib topics does this compile actually need" decision -- see `merge_program`'s
+// own header, right above, for the full design. `requested` is the WHOLE merged program's own
+// `Program.uses` (every `use topic;` line found anywhere in it, `Ast.hc`'s own `Program.uses`
+// header explains why that's a flat list rather than per-file). An empty list means no `use`
+// anywhere -- the 100%-backward-compatible "inject everything" default every pre-existing program
+// already relies on; a non-empty list means real opt-in, resolved (with transitive deps) via
+// `add_stdlib_topic_and_deps` above.
+fn resolve_stdlib_modules(requested: Vec<String>, target: Int) -> Program {
+    if requested.length() == 0 {
+        // No `use` anywhere -- the always-portable default set, unconditionally injected
+        // regardless of `target` (every one of these is plain JDK-17-compatible code, and this
+        // path never calls `add_stdlib_topic_and_deps` at all, so there's nothing to gate here
+        // even in principle).
+        var full = parse_source_file(stdlib_topic_path("option"));
+        full = merge_program(full, parse_source_file(stdlib_topic_path("result")));
+        full = merge_program(full, parse_source_file(stdlib_topic_path("vec")));
+        full = merge_program(full, parse_source_file(stdlib_topic_path("registry")));
+        full = merge_program(full, parse_source_file(stdlib_topic_path("io")));
+        return full;
+    }
+    var wanted = empty_str_vec2();
+    var i = 0;
+    while i < requested.length() {
+        wanted = add_stdlib_topic_and_deps(requested.get(i), wanted, target);
+        i = i + 1;
+    }
+    var out = parse_source_file(stdlib_topic_path(wanted.get(0)));
+    var j = 1;
+    while j < wanted.length() {
+        out = merge_program(out, parse_source_file(stdlib_topic_path(wanted.get(j))));
+        j = j + 1;
+    }
+    return out;
 }
 
 // A tiny, synthetic `Int`-returning, zero-param function merged in alongside the real six files,
@@ -314,7 +994,7 @@ pub fn run_selfcompile_probe() {
     prog = merge_program(prog, parse_source_file("selfhost/checker/Checker.hotc"));
     prog = merge_program(prog, parse_source_file("selfhost/codegen/Codegen.hotc"));
     prog = merge_program(prog, parse_source_string(probe_entry_source()));
-    prog = merge_program(parse_source_string(prelude_source()), prog);
+    prog = merge_program(resolve_stdlib_modules(prog.uses, 17), prog); // internal bootstrap probe -- always resolved at the baseline target
 
     print(
         "parsed " + JString4::valueOf(prog.fns.length()) + " function(s), " + JString4::valueOf(prog.structs.length())
@@ -323,12 +1003,207 @@ pub fn run_selfcompile_probe() {
         + " static(s) (prelude + all 6 real compiler source files)"
     );
 
-    let empty_args = Vec { data: [0; 1], len: 0 };
+    let empty_args = driver_empty_int_vec();
     let errors = compile_program(
-        prog.fns, prog.structs, prog.impls, prog.enums, prog.externs, prog.statics,
+        prog.fns, prog.structs, prog.impls, prog.enums, prog.externs, prog.statics, prog.interfaces,
         "SelfhostSelfCompileProbe", "__selfcompile_probe_entry", empty_args, "SelfhostSelfCompileProbe.class",
+        prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
+        prog.extend_decls, prog.must_use_fn_names,
+        prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
+        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
     );
     if report_errors(errors) {
         print("SELF-HOSTING MILESTONE: the self-hosted compiler successfully checked+compiled its own full source (ast+types+lexer+parser+checker+codegen)!");
+    }
+}
+
+// === Stage 2: does the COMPILED OUTPUT of self-compilation itself work as a real compiler? ===
+//
+// `run_selfcompile_probe` above proves the self-hosted compiler's own lex/parse/check/codegen
+// ALGORITHMS correctly process the self-hosted compiler's own source -- but the class file it
+// produces has no real driving logic in it, just a trivial `-> 42` stub wired up as its entry
+// point purely so codegen has somewhere to attach a `main`. This is the actual remaining question:
+// take the COMPILED bytecode that came out of that (which, critically, already contains real,
+// callable, self-hosted-COMPILED `lexer_new`/`parser_new`/`checker_new`/`compile_program`
+// functions -- see `run_selfcompile_probe`'s own header), give it a REAL driver instead of a stub,
+// and check whether THAT compiled driver can itself correctly compile a target program. This is
+// merged in exactly like the six real compiler files above -- `Driver.hotc`'s own driving logic
+// (`read_source_file`/`prelude_source`/`merge_*`/`run_bootstrap_demo`/`report_errors`) is real,
+// working `.hotc` source already, so it goes through the exact same self-hosted-compile step as
+// everything else, landing INSIDE the same produced class as compiled methods it can then call.
+fn stage2_entry_source() -> String {
+    let nl = codepoint_to_string(CP_NEWLINE);
+    return "pub fn main(args: [String]) \{" + nl + "run_bootstrap_demo(args[0]);" + nl + "\}" + nl;
+}
+
+// **Verified, not just compiled**: run manually after this writes `SelfhostStage2Compiler.class`
+// (`java -cp <asm jars>:<hotchocolate.jar, for CodegenShim>:. SelfhostStage2Compiler
+// selfhost/demo_program.hcsrc`) -- the resulting standalone executable, with NO Kotlin compiler
+// involved at any point in this step, correctly read, lexed, parsed, checked, and generated
+// bytecode for a real target program, and the class IT wrote (`SelfhostDemoProgram.class`) prints
+// exactly `18` when run, matching `demo_program.hcsrc`'s own known-correct expected value. This is
+// the actual, complete, end-to-end self-hosting fixed point: a compiler written in HotChocolate,
+// compiled BY ITSELF, correctly compiling a real HotChocolate program into correct, runnable
+// bytecode -- verified by running the real output, not just by the absence of a reported error.
+pub fn run_selfcompile_stage2() {
+    print("--- self-compilation stage 2: building a real, standalone, self-hosted-COMPILED compiler executable ---");
+
+    var prog = parse_source_file("selfhost/ast/Ast.hotc");
+    prog = merge_program(prog, parse_source_file("selfhost/types/Types.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/lexer/Lexer.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/parser/Parser.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/checker/Checker.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/codegen/Codegen.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/Driver.hotc"));
+    prog = merge_program(prog, parse_source_string(stage2_entry_source()));
+    prog = merge_program(resolve_stdlib_modules(prog.uses, 17), prog); // internal bootstrap probe -- always resolved at the baseline target
+
+    print(
+        "parsed " + JString4::valueOf(prog.fns.length()) + " function(s), " + JString4::valueOf(prog.structs.length())
+        + " struct(s) for the stage-2 compiler executable"
+    );
+
+    let empty_args = driver_empty_int_vec();
+    let errors = compile_program(
+        prog.fns, prog.structs, prog.impls, prog.enums, prog.externs, prog.statics, prog.interfaces,
+        "SelfhostStage2Compiler", "__selfcompile_probe_entry", empty_args, "SelfhostStage2Compiler.class",
+        prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
+        prog.extend_decls, prog.must_use_fn_names,
+        prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
+        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+    );
+    if report_errors(errors) {
+        print("wrote SelfhostStage2Compiler.class -- run it with a real target .hotc/.hcsrc path as argv[0] to test the true fixed point.");
+    }
+}
+
+// === Stage 3: the actual triple-bootstrap test -- can gen1 rebuild itself with ZERO Kotlin? ===
+//
+// `run_selfcompile_stage2` above still runs INSIDE a process that Kotlin compiled (`TestDriver.hotc`
+// itself was compiled by the real `hc`) -- the resulting `SelfhostStage2Compiler.class` ("gen1") is
+// genuinely self-hosted-COMPILED bytecode, and stage 2 already proved gen1 can compile an unrelated
+// target program standalone, but nothing yet has asked gen1 to compile the SAME SIX SOURCE FILES
+// that produced it, running with no Kotlin anywhere in that step. That's the real fixed-point
+// question: does the self-hosted compiler regenerate a working copy of itself, using only itself?
+//
+// This entry source is deliberately near-identical to `stage2_entry_source` -- the only difference
+// is what `main` calls. Instead of driving a single demo file, gen1's `main` here calls
+// `run_selfcompile_stage2()` directly (already baked into it, since `Driver.hotc` -- this whole
+// file, including that very function -- is merged into every stage-2/3 build the same way the six
+// core compiler files are). Running the resulting class re-executes the ENTIRE stage-2 build
+// process again, but this time every step of it (`parse_source_file` reading the six real `.hotc`
+// files fresh off disk, lexing/parsing/checking/codegen-ing them, writing the output class) runs as
+// gen1's own compiled bytecode -- zero Kotlin involved. It overwrites `SelfhostStage2Compiler.class`
+// with a freshly-produced "gen2" -- if gen2 also runs and correctly compiles a target program (same
+// verification stage 2 already did), gen1 has proven it can rebuild a working copy of itself.
+// Calls `run_selfcompile_stage2` (rebuilds `SelfhostStage2Compiler.class`, i.e. gen2),
+// `run_selfcompile_stage3_prep` (rebuilds `SelfhostSelfReplicator.class` itself), AND
+// `run_selfcompile_cli_prep` (rebuilds `SelfhostCLI.class`, the real general-purpose entry point)
+// -- proving the fixed point is stable for the WHOLE toolchain, not just one artifact: if the
+// replicator can regenerate an identical copy of itself, the stage-2 compiler, AND the CLI, then
+// this ONE checked-in class file is a permanent, sufficient bootstrap seed -- see
+// `selfhost/bootstrap/README.md` for what that actually means for retiring the Kotlin compiler.
+fn stage3_entry_source() -> String {
+    let nl = codepoint_to_string(CP_NEWLINE);
+    return "pub fn main(args: [String]) \{" + nl + "run_selfcompile_stage2();" + nl + "run_selfcompile_stage3_prep();" + nl + "run_selfcompile_cli_prep();" + nl + "\}" + nl;
+}
+
+// **Verified, not just compiled**: run manually after this writes `SelfhostSelfReplicator.class`
+// (`java -cp <asm jars>:<hotchocolate.jar>:. SelfhostSelfReplicator`, no argv needed) -- this
+// standalone executable, again with NO Kotlin compiler involved, re-parses/checks/codegens the same
+// six real compiler source files that built IT, overwriting `SelfhostStage2Compiler.class` with a
+// freshly self-self-compiled "gen2". Confirmed: gen2 runs and correctly compiles
+// `selfhost/demo_program.hcsrc` to `18`, exactly like gen1 did -- the actual triple-bootstrap fixed
+// point, entirely under the self-hosted compiler's own steam past this one build.
+pub fn run_selfcompile_stage3_prep() {
+    print("--- self-compilation stage 3 prep: building the executable that will rebuild ITSELF with no Kotlin involved ---");
+
+    var prog = parse_source_file("selfhost/ast/Ast.hotc");
+    prog = merge_program(prog, parse_source_file("selfhost/types/Types.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/lexer/Lexer.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/parser/Parser.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/checker/Checker.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/codegen/Codegen.hotc"));
+    prog = merge_program(prog, parse_source_file("selfhost/Driver.hotc"));
+    prog = merge_program(prog, parse_source_string(stage3_entry_source()));
+    prog = merge_program(resolve_stdlib_modules(prog.uses, 17), prog); // internal bootstrap probe -- always resolved at the baseline target
+
+    print(
+        "parsed " + JString4::valueOf(prog.fns.length()) + " function(s), " + JString4::valueOf(prog.structs.length())
+        + " struct(s) for the self-replicating executable"
+    );
+
+    let empty_args = driver_empty_int_vec();
+    let errors = compile_program(
+        prog.fns, prog.structs, prog.impls, prog.enums, prog.externs, prog.statics, prog.interfaces,
+        "SelfhostSelfReplicator", "__selfcompile_probe_entry", empty_args, "SelfhostSelfReplicator.class",
+        prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
+        prog.extend_decls, prog.must_use_fn_names,
+        prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
+        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+    );
+    if report_errors(errors) {
+        print("wrote SelfhostSelfReplicator.class -- run it standalone (no args) to rebuild SelfhostStage2Compiler.class with zero Kotlin involved.");
+    }
+}
+
+fn cpprobe_bool_str(b: Bool) -> String {
+    if b { return "true"; }
+    return "false";
+}
+
+// A local copy of the same "empty `Vec<String>`" idiom used everywhere else in this codebase --
+// NOT a call to `Checker.hotc`'s own `empty_str_vec2` (a real gap found running this exact probe:
+// non-`pub` top-level fns are only accessible from bytecode generated INTO the same declaring
+// file/class; calling one cross-file compiles cleanly under the flat source-level namespace this
+// bootstrap otherwise relies on everywhere, but fails at class-LOAD time with a genuine
+// `IllegalAccessError`, since the real JVM access check runs on the generated class file, not the
+// source).
+fn cpprobe_empty_str_vec() -> Vec<String> {
+    var v = vec_of("__init__");
+    return Vec { data: v.data, len: 0 };
+}
+
+// === Real classpath threading, verified end to end ===
+//
+// `Checker.hotc`'s own `verify_extern_signature`/`class_exists_reflect`/`resolve_real_methods` used
+// to only ever consult the context classloader -- this fn proves a real `--classpath`-style
+// `Vec<String>` of directory/jar paths is now genuinely consulted, not just accepted and ignored.
+// `cp_test_scratch/classes/HcCpProbeTarget.class` (a plain `public static int triple(int)`,
+// compiled with a real `javac` -- see this repo's own scratch setup, not checked in) is NOT on any
+// default classloader's classpath at all, so `class_exists_reflect` can only find it when the real
+// directory is actually passed and actually used to build a `URLClassLoader`.
+pub fn run_classpath_verify_probe() {
+    print("--- classpath-threaded reflection probe: does verify_extern_signature actually use a custom --classpath? ---");
+
+    var empty_cp = cpprobe_empty_str_vec();
+    var real_cp = vec_of("cp_test_scratch/classes");
+
+    let found_without_cp = class_exists_reflect("HcCpProbeTarget", &empty_cp);
+    let found_with_cp = class_exists_reflect("HcCpProbeTarget", &real_cp);
+    print("found without classpath (expect false): " + cpprobe_bool_str(found_without_cp));
+    print("found with classpath (expect true): " + cpprobe_bool_str(found_with_cp));
+
+    // `checker_new()` seeds `errors` with one placeholder entry (`errs.set(0, "")`, never trimmed
+    // back to length 0 -- see that fn's own body) -- `errors.length()` is always "1 + real error
+    // count", not a bare count, matching this codebase's own established convention elsewhere
+    // (real gap found writing THIS probe: assumed a bare 0/1 count at first, which made a genuinely
+    // correct signature look like a failure).
+    var checker = checker_new();
+    let baseline = checker.errors.length(); // 1, not 0
+    var correct_params = vec_of("Int");
+    checker.verify_extern_signature("HcCpProbeTarget", "HcCpProbeTarget", "triple", correct_params, "Int", true, false, &real_cp);
+    let after_correct = checker.errors.length() - baseline;
+    print("real errors after a CORRECT declared signature (expect 0): " + JString4::valueOf(after_correct));
+
+    var wrong_params = vec_of("String");
+    checker.verify_extern_signature("HcCpProbeTarget", "HcCpProbeTarget", "triple", wrong_params, "Int", true, false, &real_cp);
+    let after_wrong = checker.errors.length() - baseline;
+    print("real errors after a WRONG declared signature too (expect 1): " + JString4::valueOf(after_wrong));
+
+    if !found_without_cp && found_with_cp && after_correct == 0 && after_wrong == 1 {
+        print("CLASSPATH-THREADING PROBE PASSED: a custom --classpath entry is genuinely being consulted, not just the context classloader.");
+    } else {
+        print("CLASSPATH-THREADING PROBE FAILED");
     }
 }

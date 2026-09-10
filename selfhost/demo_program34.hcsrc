@@ -3,7 +3,9 @@ enum Opt2 {
     None {},
 }
 
-fn unwrap_or(o: Opt2, fallback: Int) -> Int {
+// `&Opt2` (not bare `Opt2`) -- `combo` below reuses `some_val` again after calling this (a `match`
+// on it), which move-checking would otherwise correctly reject as a use-after-move.
+fn unwrap_or(o: &Opt2, fallback: Int) -> Int {
     var result = fallback;
     if let Some { value: v } = o {
         result = v;

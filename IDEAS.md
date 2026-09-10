@@ -3,15 +3,18 @@
 Syntax sugar and features that came up, got weighed, and are worth doing —
 just not right now. Not a roadmap with dates, a parking lot: each entry
 should have enough context that picking it up later doesn't need
-re-deriving the reasoning from scratch. Move an entry into the README
+re-deriving the reasoning from scratch. Move an entry into ARCHITECTURE.md
 (with a real implementation, not just a description) when it actually
 gets built; delete an entry if it turns out to be a bad idea on reflection
 rather than leaving it here stale.
 
-Documentation-tooling ideas (everything building on top of the shipped
-`///` doc-comment feature) live in their own file, `DOC_TOOLING_IDEAS.md`,
-rather than mixed in here — it's a coherent enough theme to read as a
-group. Minecraft/Forge-library ideas (a separated `hotc-mc` binding
+Documentation-tooling ideas (everything building on top of the `hc doc`
+Markdown renderer — both the structured `///` doc-comment feature
+itself and the renderer shipped in `selfhost/` 2026-09-03, see ARCHITECTURE.md's
+own "Structured `///` doc comments" section) live in their own file,
+`DOC_TOOLING_IDEAS.md`, rather than mixed in here — it's a coherent
+enough theme to read as a group. Minecraft/Forge-library ideas (a
+separated `hotc-mc` binding
 library) live in `HOTC_MC_IDEAS.md` — that file also flags a couple of
 compiler-feature requests (generalizing `@serializable` to a second
 target, an `@packet` registration directive) that surfaced while
@@ -116,57 +119,6 @@ Cut real nesting in ported code as intended --
 `CopyToolItem::use_item`'s two-level `pos1_opt`/`pos2_opt` match is
 now a flat `if let ... else`.
 
-### `Result<T, E>` (~~shipped~~) + the `?` early-return operator (still open)
-
-```
-enum Result<T, E> {
-    Ok { value: T },
-    Err { error: E },
-}
-
-fn load_texture(path: String) -> Result<Texture, LoadError> {
-    let bytes = read_file(path)?;   // Err(e) returns early as Result<Texture, LoadError>::Err { error: e }
-    let tex = decode(bytes)?;
-    return Result::Ok { value: tex };
-}
-```
-
-**Update: `Result<T, E>` itself shipped** (`Prelude.kt`, alongside
-`Option`/`Vec`/`Registry`) — real `Ok { value: T }`/`Err { error: E }`
-variants, same monomorphized-generic-enum machinery `Option` already
-used, no new AST needed, exactly as predicted below. `?` has not — this
-entry now tracks only that remaining half.
-
-The direct sequel to `Option`, not a new mechanism -- `Option` is
-already a real, shipped enum (`Option::Some { value }` / `None {}`),
-already exhaustively matched, already has `if let` sugar. `Result<T,
-E>` is the exact same monomorphized-generic-enum machinery with two
-type params instead of zero, no new AST beyond what `enum`/generics
-already support. The one genuinely new piece is `?`: needs a real
-`Expr.Try`-shaped node (`expr?`) that, inside a fn returning
-`Result<T, E>`, desugars to match on `expr`'s own `Result` -- `Ok
-{ value }` unwraps to `value`, `Err { error }` triggers an early
-`return Result::Err { error }` (auto-converting the error type only if
-the enclosing fn declares the same `E`, no `From`-style implicit
-conversion for v1 -- that's real added scope, Rust's own `?` needed
-years to get `From` conversion right). Checker-side, `?` should only
-type-check inside a fn whose own return type is `Result<_, E>` with a
-matching `E`, exactly the same "only valid in this specific context"
-restriction `return`/`throw` already have.
-
-Deliberately scoped narrower than "replace exceptions everywhere":
-HC already has real `try`/`catch`/`throw` against `extern class`
-exceptions (genuine JVM interop, unavoidable — a `NoSuchMethodError`
-doesn't become an HC `Result` just because HC exists) and that stays.
-`Result` is for *HC's own* expected-failure return values, the same
-split Rust itself draws between `Result` (recoverable, expected) and
-`panic!`/an uncaught JVM exception (unrecoverable). Don't let `Option`
-grow an implicit "and also nullable-like" story either — the existing
-nullable-`extern class`/`String` mechanism (`Type?`, compared only
-against the `null` literal) stays the FFI-boundary-only feature it
-already is; `Option<T>` is the native-HC-only answer to the same
-question, not a replacement for it.
-
 ### ~~Compile-time verification of hand-written `extern class`/`extern interface` declarations~~ -- now shipped
 
 ```
@@ -176,22 +128,16 @@ error: extern class 'SimpleChannel': declared 'registerMessage(...)' doesn't mat
        configured classpath -- found: (Int, Class, BiConsumer, Function, BiConsumer) -> MessageHandler
 ```
 
-Shipped as `Checker.verifyExternSignatures` — unconditional whenever
-`--classpath` is provided (not a separate `--verify-extern` flag, and
-not opt-out-able once a classpath is given), running every explicit-
-signature `extern class`'s declared members through the same
-`ClasspathReflector` the lazy form already used, comparing declared vs.
-real param/return types (`realTyKey`) and erroring on any mismatch —
-caught for real during the ASM-interop spike below (`ClassWriter
-.toByteArray()`'s undeclarable `byte[]` return type surfaced as a
-build-time "no public member found" instead of a runtime
-`NoSuchMethodError`, exactly the win this entry predicted). One
+Shipped as `Checker.hotc`'s `verify_extern_signature` — unconditional
+whenever `--classpath` is provided (not a separate `--verify-extern`
+flag, and not opt-out-able once a classpath is given), running every
+explicit-signature `extern class`'s declared members through the same
+classpath-reflection machinery the lazy form already used, comparing
+declared vs. real param/return types and erroring on any mismatch. One
 documented, deliberate gap: any declaration involving a type the
 reflector can't represent at all (byte/short/char, an HC-native
 struct/enum param, a bound-generic `Dyn`) is skipped rather than
-flagged, "same 'degrade to no check' reasoning `javaClassToTyOrNull`
-itself already uses" per the checker's own comment — silence there
-means "unable to check," not "verified clean."
+flagged — silence there means "unable to check," not "verified clean."
 
 The single highest-value item across every idea session this project's
 own port history has generated: something like ten real bugs this
@@ -207,25 +153,11 @@ method table is where a typo/wrong-return-type/wrong-erasure mistake
 actually lives; the lazy/reflected forms can't be wrong the same way,
 since nothing was hand-typed to get wrong).
 
-Scoped as a real, opt-in build-time check, not a change to default
-behavior: `extern class` staying trust-by-default (no classpath needed
-unless a program asks for one) is a deliberate, correct design choice
-for exactly the reason `ExternClassDecl`'s own doc gives — same "trust
-the declaration" tradeoff any hand-written FFI layer in any language
-makes. `--verify-extern` (a build flag, not a language feature) runs
-every explicit-signature `ExternMethodDecl`/`ExternFieldDecl` through
-the same `ClasspathReflector` machinery the lazy form already trusts,
-comparing the declared signature/type against the real one and erroring
-on any mismatch — turning this session's entire "wrote 30 lines of
-`extern class`, ran it in-game, got a cryptic `NoSuchMethodError`, went
-back to `javap` the real jar by hand" loop into a single build-time
-error naming the exact line and the real signature. A weaker,
-docs-only version of this idea (annotating `hc doc`'s rendered output
-instead of erroring at build time) is in `DOC_TOOLING_IDEAS.md` — this
-entry is the stronger, build-blocking version, and probably the one
-actually worth building first.
+A weaker, docs-only version of this idea (annotating `hc doc`'s
+rendered output instead of erroring at build time) is in
+`DOC_TOOLING_IDEAS.md`.
 
-### ~~Lambdas / closures~~ -- now shipped
+### ~~Lambdas / closures~~ — now shipped in `selfhost/` too (2026-09-02)
 
 ```
 // || body  or  |x, y| body -- targets a single-method 'extern interface',
@@ -237,28 +169,34 @@ actually worth building first.
 PacketDistributor::PLAYER.with(|| p as JObject);
 ```
 
-Shipped as `|params| expr` lambda literals (`Expr.Lambda` in the AST,
-`Checker.checkLambda`, `CodeGen.genLambdaClass`) -- scoped exactly as
-suggested below: target must be a single-abstract-method `extern
-interface`, inferred only from a call argument's declared param type
-(`checkMethodCall`/`checkStaticCall`), body is one expression (no
+Shipped as `|params| expr` lambda literals in the now-retired Kotlin
+compiler (`Expr.Lambda` in the AST, `Checker.checkLambda`,
+`CodeGen.genLambdaClass`) -- scoped exactly as suggested below: target
+must be a single-abstract-method `extern interface`, inferred only from
+a call argument's declared param type, body is one expression (no
 statements of its own, same "ternary-shaped" cut as `Expr.If`/
-`Expr.Match`'s value forms already use). No bare method-reference syntax
-(`Type::method` used directly as a value) shipped alongside it -- a
-lambda wrapping the call (`|x| Type::method(x)`) covers the same ground
-with one extra token, so it wasn't worth a second grammar form yet.
-Verified end-to-end via `javap` against a real captured-closure call site
-(NEW+DUP+ALOAD-captures+INVOKESPECIAL at the use site, a real `implements
-java.util.function.Supplier` class with a `cap$name` field per capture at
-the definition site).
+`Expr.Match`'s value forms already use). Bare method-reference syntax
+(`Type::method` used directly as a value) did NOT ship alongside the
+Kotlin compiler's own original version, but has since been ported into
+`selfhost/` too (2026-09-03, see ARCHITECTURE.md's own "Lambda literals" and
+"Status" sections) -- desugars entirely to the same lambda machinery,
+no second emission path.
+**Ported into `selfhost/` on 2026-09-02**, redone independently in
+`Checker.hotc`/`Codegen.hotc` (this file's own registries aren't shared
+with the checker's, same split every other duplicated feature in this
+codebase already has) — see ARCHITECTURE.md's "Lambda literals" section for
+the current, verified state. One difference from the Kotlin design as
+written above: the target doesn't have to be specifically an `extern
+interface`, any single-method interface (local or extern) works, since
+codegen already needed to handle both cases for `impl X for Struct`
+anyway.
 
-**`Foo.class` literal**: shipped too (`Expr.ClassLit` in the AST,
-`Checker.checkClassLit`, `CodeGen`'s `LDC <Type>.class` via a real ASM
-`Type` operand) -- needed by `SimpleChannel.registerMessage(int, Class,
-BiConsumer, Function, BiConsumer)`'s second arg, and confirmed to be
-what was actually unblocking `NetworkHandler.java` from a full port
-(`CTab.java`/`ClipboardPacketHandler.java` didn't need it and were
-already fair game with lambdas alone).
+**`Foo.class` literal**: also shipped only in the retired Kotlin
+compiler (`Expr.ClassLit` in the AST, `Checker.checkClassLit`,
+`CodeGen`'s `LDC <Type>.class` via a real ASM `Type` operand) -- needed
+by `SimpleChannel.registerMessage(int, Class, BiConsumer, Function,
+BiConsumer)`'s second arg. Same status as lambdas: not present in
+`selfhost/`, needs porting.
 
 ### ~~~Inclusive ranges: `a..=b`~~~ shipped
 
@@ -280,123 +218,6 @@ existing `a..(b+1)` or just flips the loop-exit comparison
 (`IF_ICMPGE`→`IF_ICMPGT`). Directly fixes the actual misreadable spot in
 real code: `for z in min_z..max_z + 1` reads worse than `..=max_z` would.
 
-### ~~Structured `///` doc comments~~ (compiler-understood, not Javadoc-style text blobs) -- now shipped
-
-```
-/// Attacks an enemy and returns the resulting damage.
-/// @param target The enemy being attacked.
-/// @returns The damage dealt.
-/// @see Enemy.health
-fn attack(target: &Enemy) -> Int { ... }
-```
-
-Shipped as designed: a doc comment is a real `DocComment`/`DocSeeRef`
-node the parser attaches to the `FnDecl`/`StructDecl` it precedes
-(`Parser.docComment()`), not opaque text a separate tool re-parses
-later. `///` is now a real lexer token (`TokType.DOC_COMMENT`,
-`Lexer.docComment()`) rather than discarded trivia the way a plain
-`//` comment is -- `////` (four+ slashes) deliberately stays an
-ordinary comment, same convention Rust uses, so a decorative divider
-line doesn't suddenly start attaching itself to the next declaration.
-`@param`/`@returns`/`@example`/`@warning`/`@see`/`@deprecated` are all
-structured tagged fields; an untagged `///` line continues whatever
-section came before it (so a tag's text can wrap across multiple
-lines), except `@see`, whose target is always exactly one line.
-
-Both things that were supposed to fall out of the model almost for
-free did:
-
-- **`@see` resolves against the real symbol table.**
-  `Checker.checkDocSees`/`resolveDocSeeTarget` runs once, at the very
-  end of `check()` (once every symbol table is fully populated),
-  resolving both bare names (`SomeStruct`, `some_fn`) and dotted forms
-  (`SomeStruct.field`, `SomeEnum.Variant`) against structs/fns/enums/
-  interfaces/`extern class`es -- and errors on anything that doesn't
-  resolve. "No dead doc links, ever" is a real compile error now, not
-  just an aspiration.
-- **One renderer**: `hc doc <dir|file> [outFile]` (default `api.md`),
-  emitting plain Markdown -- headings per documented `struct`/`fn`,
-  parameters as a bullet list, `@warning`s as blockquotes, `@see`s
-  marked `(unresolved)` inline if they didn't resolve. Runs a real
-  checker pass first (same as `build`/`run`) so `@see` resolution has
-  actually happened before rendering.
-
-**Scoped to top-level `fn`/`struct` only** -- an `impl` block's own
-methods don't carry doc comments yet (this language's `impl` is
-struct-only, so there was no natural extension point to wire up
-without more design than the feature needed for v1). **Still not
-doing**, as planned: no `doc fn { }` block syntax, no compiled/verified
-`@example` blocks -- both remain real phase-2 material, not v1 scope
-creep.
-
-### Property-style *write* access for `extern class` setters (the read half already shipped)
-
-```
-enemy.health = 50      // instead of enemy.setHealth(50)
-```
-
-The read half of this (`enemy.health` reading as `enemy.getHealth()`/
-`enemy.isHealthy()`, see README) already shipped, scoped to non-`lazy`
-`extern class` declarations (explicit signature or `use { }` reflection,
-both fully resolved up front -- probing a *lazy* class for both `getX`/
-`isX` candidate names would fire real, potentially-noisy reflection
-lookups for guesses, not a single deliberate call). The write half is a
-genuinely separate, bigger addition, not just "the same trick in
-reverse": there's currently **no extern instance field *write* path at
-all** in the checker (`checkFieldAssign` only ever handles `Ty.Struct`
-receivers today) -- adding setter sugar means building that whole write
-pathway from scratch, not layering sugar over an existing mechanism the
-way the getter case did. Same resolution rule the getter case already
-established: sugar only applies when there's no real declared field of
-that name (a real field always wins, never a silent choice between the
-two), and needs a matching single-arg `setX` method whose param type
-matches the assigned value's type.
-
-### ~~`@must_use`~~ — compiler-enforced "don't silently drop this return value" -- now shipped
-
-```
-@must_use
-fn try_spawn(pos: BlockPos) -> SpawnResult { ... }
-
-fn main() {
-    try_spawn(pos);  // compile error: return value of 'try_spawn' must be used
-    let result = try_spawn(pos);  // fine
-}
-```
-
-Shipped as a bare compiler directive (`leadingMarkers()`, same "no
-quoted binary name" distinction `@serializable`/`@entry` already use --
-never reaches bytecode, purely a compile-time check), scoped to
-top-level `fn` only (same cut `@entry` already made). Checker rejects
-`@must_use` on a `Unit`-returning fn outright (nothing to enforce
-using), and errors on any `Stmt.ExprStmt` that's a bare `Expr.Call` to
-one, naming the fn and line.
-
-**Widened**: `@must_use` can now also precede a method inside an `impl`
-block (both instance and static/factory methods), and a dropped
-`Expr.MethodCall`/`Expr.StaticCall` to one is caught the same way a
-dropped `Expr.Call` always was. `implDecl()`'s method loop parses
-`@must_use` on its own now (deliberately not the full `leadingMarkers()`
--- annotations/`@serializable`/`@entry`/doc comments aren't part of
-this widening), threading `mustUse` through the existing `Struct$method`
-(instance)/`Struct@method` (static) desugared-method mangling that
-`Checker`'s `implFns` registration already did for everything else --
-no new tracking structure, `mustUseFns` just holds both bare top-level
-names and mangled method names in one flat set now. Checked after
-`checkExpr` resolves the call (unlike `Expr.Call`'s own source-level
-`callee`, a method's mangled `resolvedName` isn't known until
-resolution happens), so the check runs post-`checkExpr` for these two
-cases specifically.
-
-**Still narrower than fully general, on purpose**: extern class
-methods/static calls (Java interop) aren't covered -- this stays scoped
-to *HC's own* struct methods, the same "not Java interop's problem"
-split `Result<T, E>`'s own entry draws for error handling. A struct
-method reached through interface/`&dyn` dispatch or an explicit
-superclass override (`resolvedName` is a bare, unmangled method name on
-those paths, not the `Struct$method`/`Struct@method` form) also isn't
-covered yet -- a real, documented gap rather than a silent one, same
-spirit as the original v1 cut.
 
 ### Explicit, seeded RNG as a real type
 
@@ -510,7 +331,8 @@ doesn't change type across a mutation today).
 ### Extensible/open registries as a first-class alternative to `enum`
 
 **Update: the library-level version of this already shipped.**
-`Registry<T>` (`Prelude.kt`, alongside `Vec`/`Option`/`Result`) is a
+`Registry<T>` (`prelude_source()` in `selfhost/Driver.hotc`, alongside
+`Vec`/`Option`/`Result`) is a
 real, string-keyed, open, growable registry — `.register(key, value)`,
 `.get(key) -> Option<T>`, built on `Vec` — verified end to end holding
 two different concrete struct types under `Registry<dyn Trait>` with
@@ -616,7 +438,7 @@ written, not later as a confusing cross-reference/import error.
 
 **Deliberately not proposing this as a hard requirement or default-on
 check**, though. Directory-mode compilation is recursive now (see the
-README's "Multi-file projects"), and `kubejs-aisle-tool` itself has
+ARCHITECTURE.md's "Multi-file projects"), and `kubejs-aisle-tool` itself has
 since moved to exactly the nested-directory-mirrors-module layout this
 entry describes (`client/CopyToolHudOverlay.hotc` declaring `module
 ...client;`, etc.) — so the flat-layout argument that originally
@@ -648,12 +470,19 @@ there regardless of the flag.
 
 ### ECS with ownership-derived system scheduling
 
+**Status, 2026-09-09**: spun out into its own file, `ECS_IDEAS.md`, the same
+way Phoenix Flight got `PHOENIX_FLIGHT_IDEAS.md` once it became a real,
+actively-worked feature — that's now where the live design, phase plan
+(verification-only first, real parallel dispatch later), and open questions
+live. This entry stays as the original motivating sketch/pitch; don't track
+the design twice once `ECS_IDEAS.md` exists.
+
 ```
 component Transform { x: Float, y: Float }
 component Velocity { dx: Float, dy: Float }
 
 system Movement {
-    fn run(&mut transforms: Transform, &velocities: Velocity) {
+    fn run(transforms: &mut Transform, velocities: &Velocity) {
         transforms.x += velocities.dx;
         transforms.y += velocities.dy;
     }
@@ -759,7 +588,7 @@ before inventing HC's syntax from scratch here, rather than rediscovering
 the same design space.
 
 A different, unrelated meaning of "bounds" from "Bounded generics:
-`<T: Trait>`" (see the README) — worth stating explicitly since the two
+`<T: Trait>`" (see ARCHITECTURE.md) — worth stating explicitly since the two
 are easy to conflate: that feature bounds a *type parameter* to
 implementing a trait; this one would bound a *value* to a numeric range,
 checked at compile time where provable and at runtime (a real range
@@ -1052,32 +881,40 @@ fn damage_player(player: Entity, amount: Int) { ... }
 fn shoot(target: Vec3) { ... }
 ```
 
-Extends the already-shipped `@serializable` (see README) into genuinely
-new territory: not just "generate a codec for this struct's shape" but
-"generate the network
+**Note: this entire entry assumes `@serializable` and `@dev` as a
+foundation, and neither exists in `selfhost/` today** — `@` itself
+parses now (both real `@"binary.Name"(...)` annotations and the
+`@must_use` bare directive shipped 2026-09-03, see ARCHITECTURE.md), but
+`selfhost/`'s own directive dispatch only recognizes `must_use` --
+`@serializable`/`@dev` themselves still aren't real directives there,
+still shipped only in the now-retired Kotlin compiler. This entry's
+design reasoning is preserved below in case it gets revisited once
+`@serializable`/`@dev` land in `selfhost/`, but treat it as blocked on
+that first.
+
+Extends `@serializable` (shipped in the retired Kotlin compiler, see
+above) into genuinely new territory: not just "generate a codec for
+this struct's shape" but "generate the network
 call plumbing itself" — `@rpc` on a fn means calling it from a client
 generates the send-and-forget packet, while the *real* body only ever
 executes server-side (closely related to `ClipboardPacket`'s existing
 hand-written encode/decode/handle split in `kubejs-aisle-tool`, just
 automated). `@server`/`@client` as execution-domain markers is also the
-general form of the already-shipped `@dev` conditional-compilation idea
-— the same "compile this out entirely for the wrong target" mechanism,
-just with more possible targets than dev/release (worth designing them
-as one unified target-selection axis, not two separate ad-hoc systems,
-if both get built). Real design work, and it's substantial: `@replicated`
-needs an actual sync strategy (full-state broadcast every tick? dirty-
-field diffing? who's authoritative on conflict?) — that's a real
-networking-architecture decision this backlog entry can describe the
-annotation surface for, but shouldn't pretend to have already
-answered. `@serializable` (see README) is already the prerequisite
-codec-generation infrastructure this needs; the concrete next step is
-extending it toward `@rpc` once there's a real multiplayer HC program
-motivating the sync-strategy decisions.
+general form of the `@dev` conditional-compilation idea (also
+Kotlin-only) — the same "compile this out entirely for the wrong
+target" mechanism, just with more possible targets than dev/release
+(worth designing them as one unified target-selection axis, not two
+separate ad-hoc systems, if both get built). Real design work, and it's
+substantial: `@replicated` needs an actual sync strategy (full-state
+broadcast every tick? dirty-field diffing? who's authoritative on
+conflict?) — that's a real networking-architecture decision this
+backlog entry can describe the annotation surface for, but shouldn't
+pretend to have already answered.
 
 ### Macros
 
 Real repetition visible in `kubejs-aisle-tool`'s own `.hotc` files, even
-after directory-mode compilation (see the README's "Multi-file
+after directory-mode compilation (see the ARCHITECTURE.md's "Multi-file
 projects"/Gradle plugin sections) eliminated the biggest category of it
 (hand-redeclaring an `extern class` bridging one of HC's *own*
 already-compiled files no longer needed at all, once every file in a
@@ -1111,8 +948,8 @@ Real design work needed before picking this up, not a small addition:
   its own duplicate registration logic, a real correctness risk.
 
 Worth reassessing how much duplication is *actually* left once
-property-style-access/other backlog entries above ship (`@serializable`
-already has) — several of them independently shrink the motivating cases
+property-style-access/other backlog entries above ship — several of
+them independently shrink the motivating cases
 here (e.g. a
 real `min`/`max`-over-a-struct helper only needs bounded generics, which
 already work correctly, not a macro) — before sinking design time into
@@ -1181,26 +1018,13 @@ defer file.close();
 
 Tempting, but this is a GC'd JVM target — there's no real "this value's
 lifetime just ended" moment to hook `defer` to beyond what the existing
-`drop`/move-checker machinery (see the README's Destructors section)
+`drop`/move-checker machinery (see ARCHITECTURE.md's Destructors section)
 already tracks. `defer` would either (a) just be sugar for "declare a
 `drop` impl and let scope-exit call it," in which case it's not adding a
 capability, only a spelling, or (b) need real closure capture to defer an
 arbitrary block rather than a single method call, which circles back to
 the "no closures yet" blocker above. Worth revisiting once closures exist;
 until then `drop` already covers the actual use case.
-
-### Named arguments
-
-```
-createEnemy(health: 100, damage: 20, hostile: true, name: "Goblin");
-```
-
-Real readability win for interop signatures with several same-typed
-params (exactly the kind Minecraft/Forge APIs have a lot of). Pure parser
-+ checker sugar — resolve named args to positional slots by looking up the
-  callee's declared param names, no codegen change. Not urgent because nothing
-  currently blocks writing the positional form; low risk, low urgency, good
-  "slow week" pickup.
 
 ### Pattern matching sugar: positional enum patterns
 
@@ -1284,5 +1108,5 @@ itself would solve. **What the actual underlying want turned out to be**
 (a real, reusable `hc` Gradle plugin instead of hand-copying a
 `tasks.register('hcCompile', JavaExec) { ... }` block into every
 consuming project's `build.gradle`) is built — see `hc-gradle-plugin/`
-and the README's "Gradle plugin" section. That's the right-sized version
+and the ARCHITECTURE.md's "Gradle plugin" section. That's the right-sized version
 of this idea: extending Gradle properly, not replacing it.

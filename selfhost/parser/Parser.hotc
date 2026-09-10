@@ -38,10 +38,19 @@ pub struct Parser {
     // as a struct-literal condition swallowing the real block's own `{`). Same restriction real
     // languages with this exact ambiguity (Rust, Go) apply; see `primary`'s own use of it.
     no_struct_lit: Bool,
+    // `module a.b.c;`'s own real, dot-joined string (`"a.b.c"`), or `""` for a file with no
+    // `module` declaration at all -- real gap found integrating this compiler into an actual
+    // Java-package-organized project (Phoenix Chronicles): every struct/enum/interface this file
+    // declares gets tagged with THIS value (`Ast.hc`'s own `StructDecl.module_name` etc. header),
+    // so `Codegen.hotc` can emit a REAL, package-qualified JVM class name instead of always
+    // landing in the default package. `module` is still only ever consumed once per file, at the
+    // top -- see `parse_program`'s own header for why a real per-declaration override isn't
+    // needed (nothing in this subset re-parents a struct into a DIFFERENT module mid-file).
+    current_module: String,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "" };
 }
 
 impl Parser {
@@ -78,6 +87,29 @@ impl Parser {
         if t4.kind != IDENT { return false; }
         let t5 = self.tokens.get(self.pos + 5);
         return t5.kind == LBRACE;
+    }
+
+    // Same idea as `looks_like_generic_variant` right above, for the TWO-type-argument shape
+    // (`Result<Int, String>::Ok { ... }`, see `Ast.hc`'s own `EnumDecl.type_param2` header) --
+    // `LT IDENT COMMA IDENT GT COLONCOLON IDENT LBRACE`, 8 tokens from the current `LT`. Mutually
+    // exclusive with the one-arg check purely by shape (token 2 is `COMMA` here, `GT` there), so
+    // no ordering dependency between the two.
+    fn looks_like_generic_variant2(&self) -> Bool {
+        if self.pos + 7 >= self.tokens.length() { return false; }
+        let t1 = self.tokens.get(self.pos + 1);
+        if t1.kind != IDENT { return false; }
+        let t2 = self.tokens.get(self.pos + 2);
+        if t2.kind != COMMA { return false; }
+        let t3 = self.tokens.get(self.pos + 3);
+        if t3.kind != IDENT { return false; }
+        let t4 = self.tokens.get(self.pos + 4);
+        if t4.kind != GT { return false; }
+        let t5 = self.tokens.get(self.pos + 5);
+        if t5.kind != COLONCOLON { return false; }
+        let t6 = self.tokens.get(self.pos + 6);
+        if t6.kind != IDENT { return false; }
+        let t7 = self.tokens.get(self.pos + 7);
+        return t7.kind == LBRACE;
     }
 
     fn peek_kind(&self) -> TokType {
@@ -118,7 +150,7 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Expr {
-        let expr = self.logical_or();
+        let expr = self.elvis();
         // `return expr;` lives inside the `else`, not after the whole `if`, deliberately -- the
         // checker's move-checking is conservative about `if`/`else` by design (moved on either
         // side counts as moved afterward), so a bare `return expr;` positioned AFTER this `if`
@@ -131,12 +163,29 @@ impl Parser {
             match expr {
                 Ident { name } => { return Assign { name: name, value: value }; }
                 FieldAccess { obj, field } => { return FieldAssign { obj: obj, field: field, value: value }; }
+                ExternStaticFieldGet { type_name, field } => { return ExternStaticFieldSet { type_name: type_name, field: field, value: value }; }
                 Index { arr, index } => { return IndexAssign { arr: arr, index: index, value: value }; }
+                IndexFieldGet { arr_name, index, field } => { return IndexFieldSet { arr_name: arr_name, index: index, field: field, value: value }; }
                 _ => { throw ParseError::new("Invalid assignment target"); }
             }
         } else {
             return expr;
         }
+    }
+
+    // `x ?: default` -- Elvis, one precedence tier below `assignment`, above `logical_or` (so
+    // `a ?: b || c` parses as `a ?: (b || c)`, matching the usual convention this shape follows
+    // elsewhere). Right-associative (`a ?: b ?: c` is `a ?: (b ?: c)`), same convention `assignment`
+    // itself already uses for chained `=`. See `Ast.hc`'s own `Expr.Elvis` header.
+    fn elvis(&mut self) -> Expr {
+        let left = self.logical_or();
+        if self.check(QUESTION) && self.tokens.get(self.pos + 1).kind == COLON {
+            self.advance(); // QUESTION
+            self.advance(); // COLON
+            let right = self.elvis();
+            return Elvis { left: left, right: right };
+        }
+        return left;
     }
 
     fn logical_or(&mut self) -> Expr {
@@ -149,10 +198,39 @@ impl Parser {
     }
 
     fn logical_and(&mut self) -> Expr {
-        var expr = self.equality();
+        var expr = self.bitwise_or();
         while self.check(AMPAMP) {
             self.advance();
-            expr = Binary { op: "&&", left: expr, right: self.equality() };
+            expr = Binary { op: "&&", left: expr, right: self.bitwise_or() };
+        }
+        return expr;
+    }
+
+    // Real bitwise `|`/`&` -- weaker than `==`/comparison (matching C-family precedence, so
+    // `a & mask == 0` parses as `a & (mask == 0)`... no -- matching real C/Java precedence,
+    // `==`/comparison bind TIGHTER than `&`/`|`, so `a & mask == 0` actually parses as
+    // `a & (mask == 0)` in C too -- a famously easy mistake real C code makes, parenthesizing
+    // explicitly is the normal fix, not a HotChocolate-specific concern. `PIPE`/`AMP` are
+    // already real, distinct token kinds `Lexer.hotc` has produced all along (`PIPEPIPE`/
+    // `AMPAMP` are its own separate two-character tokens) -- the parser itself never had a rule
+    // consuming a BARE `|`/`&` as an infix binary operator until now (`&` alone was only ever
+    // read as a PREFIX borrow marker, in `unary()`, right below -- an infix use is unambiguous
+    // from that: `bitwise_and()` only checks for `&` AFTER it has already parsed a complete left
+    // operand via `equality()`, a position `unary()`'s own prefix check never reaches).
+    fn bitwise_or(&mut self) -> Expr {
+        var expr = self.bitwise_and();
+        while self.check(PIPE) {
+            self.advance();
+            expr = Binary { op: "|", left: expr, right: self.bitwise_and() };
+        }
+        return expr;
+    }
+
+    fn bitwise_and(&mut self) -> Expr {
+        var expr = self.equality();
+        while self.check(AMP) {
+            self.advance();
+            expr = Binary { op: "&", left: expr, right: self.equality() };
         }
         return expr;
     }
@@ -220,12 +298,41 @@ impl Parser {
     // looser than a bare primary/call/field-access chain, so `x as Int + 1` parses as `(x as Int)
     // + 1`, not `x as (Int + 1)`. See `Ast.hc`'s own `Cast` header for the deliberately narrow
     // scope (no cast-legality checking, `Long` not a general first-class primitive).
-    fn cast(&mut self) -> Expr {
+    // `expr is Type` joins `as` in this same loop -- see `Ast.hc`'s own `Expr.IsCheck` header for
+    // why they share a precedence tier and chain freely in either order.
+    // `expr?` -- the try operator, binds as a tight postfix, applying right after any `.field`/
+    // `.method()`/`[index]` chain (`call_or_primary` already resolved) and before `as`/`is` get a
+    // chance to bind. See `Ast.hc`'s own `Expr.TryOp` header for why it isn't named `Try`.
+    // `expr??` (double try) parses fine here -- two nested `TryOp` nodes -- same "correct by the
+    // desugaring rule, just unusual" the design doc for this feature calls out explicitly.
+    fn try_postfix(&mut self) -> Expr {
         var expr = self.call_or_primary();
-        while self.check(AS) {
+        // `?:` (Elvis, see `elvis()` above `assignment()`) and `?.` (safe call/field access, see
+        // `postfix_loop`'s own `QUESTION`+`DOT` branch -- already fully consumed by the
+        // `call_or_primary()` call above by the time this loop runs, so it never reaches here
+        // unconsumed) both start with the SAME `QUESTION` token this loop would otherwise eat as a
+        // `TryOp`. Only `?:` needs an explicit guard here -- a bare lookahead for `COLON` right
+        // after `QUESTION`, so `x ?: y` correctly leaves the `?` for `elvis()` to consume instead of
+        // wrapping `x` in a `TryOp` and choking on the dangling `: y`.
+        while self.check(QUESTION) && self.tokens.get(self.pos + 1).kind != COLON {
             self.advance();
-            let target_type = self.type_name_ref();
-            expr = Cast { expr: expr, target_type: target_type };
+            expr = TryOp { expr: expr };
+        }
+        return expr;
+    }
+
+    fn cast(&mut self) -> Expr {
+        var expr = self.try_postfix();
+        while self.check(AS) || self.check(IS) {
+            if self.check(AS) {
+                self.advance();
+                let target_type = self.type_name_ref();
+                expr = Cast { expr: expr, target_type: target_type };
+            } else {
+                self.advance();
+                let target_type2 = self.type_name_ref();
+                expr = IsCheck { expr: expr, target_type: target_type2 };
+            }
         }
         return expr;
     }
@@ -233,8 +340,86 @@ impl Parser {
     // Scoped subset of the real `callOrPrimary`: a bare-identifier call (`name(args)`), field
     // access (`.field`), and method calls (`.method(args)`) chain freely off any primary
     // expression, left to right.
+    // `arr_name[index].field` -- captured as its OWN `IndexFieldGet` shape (arr's NAME as a plain
+    // `String`, not a nested `Ident` expr) rather than the generic `FieldAccess { obj: Index {...}
+    // } }` nesting, for a real, structural reason found writing arena support: the CHECKER/CODEGEN
+    // would otherwise need to inspect `obj`'s shape (is it an `Index` on an arena value?) via `if
+    // let`/`match`, but this metalanguage's own move-checker treats ANY `if let`/`match` scrutinee
+    // as consumed for EVERY arm (including a would-be "wasn't that shape, use the original value
+    // generically" fallback) -- there's no wildcard arm that can bind "the whole original value" to
+    // fall back on (see `Parser.hotc`'s OWN `assignment()`, whose header already documents this
+    // same constraint one level up). A first attempt tried stashing the parsed index `Expr` in a
+    // loop-scoped `var` across postfix-loop iterations (materializing it into a real `Index` node
+    // once it became clear no `.field` was coming) -- broke for a DIFFERENT reason: consuming a
+    // non-`Copy` `var` via `if let` more than once, even across DIFFERENT iterations of the SAME
+    // loop with a reassignment in between, still isn't safe here (this checker's move-tracking
+    // doesn't fully reset a `var`'s moved status just because a loop iteration ends -- the exact
+    // same class of bug `Checker.hotc`'s own `declared_keys` hit earlier this session, see that
+    // fix's header). The fix here is to decide the SHAPE up front via pure TOKEN lookahead
+    // (`looks_like_index_field_access`, bracket-depth-aware, scanning for a `.` right after the
+    // matching `]`) -- no `Expr` value is ever provisionally built and reconsidered, so there's
+    // nothing to move twice. Only the plain `arr_name[idx].field` shape gets this treatment (an
+    // arena buffer access can ONLY be a bare local/param this phase anyway, see `Ast.hc`'s own
+    // `StructDecl.is_arena` header) -- `some_call()[idx].field` or `arr[idx][idx2].field` fall back
+    // to the ordinary `Index`/`FieldAccess` nesting via the untouched, original postfix loop.
     fn call_or_primary(&mut self) -> Expr {
-        var expr = self.primary();
+        if self.check(IDENT) {
+            if self.pos + 1 < self.tokens.length() {
+                let nxt = self.tokens.get(self.pos + 1);
+                if nxt.kind == LBRACKET && self.looks_like_index_field_access() {
+                    let arr_name = self.peek().text;
+                    self.advance(); // IDENT
+                    self.advance(); // LBRACKET
+                    let idx = self.expression();
+                    self.expect(RBRACKET);
+                    self.expect(DOT);
+                    let field = self.expect(IDENT).text;
+                    return self.postfix_loop(IndexFieldGet { arr_name: arr_name, index: idx, field: field });
+                }
+            }
+        }
+        let expr = self.primary();
+        return self.postfix_loop(expr);
+    }
+
+    // Bracket-depth-aware, non-consuming lookahead from the CURRENT position (an `IDENT` known to
+    // be immediately followed by `[`): true iff the token right after the MATCHING `]` is a `.` --
+    // i.e., this really is `arr_name[...].field`, not just `arr_name[...]` used some other way
+    // (`arr_name[...] + 1`, `arr_name[...];`, ...). Depth-tracked so a nested bracket inside the
+    // index expression itself (`buf[other[0]].field`) doesn't stop at the WRONG `]`.
+    // Must ALSO confirm `.field` isn't actually `.method(...)` -- a real gap found running this
+    // exact check against `arr[i].length()` (real, pre-existing `demo_program22.hcsrc` usage): the
+    // FIRST version of this only checked for a `.` right after the matching `]`, which is also
+    // true for a METHOD call on an indexed element, not just a plain field read. `IndexFieldGet`
+    // only ever represents a bare field access (see `Ast.hc`'s own header) -- a trailing `(` after
+    // the field name means this is `arr[i].method(...)`, which must fall through to the ordinary
+    // `Index`-then-`MethodCall` postfix-loop path instead.
+    fn looks_like_index_field_access(&self) -> Bool {
+        var i = self.pos + 1; // the opening `[`
+        var depth = 0;
+        while i < self.tokens.length() {
+            if self.tokens.get(i).kind == LBRACKET { depth = depth + 1; }
+            if self.tokens.get(i).kind == RBRACKET {
+                depth = depth - 1;
+                if depth == 0 {
+                    if i + 2 < self.tokens.length() {
+                        if self.tokens.get(i + 1).kind != DOT { return false; }
+                        if self.tokens.get(i + 2).kind != IDENT { return false; }
+                        if i + 3 < self.tokens.length() {
+                            return self.tokens.get(i + 3).kind != LPAREN;
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    fn postfix_loop(&mut self, start: Expr) -> Expr {
+        var expr = start;
         while true {
             if self.check(LPAREN) {
                 if let Ident { name } = expr {
@@ -259,10 +444,40 @@ impl Parser {
                 let idx = self.expression();
                 self.expect(RBRACKET);
                 expr = Index { arr: expr, index: idx };
+            } else if self.check(QUESTION) && self.tokens.get(self.pos + 1).kind == DOT {
+                // `x?.field` / `x?.method(args)` -- safe navigation. See `Ast.hc`'s own
+                // `Expr.SafeCall`/`Expr.SafeFieldAccess` header. Consumed HERE, inside the ordinary
+                // postfix chain (alongside plain `.`), not deferred to `try_postfix`'s own `?`
+                // loop -- by the time that loop runs, this branch has already eaten it.
+                self.advance(); // QUESTION
+                self.advance(); // DOT
+                let field2 = self.expect(IDENT).text;
+                if self.check(LPAREN) {
+                    self.advance();
+                    let args2 = self.arg_list();
+                    expr = SafeCall { recv: expr, method: field2, args: args2 };
+                } else {
+                    expr = SafeFieldAccess { recv: expr, field: field2 };
+                }
             } else {
                 return expr;
             }
         }
+    }
+
+    // `name: value` -- a named argument, see `Ast.hc`'s own `Expr.NamedArg` header. Unambiguous
+    // via a bounded 1-token lookahead (`IDENT` immediately followed by `COLON`): no legal
+    // expression production in this grammar ever has a bare `COLON` right after a leading `IDENT`
+    // otherwise, so this can't misfire on an ordinary positional arg that merely starts with an
+    // identifier (`x`, `x + 1`, `foo()`, ...).
+    fn one_arg(&mut self) -> Expr {
+        if self.check(IDENT) && self.tokens.get(self.pos + 1).kind == COLON {
+            let name = self.advance().text;
+            self.advance(); // COLON
+            let value = self.expression();
+            return NamedArg { name: name, value: value };
+        }
+        return self.expression();
     }
 
     fn arg_list(&mut self) -> Vec<Expr> {
@@ -270,23 +485,92 @@ impl Parser {
             self.advance();
             return empty_expr_vec();
         }
-        var args = vec_of(self.expression());
+        var args = vec_of(self.one_arg());
         while self.match_kind(COMMA) {
             if self.check(RPAREN) { break; }
-            args.push(self.expression());
+            args.push(self.one_arg());
         }
         self.expect(RPAREN);
         return args;
     }
 
+    // `|| expr` / `|x, y| expr` -- a lambda literal, see `Ast.hc`'s own `Expr.Lambda` header.
+    // Unambiguous at the START of a primary expression: `bitwise_or`/`logical_or` (this file's own
+    // `PIPE`/`PIPEPIPE`-consuming precedence levels) only ever consume those tokens AFTER already
+    // parsing a left operand, so seeing either one here can only mean a lambda is starting, never a
+    // stray `|`/`||` operator. Params are bare names, no declared types -- always inferred from the
+    // target method's own signature at check time (see `Checker.hotc`'s own `check_lambda`), so this
+    // is just an `IDENT`-comma-list, not a real `one_param()`-style parse. Body is parsed at the same
+    // `expression()` level as anything else -- naturally stops at the enclosing call's own `)`/`,`,
+    // same as any other argument expression.
+    fn lambda_lit(&mut self) -> Expr {
+        var params = empty_str_vec();
+        if self.check(PIPEPIPE) {
+            self.advance();
+        } else {
+            self.expect(PIPE);
+            if !self.check(PIPE) {
+                params.push(self.expect(IDENT).text);
+                while self.match_kind(COMMA) {
+                    params.push(self.expect(IDENT).text);
+                }
+            }
+            self.expect(PIPE);
+        }
+        let body = self.expression();
+        return Lambda { params: params, body: body };
+    }
+
     fn primary(&mut self) -> Expr {
+        if self.check(PIPE) || self.check(PIPEPIPE) {
+            return self.lambda_lit();
+        }
+        // `3.5f` / `3.5` -- see `Ast.hc`'s own `Expr.FloatLit`/`Expr.DoubleLit` header for why the
+        // literal's own source text is kept as-is rather than parsed into a native value here.
+        if self.check(FLOAT) {
+            let t = self.advance();
+            return FloatLit { text: t.text };
+        }
+        if self.check(DOUBLE) {
+            let t = self.advance();
+            return DoubleLit { text: t.text };
+        }
         if self.check(INT) {
             let t = self.advance();
             return IntLit { value: parse_int(t.text) };
         }
+        // `123L` -- a real, pre-existing gap found porting a stateful "manager" class needing a
+        // literal `-1L`/`Long` sentinel value: `Lexer.hotc`'s own `number` already produces a
+        // real, distinct `LONG` token kind for an `L`/`l`-suffixed numeral (its own `text` never
+        // includes the suffix -- already stripped during lexing), but `primary()` never checked
+        // for it at all, so EVERY `L`-suffixed literal anywhere in ANY `.hotc` program failed to
+        // parse, unconditionally -- only reachable indirectly before now (an extern method
+        // returning `Long`, or `expr as Long`). Rewritten as that exact same `Cast` shape here
+        // (`IntLit` wrapped in `as Long`) rather than adding a whole new dedicated AST node +
+        // checker + codegen path -- reuses the already-correct `I2L` conversion `gen_cast` has
+        // had all session. A real, disclosed narrower scope: the digits are parsed through
+        // `parse_int`'s own `Int`-width precision first, so a literal naming a value outside
+        // `Int`'s own 32-bit range (`9999999999L`) would silently truncate -- no real `.hotc`
+        // source (here or in this compiler's own self-hosted sources) does that today.
+        if self.check(LONG) {
+            let t2 = self.advance();
+            return Cast { expr: IntLit { value: parse_int(t2.text) }, target_type: "Long" };
+        }
+        // `arena Name[count]` -- see `Ast.hc`'s own `ArenaNew` header.
+        if self.check(ARENA) {
+            self.advance();
+            let name = self.expect(IDENT).text;
+            self.expect(LBRACKET);
+            let count = self.expression();
+            self.expect(RBRACKET);
+            return ArenaNew { struct_name: name, count: count };
+        }
         if self.check(STRING) {
             let t = self.advance();
             return StringLit { value: t.text };
+        }
+        if self.check(ISTRING_BEGIN) {
+            return self.istring_expr();
         }
         if self.check(TRUE) {
             self.advance();
@@ -295,6 +579,10 @@ impl Parser {
         if self.check(FALSE) {
             self.advance();
             return BoolLit { value: false };
+        }
+        if self.check(NULL) {
+            self.advance();
+            return NullLit;
         }
         if self.check(LPAREN) {
             self.advance();
@@ -330,15 +618,30 @@ impl Parser {
                 let variant_name = self.expect(IDENT).text;
                 return self.struct_lit(variant_name, some_string(t.text + "$" + type_arg));
             }
+            // `Result<Int, String>::Ok { ... }` -- the two-type-argument shape, see
+            // `looks_like_generic_variant2`'s own header.
+            if self.check(LT) && !self.no_struct_lit && self.looks_like_generic_variant2() {
+                self.advance(); // LT
+                let type_arg1 = self.expect(IDENT).text;
+                self.expect(COMMA);
+                let type_arg2 = self.expect(IDENT).text;
+                self.expect(GT);
+                self.expect(COLONCOLON);
+                let variant_name2 = self.expect(IDENT).text;
+                return self.struct_lit(variant_name2, some_string(t.text + "$" + type_arg1 + "$" + type_arg2));
+            }
             if self.check(LBRACE) && !self.no_struct_lit {
                 return self.struct_lit(t.text, none_string());
             }
             if self.check(COLONCOLON) {
                 self.advance();
                 let method = self.expect(IDENT).text;
-                self.expect(LPAREN);
-                let args = self.arg_list();
-                return StaticCall { type_name: t.text, method: method, args: args };
+                if self.check(LPAREN) {
+                    self.advance();
+                    let args = self.arg_list();
+                    return StaticCall { type_name: t.text, method: method, args: args };
+                }
+                return ExternStaticFieldGet { type_name: t.text, field: method };
             }
             return Ident { name: t.text };
         }
@@ -347,6 +650,23 @@ impl Parser {
         }
         let t = self.peek();
         throw ParseError::new("Parse error at line " + JString3::valueOf(t.line) + ": unexpected token '" + t.text + "'");
+    }
+
+    // `"a{x}b{y}c"` -- `Lexer.hotc`'s own `string_tokens` already did the hard part (recursively
+    // re-lexing each `{...}` span); this just consumes the resulting flat token stream, one
+    // `ISTRING_PART` per literal segment, one full sub-expression (via the ordinary `expression()`,
+    // recursing into the ALREADY-EMBEDDED tokens exactly like any parenthesized expression would)
+    // per gap between them.
+    fn istring_expr(&mut self) -> Expr {
+        self.expect(ISTRING_BEGIN);
+        var literals = vec_of(self.expect(ISTRING_PART).text);
+        var exprs = empty_expr_vec();
+        while !self.check(ISTRING_END) {
+            exprs.push(self.expression());
+            literals.push(self.expect(ISTRING_PART).text);
+        }
+        self.expect(ISTRING_END);
+        return StringInterp { literals: literals, exprs: exprs };
     }
 
     // `[e1, e2, ...]` -- non-empty only, see `Ast.hc`'s own header.
@@ -420,41 +740,52 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Stmt {
+        let start_line = self.peek().line;
         if self.check(LET) || self.check(VAR) {
             let mutable = self.check(VAR);
             self.advance();
             let name = self.expect(IDENT).text;
             // An explicit `: Type` annotation (`let found: Option<TokType> = ...;` -- a real gap
-            // found self-compiling `Lexer.hotc`) is parsed and discarded, not stored: `Stmt::Let`
-            // has no type field at all (this subset's own `let`/`var` are always inferred from
-            // `init`, see `Ast.hc`'s own header), and every real use of the annotation seen so far
-            // is redundant with what inference already produces on its own (`Registry<TokType>`'s
-            // own `.get()` already returns `Option<TokType>`) -- purely documentation from the
-            // checker's own point of view, same "accepted syntax, no semantic effect" treatment
-            // `pub`/`module` already get elsewhere in this file.
+            // found self-compiling `Lexer.hotc`) is captured now, not discarded -- see `Ast.hc`'s
+            // own `Stmt::Let.declared_type` header for why: `Checker.hotc`'s own `check_stmt`
+            // honors it for exactly one case (widening a concrete struct up to a `&dyn Interface`),
+            // and ignores it (same as before) for everything else, so this stays a strict
+            // superset of the old "accepted syntax, no semantic effect" behavior.
+            var declared_type = none_string();
             if self.check(COLON) {
                 self.advance();
-                self.type_name_ref();
+                declared_type = some_string(self.type_name_ref());
             }
             self.expect(EQ);
             let init = self.expression();
             self.expect(SEMI);
-            return Let { name: name, mutable: mutable, init: init };
+            return Let { name: name, mutable: mutable, init: init, declared_type: declared_type, line: start_line };
         }
         if self.check(RETURN) {
             self.advance();
             if self.check(SEMI) {
                 self.advance();
-                return Return { value: none_expr() };
+                return Return { value: none_expr(), line: start_line };
             }
             let e = self.expression();
             self.expect(SEMI);
-            return Return { value: some_expr(e) };
+            return Return { value: some_expr(e), line: start_line };
         }
         if self.check(IF) {
             self.advance();
             if self.check(LET) {
-                return self.if_let_stmt();
+                return self.if_let_stmt(start_line);
+            }
+            // Guard-clause null-narrowing -- see `Ast.hc`'s own `Stmt::If.narrow_name` header for
+            // why this is a raw, 3-token lookahead over the TOKEN stream (`IDENT (EQEQ|BANGEQ)
+            // NULL`) done BEFORE `cond` is parsed, rather than inspecting the built `cond` `Expr`
+            // afterward. A bare read -- `self.tokens.get(...)`, no `self.advance()` -- so it never
+            // disturbs the normal `self.expression()` parse right below.
+            var narrow_name = "";
+            var narrow_is_eq = false;
+            if self.check(IDENT) && (self.tokens.get(self.pos + 1).kind == EQEQ || self.tokens.get(self.pos + 1).kind == BANGEQ) && self.tokens.get(self.pos + 2).kind == NULL {
+                narrow_name = self.tokens.get(self.pos).text;
+                narrow_is_eq = self.tokens.get(self.pos + 1).kind == EQEQ;
             }
             self.no_struct_lit = true;
             let cond = self.expression();
@@ -466,13 +797,13 @@ impl Parser {
                 // uses for this (no separate "else-if" AST node needed).
                 if self.check(IF) {
                     let nested = self.statement();
-                    return If { cond: cond, then_body: then_body, else_body: some_stmt_vec(vec_of(nested)) };
+                    return If { cond: cond, then_body: then_body, else_body: some_stmt_vec(vec_of(nested)), line: start_line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq };
                 } else {
                     let else_body = self.block();
-                    return If { cond: cond, then_body: then_body, else_body: some_stmt_vec(else_body) };
+                    return If { cond: cond, then_body: then_body, else_body: some_stmt_vec(else_body), line: start_line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq };
                 }
             } else {
-                return If { cond: cond, then_body: then_body, else_body: none_stmt_vec() };
+                return If { cond: cond, then_body: then_body, else_body: none_stmt_vec(), line: start_line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq };
             }
         }
         if self.check(WHILE) {
@@ -481,42 +812,74 @@ impl Parser {
             let cond = self.expression();
             self.no_struct_lit = false;
             let body = self.block();
-            return While { cond: cond, body: body };
+            return While { cond: cond, body: body, line: start_line };
+        }
+        // `for var_name in a..b { }` / `for var_name in a..=b { }` (a real range, `Ast.hc`'s own
+        // `Stmt::For` header explains why it's flattened onto this ONE variant rather than a
+        // separate general `Expr::Range` type) or `for var_name in arr_expr { }` (a real `[T]`
+        // array) -- same `no_struct_lit` ambiguity-avoidance trick `while`'s own condition just
+        // used, for the exact same reason (the iterable expression is immediately followed by the
+        // body's own `{`).
+        if self.check(FOR) {
+            self.advance();
+            let var_name = self.expect(IDENT).text;
+            self.expect(IN);
+            self.no_struct_lit = true;
+            let start = self.expression();
+            if self.check(DOTDOT) || self.check(DOTDOTEQ) {
+                let inclusive = self.check(DOTDOTEQ);
+                self.advance();
+                let end = self.expression();
+                self.no_struct_lit = false;
+                let body = self.block();
+                return For { var_name: var_name, is_range: true, range_start: start, range_end: end, inclusive: inclusive, arr_expr: IntLit { value: 0 }, body: body, line: start_line };
+            } else {
+                self.no_struct_lit = false;
+                let body = self.block();
+                return For { var_name: var_name, is_range: false, range_start: IntLit { value: 0 }, range_end: IntLit { value: 0 }, inclusive: false, arr_expr: start, body: body, line: start_line };
+            }
         }
         if self.check(MATCH) {
-            return self.match_stmt();
+            return self.match_stmt(start_line);
         }
         if self.check(THROW) {
             self.advance();
             let e = self.expression();
             self.expect(SEMI);
-            return Throw { value: e };
+            return Throw { value: e, line: start_line };
         }
         if self.check(BREAK) {
             self.advance();
             self.expect(SEMI);
-            return Break {};
+            return Break { line: start_line };
         }
         if self.check(CONTINUE) {
             self.advance();
             self.expect(SEMI);
-            return Continue {};
+            return Continue { line: start_line };
         }
         if self.check(TRY) {
-            return self.try_stmt();
+            return self.try_stmt(start_line);
         }
         let e = self.expression();
         self.expect(SEMI);
-        return ExprStmt { expr: e };
+        return ExprStmt { expr: e, line: start_line };
     }
 
     // `if let VariantName { field, ... } = subject { then_body } [else { else_body }]` --
     // desugars directly to a two-arm `Match` (the variant arm, plus an implicit `_` wildcard arm
     // holding `else_body`, or an empty one if there's no `else`) rather than needing its own
     // separate AST node or Checker/Codegen support -- reuses everything `match` already has.
-    fn if_let_stmt(&mut self) -> Stmt {
+    // `EnumName::VariantName` (the qualifier parsed and discarded) -- same real gap `match_arm`'s
+    // own header explains, found by the exact same `examples/calc/Calculator.hotc` usage
+    // (`if let Option::Some { value: a } = a_opt { ... }`).
+    fn if_let_stmt(&mut self, start_line: Int) -> Stmt {
         self.expect(LET);
-        let variant_name = self.expect(IDENT).text;
+        var variant_name = self.expect(IDENT).text;
+        if self.check(COLONCOLON) {
+            self.advance();
+            variant_name = self.expect(IDENT).text;
+        }
         self.expect(LBRACE);
         var field_names = empty_str_vec();
         var bind_names = empty_str_vec();
@@ -538,18 +901,18 @@ impl Parser {
         self.no_struct_lit = false;
         let then_body = self.block();
         var arms = empty_matcharm_vec();
-        arms.push(MatchArm { variant_name: variant_name, field_names: field_names, bind_names: bind_names, body: then_body });
+        arms.push(MatchArm { variant_name: variant_name, field_names: field_names, bind_names: bind_names, body: then_body, is_literal: false, literal: IntLit { value: 0 } });
         if self.match_kind(ELSE) {
             let else_body = self.block();
-            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: else_body });
+            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: else_body, is_literal: false, literal: IntLit { value: 0 } });
         } else {
-            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec() });
+            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec(), is_literal: false, literal: IntLit { value: 0 } });
         }
-        return Match { subject: subject, arms: arms };
+        return Match { subject: subject, arms: arms, line: start_line };
     }
 
     // === `match subject { VariantName { field, ... } => { body } ... _ => { body } }` ===
-    fn match_stmt(&mut self) -> Stmt {
+    fn match_stmt(&mut self, start_line: Int) -> Stmt {
         self.expect(MATCH);
         self.no_struct_lit = true; // same reasoning as if/while's own condition parsing
         let subject = self.expression();
@@ -560,15 +923,25 @@ impl Parser {
             arms.push(self.match_arm());
         }
         self.expect(RBRACE);
-        return Match { subject: subject, arms: arms };
+        return Match { subject: subject, arms: arms, line: start_line };
     }
 
-    // `try { ... } catch (name: Type) { ... }` -- SINGLE catch clause only, see `Ast.hc`'s own
-    // `Try` header for why (the real compiler supports a list; this subset only ever needs to
-    // catch one real exception type at a time).
-    fn try_stmt(&mut self) -> Stmt {
+    // `try { ... } catch (name: Type) { ... } catch (name2: Type2) { ... } ...` -- one or more
+    // catch clauses (real gap closed, see `Ast.hc`'s own `Try`/`CatchClause` headers). Each is
+    // parsed identically; the loop just keeps going as long as another bare `catch` follows the
+    // previous clause's own closing `}`.
+    fn try_stmt(&mut self, start_line: Int) -> Stmt {
         self.expect(TRY);
         let try_block = self.block();
+        var catches = empty_catchclause_vec();
+        catches.push(self.catch_clause());
+        while self.check(CATCH) {
+            catches.push(self.catch_clause());
+        }
+        return Try { try_block: try_block, catches: catches, line: start_line };
+    }
+
+    fn catch_clause(&mut self) -> CatchClause {
         self.expect(CATCH);
         self.expect(LPAREN);
         let catch_var = self.expect(IDENT).text;
@@ -576,7 +949,7 @@ impl Parser {
         let catch_type = self.type_name_ref();
         self.expect(RPAREN);
         let catch_block = self.block();
-        return Try { try_block: try_block, catch_var: catch_var, catch_type: catch_type, catch_block: catch_block };
+        return CatchClause { catch_var: catch_var, catch_type: catch_type, catch_block: catch_block };
     }
 
     // `field` or `field: localName` -- returns the declared field name and the local binding name
@@ -595,12 +968,57 @@ impl Parser {
         }
     }
 
+    // A literal pattern (`"+" => { ... }`, `1 => { ... }`, `true => { ... }`) -- tried BEFORE the
+    // ordinary variant-name pattern (`match_arm`'s own header, right below), mirroring the real
+    // compiler's own `literalPattern`/`matchExpr` ordering exactly: an `INT`/`STRING`/`TRUE`/
+    // `FALSE` token here can never be the start of a real variant-name pattern (which always
+    // starts with `IDENT`), so trying this first is unambiguous. `None` when the next token isn't
+    // one of those, letting `match_arm` fall through to the variant-pattern path unchanged.
+    fn try_literal_pattern(&mut self) -> Option<Expr> {
+        if self.check(INT) {
+            let t = self.advance();
+            return some_expr(IntLit { value: parse_int(t.text) });
+        }
+        if self.check(STRING) {
+            let t = self.advance();
+            return some_expr(StringLit { value: t.text });
+        }
+        if self.check(TRUE) {
+            self.advance();
+            return some_expr(BoolLit { value: true });
+        }
+        if self.check(FALSE) {
+            self.advance();
+            return some_expr(BoolLit { value: false });
+        }
+        return none_expr();
+    }
+
+    // `VariantName { field, ... } => { body }` / `EnumName::VariantName { ... } => { body }` (the
+    // qualifier is parsed and discarded -- real `examples/calc/Calculator.hotc` usage,
+    // `match op { "+" => ..., }`'s own sibling `if let Option::Some { ... }`, found needing this;
+    // this subset's own variant names are already unique/unqualified everywhere else, so dropping
+    // the qualifier loses no real information) / a literal pattern (`try_literal_pattern`, above --
+    // `is_literal: true`, `variant_name`/`field_names`/`bind_names` unused placeholders then) /
+    // `_ => { body }` (the wildcard). See `Ast.hc`'s own `MatchArm.is_literal` header for why
+    // literal patterns get their own flag rather than a separate AST node.
     fn match_arm(&mut self) -> MatchArm {
-        let head = self.expect(IDENT).text;
-        if head == "_" {
+        let lit_found = self.try_literal_pattern();
+        if let Some { value: lit } = lit_found {
             self.expect(FATARROW);
             let body = self.block();
-            return MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body };
+            return MatchArm { variant_name: "$literal", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body, is_literal: true, literal: lit };
+        }
+        let head0 = self.expect(IDENT).text;
+        if head0 == "_" {
+            self.expect(FATARROW);
+            let body = self.block();
+            return MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body, is_literal: false, literal: IntLit { value: 0 } };
+        }
+        var head = head0;
+        if self.check(COLONCOLON) {
+            self.advance();
+            head = self.expect(IDENT).text;
         }
         // The `{ ... }` field-binding list is OPTIONAL, not required -- a fieldless variant can be
         // matched bare (`TyInt => { ... }`, no braces at all), real `Checker.hotc` usage
@@ -626,7 +1044,7 @@ impl Parser {
         }
         self.expect(FATARROW);
         let body = self.block();
-        return MatchArm { variant_name: head, field_names: field_names, bind_names: bind_names, body: body };
+        return MatchArm { variant_name: head, field_names: field_names, bind_names: bind_names, body: body, is_literal: false, literal: IntLit { value: 0 } };
     }
 
     // === One `fn` declaration form: `fn name(params) [-> RetType] { block }` ===
@@ -668,6 +1086,18 @@ impl Parser {
             self.advance();
             if self.check(MUT) { self.advance(); }
         }
+        // `&dyn Name` -- dynamic-dispatch interface type. Encoded as the plain type-name string
+        // "dyn Name" (the same "just a type-name string, no separate type-ref struct" convention
+        // this whole subset already uses for arrays -- `"[Name]"` above), NOT a new `Ty` variant:
+        // `ty_from_name`'s existing catch-all (`TyStruct { name: name }`) already handles any
+        // unrecognized name, so "dyn Name" flows through the checker/codegen as a plain
+        // reference-typed name string that happens to start with "dyn " -- see `Checker.hotc`'s own
+        // `is_dyn_type_name`/`dyn_interface_name` for where that prefix gets interpreted.
+        if self.check(DYN) {
+            self.advance();
+            let iface = self.expect(IDENT).text;
+            return "dyn " + iface;
+        }
         if self.check(LBRACKET) {
             self.advance();
             let inner = self.expect(IDENT).text;
@@ -675,30 +1105,69 @@ impl Parser {
             return "[" + inner + "]";
         }
         let base = self.expect(IDENT).text;
+        var result = base;
         if self.check(LT) {
             self.advance();
             let arg = self.type_name_ref();
-            self.expect(GT);
-            return base + "$" + arg;
+            // `Result<T, E>` -- a SECOND type argument, comma-separated (see `Ast.hc`'s own
+            // `EnumDecl.type_param2` header: enums only, but this is just building the mono-name
+            // STRING, the same "Base$Arg" convention a one-param reference already uses -- nothing
+            // here needs to know whether `base` even resolves to a real two-param enum).
+            if self.match_kind(COMMA) {
+                let arg2 = self.type_name_ref();
+                self.expect(GT);
+                result = base + "$" + arg + "$" + arg2;
+            } else {
+                self.expect(GT);
+                result = base + "$" + arg;
+            }
         }
-        return base;
+        // `TypeName?` -- a nullable type, same "plain suffixed type-name string" convention as
+        // `dyn Name`/`[Name]` above (no new `Ty` variant -- `ty_from_name`'s catch-all already
+        // carries this suffix through untouched). See README's own "Nullable types" section for
+        // the real scope this covers this pass (a `TyStruct`-shaped value only -- not native
+        // `String?`, a disclosed narrower cut).
+        if self.check(QUESTION) {
+            self.advance();
+            result = result + "?";
+        }
+        return result;
     }
 
     fn one_param(&mut self) -> Param {
         let name = self.expect(IDENT).text;
         self.expect(COLON);
+        // Consumed HERE, before `type_name_ref` gets a chance to silently eat the same tokens
+        // itself (see that fn's own header) -- this is the one call site that actually needs to
+        // remember it saw a `&`/`&mut`, for `Param.is_ref` (see that field's own header).
+        var is_ref = false;
+        var is_mut_ref = false;
+        if self.check(AMP) {
+            self.advance();
+            if self.check(MUT) { self.advance(); is_mut_ref = true; }
+            is_ref = true;
+        }
         let type_name = self.type_name_ref();
-        return Param { name: name, type_name: type_name };
+        return Param { name: name, type_name: type_name, is_ref: is_ref, is_mut_ref: is_mut_ref };
     }
 
     fn fn_decl(&mut self) -> FnDecl {
         self.expect(FN);
         let name = self.expect(IDENT).text;
         var type_param = none_string();
+        var type_bounds = empty_str_vec();
         if self.match_kind(LT) {
             let tp = self.expect(IDENT).text;
-            self.expect(GT);
             type_param = some_string(tp);
+            // `<T: A + B>` -- one or more bound trait names, `+`-joined. See `Ast.hc`'s own
+            // `FnDecl.type_bounds` header.
+            if self.match_kind(COLON) {
+                type_bounds.push(self.expect(IDENT).text);
+                while self.match_kind(PLUS) {
+                    type_bounds.push(self.expect(IDENT).text);
+                }
+            }
+            self.expect(GT);
         }
         let params = self.param_list();
         var ret_type = none_string();
@@ -706,7 +1175,7 @@ impl Parser {
             ret_type = some_string(self.type_name_ref());
         }
         let body = self.block();
-        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: type_param };
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: type_param, type_bounds: type_bounds, self_is_mut: false };
     }
 
     // === One `struct` declaration form: `struct Name { field: Type, field: Type, ... }` ===
@@ -725,6 +1194,18 @@ impl Parser {
         return fields;
     }
 
+    // `self.current_module` as an `Option<String>` (`None` for `""`, the "no `module` decl seen
+    // yet" sentinel) -- every struct/enum/interface declaration reads this fresh, right at
+    // construction time, so a `module` declared partway through a file (this subset's own real,
+    // disclosed leniency -- see `parse_program`'s own header) still correctly tags everything
+    // parsed AFTER it.
+    fn current_module_opt(&mut self) -> Option<String> {
+        if self.current_module == "" {
+            return none_string();
+        }
+        return some_string(self.current_module);
+    }
+
     fn struct_decl(&mut self) -> StructDecl {
         self.expect(STRUCT);
         let name = self.expect(IDENT).text;
@@ -734,30 +1215,58 @@ impl Parser {
             self.expect(GT);
             type_param = some_string(tp);
         }
+        var super_class = none_string();
+        if self.match_kind(EXTENDS) {
+            super_class = some_string(self.expect(IDENT).text);
+        }
         let fields = self.struct_fields();
-        return StructDecl { name: name, type_param: type_param, fields: fields };
+        let mod0 = self.current_module_opt();
+        return StructDecl { name: name, type_param: type_param, fields: fields, is_arena: false, module_name: mod0, super_class: super_class };
+    }
+
+    // `arena struct Name { field: Type, ... }` -- see `Ast.hc`'s own `StructDecl.is_arena` header.
+    // No generic arena structs (`arena struct Box<T>`) this phase -- `type_param` stays `None`
+    // unconditionally, a real, disclosed narrower scope than the real compiler's own grammar
+    // (which doesn't restrict it either, though nothing exercises a generic arena struct there).
+    fn arena_struct_decl(&mut self) -> StructDecl {
+        self.expect(ARENA);
+        self.expect(STRUCT);
+        let name = self.expect(IDENT).text;
+        let fields = self.struct_fields();
+        let mod1 = self.current_module_opt();
+        return StructDecl { name: name, type_param: none_string(), fields: fields, is_arena: true, module_name: mod1, super_class: none_string() };
     }
 
     // === `impl Name { fn method(self[, ...]) [-> Ret] { block } ... }` ===
     // `self`/`&self`/`&mut self` -- the `&`/`mut` markers are accepted but not distinguished
     // (this subset has no borrow-checking at all); required as the literal first parameter of
     // every method, and NOT added to the returned `FnDecl.params` (see `Ast.hc`'s own header).
-    fn self_receiver(&mut self) {
+    // Returns whether the receiver was declared `&mut self` specifically (not `&self` or bare
+    // `self`) -- `Param.self_is_mut`'s own header explains why `method_decl` needs this.
+    fn self_receiver(&mut self) -> Bool {
+        var is_mut = false;
         if self.check(AMP) {
             self.advance();
-            if self.check(MUT) { self.advance(); }
+            if self.check(MUT) { self.advance(); is_mut = true; }
         }
         let t = self.expect(IDENT);
         if t.text != "self" {
             throw ParseError::new("expected 'self' as the first parameter of an impl method, got '" + t.text + "'");
         }
+        return is_mut;
     }
 
     fn method_decl(&mut self) -> FnDecl {
+        // `override fn method(...)` -- purely cosmetic this phase (see README's own "`extends`:
+        // subclassing a real Java class" section): an extends-struct's override is recognized by
+        // ORDINARY name-matching against the struct's own compiled superclass method table, the
+        // same mechanism an interface override already uses, so `override` itself carries no
+        // checker-enforced meaning yet -- just consumed here so it parses at all.
+        self.match_kind(OVERRIDE);
         self.expect(FN);
         let name = self.expect(IDENT).text;
         self.expect(LPAREN);
-        self.self_receiver();
+        let self_is_mut = self.self_receiver();
         var params = empty_param_vec();
         while self.match_kind(COMMA) {
             if self.check(RPAREN) { break; }
@@ -769,7 +1278,7 @@ impl Parser {
             ret_type = some_string(self.type_name_ref());
         }
         let body = self.block();
-        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string() };
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: self_is_mut };
     }
 
     // `static fn name(...) -> Ret { body }` -- no `self`, plain params like a top-level `fn`.
@@ -783,7 +1292,7 @@ impl Parser {
             ret_type = some_string(self.type_name_ref());
         }
         let body = self.block();
-        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string() };
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false };
     }
 
     // `impl Box<T> { ... }` -- the `<T>` (matching the struct's own declared type parameter) is
@@ -793,10 +1302,49 @@ impl Parser {
     // (see `Checker.hotc`'s own `generic_method_templates` header).
     fn impl_decl(&mut self) -> ImplDecl {
         self.expect(IMPL);
-        let struct_name = self.expect(IDENT).text;
+        // `impl<T> Box<T> { ... }` / `impl<T> Labeled for Box<T> { ... }` -- an optional LEADING
+        // `<T>` right after `impl`, before the struct/interface name (the Rust-familiar spelling
+        // for "this impl block is generic over T"). Real gap found running `examples/methods.hc`/
+        // `examples/interfaces2.hc`/`examples/showcase.hc`: only the TRAILING `<T>` right after the
+        // struct name (`impl Box<T> { ... }`, `for StructName<T>` below) was ever accepted, both of
+        // which this parser already discards outright (a struct's own declared `type_param` is what
+        // the checker/codegen actually key off of via `struct_name` -- see `generic_method_templates`/
+        // `ensure_method_instantiated` in `Checker.hotc`, unaffected either way) -- so accepting and
+        // discarding this leading form the same way is a pure parser change, no checker/codegen gap
+        // at all once past this point.
         if self.match_kind(LT) {
             self.expect(IDENT);
             self.expect(GT);
+        }
+        let name1 = self.expect(IDENT).text;
+        if self.match_kind(LT) {
+            self.expect(IDENT);
+            self.expect(GT);
+        }
+        // `impl InterfaceName for StructName { ... }` -- the FIRST identifier is the interface, the
+        // one after `for` is the struct actually implementing it (mirrors the real compiler's own
+        // `implDecl` exactly: `name1` is provisionally the struct name, reinterpreted as the
+        // interface name only once `for` is actually seen). Plain `impl StructName { ... }`
+        // (`interface_name` stays `None`) is unaffected -- `for` never appears in that form.
+        var struct_name = name1;
+        var interface_name = none_string();
+        if self.match_kind(FOR) {
+            interface_name = some_string(name1);
+            struct_name = self.expect(IDENT).text;
+            if self.match_kind(LT) {
+                self.expect(IDENT);
+                self.expect(GT);
+            }
+        }
+        // `by fieldName` -- composition delegation sugar, only meaningful right after `for
+        // StructName` (an interface impl); see `Ast.hc`'s own `ImplDecl.delegate_field` header. No
+        // method bodies are required in the `{ }` block below when this is present -- any interface
+        // method not explicitly overridden gets a forwarding method synthesized later (see
+        // `Codegen.hotc`'s own `materialize_delegated_methods`).
+        var delegate_field = none_string();
+        if self.check(BY) {
+            self.advance();
+            delegate_field = some_string(self.expect(IDENT).text);
         }
         self.expect(LBRACE);
         var methods = empty_fn_decl_vec();
@@ -809,7 +1357,123 @@ impl Parser {
             }
         }
         self.expect(RBRACE);
-        return ImplDecl { struct_name: struct_name, methods: methods, static_methods: static_methods };
+        return ImplDecl { struct_name: struct_name, methods: methods, static_methods: static_methods, interface_name: interface_name, delegate_field: delegate_field };
+    }
+
+    // `extend Target { fn m(&self, params) -> Ret { body } ... }` -- see `Ast.hc`'s own
+    // `ExtendDecl` header. Structurally almost identical to a plain `impl Target { ... }` block
+    // (same `self_receiver`-required, real-body-required `method_decl()` reused directly), just
+    // with no `for Interface`/`by field`/`static fn` shapes at all -- an extension method is
+    // always an ordinary instance method, on a target this block doesn't own the declaration of.
+    fn extend_decl(&mut self) -> ExtendDecl {
+        self.expect(EXTEND);
+        let target = self.expect(IDENT).text;
+        self.expect(LBRACE);
+        var methods = empty_fn_decl_vec();
+        while !self.check(RBRACE) {
+            methods.push(self.method_decl());
+        }
+        self.expect(RBRACE);
+        return ExtendDecl { target: target, methods: methods };
+    }
+
+    // `[open] [sealed] interface Name [: Super1, Super2] { fn method(&self, ...) -> RetType; ... }`
+    // -- see `Ast.hc`'s own `InterfaceDecl` header for the real, disclosed scope cut versus the real
+    // language's own `interface` (no static methods, no `by` delegate-field impls). Interface
+    // inheritance (`: Super1, Super2`) AND default method bodies
+    // (`fn m(&self) -> T { ... }` instead of a bare `;`-terminated signature) ARE now both real --
+    // see `flatten_interface_methods`'s own header (`Ast.hc`) for how a supertrait's methods reach
+    // an implementing struct, and `Checker.hotc`'s own `check_interface_completeness` for how a
+    // default method excuses a struct from providing its own override. `sealed`-exhaustiveness
+    // itself is still real too (`Checker.hotc`'s own `check_sealed_match`) -- only a `sealed
+    // interface` can be `match`ed on at all.
+    fn interface_decl(&mut self) -> InterfaceDecl {
+        let is_open = self.match_kind(OPEN);
+        let is_sealed = self.match_kind(SEALED);
+        self.expect(INTERFACE);
+        let name = self.expect(IDENT).text;
+        var parents = empty_str_vec();
+        if self.match_kind(COLON) {
+            parents.push(self.expect(IDENT).text);
+            while self.match_kind(COMMA) {
+                parents.push(self.expect(IDENT).text);
+            }
+        }
+        self.expect(LBRACE);
+        var methods = empty_interface_method_vec();
+        while !self.check(RBRACE) {
+            methods.push(self.interface_method_decl());
+        }
+        self.expect(RBRACE);
+        let mod2 = self.current_module_opt();
+        return InterfaceDecl { name: name, methods: methods, is_sealed: is_sealed, parents: parents, extern_binary_name: none_string(), module_name: mod2, is_open: is_open };
+    }
+
+    // `extern interface Name = "java.lang.Runnable" { fn method(&self, ...) -> RetType; ... }` --
+    // see `Ast.hc`'s own `InterfaceDecl.extern_binary_name` header. Every method is ALWAYS a bare,
+    // `;`-terminated abstract signature -- there's no HC body to give a method that binds to an
+    // already-implemented-elsewhere real Java interface (unlike a plain `interface`'s own default
+    // methods), so this reuses `interface_method_decl`'s own params/ret-type parsing directly but
+    // never calls into ITS body-vs-`;` branch at all. No `sealed`/`: Super1, Super2` here either --
+    // a real JVM interface's own implementors aren't a closed world this compile unit can see, and
+    // real interface inheritance is already expressed by the real interface's OWN `extends` clause
+    // on the JVM side, not something this declaration needs to re-state.
+    fn extern_interface_decl(&mut self) -> InterfaceDecl {
+        self.expect(EXTERN);
+        self.expect(INTERFACE);
+        let name = self.expect(IDENT).text;
+        self.expect(EQ);
+        let binary_name = self.expect(STRING).text;
+        self.expect(LBRACE);
+        var methods = empty_interface_method_vec();
+        while !self.check(RBRACE) {
+            self.expect(FN);
+            let mname = self.expect(IDENT).text;
+            self.expect(LPAREN);
+            self.self_receiver();
+            var params = empty_param_vec();
+            while self.match_kind(COMMA) {
+                if self.check(RPAREN) { break; }
+                params.push(self.one_param());
+            }
+            self.expect(RPAREN);
+            var ret_type = "Unit";
+            if self.match_kind(ARROW) {
+                ret_type = self.type_name_ref();
+            }
+            self.expect(SEMI);
+            methods.push(InterfaceMethod { name: mname, params: params, ret_type: ret_type, body: none_stmt_vec() });
+        }
+        self.expect(RBRACE);
+        return InterfaceDecl { name: name, methods: methods, is_sealed: false, parents: empty_str_vec(), extern_binary_name: some_string(binary_name), module_name: none_string(), is_open: false };
+    }
+
+    fn interface_method_decl(&mut self) -> InterfaceMethod {
+        self.expect(FN);
+        let name = self.expect(IDENT).text;
+        self.expect(LPAREN);
+        self.self_receiver(); // every interface method takes `&self` -- see `Ast.hc`'s own header
+        var params = empty_param_vec();
+        while self.match_kind(COMMA) {
+            if self.check(RPAREN) { break; }
+            params.push(self.one_param());
+        }
+        self.expect(RPAREN);
+        var ret_type = "Unit";
+        if self.match_kind(ARROW) {
+            ret_type = self.type_name_ref();
+        }
+        // A default method's body parses through the EXACT SAME `self.block()` every plain `fn`
+        // body already uses -- a real `{ ... }` here means "default", `;` means "abstract, every
+        // implementer must override it" -- same `Some`/`None`-on-presence convention `if`'s own
+        // `else_body` (`some_stmt_vec`/`none_stmt_vec`, right above) already established.
+        var body = none_stmt_vec();
+        if self.check(LBRACE) {
+            body = some_stmt_vec(self.block());
+        } else {
+            self.expect(SEMI);
+        }
+        return InterfaceMethod { name: name, params: params, ret_type: ret_type, body: body };
     }
 
     // === `enum Name { Variant1 { field: Type, ... }, Variant2 {}, ... }` ===
@@ -835,10 +1499,15 @@ impl Parser {
         self.expect(ENUM);
         let name = self.expect(IDENT).text;
         var type_param = none_string();
+        var type_param2 = none_string();
         if self.match_kind(LT) {
             let tp = self.expect(IDENT).text;
-            self.expect(GT);
             type_param = some_string(tp);
+            // `<T, E>` -- see `Ast.hc`'s own `EnumDecl.type_param2` header.
+            if self.match_kind(COMMA) {
+                type_param2 = some_string(self.expect(IDENT).text);
+            }
+            self.expect(GT);
         }
         self.expect(LBRACE);
         var variants = empty_variant_vec();
@@ -850,7 +1519,8 @@ impl Parser {
             }
         }
         self.expect(RBRACE);
-        return EnumDecl { name: name, variants: variants, type_param: type_param };
+        let mod3 = self.current_module_opt();
+        return EnumDecl { name: name, variants: variants, type_param: type_param, module_name: mod3, type_param2: type_param2 };
     }
 
     // === `extern class Alias = "binary/Name" { fn new(...) -> Self; fn m(&self, ...) -> Ret;
@@ -876,6 +1546,26 @@ impl Parser {
         }
         self.pos = saved_pos;
         return is_self;
+    }
+
+    // Disambiguates an `extern class` body item: `[static] fn ...` is a method, `[static] IDENT :
+    // Type;` is a field (see `Ast.hc`'s own `ExternField` header) -- a bounded 1-token lookahead
+    // past an optional leading `static`, same "peek, don't backtrack" style `looks_like_generic_lit`
+    // and friends already use.
+    fn is_extern_field_next(&self) -> Bool {
+        var idx = self.pos;
+        if self.tokens.get(idx).kind == STATIC { idx = idx + 1; }
+        if idx >= self.tokens.length() { return false; }
+        return self.tokens.get(idx).kind != FN;
+    }
+
+    fn extern_field(&mut self) -> ExternField {
+        let is_static = self.match_kind(STATIC);
+        let name = self.expect(IDENT).text;
+        self.expect(COLON);
+        let type_name = self.type_name_ref();
+        self.expect(SEMI);
+        return ExternField { name: name, type_name: type_name, is_static: is_static };
     }
 
     fn extern_method(&mut self) -> ExternMethod {
@@ -925,17 +1615,98 @@ impl Parser {
         let name = self.expect(IDENT).text;
         self.expect(EQ);
         let binary_name = self.expect(STRING).text;
+        // Optional trailing `interface` keyword -- see `Ast.hc`'s own `ExternClassDecl` header
+        // for what it changes (instance-call dispatch opcode only).
+        var is_interface = false;
+        if self.check(INTERFACE) {
+            self.advance();
+            is_interface = true;
+        }
         self.expect(LBRACE);
         var methods = empty_extern_method_vec();
+        var fields = empty_extern_field_vec();
         while !self.check(RBRACE) {
-            methods.push(self.extern_method());
+            if self.is_extern_field_next() {
+                fields.push(self.extern_field());
+            } else {
+                methods.push(self.extern_method());
+            }
         }
         self.expect(RBRACE);
-        return ExternClassDecl { name: name, binary_name: binary_name, methods: methods };
+        return ExternClassDecl { name: name, binary_name: binary_name, methods: methods, fields: fields, is_interface: is_interface };
     }
 
     // === Top level: a whole source file is zero or more `fn`/`struct`/`impl`/`enum`/`extern`
     // declarations ===
+    // Consumes every consecutive `DOC_COMMENT` token (one per `///` line) right here, building a
+    // structured `DocComment` -- see `Ast.hc`'s own `DocComment` header for the full section
+    // model. Called from `parse_program`'s own top-level loop, right before the `struct`/`fn` it's
+    // attached to (mirrors `annotation()`'s own calling convention).
+    fn doc_comment_block(&mut self) -> DocComment {
+        var summary = "";
+        var param_names = empty_str_vec();
+        var param_texts = empty_str_vec();
+        var returns_text = "";
+        var example_text = "";
+        var warning_text = "";
+        var see_targets = empty_str_vec();
+        var deprecated_text = "";
+        var has_deprecated = false;
+        // Which section an untagged line continues: 0=summary, 1=the LAST @param's own text,
+        // 2=@returns, 3=@example, 4=@warning, 5=@deprecated, -1=none (right after @see, whose own
+        // target is never continued).
+        var section = 0;
+        while self.check(DOC_COMMENT) {
+            let line = self.advance().text;
+            if str_starts_with(line, "@param") {
+                let rest = str_after_prefix(line, "@param");
+                var pname = rest;
+                var ptext = "";
+                let sp = rest.indexOf(" ");
+                if sp >= 0 {
+                    pname = rest.substring(0, sp);
+                    ptext = rest.substring(sp + 1, rest.length());
+                }
+                param_names.push(pname);
+                param_texts.push(ptext);
+                section = 1;
+            } else if str_starts_with(line, "@returns") {
+                returns_text = str_after_prefix(line, "@returns");
+                section = 2;
+            } else if str_starts_with(line, "@example") {
+                example_text = str_after_prefix(line, "@example");
+                section = 3;
+            } else if str_starts_with(line, "@warning") {
+                warning_text = str_after_prefix(line, "@warning");
+                section = 4;
+            } else if str_starts_with(line, "@deprecated") {
+                deprecated_text = str_after_prefix(line, "@deprecated");
+                has_deprecated = true;
+                section = 5;
+            } else if str_starts_with(line, "@see") {
+                see_targets.push(str_after_prefix(line, "@see"));
+                section = -1;
+            } else if section == 0 {
+                if summary == "" { summary = line; } else { summary = summary + " " + line; }
+            } else if section == 1 {
+                let pidx = param_texts.length() - 1;
+                param_texts.set(pidx, param_texts.get(pidx) + " " + line);
+            } else if section == 2 {
+                returns_text = returns_text + " " + line;
+            } else if section == 3 {
+                example_text = example_text + " " + line;
+            } else if section == 4 {
+                warning_text = warning_text + " " + line;
+            } else if section == 5 {
+                deprecated_text = deprecated_text + " " + line;
+            }
+            // `section == -1` (right after `@see`): an untagged line here has nothing real to
+            // continue -- dropped, same as this design's own "@see's target is always exactly one
+            // line" rule implies.
+        }
+        return DocComment { summary: summary, param_names: param_names, param_texts: param_texts, returns_text: returns_text, example_text: example_text, warning_text: warning_text, see_targets: see_targets, deprecated_text: deprecated_text, has_deprecated: has_deprecated };
+    }
+
     fn parse_program(&mut self) -> Program {
         var fns = empty_fn_decl_vec();
         var structs = empty_struct_decl_vec();
@@ -943,39 +1714,387 @@ impl Parser {
         var enums = empty_enum_decl_vec();
         var externs = empty_extern_class_vec();
         var statics = empty_static_decl_vec();
+        var interfaces = empty_interface_decl_vec();
+        var extend_decls = empty_extend_decl_vec();
+        var struct_annotation_names = empty_str_vec();
+        var struct_annotation_data = empty_annotation_vec();
+        var fn_annotation_names = empty_str_vec();
+        var fn_annotation_data = empty_annotation_vec();
+        var must_use_fn_names = empty_str_vec();
+        var struct_doc_names = empty_str_vec();
+        var struct_doc_data = empty_doc_comment_vec();
+        var fn_doc_names = empty_str_vec();
+        var fn_doc_data = empty_doc_comment_vec();
+        var uses = empty_str_vec();
+        var sendable_struct_names = empty_str_vec();
+        var components = empty_component_decl_vec();
+        var systems = empty_system_decl_vec();
         while !self.check(EOF) {
-            // Same "parsed, not enforced" treatment as `pub` -- this subset only ever compiles
-            // one file at a time, so there's no cross-module resolution for a `module` name to
-            // participate in. Consumes `module a.b.c;` (one or more dot-separated segments).
-            if self.check(MODULE) {
+            // `use vec;` -- see `Ast.hc`'s own `Program.uses` header for the full design. A bare
+            // topic name, no path/namespace syntax at all (there's no real module-path resolution
+            // system behind this) -- `Driver.hotc`'s own `resolve_stdlib_modules` is the only
+            // reader. Consumed in this same top-level loop, same "no fixed position enforced"
+            // leniency `module`/`pub` already get right above/below.
+            if self.check(USE) {
                 self.advance();
-                self.expect(IDENT);
-                while self.match_kind(DOT) {
-                    self.expect(IDENT);
-                }
+                uses.push(self.expect(IDENT).text);
                 self.expect(SEMI);
                 continue;
+            }
+            // `module a.b.c;` -- real now (see `Ast.hc`'s own `StructDecl.module_name` header):
+            // builds the real dot-joined string into `self.current_module`, read back by every
+            // struct/enum/interface declaration parsed from THIS POINT ON in the file. Consuming
+            // it inline in this same top-level loop (rather than requiring it strictly first)
+            // still matches this subset's existing leniency elsewhere (`pub` also isn't gated to
+            // a fixed position) -- real `.hotc` source always puts it first anyway, by
+            // convention, not by a rule this parser enforces.
+            if self.check(MODULE) {
+                self.advance();
+                var mod = self.expect(IDENT).text;
+                while self.match_kind(DOT) {
+                    mod = mod + "." + self.expect(IDENT).text;
+                }
+                self.expect(SEMI);
+                self.current_module = mod;
+                continue;
+            }
+            // `/// ...` -- see `Ast.hc`'s own `DocComment` header. Consumed BEFORE any `@`
+            // annotation/directive (same ordering `///` doc comments always take relative to
+            // attributes in every language that has both), so a doc comment followed by
+            // `@must_use`/`@"binary.Name"(...)` followed by the actual declaration all attach
+            // correctly. Scoped to top-level `struct`/`fn` only, same cut every other side-channel
+            // feature in this loop already makes.
+            var pending_doc = none_doc_comment();
+            var has_pending_doc = false;
+            if self.check(DOC_COMMENT) {
+                pending_doc = some_doc_comment(self.doc_comment_block());
+                has_pending_doc = true;
+            }
+            // `@"binary.Name"(...)` -- see `Ast.hc`'s own `Program.struct_annotation_names`
+            // header for why this is a side-channel rather than a field threaded through
+            // `StructDecl`/`FnDecl` themselves. Scoped to top-level `struct`/`fn` only -- any
+            // OTHER following declaration is a real error, not silently dropped.
+            var pending_annotation = none_annotation();
+            var has_pending_annotation = false;
+            // `@must_use` -- a bare compiler DIRECTIVE (no quoted binary name), distinguished from
+            // a real `@"binary.Name"(...)` annotation right here, at parse time, by whether a
+            // STRING or an IDENT follows the `@` -- same distinction `Ast.hc`'s own `Annotation`
+            // header already draws for `@serializable` (a different, still-unported directive).
+            var pending_must_use = false;
+            // `@sendable` -- see `Ast.hc`'s own `Program.sendable_struct_names` header. Same bare-
+            // directive distinction as `@must_use` right below, and same "only on struct" gate as
+            // Phoenix Flight's own `PhoenixPool::spawn` needs to actually check anything -- see
+            // README's own "Compile-time concurrency safety" section.
+            var pending_sendable = false;
+            // `@after(Other)` / `@before(Other)` / `@profile` -- `system`-only directives (see
+            // `Ast.hc`'s own `SystemDecl` header), the first ones needing a parenthesized argument
+            // rather than being bare like `@must_use`/`@sendable` -- parsed inline here rather than
+            // generalizing `directive()` itself, since nothing else needs an argument yet. A `while`
+            // here (not the single `if` this used to be) so multiple directives can stack on one
+            // declaration (`@after(...) @profile system Foo { ... }`) -- strictly more permissive
+            // than before, every previously-valid single-`@` case still parses identically.
+            var pending_after = none_string();
+            var pending_before = none_string();
+            var pending_profile = false;
+            while self.check(AT) {
+                if self.tokens.get(self.pos + 1).kind == STRING {
+                    pending_annotation = some_annotation(self.annotation());
+                    has_pending_annotation = true;
+                } else {
+                    let directive = self.directive();
+                    if directive == "must_use" {
+                        pending_must_use = true;
+                    } else if directive == "sendable" {
+                        pending_sendable = true;
+                    } else if directive == "after" {
+                        self.expect(LPAREN);
+                        pending_after = some_string(self.expect(IDENT).text);
+                        self.expect(RPAREN);
+                    } else if directive == "before" {
+                        self.expect(LPAREN);
+                        pending_before = some_string(self.expect(IDENT).text);
+                        self.expect(RPAREN);
+                    } else if directive == "profile" {
+                        pending_profile = true;
+                    } else {
+                        throw ParseError::new("unknown compiler directive '@" + directive + "'");
+                    }
+                }
             }
             // Visibility isn't tracked or enforced at all this phase -- this subset only ever
             // compiles one file at a time (no cross-module resolution to gate), so `pub` is
             // parsed purely so real HC source that uses it doesn't fail to parse; consumed and
             // otherwise ignored.
             self.match_kind(PUB);
+            // `@sendable` is only meaningful on `struct` -- checked HERE (after `pub`, before
+            // dispatching on which declaration kind follows) rather than repeating a reject in
+            // every OTHER arm's own body the way `@must_use`'s reverse restriction does below,
+            // since there's only ONE valid target to check for instead of many invalid ones.
+            if pending_sendable && !self.check(STRUCT) {
+                throw ParseError::new("'@sendable' is only supported on 'struct' declarations");
+            }
+            // `@after`/`@before`/`@profile` are only meaningful on `system` -- same single up-
+            // front gate `@sendable` uses right above, rather than repeating the reject in every
+            // other arm.
+            var has_pending_ordering_or_profile = pending_profile;
+            if let Some { value: pa0 } = pending_after { has_pending_ordering_or_profile = true; }
+            if let Some { value: pb0 } = pending_before { has_pending_ordering_or_profile = true; }
+            if has_pending_ordering_or_profile && !self.check(SYSTEM) {
+                throw ParseError::new("'@after'/'@before'/'@profile' are only supported on 'system' declarations");
+            }
             if self.check(STRUCT) {
-                structs.push(self.struct_decl());
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'struct' declarations");
+                }
+                let sd = self.struct_decl();
+                if pending_sendable {
+                    sendable_struct_names.push(sd.name);
+                }
+                if has_pending_annotation {
+                    if let Some { value: ann } = pending_annotation {
+                        struct_annotation_names.push(sd.name);
+                        struct_annotation_data.push(ann);
+                    }
+                }
+                if has_pending_doc {
+                    if let Some { value: docv } = pending_doc {
+                        struct_doc_names.push(sd.name);
+                        struct_doc_data.push(docv);
+                    }
+                }
+                structs.push(sd);
+            } else if self.check(ARENA) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'arena struct' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'arena struct' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'arena struct' declarations");
+                }
+                structs.push(self.arena_struct_decl());
             } else if self.check(IMPL) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'impl' blocks");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'impl' blocks");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'impl' blocks");
+                }
                 impls.push(self.impl_decl());
             } else if self.check(ENUM) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'enum' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'enum' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'enum' declarations");
+                }
                 enums.push(self.enum_decl());
+            } else if self.check(EXTERN) && self.tokens.get(self.pos + 1).kind == INTERFACE {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'extern interface' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'extern interface' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'extern interface' declarations");
+                }
+                interfaces.push(self.extern_interface_decl());
             } else if self.check(EXTERN) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'extern class' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'extern class' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'extern class' declarations");
+                }
                 externs.push(self.extern_class_decl());
             } else if self.check(STATIC) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on top-level 'static' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on top-level 'static' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on top-level 'static' declarations");
+                }
                 statics.push(self.static_decl());
+            } else if self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'interface' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'interface' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'interface' declarations");
+                }
+                interfaces.push(self.interface_decl());
+            } else if self.check(EXTEND) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'extend' blocks");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'extend' blocks");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'extend' blocks");
+                }
+                extend_decls.push(self.extend_decl());
+            } else if self.check(COMPONENT) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'component' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'component' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'component' declarations");
+                }
+                components.push(self.component_decl());
+            } else if self.check(SYSTEM) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'system' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'system' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'system' declarations");
+                }
+                systems.push(self.system_decl(pending_after, pending_before, pending_profile));
             } else {
-                fns.push(self.fn_decl());
+                let fd = self.fn_decl();
+                if has_pending_annotation {
+                    if let Some { value: ann2 } = pending_annotation {
+                        fn_annotation_names.push(fd.name);
+                        fn_annotation_data.push(ann2);
+                    }
+                }
+                if pending_must_use {
+                    must_use_fn_names.push(fd.name);
+                }
+                if has_pending_doc {
+                    if let Some { value: docv2 } = pending_doc {
+                        fn_doc_names.push(fd.name);
+                        fn_doc_data.push(docv2);
+                    }
+                }
+                fns.push(fd);
             }
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems };
+    }
+
+    // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field
+    // syntax reuses `struct_fields()` directly (same `name: Type, ...` shape a struct's own fields
+    // already use).
+    fn component_decl(&mut self) -> ComponentDecl {
+        self.expect(COMPONENT);
+        let name = self.expect(IDENT).text;
+        let fields = self.struct_fields();
+        return ComponentDecl { name: name, fields: fields };
+    }
+
+    // `system Name { fn run(a: &mut A, b: &B) { ... } }` -- see `Ast.hc`'s own `SystemDecl` header.
+    // `after`/`before`/`has_profile` come from whichever `@after`/`@before`/`@profile` directives
+    // preceded this declaration in the top-level loop (already parsed by the time this runs).
+    fn system_decl(&mut self, after: Option<String>, before: Option<String>, has_profile: Bool) -> SystemDecl {
+        self.expect(SYSTEM);
+        let name = self.expect(IDENT).text;
+        self.expect(LBRACE);
+        self.expect(FN);
+        let run_name = self.expect(IDENT).text;
+        if run_name != "run" {
+            throw ParseError::new("a 'system' block's only method must be named 'run', got '" + run_name + "'");
+        }
+        let run_params = self.param_list();
+        // `run` never declares its own return type -- always `Unit`, same as a `fn` with no
+        // `-> Ret` at all.
+        let run_body = self.block();
+        self.expect(RBRACE);
+        return SystemDecl { name: name, run_params: run_params, run_body: run_body, after: after, before: before, has_profile: has_profile };
+    }
+
+    // `@must_use` -- a bare `@IDENT` compiler directive, no quoted binary name and no `(...)`
+    // argument list either (unlike `@"binary.Name"(...)`). See `Ast.hc`'s own
+    // `Program.must_use_fn_names` header.
+    fn directive(&mut self) -> String {
+        self.expect(AT);
+        return self.expect(IDENT).text;
+    }
+
+    // `@"binary.Name"` alone (marker) or `@"binary.Name"(argName: value, ...)` -- see `Ast.hc`'s
+    // own `Annotation` header for the full value grammar. Called from `parse_program`'s own
+    // top-level loop, right before the `struct`/`fn` it's attached to.
+    fn annotation(&mut self) -> Annotation {
+        self.expect(AT);
+        let binary_name = self.expect(STRING).text;
+        var args = empty_annotation_arg_vec();
+        if self.check(LPAREN) {
+            self.advance();
+            if !self.check(RPAREN) {
+                args.push(self.annotation_arg());
+                while self.match_kind(COMMA) {
+                    if self.check(RPAREN) { break; } // trailing comma
+                    args.push(self.annotation_arg());
+                }
+            }
+            self.expect(RPAREN);
+        }
+        return Annotation { binary_name: binary_name, args: args };
+    }
+
+    fn annotation_arg(&mut self) -> AnnotationArg {
+        let name = self.expect(IDENT).text;
+        self.expect(COLON);
+        let value = self.annotation_value();
+        return AnnotationArg { name: name, value: value };
+    }
+
+    // Three shapes only -- see `Ast.hc`'s own `AnnValue` header for why this is its own small
+    // grammar, not the general expression language. `enum(...)` reuses the ordinary `ENUM`
+    // keyword token in this one new context (same "one token, more than one grammar position"
+    // convention `static` already has between a top-level `static NAME: Type = ...;` and an
+    // impl-block `static fn ...`).
+    fn annotation_value(&mut self) -> AnnValue {
+        if self.check(STRING) {
+            return AnnStr { value: self.advance().text };
+        }
+        if self.check(ENUM) {
+            self.advance();
+            self.expect(LPAREN);
+            let ebin = self.expect(STRING).text;
+            self.expect(COMMA);
+            let econst = self.expect(STRING).text;
+            self.expect(RPAREN);
+            return AnnEnumConst { binary_name: ebin, const_name: econst };
+        }
+        if self.check(LBRACKET) {
+            self.advance();
+            var values = empty_annvalue_vec();
+            if !self.check(RBRACKET) {
+                values.push(self.annotation_value());
+                while self.match_kind(COMMA) {
+                    if self.check(RBRACKET) { break; }
+                    values.push(self.annotation_value());
+                }
+            }
+            self.expect(RBRACKET);
+            return AnnArray { values: values };
+        }
+        let t = self.peek();
+        throw ParseError::new("Parse error at line " + JString3::valueOf(t.line) + ": expected an annotation value (string, enum(...), or [...]), got '" + t.text + "'");
     }
 
     // `pub static NAME: Type = expr;` -- see `Ast.hc`'s own `StaticDecl` header. Unambiguous with
@@ -993,22 +2112,91 @@ impl Parser {
     }
 }
 
+// `String` has no built-in `startsWith` in this compiler's own intrinsic set (`length`/
+// `substring`/`indexOf`/etc only, see `Checker.hotc`'s own matching `extern class` declaration) --
+// built from those instead. Used by `doc_comment_block`'s own tag dispatch.
+fn str_starts_with(s: String, prefix: String) -> Bool {
+    if s.length() < prefix.length() { return false; }
+    return s.substring(0, prefix.length()) == prefix;
+}
+
+// The text after `prefix`, with exactly one leading space (if any) also stripped -- `"@param x
+// the thing"` stripped of `"@param"` is `" x the thing"`, and every doc-comment tag line has
+// that one separating space before its own real content.
+fn str_after_prefix(s: String, prefix: String) -> String {
+    var rest = s.substring(prefix.length(), s.length());
+    if rest.length() > 0 && rest.substring(0, 1) == " " {
+        rest = rest.substring(1, rest.length());
+    }
+    return rest;
+}
+
+fn empty_doc_comment_vec() -> Vec<DocComment> {
+    var v = vec_of(DocComment { summary: "_", param_names: empty_str_vec(), param_texts: empty_str_vec(), returns_text: "", example_text: "", warning_text: "", see_targets: empty_str_vec(), deprecated_text: "", has_deprecated: false });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_annotation_vec() -> Vec<Annotation> {
+    var v = vec_of(Annotation { binary_name: "_", args: empty_annotation_arg_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_annotation_arg_vec() -> Vec<AnnotationArg> {
+    var v = vec_of(AnnotationArg { name: "_", value: AnnStr { value: "_" } });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_annvalue_vec() -> Vec<AnnValue> {
+    var v = vec_of(AnnStr { value: "_" });
+    return Vec { data: v.data, len: 0 };
+}
+
 fn empty_fn_decl_vec() -> Vec<FnDecl> {
-    var v = vec_of(FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string() });
+    var v = vec_of(FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false });
     return Vec { data: v.data, len: 0 };
 }
 
 fn empty_struct_decl_vec() -> Vec<StructDecl> {
-    var v = vec_of(StructDecl { name: "_", type_param: none_string(), fields: empty_param_vec() });
+    var v = vec_of(StructDecl { name: "_", type_param: none_string(), fields: empty_param_vec(), is_arena: false, module_name: none_string(), super_class: none_string() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_impl_decl_vec() -> Vec<ImplDecl> {
-    var v = vec_of(ImplDecl { struct_name: "_", methods: empty_fn_decl_vec(), static_methods: empty_fn_decl_vec() });
+fn empty_component_decl_vec() -> Vec<ComponentDecl> {
+    var v = vec_of(ComponentDecl { name: "_", fields: empty_param_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_str_vec() -> Vec<String> {
+fn empty_system_decl_vec() -> Vec<SystemDecl> {
+    var v = vec_of(SystemDecl { name: "_", run_params: empty_param_vec(), run_body: empty_stmt_vec(), after: none_string(), before: none_string(), has_profile: false });
+    return Vec { data: v.data, len: 0 };
+}
+
+// `pub`: `Codegen.hotc`'s own `materialize_default_methods` needs this cross-module too now.
+pub fn empty_impl_decl_vec() -> Vec<ImplDecl> {
+    var v = vec_of(ImplDecl { struct_name: "_", methods: empty_fn_decl_vec(), static_methods: empty_fn_decl_vec(), interface_name: none_string(), delegate_field: none_string() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_extend_decl_vec() -> Vec<ExtendDecl> {
+    var v = vec_of(ExtendDecl { target: "_", methods: empty_fn_decl_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+// `pub`: `Ast.hc`'s own `flatten_interface_methods_depth`/`remove_interface_method_named` need
+// this cross-module too now.
+pub fn empty_interface_method_vec() -> Vec<InterfaceMethod> {
+    var v = vec_of(InterfaceMethod { name: "_", params: empty_param_vec(), ret_type: "Unit", body: none_stmt_vec() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_interface_decl_vec() -> Vec<InterfaceDecl> {
+    var v = vec_of(InterfaceDecl { name: "_", methods: empty_interface_method_vec(), is_sealed: false, parents: empty_str_vec(), extern_binary_name: none_string(), module_name: none_string(), is_open: false });
+    return Vec { data: v.data, len: 0 };
+}
+
+// `pub`: `Ast.hc`'s own `transitive_supertraits`/`push_str_if_absent` need this cross-module too
+// now.
+pub fn empty_str_vec() -> Vec<String> {
     var v = vec_of("__init__");
     return Vec { data: v.data, len: 0 };
 }
@@ -1019,12 +2207,17 @@ fn empty_variant_vec() -> Vec<EnumVariant> {
 }
 
 fn empty_enum_decl_vec() -> Vec<EnumDecl> {
-    var v = vec_of(EnumDecl { name: "_", variants: empty_variant_vec(), type_param: none_string() });
+    var v = vec_of(EnumDecl { name: "_", variants: empty_variant_vec(), type_param: none_string(), module_name: none_string(), type_param2: none_string() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn empty_catchclause_vec() -> Vec<CatchClause> {
+    var v = vec_of(CatchClause { catch_var: "_", catch_type: "_", catch_block: empty_stmt_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
 fn empty_matcharm_vec() -> Vec<MatchArm> {
-    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec() });
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec(), is_literal: false, literal: IntLit { value: 0 } });
     return Vec { data: v.data, len: 0 };
 }
 
@@ -1033,8 +2226,13 @@ fn empty_extern_method_vec() -> Vec<ExternMethod> {
     return Vec { data: v.data, len: 0 };
 }
 
+fn empty_extern_field_vec() -> Vec<ExternField> {
+    var v = vec_of(ExternField { name: "_", type_name: "Unit", is_static: false });
+    return Vec { data: v.data, len: 0 };
+}
+
 fn empty_extern_class_vec() -> Vec<ExternClassDecl> {
-    var v = vec_of(ExternClassDecl { name: "_", binary_name: "_", methods: empty_extern_method_vec() });
+    var v = vec_of(ExternClassDecl { name: "_", binary_name: "_", methods: empty_extern_method_vec(), fields: empty_extern_field_vec(), is_interface: false });
     return Vec { data: v.data, len: 0 };
 }
 
@@ -1053,11 +2251,11 @@ fn empty_expr_vec() -> Vec<Expr> {
     return Vec { data: v.data, len: 0 };
 }
 fn empty_stmt_vec() -> Vec<Stmt> {
-    var v = vec_of(ExprStmt { expr: IntLit { value: 0 } });
+    var v = vec_of(ExprStmt { expr: IntLit { value: 0 }, line: 0 });
     return Vec { data: v.data, len: 0 };
 }
 fn empty_param_vec() -> Vec<Param> {
-    var v = vec_of(Param { name: "_", type_name: "_" });
+    var v = vec_of(Param { name: "_", type_name: "_", is_ref: false, is_mut_ref: false });
     return Vec { data: v.data, len: 0 };
 }
 fn none_expr() -> Option<Expr> {
@@ -1067,14 +2265,30 @@ fn none_expr() -> Option<Expr> {
 fn some_expr(e: Expr) -> Option<Expr> {
     return Some { value: e };
 }
-fn none_stmt_vec() -> Option<Vec<Stmt>> {
+// `pub`: `Checker.hotc`'s own `checker_new` seed and `Ast.hc`'s `InterfaceMethod` construction
+// need a genuine cross-module `Option<Vec<Stmt>>::None` too now that a default method's own `body`
+// field is one (see `Ast.hc`'s own `InterfaceMethod` header) -- every other caller of these two was
+// already inside this same module, so this never needed to be `pub` before.
+pub fn none_stmt_vec() -> Option<Vec<Stmt>> {
     return None;
 }
-fn some_stmt_vec(v: Vec<Stmt>) -> Option<Vec<Stmt>> {
+pub fn some_stmt_vec(v: Vec<Stmt>) -> Option<Vec<Stmt>> {
     return Some { value: v };
 }
 fn none_string() -> Option<String> {
     return None;
+}
+fn none_annotation() -> Option<Annotation> {
+    return None;
+}
+fn some_annotation(a: Annotation) -> Option<Annotation> {
+    return Some { value: a };
+}
+fn none_doc_comment() -> Option<DocComment> {
+    return None;
+}
+fn some_doc_comment(d: DocComment) -> Option<DocComment> {
+    return Some { value: d };
 }
 fn some_string(s: String) -> Option<String> {
     return Some { value: s };

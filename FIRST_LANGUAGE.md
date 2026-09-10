@@ -296,6 +296,16 @@ hp: 100 }` then actually *builds* one, giving a real value to each field.
 
 ## 11. Ownership: the one genuinely new idea
 
+**Status note**: this whole section is real now (fixed 2026-09-09 —
+see ARCHITECTURE.md's own "Compile-time safety roadmap" section for the full
+design). The `take(p); print(p.hp);` example below really does fail to
+compile, with `"use of moved value 'p'"`, exactly as this section
+describes — and the borrowing rules below it are enforced too: taking
+`&mut x` when `x` isn't declared `var`, mutating a field through a
+plain `&` borrow, and borrowing the same variable `&mut` alongside any
+other borrow of it within one call are all real compile errors now,
+not just described intent.
+
 Everything so far works roughly the way it would in most languages. This
 part is different, and it's the actual reason Hot Chocolate exists as its
 own language rather than just being "Java with nicer syntax" — so take it

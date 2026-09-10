@@ -1,0 +1,47 @@
+// Exercises `Float`/`Double` end to end -- the newest self-hosting port, following the exact same
+// scoped pattern `Long` already established (see `Types.hotc`'s own header): real arithmetic
+// (`+`/`-`/`*`/`/`), comparison (`<`/`>`), negation, and every numeric-cast pair, but no literal
+// syntax -- values arrive only via `as Float`/`as Double` casts from `Int`, same as `Long` only
+// ever arrives via `as Long`/an extern call, never a `123L`-style literal token.
+//
+// Real bugs this demo would have caught (found writing it, not guessed): `Checker.hotc`'s own
+// `check_unary` used to accept ONLY `Int` for unary `-`, silently mistyping a negated `Long`/
+// `Float`/`Double` as `Int`; `Codegen.hotc`'s own `gen_unary` matched that with an unconditional
+// `INEG` regardless of the operand's real type. Both fixed alongside this port -- `add_floats`/
+// `add_doubles` below negate a `Float` and compare a `Double` specifically to exercise that path,
+// not just addition.
+
+fn add_floats(x: Float, y: Float) -> Float {
+    var z: Float = x + y;
+    return z;
+}
+
+fn add_doubles(x: Double, y: Double) -> Double {
+    var z: Double = x + y;
+    let extra = 100;
+    return z + (extra as Double);
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let f1 = 3 as Float;
+    let f2 = 4 as Float;
+    let fsum = add_floats(f1, f2); // 7.0
+    let fi = fsum as Int; // 7
+
+    let d1 = 10 as Double;
+    let d2 = 5 as Double;
+    let dsum = add_doubles(d1, d2); // 10 + 5 + 100 = 115.0
+    let di = dsum as Int; // 115
+
+    let neg = -f1; // -3.0 -- real gap check: used to type-check/codegen as Int, wrong bits
+    let negi = neg as Int; // -3
+
+    var result = 0;
+    if fi == 7 { result = result + 100; }
+    if di == 115 { result = result + 200; }
+    if negi == -3 { result = result + 400; }
+    if f1 < f2 { result = result + 800; } // 3.0 < 4.0
+    if d1 > d2 { result = result + 1600; } // 10.0 > 5.0
+
+    return result + a + b;
+}

@@ -53,7 +53,9 @@ struct Reg<T> {
     entries: Vec3<RegEntry<T>>,
 }
 
-fn reg_get(r: Reg<Int>, key: String) -> Int {
+// `&Reg<Int>` (not bare `Reg<Int>`) -- `combo` below calls this three times on the SAME `r`, which
+// move-checking would otherwise correctly reject as a use-after-move on the 2nd/3rd call.
+fn reg_get(r: &Reg<Int>, key: String) -> Int {
     var i = 0;
     while i < r.entries.length() {
         let e = r.entries.get(i);

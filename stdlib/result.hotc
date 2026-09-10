@@ -1,0 +1,10 @@
+// `Result<T, E>` -- see README's own "Standard library modules" section. No dependencies on any
+// other stdlib topic. Construction always needs the fully explicit qualified form
+// (`Result<Int, String>::Ok { value: n }`) -- bare-literal inference (`Ok { value: n }` alone)
+// isn't supported for a two-type-parameter type this phase, see `Ast.hc`'s own
+// `EnumDecl.type_param2` header for why.
+
+enum Result<T, E> {
+    Ok { value: T },
+    Err { error: E },
+}

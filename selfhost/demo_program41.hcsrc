@@ -22,7 +22,11 @@ enum Wrapped {
     WBool { value: Bool },
 }
 
-fn tag_of(w: Wrapped) -> Int {
+// `&Wrapped` (not bare `Wrapped`) on all three -- these are read-only accessors, and `combo`
+// below calls `tag_of`/`unwrap_str`/`unwrap_bool` on the SAME `s`/`bo` more than once each, which
+// move-checking (added later than the two fixes above -- see README's own "Compile-time safety
+// roadmap" section) would otherwise correctly reject as a real use-after-move.
+fn tag_of(w: &Wrapped) -> Int {
     match w {
         // Bare, fieldless-STYLE match against variants that actually HAVE fields -- proves the
         // parser fix (1) independently of proving fix (2): this only tests "no braces required",
@@ -33,14 +37,14 @@ fn tag_of(w: Wrapped) -> Int {
     }
 }
 
-fn unwrap_str(w: Wrapped) -> String {
+fn unwrap_str(w: &Wrapped) -> String {
     match w {
         WStr { value } => { return value; }
         _ => { return "none"; }
     }
 }
 
-fn unwrap_bool(w: Wrapped) -> Bool {
+fn unwrap_bool(w: &Wrapped) -> Bool {
     match w {
         WBool { value } => { return value; }
         _ => { return false; }

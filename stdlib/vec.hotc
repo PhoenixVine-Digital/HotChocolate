@@ -1,0 +1,62 @@
+// `Vec<T>` -- see README's own "Standard library modules" section. No dependencies on any other
+// stdlib topic.
+
+struct Vec<T> {
+    data: [T],
+    len: Int,
+}
+
+impl Vec<T> {
+    fn push(&mut self, value: T) {
+        if self.len == self.data.length {
+            var newCap = self.data.length * 2;
+            if newCap == 0 {
+                newCap = 4;
+            }
+            var newData = [value; newCap];
+            var i = 0;
+            while i < self.len {
+                newData[i] = self.data[i];
+                i = i + 1;
+            }
+            self.data = newData;
+        }
+        self.data[self.len] = value;
+        self.len = self.len + 1;
+    }
+
+    fn get(&self, i: Int) -> T {
+        return self.data[i];
+    }
+
+    fn set(&mut self, i: Int, value: T) {
+        self.data[i] = value;
+    }
+
+    fn length(&self) -> Int {
+        return self.len;
+    }
+
+    // Removes and returns the last element. No bounds check -- same trust-the-caller convention
+    // `get`/`set` already have; popping an empty `Vec` is a caller bug, not a case to guard here.
+    fn pop(&mut self) -> T {
+        self.len = self.len - 1;
+        return self.data[self.len];
+    }
+
+    // Resets this `Vec` back to empty, keeping the existing backing array (the next `.push(...)`
+    // just overwrites it from index 0 again) -- a plain field write through `&mut self`, real
+    // reason this exists as a method rather than a bare `v.len = 0;` at the call site: Phase 3's
+    // own borrow checker only ever recognizes a direct field assignment's receiver as mutable
+    // when it's a `var` local, an `&mut`-borrowed param, or `&mut self` -- a top-level `pub
+    // static` (real ECS usage: draining `world.add`/`world.remove`'s own queued transitions,
+    // see `ECS_IDEAS.md`) is none of those, even though calling a REAL `&mut self` method on it
+    // (this one) already works fine, same as `.push()`/`.pop()` on a static already did.
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+fn vec_of<T>(first: T) -> Vec<T> {
+    return Vec<T> { data: [first; 4], len: 1 };
+}

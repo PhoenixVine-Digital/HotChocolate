@@ -4,3 +4,12 @@ out/
 .idea/
 *.iml
 .intellijPlatform/
+
+# Stray compiled output from running `SelfhostCLI run <path>`/`run selfhost` directly (via
+# `java -cp ...`) without an explicit output path -- lands in the working directory otherwise.
+# Root-anchored (leading `/`) so this never matches the real, checked-in bootstrap seed under
+# selfhost/bootstrap/*.class or selfhost/bootstrap/hc/**/*.class.
+/*.class
+/hc/
+/net/
+/hs_err_pid*.log

@@ -13,13 +13,31 @@ module hc.selfhost.ast;
 // layer (let, if, while, match, return, expression statements) -- enough to parse a real function
 // body end to end, plus three declaration forms beyond `fn`: `struct`s, `impl` blocks (methods
 // with a `self` receiver), and `enum`s (with field-carrying variants, matched via `match`). NOT
-// covered yet: interface/extern declarations, generics, lambdas, string interpolation tokens,
+// covered yet: interface/extern declarations, generics, string interpolation tokens,
 // full `TypeRef` parsing (param/return/field types are bare names only, no arrays/refs/generics).
+// (Lambdas now ARE covered -- see `Expr.Lambda`'s own header below -- narrower scope crossed off.)
 // Each is a real, separate follow-up, not an oversight.
 
 pub enum Expr {
     IntLit { value: Int },
+    // `3.5f` / `3.5` -- a `Float`/`Double` literal. Stored as the literal's own SOURCE TEXT
+    // (`Lexer.hotc`'s own `number()` already strips the `f`/`F` suffix before handing this back),
+    // not a native `Float`/`Double` value -- this compiler's own implementation language has no
+    // first-class `Float`/`Double` locals anywhere else (`Int`/`Bool`/`String` are the only real
+    // `Copy` primitives it uses for itself; `Long` only ever appears as a transient `as Long` cast
+    // target, see `Cast`'s own header), so a real `Codegen.hotc`-side parse (`java.lang.Double`/
+    // `java.lang.Float`'s own `valueOf(String)`, which parses AND boxes in one call) turns this
+    // into a real LDC constant only at the point `gen_expr` actually needs one, never earlier.
+    FloatLit { text: String },
+    DoubleLit { text: String },
     StringLit { value: String },
+    // `"a{x}b{y}c"` -- `literals.length() == exprs.length() + 1` (interleaved: lit0, expr0, lit1,
+    // expr1, ..., litN), same convention the real compiler's own `Expr.StringInterp` already uses.
+    // Built entirely at LEX time (`Lexer.hotc`'s own `string_tokens`, which recursively re-lexes
+    // each `{...}` span as its own standalone source string) -- the parser just consumes the
+    // resulting `ISTRING_BEGIN`/`ISTRING_PART`/`ISTRING_END` token stream, it never re-scans raw
+    // string text itself.
+    StringInterp { literals: Vec<String>, exprs: Vec<Expr> },
     BoolLit { value: Bool },
     Ident { name: String },
     Binary { op: String, left: Expr, right: Expr },
@@ -48,6 +66,20 @@ pub enum Expr {
     // The prelude's own `Vec<T>`'s `push`/`vec_of` (`[value; newCap]`, `[first; 4]`) are exactly
     // why this exists -- real self-hosting needs it, not a hypothetical feature.
     ArrayRepeat { value: Expr, count: Expr },
+    // `arena Name[count]` -- allocates a real, contiguous, off-heap buffer of `count` `Name`
+    // arena-structs (see `StructDecl`'s own `is_arena` header). Checked type is the plain string
+    // `"arena Name"` (same "just a type-name string" convention `"dyn Name"` already uses for
+    // interface types -- see `Parser.hotc`'s own `type_name_ref` header), not a new `Ty` variant.
+    ArenaNew { struct_name: String, count: Expr },
+    // `arr_name[index].field` (read) / `arr_name[index].field = value` (write) -- see
+    // `Parser.hotc`'s own `call_or_primary` header for why this is its OWN `Expr` shape (`arr_name`
+    // a plain `String`, not a nested `Ident`) rather than the generic `FieldAccess { obj: Index
+    // {...} } }` nesting a non-arena `Index`-then-field access still uses: a real, structural move-
+    // checker constraint, not a style choice. Used for BOTH arena and ordinary array-of-structs
+    // access off a bare identifier -- the checker/codegen decide which based on `arr_name`'s actual
+    // declared type, same as they always did for the ordinary nested shape.
+    IndexFieldGet { arr_name: String, index: Expr, field: String },
+    IndexFieldSet { arr_name: String, index: Expr, field: String, value: Expr },
     Index { arr: Expr, index: Expr },
     IndexAssign { arr: Expr, index: Expr, value: Expr },
     // `Alias::new(args)` (a constructor call) or `Alias::method(args)` (a real static method) --
@@ -55,6 +87,13 @@ pub enum Expr {
     // as how `StructLit` doesn't distinguish plain-struct from enum-variant construction in the
     // AST itself. See `ExternClassDecl`'s own header.
     StaticCall { type_name: String, method: String, args: Vec<Expr> },
+    // `Alias::FIELD` (read) / `Alias::FIELD = value` (write) -- a static field on an `extern class`.
+    // Distinct from `StaticCall` above because `Alias` here names an `extern class`, not a value in
+    // `self.vars`, so the ordinary `FieldAccess`/`FieldAssign` nodes (which resolve `obj` as an
+    // expression) don't fit; parsed only where `Alias::IDENT` is NOT immediately followed by `(`
+    // (see `Parser.hotc`'s own `call_or_primary` `COLONCOLON` branch).
+    ExternStaticFieldGet { type_name: String, field: String },
+    ExternStaticFieldSet { type_name: String, field: String, value: Expr },
     // `expr as Type` -- a real gap found self-compiling the compiler's OWN `Lexer.hotc`, which
     // narrows a real `Long` (from `JLong::parseLong`, a native `java.lang.Long` extern method
     // return) down to `Int` this exact way. Deliberately narrow scope: `target_type` is trusted at
@@ -64,31 +103,149 @@ pub enum Expr {
     // it only ever appears as a transient value between an extern call that returns one and an
     // immediate `as Int`/`as Long` cast consuming it (see `Codegen.hotc`'s own `gen_cast`).
     Cast { expr: Expr, target_type: String },
+    // `expr is Type` -- `as`'s boolean-returning counterpart, a real JVM `INSTANCEOF`. Same
+    // deliberately narrow scope as `Cast` right above (`target_type` trusted at face value, no
+    // legality checking) and same precedence tier (`Parser.hotc`'s own `cast()` handles both `AS`
+    // and `IS` in the same loop, so the two chain freely: `x is Foo`, `x as Foo is Bar`). Unlike
+    // `Cast`, this is deliberately NON-consuming -- `x is Foo` is a peek at `x`, not a move (this
+    // subset has no move-checking to enforce that distinction against yet, but the design intent
+    // matters for when it does).
+    IsCheck { expr: Expr, target_type: String },
+    // `|params| expr` / `|| expr` -- a lambda literal. Deliberately narrow, matching the real
+    // compiler's own original scope exactly (see IDEAS.md's "Lambdas / closures" entry, which this
+    // reimplements in `selfhost/` for the first time): legal ONLY directly as a call argument
+    // (top-level `Call`, extern-class `MethodCall`, or extern `StaticCall`) whose corresponding
+    // declared param type is a single-abstract-method `extern interface` -- never stored in a
+    // `let`/`var`, never passed where the target type isn't already known, so there's no general
+    // "lambda type" to represent here at all. `params` are bare names, no declared types (always
+    // inferred from the target method's own declared param types -- see `Checker.hotc`'s own
+    // `check_lambda`). `body` is exactly ONE expression, not a statement block (the same
+    // "ternary-shaped" cut `Expr.If`/`Expr.Match`'s value forms already use) -- for anything needing
+    // real locals or multiple statements, factor the logic into an ordinary top-level `fn` and
+    // forward to it from a one-line lambda instead.
+    Lambda { params: Vec<String>, body: Expr },
+    // `expr?` -- the try operator, only legal inside a fn whose own return type is `Result<T, E>`.
+    // Desugars to a match on `expr`'s own `Result` tag: `Ok { value }` unwraps to `value`, `Err
+    // { error }` triggers an early `return` of a freshly-constructed `Result<FnT, E>::Err { error
+    // }` (`FnT` the ENCLOSING fn's own `T`, which may differ from `expr`'s own `T` on a chained
+    // `?` -- only `E` has to match). See README's own "The `?` operator" section for the full
+    // design. Named `TryOp`, not the more obvious `Try`, specifically to avoid colliding with
+    // `Stmt.Try` (the `try`/`catch` statement) -- variant names are a single FLAT namespace across
+    // every `enum` in a compile unit (`Checker.hotc`'s own `variant_owner` registry, keyed by bare
+    // variant name alone, no per-enum scoping), so two DIFFERENT enums sharing one variant name
+    // would silently clobber each other's registration; a real, structural constraint this
+    // codebase's own generic-enum-literal-inference design already has, not a style choice made
+    // fresh here.
+    TryOp { expr: Expr },
+    // `name: value` inside a call's own argument list -- `createEnemy(health: 100, damage: 20)`.
+    // Only ever appears as an ELEMENT of a `Call`/`MethodCall`/`StaticCall`'s own `args: Vec<Expr>`
+    // (there's no standalone "name: value" expression anywhere else in this grammar), resolved
+    // back to ordinary positional order by looking up the callee's own declared param names --
+    // see README's own "Named arguments" section. Scoped to plain top-level `fn` calls only this
+    // pass (`Checker.hotc`'s own `resolve_named_args_chk`, `Codegen.hotc`'s own `resolve_named_
+    // args_cg`) -- a `NamedArg` reaching `check_expr`/`gen_expr` directly (an unsupported call
+    // shape, or mixed with positional args) is a real error, not silently misinterpreted as some
+    // other expression shape.
+    NamedArg { name: String, value: Expr },
+    // `null` -- the literal, only meaningful where a `TypeName?` (nullable) value is expected: as
+    // one side of `==`/`!=`, or assigned/returned/passed where the declared type is nullable. See
+    // README's own "Nullable types" section. `Checker.hotc`'s own `check_expr` gives this
+    // `TyUnknown` (the same "compatible with anything, no static check to run" escape hatch every
+    // other genuinely-untyped-until-context-arrives shape in this checker already gets, e.g. an
+    // unresolved lambda) rather than inventing a dedicated "null type" -- `Codegen.hotc`'s own
+    // `gen_expr` just emits a bare `ACONST_NULL`.
+    NullLit,
+    // `x?.field` / `x?.method(args)` -- safe navigation. `recv` is evaluated once; if it's null the
+    // whole expression short-circuits to null WITHOUT evaluating `args` at all, otherwise it's the
+    // real field value / method result. See README's own "Nullable types" section, "The `?.`/`?:`
+    // operators" -- a real, disclosed scope cut: the field's/method's own type must itself be a
+    // struct/extern-class type (`TyStruct`-shaped) for this to type-check, since there's no boxed
+    // "nullable Int" representation to hand back for a primitive-returning member.
+    SafeCall { recv: Expr, method: String, args: Vec<Expr> },
+    SafeFieldAccess { recv: Expr, field: String },
+    // `x ?: default` -- Elvis. `left`'s value if non-null, else `default`'s -- `left` must itself
+    // be a nullable (`Type?`) value (a plain non-nullable `left` is a real error: nothing for this
+    // to ever short-circuit around). `default`'s own type must match `left`'s underlying (stripped-
+    // of-`?`) type, same widening rule `check_call`'s own arg-type checking already applies.
+    Elvis { left: Expr, right: Expr },
 }
 
+// Every variant carries a `line: Int` -- real per-STATEMENT debug info (`Codegen.hotc`'s own
+// `mark_line`, called once per statement before its own bytecode). A real, disclosed narrower
+// scope than the real compiler's own line-tracking, which goes down to individual `Expr`s too
+// (`Expr` here carries none): a JVM `LineNumberTable` only needs ONE entry per bytecode range that
+// maps to the same source line for breakpoints/stepping to work at all -- a debugger steps
+// statement by statement, not sub-expression by sub-expression, so statement-level granularity is
+// the real, useful floor, and skipping `Expr`-level line tracking avoids adding a field to every
+// one of `Ast.hc`'s own ~20 `Expr` variants (and every construction site of each, across all four
+// files) for marginal-at-best debugging precision beyond what statement-level already gives.
 pub enum Stmt {
-    Let { name: String, mutable: Bool, init: Expr },
-    ExprStmt { expr: Expr },
-    Return { value: Option<Expr> },
-    If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>> },
-    While { cond: Expr, body: Vec<Stmt> },
-    Match { subject: Expr, arms: Vec<MatchArm> },
+    // `declared_type` (`let x: DeclaredType = init;`) is `Some` only for the one case that
+    // actually needs it: WIDENING a concrete struct up to a `&dyn Interface` it implements
+    // (`let e: &dyn Enemy = &Goblin {};`) -- everywhere else this subset's own `let`/`var` still
+    // infer purely from `init`'s own real type, same as ever (see `Checker.hotc`'s own `check_stmt`
+    // `Let` header for exactly which case overrides). A real gap found compiling `examples/battle`:
+    // without honoring the annotation, `first`'s checker-tracked type stayed the CONCRETE `Goblin`
+    // (from `&Goblin {}`), so passing it into `registry_new("goblin", &first)` inferred that
+    // generic `Registry<T>`'s own `T` as `Goblin` too, and a LATER `roster.register("orc", &second)`
+    // (a real `Orc`) failed with "expects Goblin, got Orc" -- `first`'s own DECLARED type was the
+    // whole point of writing `: &dyn Enemy` there at all, and this subset was silently discarding
+    // it. `None` for a bare `let x = init;`/`var x = init;` with no annotation at all.
+    Let { name: String, mutable: Bool, init: Expr, declared_type: Option<String>, line: Int },
+    ExprStmt { expr: Expr, line: Int },
+    Return { value: Option<Expr>, line: Int },
+    // `narrow_name`/`narrow_is_eq` -- populated by `Parser.hotc`'s own `if_stmt` (a plain 3-token
+    // lookahead over the RAW token stream, `IDENT (EQEQ|BANGEQ) NULL`, done BEFORE `cond` itself is
+    // parsed) when `cond` is exactly `Ident == null` / `Ident != null`: `narrow_name` names the
+    // ident (`""` when the shape wasn't recognized), `narrow_is_eq` is `true` for `==`, `false` for
+    // `!=`. See README's own "Nullable types" section for the two guard-clause idioms these two
+    // extra fields drive (`Checker.hotc`'s own `check_stmt`, `Codegen.hotc`'s own `gen_stmt`, both
+    // reading them directly rather than re-inspecting `cond` itself). Carried as plain fields
+    // instead of re-destructuring `cond` at check/codegen time for a real, mechanical reason: `Expr`
+    // is move-only, and `cond` still has to reach `check_expr`/`gen_expr` UNCHANGED either way, so
+    // there is no way to inspect its shape a second time downstream without consuming the one copy
+    // that call needs. The PARSER doesn't have that problem -- it reads the raw tokens, not an
+    // already-built `Expr` -- so it's the cheapest place to capture this.
+    If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>>, line: Int, narrow_name: String, narrow_is_eq: Bool },
+    While { cond: Expr, body: Vec<Stmt>, line: Int },
+    // `for var_name in a..b { }` (`is_range: true`, `range_start`/`range_end`/`inclusive` real,
+    // `arr_expr` an unused placeholder) or `for var_name in arr_expr { }` (`is_range: false`,
+    // `arr_expr` real, the three range fields unused placeholders) -- both shapes flattened onto
+    // ONE `Stmt` variant rather than a separate `Expr::Range` type the way the real compiler has
+    // one (`Expr.Range`, legal ONLY as this exact position's iterable -- "a range (a..b) can only
+    // appear directly in 'for x in a..b { }'", real `Checker.kt` restriction), since giving range
+    // its own general `Expr` variant would mean adding a matching arm to every OTHER exhaustive
+    // `Expr` match across all four files for a shape that's never actually legal anywhere else --
+    // real, disclosed extra AST-shape cost (`is_range`/three placeholder-when-unused fields) traded
+    // for real savings everywhere else. `var_name` is bound fresh each iteration (`Int` for a
+    // range, the array's own element type for an array) -- see `Checker.hotc`'s own `check_for`.
+    For { var_name: String, is_range: Bool, range_start: Expr, range_end: Expr, inclusive: Bool, arr_expr: Expr, body: Vec<Stmt>, line: Int },
+    Match { subject: Expr, arms: Vec<MatchArm>, line: Int },
     // `throw expr;` -- `expr` must be a `String` message (a real, disclosed simplification: this
     // subset has no `extern class` support yet, so there's no real exception *type* to throw --
     // codegen always targets a hardcoded `java.lang.RuntimeException`, see `Codegen.hotc`).
-    Throw { value: Expr },
-    // `break;` / `continue;` -- fieldless, only legal inside a `while` body (checker-enforced, see
+    Throw { value: Expr, line: Int },
+    // `break;` / `continue;` -- only legal inside a `while` body (checker-enforced, see
     // `Checker.hotc`'s `loop_depth`). Scope cut, disclosed: no drop-list tracking (this subset has
     // no `Drop`/RAII mechanism at all, unlike the real compiler's `varsToDropBeforeBreak`), so
     // codegen is a plain unconditional jump to the loop's end/start label -- nothing to clean up.
-    Break {},
-    Continue {},
-    // `try { try_block } catch (catch_var: catch_type) { catch_block }` -- SINGLE catch clause
-    // only (the real compiler supports a list of them; this subset only ever needs to catch one
-    // real exception type at a time so far -- classpath reflection's own `ClassNotFoundException`
-    // handling, see `Checker.hotc`'s own header). `catch_type` must name a known `extern class`
-    // (a real JVM exception type); `catch_var` is bound to it, in scope only within `catch_block`.
-    Try { try_block: Vec<Stmt>, catch_var: String, catch_type: String, catch_block: Vec<Stmt> },
+    Break { line: Int },
+    Continue { line: Int },
+    // `try { try_block } catch (catch_var: catch_type) { catch_block } catch (...) { ... } ...` --
+    // now a real Vec of `CatchClause`s (one or more), not a single fixed catch -- see
+    // `CatchClause`'s own header, right below, for the shape each one carries. Each `catch_type`
+    // must name a known `extern class` (a real JVM exception type); each `catch_var` is bound to
+    // it, in scope only within that clause's own `catch_block`.
+    Try { try_block: Vec<Stmt>, catches: Vec<CatchClause>, line: Int },
+}
+
+// One `catch (catch_var: catch_type) { catch_block }` clause of a `Try` statement -- see that
+// variant's own header. Pulled out to its own struct (rather than `Try` holding three parallel
+// `Vec`s) purely for readability -- there's no other consumer.
+pub struct CatchClause {
+    catch_var: String,
+    catch_type: String,
+    catch_block: Vec<Stmt>,
 }
 
 // `VariantName { field1, field2 } => { body }`, or `_ => { body }` (`variant_name == "_"`, no
@@ -103,16 +260,42 @@ pub enum Stmt {
 // pattern rename a field to a different local (`field: localName`), same real-language syntax
 // `if let`'s own real counterpart already supports. Always the same length as `field_names`,
 // index-paired.
+// `is_literal`/`literal` (`match op { "+" => { ... }, ... }`) -- a real INT/STRING/TRUE/FALSE
+// value pattern, distinct from a variant-name pattern (`variant_name`/`field_names`/`bind_names`
+// are unused placeholders when `is_literal` is true, mirroring the same "flatten onto one variant,
+// placeholder-fill whichever half doesn't apply" convention `Stmt::For`'s own header already
+// established -- a general `variant_name: String?`, matching the real compiler's own `MatchArm`,
+// isn't available since this subset's `String` has no nullable form to spare for it). Real gap
+// found running `examples/calc/Calculator.hotc`: matching a `String`-typed operator against
+// `"+"`/`"-"`/`"*"`/`"/"` literals directly, not enum variants at all. No exhaustiveness
+// requirement for a literal-pattern match (a real, disclosed simplification -- `Checker.hotc`'s own
+// `check_match` simply never finds a registered enum for a non-enum subject type, so its existing
+// exhaustiveness check silently no-ops for these, same as it already does for `sn == "?"`).
 pub struct MatchArm {
     variant_name: String,
     field_names: Vec<String>,
     bind_names: Vec<String>,
     body: Vec<Stmt>,
+    is_literal: Bool,
+    literal: Expr,
 }
 
 pub struct Param {
     name: String,
     type_name: String,
+    // True for a leading `&`/`&mut` on this param's declared type (`p: &Player`, `cw: &mut
+    // ClassWriter2`) -- previously accepted but completely discarded by the parser (see
+    // `Parser.hotc`'s own `type_name_ref` header for why: "this subset has no borrow-checking at
+    // all either way"). Now real, and the ONE piece of information Phase 2 move-checking needs to
+    // tell "this call moves its argument" apart from "this call only borrows it" -- see
+    // `Checker.hotc`'s own move-checking header. Deliberately collapses `&`/`&mut` into one flag
+    // (move-checking only cares "was this borrowed at all", not which kind) -- Phase 3 borrow-
+    // checking needs the shared/exclusive distinction too, added back in below.
+    is_ref: Bool,
+    // True only for `&mut` specifically (false for a plain `&`, and for a by-value param where
+    // `is_ref` is already false) -- the shared/exclusive distinction `is_ref` alone deliberately
+    // doesn't carry. See `Checker.hotc`'s own move/borrow-checking header.
+    is_mut_ref: Bool,
 }
 
 // `type_param` mirrors `StructDecl`'s/`EnumDecl`'s own field (`Some("T")` for `fn identity<T>(x:
@@ -133,6 +316,26 @@ pub struct FnDecl {
     ret_type: Option<String>,
     body: Vec<Stmt>,
     type_param: Option<String>,
+    // `fn f<T: A + B>(...) { ... }` -- the bound trait name(s) `T` must implement, empty for an
+    // ordinary unbounded generic (or a non-generic fn, where this is always meaningless). See
+    // README's own "Bounded generics" section for the full design. Scoped to TOP-LEVEL generic fns
+    // only this pass (a generic struct's own impl-block methods, where the RECEIVER itself would
+    // need bounding, aren't covered) -- `Checker.hotc`'s own `ensure_fn_instantiated` is the only
+    // reader, validating (at each concrete instantiation) that the substituted type argument
+    // actually implements every bound trait. Real, disclosed narrower scope than the retired
+    // Kotlin compiler's own bounded generics: that version ALSO checked a bounded body once,
+    // abstractly, against a synthetic merged-bound `&dyn` interface (catching a body calling a
+    // method outside the declared bound before any instantiation, not just an incompatible
+    // instantiation) -- this port only has the per-instantiation validation, not that abstract
+    // check.
+    type_bounds: Vec<String>,
+    // True for an impl-block method declared `&mut self` (false for `&self`, bare `self`, or a
+    // plain top-level fn/static method with no receiver at all -- meaningless in those cases).
+    // `self` isn't itself an entry in `params` (see this struct's own header), so its ref-kind
+    // needs its own field -- previously not tracked at all (`Parser.hotc`'s own `self_receiver`
+    // parsed and discarded `&`/`mut` unconditionally). The one thing Phase 3 borrow checking needs
+    // to know whether `self.field = ...` is allowed inside a given method body.
+    self_is_mut: Bool,
 }
 
 // `Param` doubles as a struct field decl (`name: type_name`) -- same shape, no separate type
@@ -141,10 +344,45 @@ pub struct FnDecl {
 // struct's *uses* (`Box<Int>`, `Box<String>`, ...) get monomorphized into real, separate classes.
 // Scope cut, disclosed: exactly one type parameter, no generic functions/methods/enums this
 // phase -- only struct declarations.
+// `is_arena` (`arena struct Name { field: Type, ... }`) marks a struct laid out as raw off-heap
+// memory (`java.lang.foreign.MemorySegment`) instead of an ordinary JVM object -- see
+// `Codegen.hotc`'s own `gen_arena_new`/`gen_arena_field_get` header for the real, disclosed scope
+// cut versus the real language's own arena support: `Int`/`Bool`/`Long` fields only (matching the
+// real compiler's own `valueLayoutField` fallback-to-`Int` for anything else -- `Float`/`Double`
+// arena fields were never really supported there either), no per-field alignment padding (fields
+// are packed sequentially, narrow ones 4 bytes, `Long` 8 -- the real compiler's own `ArenaLayout`
+// makes the exact same simplification), and `buf[i].field` access only when `buf` is a plain local
+// variable/param identifier, not an arbitrary expression (`Codegen.hotc` has no general "what type
+// does this arbitrary expression have, without re-evaluating it" query outside `gen_expr`'s own
+// return-value threading, and threading a mutable `ty` cache field onto every AST node the way the
+// real compiler's Kotlin classes do is a much bigger change than this port needs to make to
+// deliver the real, working feature: raw off-heap struct arrays with real per-field reads/writes).
+// `module_name` (`Some("net.phoenixvine.chronicles.model")` for a struct declared in a file
+// starting `module net.phoenixvine.chronicles.model;`, `None` for a file with no `module`
+// declaration at all) -- real gap found integrating this compiler into an actual Java-package-
+// organized project: every struct used to land in the JVM's default (unnamed) package
+// regardless, which real Java code in a NAMED package can't even reference (the JLS forbids it --
+// there's no qualified name for the default package to import). `Codegen.hotc`'s own `qualify`
+// (a method on `CodeGen`) and its free-function siblings (`qualify_names_cg`,
+// `qualify_with_opt_module_cg` + `find_struct_module_cg`/`find_enum_module_cg`, used by
+// `gen_struct`/`gen_enum`/`gen_interface` before any `CodeGen` instance exists yet) are the
+// places this actually turns into a real, package-qualified JVM class name -- see any of their
+// own headers for how a monomorphized generic instantiation (`"Vec$Int"`) still resolves back to
+// its TEMPLATE's own module.
 pub struct StructDecl {
     name: String,
     type_param: Option<String>,
     fields: Vec<Param>,
+    is_arena: Bool,
+    module_name: Option<String>,
+    // `struct S extends C { }` -- `Some("C")` when `C` is a previously-declared `extern class`
+    // alias this struct subclasses for real (JVM `superName`), `None` for the overwhelmingly
+    // common case (plain composition via `impl Interface for Struct`). See README's own "`extends`:
+    // subclassing a real Java class" section for the full design -- real scope cuts, disclosed
+    // there: `S` must have zero fields of its own (`Checker.hotc`'s own `register_struct` enforces
+    // this), no `super.method(...)`, single inheritance only (an extends-struct can't itself be
+    // extended further -- `gen_struct` emits it `final`).
+    super_class: Option<String>,
 }
 
 // `impl Name { fn method(self[, params]) [-> Ret] { body } ... }` -- `self` (bare, `&self`, or
@@ -155,10 +393,240 @@ pub struct StructDecl {
 // `StructName::method(args)`, the same `Expr::StaticCall` syntax `extern class` static methods
 // and constructors use (see `ExternClassDecl`'s own header) -- resolved by name lookup, extern
 // classes checked first, struct static methods as the fallback.
+// `interface_name` is `Some(name)` for `impl InterfaceName for StructName { ... }` (a real
+// interface implementation -- see `InterfaceDecl`'s own header) and `None` for a plain `impl
+// StructName { ... }` inherent-methods block, same optional-name convention `FnDecl.ret_type`
+// already uses. Scope cut, disclosed: a struct implementing MORE than one interface isn't
+// supported this phase (`Checker.hotc`'s own `struct_interfaces` registry is one-interface-per-
+// struct) -- the real language allows it, this subset doesn't need to yet.
+// `delegate_field` (`impl InterfaceName for StructName by fieldName { ... }`) is `Some(fieldName)`
+// when this impl uses composition-delegation sugar -- any interface method NOT explicitly
+// overridden in `methods` gets a forwarding method synthesized automatically (`fn m(&self, ...) {
+// return self.fieldName.m(...); }`), same "materialize before checking" mechanism
+// `materialize_default_methods` already uses for interface default methods (see
+// `Codegen.hotc`'s own `materialize_delegated_methods`) -- `None` for every other impl (the
+// overwhelmingly common case), including a plain `impl StructName { ... }` inherent block, where
+// this is always meaningless.
 pub struct ImplDecl {
     struct_name: String,
     methods: Vec<FnDecl>,
     static_methods: Vec<FnDecl>,
+    interface_name: Option<String>,
+    delegate_field: Option<String>,
+}
+
+// `interface Name { fn method(&self, ...) -> RetType [{ default body }]; ... }` -- a real,
+// disclosed subset of the real language's own `interface`/`sealed interface`: every method always
+// takes `&self` (no static interface methods), no `open`/`extend` extension methods, no `by`
+// delegate-field impls. `body` is `None` for a bare, `;`-terminated ABSTRACT signature (every
+// implementer must provide its own override) and `Some(stmts)` for a real DEFAULT method body --
+// see `Checker.hotc`'s own `check_interface_completeness` for how a default excuses a struct from
+// providing an override at all. Dynamic dispatch (a `&dyn Name`-typed value calling `.method(...)`,
+// resolved via a real JVM `INVOKEINTERFACE` against whichever concrete struct is actually running
+// underneath) AND `sealed`-exhaustiveness checking in `match` (a `sealed interface` real
+// closed-world set of implementors, verified exactly like enum-variant exhaustiveness already is
+// -- see `Checker.hotc`'s own `check_sealed_match`) are both real, working parts this port
+// delivers -- only a `sealed interface` supports the latter at all, a plain `interface` can be
+// dispatched on dynamically but never `match`ed exhaustively.
+pub struct InterfaceMethod {
+    name: String,
+    params: Vec<Param>,
+    ret_type: String,
+    body: Option<Vec<Stmt>>,
+}
+
+// `is_sealed` (`sealed interface Name { ... }`) is what makes `match`ing on a `&dyn Name` value
+// legal at all -- see `Checker.hotc`'s own `check_sealed_match` header for why a PLAIN, non-sealed
+// `interface` can never support real exhaustiveness checking (nothing closes its set of
+// implementors; a sealed one's implementors are exactly the `impl Name for X` blocks this same
+// compile unit sees, same closed-world assumption enum exhaustiveness already relies on).
+// `extends` (`interface Child : Parent1, Parent2 { ... }`) is real interface INHERITANCE -- a
+// struct that `impl`s `Child` inherits every one of `Parent1`/`Parent2`'s own methods too (both
+// their signatures, for completeness-checking purposes, AND any default bodies they carry), and
+// the JVM interface `Child.class` genuinely `extends` `Parent1`/`Parent2` at the class-file level
+// (see `Codegen.hotc`'s own `gen_interface` header) -- real JVM interface-method resolution is
+// what lets an `INVOKEINTERFACE Child.inheritedMethod` succeed even though `Child.class` itself
+// never redeclares that method. `flatten_interface_methods` (this file, right below) is the one
+// real piece of machinery both `Checker.hotc` (validating calls/completeness) and `Codegen.hotc`
+// (building the "dyn InterfaceName#method" descriptor table) share to see a `Child`'s FULL,
+// inherited method set without duplicating the walk in each file. Scope cut, disclosed: a struct
+// still implements at most one interface directly (`Checker.hotc`'s own `struct_interfaces`
+// registry is one-interface-per-struct, same limitation `ImplDecl`'s own header already discloses)
+// -- inheriting from MULTIPLE supertraits through one `impl` is real, having a struct `impl` two
+// UNRELATED interfaces directly isn't, this phase.
+// `extern_binary_name` (`extern interface Name = "java.lang.Runnable" { fn method(&self, ...) ->
+// RetType; ... }`, always abstract-methods-only -- there's no HC body to give a method that binds
+// to an ALREADY-implemented-elsewhere real Java interface) is `Some` for the OTHER half of Java
+// interop: `extern class` lets HC code call INTO an existing JVM class, this lets an HC struct
+// IMPLEMENT an existing JVM interface so real Java code can call back INTO it -- exactly the shape
+// a Forge/Fabric mod loader needs (event listeners, `Runnable`-style callbacks, capability
+// providers, ...), real gap found starting Minecraft-modding work with this compiler
+// (`examples/extern_interface.hc`'s own `java.lang.Runnable` demo). `None` for an ordinary,
+// locally-declared `interface`/`sealed interface` (`is_sealed`/`parents` stay meaningful only
+// then -- a real JVM interface's own implementors aren't a closed world this compile unit can see,
+// so `sealed`+`extern` are mutually exclusive by construction: `Parser.hotc`'s own
+// `extern_interface_decl` never even looks for a `sealed` keyword). No JVM `.class` file gets
+// emitted for one of these at all (`Codegen.hotc`'s own `gen_interface` call site skips them) --
+// the real interface already exists on the classpath; every place that would otherwise use this
+// interface's OWN declared name as its JVM binary name (a struct's own `implements` entry, a `&dyn
+// Name` value's descriptor, an `INVOKEINTERFACE`/`INSTANCEOF`/`CHECKCAST` owner) substitutes the
+// real one in instead -- see `Codegen.hotc`'s own `resolve_descriptor`/`descriptor_of_type` headers
+// for the one shared mechanism that covers all of those.
+// `module_name` -- see `StructDecl`'s own header, same real feature. Meaningless (always `None`)
+// for an `extern interface` -- `extern_binary_name` already IS its real, final JVM name, nothing
+// to additionally qualify.
+pub struct InterfaceDecl {
+    name: String,
+    methods: Vec<InterfaceMethod>,
+    is_sealed: Bool,
+    parents: Vec<String>,
+    extern_binary_name: Option<String>,
+    module_name: Option<String>,
+    // `pub open interface X { ... }` -- marks `X` as allowed to receive new methods from an
+    // `extend X { ... }` block declared anywhere else in the compile unit (see `ExtendDecl`'s own
+    // header). Orthogonal to `is_sealed`: `sealed` is about the closed set of IMPLEMENTERS (what
+    // `match` exhaustiveness needs); `open` is about the extensible set of EXTENSION methods,
+    // which never changes who implements the interface. `false` for an `extern interface` too --
+    // there's no real HC-side method table on one to extend in the first place (every method is
+    // already bound to a real Java interface method).
+    is_open: Bool,
+}
+
+// `extend Target { fn m(&self, params) -> Ret { body } ... }` -- adds a callable method to an
+// existing struct OR `open interface`, from anywhere in the compile unit, without touching
+// `Target`'s own declaration. See README's own "Modules: `module`, `pub`, `open`, `extend`"
+// section for the full design. `target` is just the bare declared name (a struct's own name, or
+// an interface's) -- which one it actually is gets resolved later, by
+// `Codegen.hotc`'s own `materialize_extend_fns` (the ONLY reader of this struct), which desugars
+// each method into an ordinary top-level `FnDecl` taking the receiver as an explicit first
+// param -- see that fn's own header for exactly how. `methods` reuses the plain `impl`-block
+// method shape (`self_receiver`-style parsing, a real body every time -- there's no already-
+// compiled implementer to ask for a default/override the way an interface method sometimes can).
+pub struct ExtendDecl {
+    target: String,
+    methods: Vec<FnDecl>,
+}
+
+// The real, closed-world (per this compile unit) set of methods `name` answers to, INCLUDING every
+// method inherited from its own `extends` chain, transitively -- own methods win on a name
+// collision (mirrors a real language's "the most-derived declaration wins" rule), matched by
+// linear-scanning `interfaces` for a `name`-matching `InterfaceDecl` rather than needing a
+// `Registry` (this runs during AST-level flattening, before `Checker.hotc` has built any of its
+// own registries yet -- `Codegen.hotc` calls this directly too, off the raw `Vec<InterfaceDecl>` it
+// already has, rather than needing a `TyChecker` reference at all). Cycle protection is a plain
+// recursion-depth cap (20 levels) rather than a real visited-set -- a `Vec<String>` visited-set
+// would need to be threaded (by move) through every sibling `extends` entry's own recursive call,
+// which this subset's real move-checker can't do without an explicit clone; a real cycle would
+// still terminate here (just with an incomplete, not-infinitely-looping result) and gets its own
+// proper diagnostic from `Checker.hotc`'s own `register_interface`, which walks `extends` itself
+// with real cycle detection before ever calling this.
+pub fn flatten_interface_methods(interfaces: &Vec<InterfaceDecl>, name: String) -> Vec<InterfaceMethod> {
+    return flatten_interface_methods_depth(&interfaces, name, 0);
+}
+
+fn flatten_interface_methods_depth(interfaces: &Vec<InterfaceDecl>, name: String, depth: Int) -> Vec<InterfaceMethod> {
+    var out = empty_interface_method_vec();
+    // Guarding the WHOLE body in one `if depth <= 20 { ... }` (rather than an early `return out;`
+    // right at the top for the `depth > 20` case) is deliberate, not just style -- this subset's
+    // real move-checker treats a `return out;` inside an early `if`-with-no-`else` as consuming
+    // `out` for every LATER use too, not just that one branch (the exact same "if-with-return-then-
+    // reuse" trap `Checker.hotc`'s own `check_match`/`check_sealed_match` headers document hitting
+    // and fixing earlier this session). Structuring it this way instead sidesteps that entirely:
+    // `out` is only ever pushed to, never moved-then-reused, right up to the single `return out;`
+    // at the very end.
+    if depth <= 20 {
+        var i = 0;
+        while i < interfaces.length() {
+            let ifd = interfaces.get(i);
+            if ifd.name == name {
+                var si = 0;
+                while si < ifd.parents.length() {
+                    let sup = ifd.parents.get(si);
+                    let sup_methods = flatten_interface_methods_depth(&interfaces, sup, depth + 1);
+                    var smi = 0;
+                    while smi < sup_methods.length() {
+                        out.push(sup_methods.get(smi));
+                        smi = smi + 1;
+                    }
+                    si = si + 1;
+                }
+                var omi = 0;
+                while omi < ifd.methods.length() {
+                    let om = ifd.methods.get(omi);
+                    out = remove_interface_method_named(out, om.name);
+                    out.push(om);
+                    omi = omi + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn remove_interface_method_named(methods: Vec<InterfaceMethod>, name: String) -> Vec<InterfaceMethod> {
+    var out = empty_interface_method_vec();
+    var i = 0;
+    while i < methods.length() {
+        let m = methods.get(i);
+        if m.name != name {
+            out.push(m);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Every interface `name` inherits from, transitively (`Parent`, and `Parent`'s own supertraits, and
+// so on) -- NOT including `name` itself. `Checker.hotc`'s own `is_arg_type_mismatch` is the reader:
+// passing a `Circle` (which directly `impl`s `Child`) where a `&dyn Parent` is expected has to
+// widen through `Child`'s own inheritance chain to see `Parent` there, not just compare `"Child" ==
+// "Parent"` as bare strings. Same depth-capped-instead-of-visited-set cycle protection as
+// `flatten_interface_methods_depth`'s own header explains (and same dedup-on-push convention, via
+// `push_str_if_absent`, to keep a diamond-shaped `extends` graph from duplicating an ancestor name).
+pub fn transitive_supertraits(interfaces: &Vec<InterfaceDecl>, name: String, depth: Int) -> Vec<String> {
+    var out = empty_str_vec();
+    // Same "guard the whole body in one `if`, never an early `return out;`" shape as
+    // `flatten_interface_methods_depth`'s own header explains -- avoids the real move-checker's
+    // "if-with-return-then-reuse" trap on `out`.
+    if depth <= 20 {
+        var i = 0;
+        while i < interfaces.length() {
+            let ifd = interfaces.get(i);
+            if ifd.name == name {
+                var si = 0;
+                while si < ifd.parents.length() {
+                    let sup = ifd.parents.get(si);
+                    out = push_str_if_absent(out, sup);
+                    let sup_supers = transitive_supertraits(&interfaces, sup, depth + 1);
+                    var ssi = 0;
+                    while ssi < sup_supers.length() {
+                        out = push_str_if_absent(out, sup_supers.get(ssi));
+                        ssi = ssi + 1;
+                    }
+                    si = si + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn push_str_if_absent(v: Vec<String>, s: String) -> Vec<String> {
+    var out = v;
+    var i = 0;
+    var found = false;
+    while i < out.length() {
+        if out.get(i) == s {
+            found = true;
+        }
+        i = i + 1;
+    }
+    if !found {
+        out.push(s);
+    }
+    return out;
 }
 
 // `enum Name { Variant1 { field: Type, ... }, Variant2 {}, ... }` -- every variant needs explicit
@@ -186,10 +654,24 @@ pub struct EnumVariant {
 // used in one program and both tried to register a bare `"Some"` owner. Scope cut, disclosed: bare
 // unqualified variant construction only resolves for a *non*-generic enum's variants, same as
 // today.
+// `module_name` -- see `StructDecl`'s own header, same real feature, same convention.
 pub struct EnumDecl {
     name: String,
     variants: Vec<EnumVariant>,
     type_param: Option<String>,
+    module_name: Option<String>,
+    // `enum Result<T, E> { ... }` -- the SECOND type parameter, `None` for the overwhelmingly
+    // common one-param case (`Option<T>`) or a non-generic enum. See README's own "Two-type-
+    // parameter generics" section for the full design. Scoped to ENUMS only this pass, not
+    // structs (`Result<T, E>` -- a sum type where each variant typically only touches ONE of the
+    // two params -- was the actual motivating gap, not a general "N-param generics" ask) --
+    // `StructDecl` stays single-param. Construction requires the FULLY explicit qualified form
+    // (`Result<Int, String>::Ok { value: 5 }`, see `Parser.hotc`'s own `looks_like_generic_variant`
+    // header) always, never bare-literal inference (`Ok { value: 5 }` alone) -- inferring TWO
+    // independent type arguments from whichever ONE of them a single variant's own fields happen
+    // to touch is a genuinely different, harder inference problem than the existing one-param
+    // case already solves, and isn't attempted this pass.
+    type_param2: Option<String>,
 }
 
 // `extern class Alias = "binary/internal/Name" { fn new(...) -> Self; fn method(&self, ...) ->
@@ -204,7 +686,7 @@ pub struct EnumDecl {
 // either one of those, `Unit`, or the literal `Self` (mapped to the real binary name's own
 // descriptor) -- extern classes cannot appear as params/returns of *other* extern methods. Plain
 // struct fields and top-level fn/impl-method params/returns may now name an extern class alias
-// (see `Codegen.hotc`'s own header). No `interface`/`use { ... }` reflected form either -- every
+// (see `Codegen.hotc`'s own header). `use { ... }` reflected form isn't supported -- every
 // member is spelled out explicitly.
 pub struct ExternMethod {
     name: String,
@@ -214,10 +696,38 @@ pub struct ExternMethod {
     is_ctor: Bool,
 }
 
+// `extern class Alias = "binary" interface { ... }` -- the optional trailing `interface` keyword
+// sets `is_interface`, telling `Codegen.hotc` this alias's `binary_name` names a real JVM
+// INTERFACE, not a class: instance-method calls (`Expr::MethodCall`) on it emit a real
+// `INVOKEINTERFACE` (opcode 185, `isInterface = true`) instead of the usual `INVOKEVIRTUAL` --
+// see `Codegen.hotc`'s own `gen_expr` `MethodCall` header for why that distinction is load-
+// bearing (an `INVOKEVIRTUAL` against a real interface method is flatly illegal bytecode, a
+// `VerifyError` at class-load time). Not to be confused with `InterfaceDecl.extern_binary_name`
+// (`extern interface Name = "binary" { ... }`, a DIFFERENT decl kind, disambiguated by the
+// parser at the `extern` keyword itself) -- that's for an HC STRUCT implementing an existing
+// real interface so JAVA code can call back into it; this is for HC code calling INTO a value
+// that's already interface-typed on the Java side (`java.util.List`, `java.lang.Runnable` used
+// as a received/stored value, not implemented), without forcing every such API to be re-bound to
+// one arbitrary concrete implementation class. Static methods and (real, since Java 8) static
+// interface methods both still compile to a plain `INVOKESTATIC` either way -- `is_interface`
+// only changes instance-call dispatch. A `new` ctor on an `is_interface` alias is nonsensical
+// (real interfaces have no constructor) but not rejected -- same "declared signature is trusted
+// at face value" honesty every other `extern class` member already gets; a user who declares one
+// anyway gets a real, disclosed downstream `VerifyError`, not a friendlier compile-time message.
 pub struct ExternClassDecl {
     name: String,
     binary_name: String,
     methods: Vec<ExternMethod>,
+    fields: Vec<ExternField>,
+    is_interface: Bool,
+}
+
+// `static NAME: Type;` (or non-static `NAME: Type;`) inside an `extern class` body -- a real
+// field on the underlying Java class, accessed via `Alias::NAME` (static) or `recv.name` (instance).
+pub struct ExternField {
+    name: String,
+    type_name: String,
+    is_static: Bool,
 }
 
 // `pub static NAME: Type = expr;` at the top level -- a real gap found attempting to self-compile
@@ -233,6 +743,40 @@ pub struct StaticDecl {
     value: Expr,
 }
 
+// `component Name { field: Type, ... }` -- see `ECS_IDEAS.md`'s own design doc. Close to a plain
+// `struct` (a data record, no methods, no generics, no `extends` this pass) -- kept as its own
+// declaration shape rather than reusing `StructDecl` directly so the checker can tell "this is a
+// component, usable in a `system`'s own query params" apart from an ordinary struct without a
+// separate existence-registry lookup at every use site (still needs ONE, see `Checker.hotc`'s own
+// `components` registry -- but `ComponentDecl` being its own AST shape keeps the PARSE side honest
+// about the distinction too).
+pub struct ComponentDecl {
+    name: String,
+    fields: Vec<Param>,
+}
+
+// `system Name { fn run(a: &mut A, b: &B) { ... } }` -- see `ECS_IDEAS.md`'s own design doc for
+// the full design (the query IS `run`'s own param list: `&`/`&mut` on a param naming a `component`
+// type decides read vs write access, reusing `Param.is_ref`/`is_mut_ref` -- Phase 3's move/borrow-
+// checking machinery -- rather than a second, hand-written `reads(...)/writes(...)` declaration).
+// `run` takes no `self` (a `system` isn't a struct instance) and is the ONLY method a `system` can
+// declare this pass.
+pub struct SystemDecl {
+    name: String,
+    run_params: Vec<Param>,
+    run_body: Vec<Stmt>,
+    // `@after(OtherSystem)` -- an explicit ordering hint: this system runs after `OtherSystem`.
+    // Single-target only this pass (see `ECS_IDEAS.md`'s own "Resolved decisions" #1 -- confirmed,
+    // not a temporary cut). `None` when no `@after` was written.
+    after: Option<String>,
+    // `@before(OtherSystem)` -- the mirror of `after`: this system runs before `OtherSystem`.
+    before: Option<String>,
+    // `@profile` -- deferred to v2 per `ECS_IDEAS.md`'s own "Still open" #1 answer, but the parser
+    // already records it (cheap, and avoids a second syntax change once the checker/codegen catch
+    // up) -- unread by anything yet.
+    has_profile: Bool,
+}
+
 pub struct Program {
     fns: Vec<FnDecl>,
     structs: Vec<StructDecl>,
@@ -240,4 +784,124 @@ pub struct Program {
     enums: Vec<EnumDecl>,
     externs: Vec<ExternClassDecl>,
     statics: Vec<StaticDecl>,
+    interfaces: Vec<InterfaceDecl>,
+    // `@"binary.Name"(arg: value, ...)` immediately before a top-level `struct` or `fn` -- see
+    // README's own "Java annotations" section for the full design. Kept as a side-channel
+    // (name -> `Annotation`) rather than a field directly on `StructDecl`/`FnDecl` deliberately:
+    // those two structs each already have a double-digit number of constructor call sites spread
+    // across every pass (monomorphization, delegation-forwarder synthesis, default-method
+    // materialization, ...), none of which have or need an annotation to carry through -- a bare
+    // side list here means only the actual reader (`gen_struct`/`gen_fn`'s own annotation-emission
+    // call, plus this file's own top-level parse loop and `Driver.hotc`'s own `merge_program`) ever
+    // has to know this feature exists at all. Scoped to top-level `struct`/`fn` only (not `impl`
+    // methods, interfaces, or enums -- see the README section for why that's exactly the shape
+    // Forge's own event-bus pattern needs), so a flat "declared name -> its one `Annotation`"
+    // mapping is enough; at most one annotation per declaration this pass (a disclosed scope cut,
+    // not a limitation of the storage shape itself).
+    struct_annotation_names: Vec<String>,
+    struct_annotation_data: Vec<Annotation>,
+    fn_annotation_names: Vec<String>,
+    fn_annotation_data: Vec<Annotation>,
+    // `extend Target { ... }` blocks -- see `ExtendDecl`'s own header.
+    extend_decls: Vec<ExtendDecl>,
+    // `@must_use fn f(...) -> Ret { ... }` -- the DECLARED name of every top-level fn marked
+    // `@must_use` (see README's own "`@must_use`" section). A bare compiler DIRECTIVE, not a real
+    // Java annotation (no quoted binary name, never reaches bytecode) -- kept as its own flat
+    // name-list side-channel, same "don't thread a feature through FnDecl's own dozen-plus
+    // constructor sites" reasoning `struct_annotation_names`/`fn_annotation_names` above already
+    // use. `Checker.hotc`'s own `check_stmt` (the `ExprStmt` arm) is the only reader: a bare
+    // `Expr.Call` to a `@must_use` fn, with no `let`/`return`/anything else consuming its result,
+    // is a real compile error naming the fn.
+    must_use_fn_names: Vec<String>,
+    // `/// ...` immediately before a top-level `struct` or `fn` -- see README's own "Structured
+    // doc comments" section. Same flat-side-channel reasoning as `struct_annotation_names`/
+    // `must_use_fn_names` above -- `Checker.hotc`'s own `check_doc_sees` (a pass at the very end
+    // of `check()`, once every symbol table is fully populated) is the only reader that validates
+    // anything; nothing else in the pipeline needs to know this feature exists.
+    struct_doc_names: Vec<String>,
+    struct_doc_data: Vec<DocComment>,
+    fn_doc_names: Vec<String>,
+    fn_doc_data: Vec<DocComment>,
+    // `use vec;` / `use registry;` / ... -- see README's own "Standard library modules" section
+    // for the full design. Each entry is one requested stdlib TOPIC name (`Parser.hotc`'s own
+    // top-level parse loop just collects the bare identifier after `use`, no path/namespace
+    // resolution at all -- there's no real module-path system to back one). `Driver.hotc`'s own
+    // `resolve_stdlib_modules` is the only reader: an EMPTY list here (no `use` anywhere in the
+    // whole merged program) means "inject the full legacy prelude, unchanged" -- the 100%
+    // backward-compatible default every existing program already relies on; a NON-empty list
+    // means "inject ONLY these topics (plus their own transitive deps)," real opt-in instead of
+    // getting everything unconditionally.
+    uses: Vec<String>,
+    // `@sendable struct Foo { ... }` -- the DECLARED name of every struct marked `@sendable`, an
+    // author's own assertion that every field of this struct is safe to hand across a thread
+    // boundary (immutable, or itself made of only `Copy` primitives/`String`/other `@sendable`
+    // structs -- NOT verified field-by-field this pass, same "declared type is truth" honesty
+    // `extern class` already gets elsewhere in this checker). A bare compiler DIRECTIVE, not a
+    // real Java annotation, same side-channel shape `must_use_fn_names` above already uses.
+    // `Codegen.hotc`'s own Phoenix Flight `PhoenixPool::spawn` capture check is the only reader --
+    // see README's own "Compile-time concurrency safety" section.
+    sendable_struct_names: Vec<String>,
+    // `component Name { fields }` / `system Name { fn run(...) { ... } }` -- see `ECS_IDEAS.md`'s
+    // own design doc, and `ComponentDecl`/`SystemDecl`'s own headers right above `Program` here.
+    components: Vec<ComponentDecl>,
+    systems: Vec<SystemDecl>,
+}
+
+// `/// text` lines immediately before a `struct`/`fn`, parsed into structured sections rather than
+// kept as an opaque text blob -- see README's own "Structured doc comments" section for the full
+// design and why (`@see` resolution against the real symbol table is the actual payoff; that needs
+// each `@see` target pulled out as its own real string, not buried in prose). An untagged line
+// continues whichever section came before it (so a tag's own text can wrap across multiple `///`
+// lines) -- `summary` is that same behavior for the lines BEFORE any tag at all. `@param` is the
+// only tag that can repeat with different data per occurrence (one struct/fn can have several
+// params); `@returns`/`@example`/`@warning`/`@deprecated` each keep only their own text (last
+// occurrence wins on a repeat -- a real, disclosed simplification, not expected to matter for how
+// short a real doc comment usually is). `@see`'s own target is always exactly one line (never
+// continued) -- multiple `@see` tags each add their own entry to `see_targets`.
+pub struct DocComment {
+    summary: String,
+    param_names: Vec<String>,
+    param_texts: Vec<String>,
+    returns_text: String,
+    example_text: String,
+    warning_text: String,
+    see_targets: Vec<String>,
+    deprecated_text: String,
+    // `true` iff `@deprecated` appeared at all (an EMPTY `deprecated_text` -- bare `@deprecated`,
+    // no reason given -- is still a real deprecation marker, not "absent"; same reason
+    // `Option<String>` would be the obvious shape here, spelled as a flag instead to avoid a
+    // fourth `Vec`-of-`Option` shape in what's already a wide flat struct).
+    has_deprecated: Bool,
+}
+
+// A single Java annotation VALUE -- a real classfile `RuntimeVisibleAnnotations` attribute entry
+// can only ever be one of these three shapes (see `AnnotationVisitor`'s own real methods:
+// `visit`/`visitEnum`/`visitArray`), not the general expression language -- annotation arguments
+// are compile-time constants baked directly into the classfile, never executed. `AnnArray` nesting
+// `Vec<AnnValue>` (not a further-restricted "array of scalar" type) mirrors the same
+// self-referential-`Vec<Self>` shape `Expr::StringInterp`'s own `exprs: Vec<Expr>` already uses --
+// same real precedent, not a new pattern this feature invented.
+pub enum AnnValue {
+    AnnStr { value: String },
+    // A real Java `enum` CONSTANT, referenced by its declaring enum's own binary name plus the
+    // constant's name (`enum("net.minecraftforge.api.distmarker.Dist", "CLIENT")`) -- compiles to
+    // `AnnotationVisitor.visitEnum`, exactly what an enum-typed annotation argument is stored as
+    // at the classfile level. Deliberately NOT modeled as a resolved runtime value (there's no
+    // `GETSTATIC`-style reference the way ordinary code reads an enum constant) -- annotation
+    // metadata is inert data read back by reflection, never executed.
+    AnnEnumConst { binary_name: String, const_name: String },
+    AnnArray { values: Vec<AnnValue> },
+}
+
+pub struct AnnotationArg {
+    name: String,
+    value: AnnValue,
+}
+
+// `@"binary.Name"` alone (no `(...)`) is a marker annotation -- `args` is simply empty, same
+// "absence is the empty case, not a separate variant" convention this codebase already uses for
+// `ImplDecl.delegate_field`/`ExternClassDecl.fields` and everywhere else an optional list shows up.
+pub struct Annotation {
+    binary_name: String,
+    args: Vec<AnnotationArg>,
 }

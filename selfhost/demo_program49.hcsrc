@@ -1,0 +1,22 @@
+// Exercises real string interpolation end to end: multiple `{expr}` spans, back-to-back
+// interpolations with an empty literal segment between them, and Int/Bool/String all interpolated
+// in the SAME string -- each going through the real `StringBuilder.append` overload picked by the
+// interpolated expression's own runtime type.
+struct Box {
+    v: Int,
+}
+
+fn describe(x: Int, flag: Bool, name: String) -> String {
+    let b = Box { v: x * 2 };
+    return "x=" + "{x}" + ", doubled={b.v}, flag={flag}, name={name}{name}";
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let s = describe(5, true, "!");
+    // Expect exactly "x={5}, doubled=10, flag=true, name=!!" -- wait, the "x=" + "{x}" above is
+    // two SEPARATE string exprs concatenated with `+` (not one interpolation), so this checks BOTH
+    // ordinary `+` string concatenation AND interpolation compose correctly.
+    var ok = 0;
+    if s == "x=5, doubled=10, flag=true, name=!!" { ok = 100; }
+    return ok + a + b;
+}

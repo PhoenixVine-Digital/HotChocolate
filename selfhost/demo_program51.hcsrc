@@ -1,0 +1,72 @@
+// Exercises real interface INHERITANCE and DEFAULT METHODS end to end -- the newest self-hosting
+// port: `interface Child : Parent { ... }` (a real JVM `Child.class extends Parent` at the
+// class-file level, see `Codegen.hotc`'s own `gen_interface`) and a default method body right on
+// an interface declaration (`fn m(&self) -> T { ... }` instead of a bare `;`), which an
+// implementing struct doesn't have to override -- `Codegen.hotc`'s own `materialize_default_methods`
+// gives every implementer that doesn't override it a real, compiled copy.
+//
+// `Animal` declares ONE default (`legs`, unconditionally 4) and one abstract method (`sound`).
+// `Pet : Animal` inherits both and adds its own abstract method (`name`) plus its OWN default
+// (`greet`, which calls `self.sound()` -- proving a default method's body can call ANOTHER
+// interface method through `self`, resolved against whichever concrete struct is actually
+// implementing it).
+interface Animal {
+    fn sound(&self) -> String;
+    fn legs(&self) -> Int {
+        return 4;
+    }
+}
+
+interface Pet : Animal {
+    fn name(&self) -> String;
+    fn greet(&self) -> String {
+        return self.sound() + "!";
+    }
+}
+
+struct Dog {
+    tag: Int,
+}
+impl Pet for Dog {
+    fn sound(&self) -> String {
+        return "Woof";
+    }
+    fn name(&self) -> String {
+        return "Rex";
+    }
+}
+
+// `Bird` overrides the INHERITED default `legs` (2, not the `Animal` default of 4) but leaves
+// `greet` to the inherited `Pet` default -- proving an explicit override wins over an inherited
+// default, and an unrelated default still gets its own separate materialized copy.
+struct Bird {
+    tag: Int,
+}
+impl Pet for Bird {
+    fn sound(&self) -> String {
+        return "Tweet";
+    }
+    fn name(&self) -> String {
+        return "Kiwi";
+    }
+    fn legs(&self) -> Int {
+        return 2;
+    }
+}
+
+fn describe(p: &dyn Pet) -> Int {
+    // `p.greet()` -- a call through a `&dyn Pet`-typed receiver to a method `Pet` only inherits
+    // from `Animal`'s own default, dispatched via real `INVOKEINTERFACE` -- proves `flatten_
+    // interface_methods` really does thread an inherited default's descriptor into the "dyn
+    // Pet#legs"/"dyn Pet#greet" table, not just `Pet`'s own directly-declared methods.
+    let g = p.greet();
+    return g.length() + p.legs();
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let dog = Dog { tag: 1 };
+    let bird = Bird { tag: 2 };
+    let dv = describe(dog); // greet() = "Woof!" (5 chars) + legs() = 4 (inherited default) -> 9
+    let bv = describe(bird); // greet() = "Tweet!" (6 chars) + legs() = 2 (overridden) -> 8
+    return dv + bv + a + b;
+}

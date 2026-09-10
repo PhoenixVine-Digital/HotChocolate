@@ -1,0 +1,58 @@
+// Phoenix Flight -- virtual threads (`Executors.newVirtualThreadPerTaskExecutor()`, stable since
+// JDK 21). Opt-in via `use phoenix_virtual;` -- gated at `--target 21` or higher (see
+// `min_target_for_topic` in `Driver.hotc`), so a `--target 17` compile never sees this type exist
+// at all. A NEW, separate type from `PhoenixPool` (`stdlib/phoenix.hotc`), not a modification of
+// it in place -- so `PhoenixPool`'s own platform-thread-backed behavior never silently changes
+// underneath existing `--target 17` callers.
+//
+// ```
+// use phoenix_virtual;
+//
+// fn main() {
+//     let pool = PhoenixVirtualPool::new();
+//     let task = pool.spawn(|| expensive_io());
+//     let result = task.join() as String;
+//     pool.shutdown();
+// }
+// ```
+//
+// Depends on `phoenix` for `PhoenixExecutorService`/`PhoenixCallable`/`PhoenixTask` -- reused
+// as-is, since a `Future`/`Callable`-based task submitted to a virtual-thread-backed
+// `ExecutorService` behaves identically from the caller's own side (`submit`/`get`/`cancel`/etc.
+// are all still real `ExecutorService`/`Future` methods); only what runs UNDERNEATH each submitted
+// task differs -- one real OS thread shared pool-wide versus one cheap virtual thread per task.
+// `join_all` (`stdlib/phoenix.hotc`) already works unchanged against `PhoenixVirtualPool`-spawned
+// tasks too, since it only ever touches `PhoenixTask`, never the pool that spawned it.
+use phoenix;
+
+// Same real JVM class as `PhoenixExecutors` (`stdlib/phoenix.hotc`) -- `java.util.concurrent.
+// Executors` -- under a separate HC-level extern name: this compiler has no notion of "extend an
+// existing extern class with one more static method," so a second extern pointed at the same real
+// binary name is how this topic adds just the one new factory it needs without touching (or
+// re-declaring) `PhoenixExecutors` itself.
+extern class PhoenixVirtualExecutors = "java.util.concurrent.Executors" {
+    static fn newVirtualThreadPerTaskExecutor() -> PhoenixExecutorService;
+}
+
+struct PhoenixVirtualPool {
+    exec: PhoenixExecutorService,
+}
+
+impl PhoenixVirtualPool {
+    // No thread-count parameter, unlike `PhoenixPool::new(threads)` -- a virtual-thread executor
+    // starts a fresh, cheap virtual thread per submitted task rather than drawing from a fixed
+    // pool of real OS threads, so there's no pool size to configure.
+    static fn new() -> PhoenixVirtualPool {
+        return PhoenixVirtualPool { exec: PhoenixVirtualExecutors::newVirtualThreadPerTaskExecutor() };
+    }
+
+    // Identical shape to `PhoenixPool::spawn` -- see its own header (`stdlib/phoenix.hotc`) for
+    // the real capture restriction this call gets and the raw-`Object`-result caveat on `join()`.
+    fn spawn(&self, task: &dyn PhoenixCallable) -> PhoenixTask {
+        return PhoenixTask { raw: self.exec.submit(task) };
+    }
+
+    fn shutdown(&self) {
+        self.exec.shutdown();
+    }
+}

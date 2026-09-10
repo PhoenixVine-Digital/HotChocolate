@@ -1,0 +1,7 @@
+// `Option<T>` -- see README's own "Standard library modules" section. No dependencies on any
+// other stdlib topic.
+
+enum Option<T> {
+    Some { value: T },
+    None {},
+}

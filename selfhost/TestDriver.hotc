@@ -18,7 +18,10 @@ fn dump_args(args: Vec<Expr>) -> String {
 fn dump_expr(e: Expr) -> String {
     match e {
         IntLit { value } => { return "Int(" + JString::valueOf(value) + ")"; }
+        FloatLit { text } => { return "Float(" + text + ")"; }
+        DoubleLit { text } => { return "Double(" + text + ")"; }
         StringLit { value } => { return "Str(" + value + ")"; }
+        StringInterp { literals, exprs } => { return "Interp(" + dump_args(exprs) + ")"; }
         BoolLit { value } => {
             if value { return "Bool(true)"; }
             return "Bool(false)";
@@ -36,9 +39,33 @@ fn dump_expr(e: Expr) -> String {
         ArrayRepeat { value, count } => { return "[" + dump_expr(value) + "; " + dump_expr(count) + "]"; }
         Index { arr, index } => { return dump_expr(arr) + "[" + dump_expr(index) + "]"; }
         IndexAssign { arr, index, value } => { return dump_expr(arr) + "[" + dump_expr(index) + "] = " + dump_expr(value); }
+        IndexFieldGet { arr_name, index, field } => { return arr_name + "[" + dump_expr(index) + "]." + field; }
+        IndexFieldSet { arr_name, index, field, value } => { return arr_name + "[" + dump_expr(index) + "]." + field + " = " + dump_expr(value); }
+        ArenaNew { struct_name, count } => { return "arena " + struct_name + "[" + dump_expr(count) + "]"; }
         StaticCall { type_name, method, args } => { return type_name + "::" + method + "(" + dump_args(args) + ")"; }
+        ExternStaticFieldGet { type_name, field } => { return type_name + "::" + field; }
+        ExternStaticFieldSet { type_name, field, value } => { return type_name + "::" + field + " = " + dump_expr(value); }
         Cast { expr, target_type } => { return dump_expr(expr) + " as " + target_type; }
+        IsCheck { expr, target_type } => { return dump_expr(expr) + " is " + target_type; }
+        Lambda { params, body } => { return "|" + dump_args_str(params) + "| " + dump_expr(body); }
+        TryOp { expr } => { return dump_expr(expr) + "?"; }
+        NamedArg { name, value } => { return name + ": " + dump_expr(value); }
+        NullLit => { return "null"; }
+        SafeCall { recv, method, args } => { return dump_expr(recv) + "?." + method + "(" + dump_args(args) + ")"; }
+        SafeFieldAccess { recv, field } => { return dump_expr(recv) + "?." + field; }
+        Elvis { left, right } => { return dump_expr(left) + " ?: " + dump_expr(right); }
     }
+}
+
+fn dump_args_str(names: Vec<String>) -> String {
+    var out = "";
+    var i = 0;
+    while i < names.length() {
+        if i > 0 { out = out + ", "; }
+        out = out + names.get(i);
+        i = i + 1;
+    }
+    return out;
 }
 
 fn dump_block(stmts: Vec<Stmt>, indent: String) -> String {
@@ -53,38 +80,52 @@ fn dump_block(stmts: Vec<Stmt>, indent: String) -> String {
 
 fn dump_stmt(s: Stmt, indent: String) -> String {
     match s {
-        Let { name, mutable, init } => {
+        Let { name, mutable, init, declared_type, line } => {
             if mutable {
                 return "var " + name + " = " + dump_expr(init) + ";";
             } else {
                 return "let " + name + " = " + dump_expr(init) + ";";
             }
         }
-        ExprStmt { expr } => { return dump_expr(expr) + ";"; }
-        Return { value } => {
+        ExprStmt { expr, line } => { return dump_expr(expr) + ";"; }
+        Return { value, line } => {
             if let Some { value: v } = value {
                 return "return " + dump_expr(v) + ";";
             }
             return "return;";
         }
-        If { cond, then_body, else_body } => {
+        If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
             var out = "if " + dump_expr(cond) + " \{\n" + dump_block(then_body, indent + "  ") + indent + "\}";
             if let Some { value: eb } = else_body {
                 out = out + " else \{\n" + dump_block(eb, indent + "  ") + indent + "\}";
             }
             return out;
         }
-        While { cond, body } => {
+        While { cond, body, line } => {
             return "while " + dump_expr(cond) + " \{\n" + dump_block(body, indent + "  ") + indent + "\}";
         }
-        Match { subject, arms } => {
+        For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+            if is_range {
+                return "for " + var_name + " in " + dump_expr(range_start) + ".." + dump_expr(range_end) + " \{\n" + dump_block(body, indent + "  ") + indent + "\}";
+            } else {
+                return "for " + var_name + " in " + dump_expr(arr_expr) + " \{\n" + dump_block(body, indent + "  ") + indent + "\}";
+            }
+        }
+        Match { subject, arms, line } => {
             return "match " + dump_expr(subject) + " \{ ... " + JString::valueOf(arms.length()) + " arm(s) ... \}";
         }
-        Throw { value } => { return "throw " + dump_expr(value) + ";"; }
-        Break {} => { return "break;"; }
-        Continue {} => { return "continue;"; }
-        Try { try_block, catch_var, catch_type, catch_block } => {
-            return "try \{ ... \} catch (" + catch_var + ": " + catch_type + ") \{ ... \}";
+        Throw { value, line } => { return "throw " + dump_expr(value) + ";"; }
+        Break { line } => { return "break;"; }
+        Continue { line } => { return "continue;"; }
+        Try { try_block, catches, line } => {
+            var out = "try \{ ... \}";
+            var i = 0;
+            while i < catches.length() {
+                let c = catches.get(i);
+                out = out + " catch (" + c.catch_var + ": " + c.catch_type + ") \{ ... \}";
+                i = i + 1;
+            }
+            return out;
         }
     }
 }
@@ -594,10 +635,64 @@ pub fn main(args: [String]) {
     // header for what this proves and how it's actually verified (a separate `java` invocation
     // with real command-line args, not this demo's own compile-time print).
     run_bootstrap_demo("selfhost/demo_program45.hcsrc");
+    run_bootstrap_demo("selfhost/demo_program46.hcsrc");
+    run_bootstrap_demo("selfhost/demo_program47.hcsrc");
+    run_bootstrap_demo("selfhost/demo_program48.hcsrc");
+    run_bootstrap_demo("selfhost/demo_program49.hcsrc");
+
+    // Also proves real `sealed interface` exhaustiveness checking (a real gap closed this phase --
+    // see Checker.hotc's own `check_sealed_match` header): `match` over a `&dyn Shape3`-typed value,
+    // arms naming `Circle3`/`Square3` (real closed set of implementors, no `_` needed since both are
+    // covered), dispatched via a real JVM `INSTANCEOF`/`CHECKCAST`, not the enum-tag path.
+    // `combo(3, 4)`: describe_shape(Circle3{r:2}) = 2*2*3 = 12, describe_shape(Square3{side:3}) =
+    // 3*3 = 9. 12 + 9 + 3 + 4 = 28.
+    run_bootstrap_demo("selfhost/demo_program50.hcsrc");
+
+    // Also proves real interface INHERITANCE and DEFAULT METHODS (a real gap closed this phase --
+    // see `Ast.hc`'s own `flatten_interface_methods` header and `Codegen.hotc`'s own
+    // `materialize_default_methods`): `interface Pet : Animal` inherits `Animal`'s own default
+    // `legs()` (unconditionally 4) alongside its abstract `sound()`, `Dog` never overrides `legs`
+    // (gets the inherited default) while `Bird` does (gets 2), and `Pet`'s own default `greet()`
+    // calls `self.sound()` -- a default method body calling ANOTHER interface method through
+    // `self`, resolved against whichever concrete struct is actually running. `combo(3, 4)`:
+    // describe(Dog) = "Woof!".length() + 4 = 5 + 4 = 9, describe(Bird) = "Tweet!".length() + 2 =
+    // 6 + 2 = 8. 9 + 8 + 3 + 4 = 24.
+    run_bootstrap_demo("selfhost/demo_program51.hcsrc");
+
+    // Also proves real `extern interface` (a real gap closed this phase, found starting
+    // Minecraft-modding work on top of this compiler -- see `Ast.hc`'s own
+    // `InterfaceDecl.extern_binary_name` header): an HC struct (`Counter52`) implementing a REAL,
+    // already-existing JVM interface (`java.lang.Runnable`), dispatched two ways -- directly
+    // (`runIt(&c)`, a real `INVOKEINTERFACE` against `java/lang/Runnable`, not the bare local name
+    // "Run", which is never even emitted a `.class` file) AND by a REAL JDK class calling back
+    // INTO it (`java.lang.Thread`'s own `start()`/`join()`, proving `Counter52` genuinely
+    // implements `Runnable` at the JVM level, not just at this compiler's own internal bookkeeping
+    // level) -- exactly the shape a Forge/Fabric mod loader needs (event listeners, capability
+    // providers, ...). `combo(3, 4)`: two "ran: first" prints (one direct, one via the real
+    // `Thread`), then `a + b` = 7.
+    run_bootstrap_demo("selfhost/demo_program52.hcsrc");
 
     // The actual fixed-point self-hosting test -- see `Driver.hotc`'s own header on
     // `run_selfcompile_probe` for why a single-file `run_bootstrap_demo` call can't do this.
     run_selfcompile_probe();
+
+    // Stage 2 -- see `Driver.hotc`'s own header on `run_selfcompile_stage2`: builds a REAL,
+    // standalone compiler executable out of the self-compiled output, instead of just proving the
+    // algorithms themselves check out.
+    run_selfcompile_stage2();
+
+    // Stage 3 prep -- see `Driver.hotc`'s own header on `run_selfcompile_stage3_prep`: builds the
+    // executable that will, standalone and with zero Kotlin involved, recompile the six real
+    // compiler source files AGAIN (the actual triple-bootstrap fixed-point test).
+    run_selfcompile_stage3_prep();
+
+    // The real, general-purpose entry point -- see `Driver.hotc`'s own header on
+    // `run_selfcompile_cli_prep`: builds a standalone `hc`-replacement CLI, no hardcoded target.
+    run_selfcompile_cli_prep();
+
+    // Verifies the newly classpath-threaded `verify_extern_signature` -- see `Driver.hotc`'s own
+    // header on `run_classpath_verify_probe`.
+    run_classpath_verify_probe();
 
     // `selfhost/demo_program_throw_test.hcsrc` (throws "a was positive" when a>0) is a
     // deliberately-terminating negative case verifying `throw` codegen for real -- confirmed

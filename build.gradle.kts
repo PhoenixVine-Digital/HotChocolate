@@ -1,5 +1,4 @@
 plugins {
-    kotlin("jvm") version "1.9.24"
     application
 }
 
@@ -18,17 +17,32 @@ repositories {
 dependencies {
     implementation("org.ow2.asm:asm:9.7")
     implementation("org.ow2.asm:asm-util:9.7")
-    testImplementation(kotlin("test"))
 }
 
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(17))
+    }
+}
+
+// `selfhost/bootstrap` -- the checked-in, pre-compiled bootstrap seed of the self-hosted
+// HotChocolate compiler (see selfhost/bootstrap/README.md). These `.class` files have no
+// Gradle-compilable source at all (they're built FROM `selfhost/*.hotc` by the self-hosted
+// compiler itself, not by `javac`) -- unioning the directory straight onto the runtime classpath
+// is how `mainClass.set("SelfhostCLI")` below finds it.
+val selfhostBootstrap = files("selfhost/bootstrap")
+sourceSets.main.get().runtimeClasspath += selfhostBootstrap
+
 application {
-    mainClass.set("hc.MainKt")
+    mainClass.set("SelfhostCLI")
 }
 
 // The application plugin's `run` task doesn't forward stdin to the Gradle Daemon-spawned
 // process by default -- `read_line()`-using programs would see EOF immediately even when run
 // interactively. Wiring `standardInput` explicitly makes Gradle actually pipe the terminal's
-// stdin through.
+// stdin through -- `SelfhostCLI`'s own "run" mode (`Driver.hotc`'s own `run_cli`) further
+// inherits it into the real child `java` process it spawns for the compiled target, so this one
+// override covers both hops.
 tasks.named<JavaExec>("run") {
     standardInput = System.`in`
 }
@@ -40,7 +54,7 @@ tasks.named<JavaExec>("run") {
 tasks.register<JavaExec>("playBattle") {
     group = "application"
     description = "Runs the interactive examples/battle dungeon-crawl demo (hc program)."
-    mainClass.set("hc.MainKt")
+    mainClass.set("SelfhostCLI")
     classpath = sourceSets.main.get().runtimeClasspath
     args = listOf("run", "examples/battle")
     standardInput = System.`in`
@@ -49,16 +63,8 @@ tasks.register<JavaExec>("playBattle") {
 tasks.register<JavaExec>("calc") {
     group = "application"
     description = "Runs the hotc calculator."
-    mainClass.set("hc.MainKt")
+    mainClass.set("SelfhostCLI")
     classpath = sourceSets.main.get().runtimeClasspath
     args = listOf("run", "examples/calc")
     standardInput = System.`in`
-}
-
-tasks.test {
-    useJUnitPlatform()
-}
-
-kotlin {
-    jvmToolchain(17)
 }

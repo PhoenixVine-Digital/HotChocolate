@@ -1,0 +1,39 @@
+// Exercises real `extern interface` end to end -- the newest self-hosting port: an HC struct
+// implementing an EXISTING real JVM interface (`java.lang.Runnable`), so real Java code (here,
+// `java.lang.Thread`'s own constructor) can call back INTO it. Exactly the shape a Forge/Fabric
+// mod loader needs (event listeners, capability providers, ...) -- mirrors
+// `examples/extern_interface.hc` exactly, the design this port is based on.
+extern interface Run = "java.lang.Runnable" {
+    fn run(&self);
+}
+
+extern class JThread52 = "java.lang.Thread" {
+    fn new(target: &dyn Run) -> Self;
+    fn start(self);
+    fn join(self);
+}
+
+struct Counter52 {
+    label: String,
+}
+impl Run for Counter52 {
+    fn run(&self) {
+        print("ran: " + self.label);
+    }
+}
+
+fn runIt(r: &dyn Run) {
+    // Proves dyn dispatch through an extern-interface-typed value works the same as a local
+    // interface's -- real `INVOKEINTERFACE` against `java/lang/Runnable`, not the bare (never
+    // emitted) local name "Run".
+    r.run();
+}
+
+fn combo(a: Int, b: Int) -> Int {
+    let c = Counter52 { label: "first" };
+    runIt(&c);
+    let t = JThread52::new(&c);
+    t.start();
+    t.join();
+    return a + b;
+}

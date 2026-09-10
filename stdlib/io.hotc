@@ -1,0 +1,24 @@
+// `read_int`/`read_string` -- see README's own "Standard library modules" section. Depends on
+// `option` (`read_int`'s own return type) -- `use io;` alone pulls that in automatically, see
+// `Driver.hotc`'s own `resolve_stdlib_modules`. Real HC functions, NOT codegen intrinsics (only
+// `read_line` itself is one -- see `Codegen.hotc`'s own `Call` codegen header): `read_int` parses
+// `read_line()`'s own result, returning `None` (not throwing) on a bad line via a real
+// `try`/`catch` around `Integer::parseInt`'s own `NumberFormatException`.
+
+extern class __PreludeInteger = "java.lang.Integer" {
+    static fn parseInt(s: String) -> Int;
+}
+extern class __PreludeNumberFormatException = "java.lang.NumberFormatException" {}
+
+fn read_int() -> Option<Int> {
+    let line = read_line().trim();
+    try {
+        return Option<Int>::Some { value: __PreludeInteger::parseInt(line) };
+    } catch (e: __PreludeNumberFormatException) {
+        return Option<Int>::None {};
+    }
+}
+
+fn read_string() -> String {
+    return read_line().trim();
+}

@@ -1,5 +1,6 @@
 package hc.selfhost.codegen;
 
+import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
 
@@ -19,8 +20,20 @@ public final class CodegenShim {
 
     public static void writeClass(ClassWriter cw, String path) {
         byte[] bytes = cw.toByteArray();
-        try (OutputStream out = Files.newOutputStream(Paths.get(path))) {
-            out.write(bytes);
+        Path target = Paths.get(path);
+        try {
+            // A module-qualified class name (e.g. "a/b/c/Name.class", once `Codegen.hotc`'s own
+            // module-porting feature qualifies it) needs its real package directory structure to
+            // already exist on disk -- unlike the previous default-package-only case, where `path`
+            // was always just a bare filename in the current directory. `createDirectories` is a
+            // no-op when the parent already exists (the default-package case), so this is safe for
+            // every existing caller too.
+            if (target.getParent() != null) {
+                Files.createDirectories(target.getParent());
+            }
+            try (OutputStream out = Files.newOutputStream(target)) {
+                out.write(bytes);
+            }
         } catch (IOException e) {
             throw new RuntimeException("CodegenShim: failed writing " + path, e);
         }
@@ -49,5 +62,26 @@ public final class CodegenShim {
 
     public static MethodVisitor visitMethodNoSig(ClassWriter cw, int access, String name, String descriptor, String[] exceptions) {
         return cw.visitMethod(access, name, descriptor, null, exceptions);
+    }
+
+    // Same real "needs a genuine Java null" gap once more: `ClassWriter.visitSource`'s second
+    // param (a debug-info string, e.g. SMAP data for other JVM languages) is always `null` for
+    // this compiler -- real per-class debug info (source file name for stack traces and a JVM
+    // debugger's own source lookup).
+    public static void visitSource(ClassWriter cw, String source) {
+        cw.visitSource(source, null);
+    }
+
+    // A fourth instance of the same real "needs a genuine Java null" gap: an annotation array
+    // element (`AnnotationVisitor.visit`/`.visitEnum`'s own `name` param) is unnamed by definition
+    // -- ASM's own convention for "this call is inside a `visitArray` block, not a top-level named
+    // argument" is passing `null` for `name`, which HC's `null` literal can't do as a bare call
+    // argument. Staying entirely on the Java side of that gap too, same as every other one above.
+    public static void visitArrayString(AnnotationVisitor av, String value) {
+        av.visit(null, value);
+    }
+
+    public static void visitArrayEnum(AnnotationVisitor av, String enumDescriptor, String value) {
+        av.visitEnum(null, enumDescriptor, value);
     }
 }

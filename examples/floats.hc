@@ -1,5 +1,8 @@
-// `1.5` -> Double (Java's own unsuffixed default). `1.5f` -> Float. No implicit promotion
-// between Int/Float/Double -- same-type strictness like everywhere else in this language.
+// `1.5` -> Double (Java's own unsuffixed default). `1.5f` -> Float. Fixed 2026-09-08: mixed
+// Int/Long/Float/Double arithmetic and comparisons now widen to the "bigger" side automatically
+// (`5 * 2.0` -> `10.0`, no `as Double` needed) -- this comment used to say there was no implicit
+// promotion at all; that's now only true for the one still-excluded pair, Int+Long together
+// (see README's own "Numeric widening" section for why that pair specifically stays excluded).
 
 extern class JMath = "java.lang.Math" {
     fn sqrt(x: Double) -> Double;
@@ -47,6 +50,19 @@ fn main() {
 
     let farr = [1.0f, 2.0f];
     print(farr[0] + farr[1]);
+
+    // Mixed-type widening -- a bare Int literal/local mixed into Float/Double math, either
+    // operand order, arithmetic and comparisons alike.
+    print(5 * 2.0);   // 10.0 -- Int widened to Double
+    print(2.0 * 5);   // 10.0 -- same, other order
+    print(5 > 2.0);   // true
+    var total = 0.0;
+    var k = 0;
+    while k < 3 {
+        total = total + k * 1.5; // Int loop counter mixed with a Double step, every iteration
+        k = k + 1;
+    }
+    print(total); // 4.5
 
     // Vec<T>/Registry<T> from the prelude are fully generic -- Vec<Double> works exactly like
     // Vec<Int>, including the wide (2-slot) local-variable handling that only Double needs.

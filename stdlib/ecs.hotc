@@ -1,0 +1,19 @@
+// `World` -- see ECS_IDEAS.md's own design doc. Deliberately opaque/empty: the REAL archetype
+// storage a program needs is synthesized directly by the compiler (`Codegen.hotc`'s own
+// archetype-synthesis pass) as hidden top-level statics, one per distinct component set actually
+// spawned via `world.spawn(...)` -- there's only ever ONE implicit world per program this phase
+// (a real, disclosed scope cut), so `World` itself carries no per-instance state at all.
+//
+// `spawn`/`run_all` are deliberately NOT real declared methods here -- there's no way to give
+// `spawn` a single fixed signature (it takes an arbitrary set of DIFFERENT component types per
+// call site), so both are recognized and compiled specially by `Checker.hotc`/`Codegen.hotc`, the
+// same way `PhoenixPool::spawn` (see `stdlib/phoenix.hotc`) is.
+struct World {
+    _unused: Int,
+}
+
+impl World {
+    static fn new() -> World {
+        return World { _unused: 0 };
+    }
+}

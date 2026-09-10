@@ -1,0 +1,226 @@
+// Real, previously-hit gap surfaced FIXING `shutdown_now` below (see `PhoenixPool::shutdown_now`'s
+// own header): `ExecutorService.shutdownNow()` really returns `List<Runnable>` (erased to
+// `java.util.List` at the descriptor level), NOT `Object` -- declaring it as `PhoenixObject`
+// (`java.lang.Object`) compiled clean but crashed at RUNTIME with `NoSuchMethodError:
+// 'java.lang.Object java.util.concurrent.ExecutorService.shutdownNow()'`, since real JVM
+// `INVOKEINTERFACE` resolution matches an instruction's own descriptor EXACTLY (return type
+// included), not by assignability -- `Object`/`List` being compatible at the SOURCE level (any
+// `List` reference IS-A `Object`) means nothing to the raw bytecode instruction, which names a
+// specific descriptor that has to exist verbatim on the target interface. `PhoenixTaskList`
+// below is a real, distinct extern binding to `java.util.List` (a real JVM interface, hence its
+// own `interface` marker) purely so `shutdownNow`'s own declared return type matches reality --
+// nothing here ever calls a method ON the returned list, so it stays otherwise opaque, same
+// "declared type is truth, nothing more" scope cut as `PhoenixExecutor`'s own empty body.
+extern class PhoenixTaskList = "java.util.List" interface {}
+
+extern class PhoenixExecutorService = "java.util.concurrent.ExecutorService" interface {
+    fn submit(&self, task: &dyn PhoenixCallable) -> PhoenixFuture;
+    fn shutdown(&self) -> Unit;
+    fn shutdownNow(&self) -> PhoenixTaskList;
+}
+
+extern interface PhoenixCallable = "java.util.concurrent.Callable" {
+    fn call(&self) -> PhoenixObject;
+}
+
+
+extern interface PhoenixSupplier = "java.util.function.Supplier" {
+    fn get(&self) -> PhoenixObject;
+}
+
+extern interface PhoenixFunction = "java.util.function.Function" {
+    fn apply(&self, arg: PhoenixObject) -> PhoenixObject;
+}
+
+extern class PhoenixExecutor = "java.util.concurrent.Executor" interface {}
+
+extern class PhoenixFuture = "java.util.concurrent.Future" interface {
+    fn get(&self) -> PhoenixObject;
+    fn cancel(&self, mayInterruptIfRunning: Bool) -> Bool;
+    fn isCancelled(&self) -> Bool;
+    fn isDone(&self) -> Bool;
+}
+
+extern class PhoenixExecutors = "java.util.concurrent.Executors" {
+    static fn newFixedThreadPool(threads: Int) -> PhoenixExecutorService;
+}
+
+extern class PhoenixObject = "java.lang.Object" {}
+
+extern class PhoenixExecutionException = "java.util.concurrent.ExecutionException" {
+    fn getCause(&self) -> PhoenixThrowable;
+}
+
+extern class PhoenixThrowable = "java.lang.Throwable" {
+    fn getMessage(&self) -> String;
+}
+
+extern class PhoenixCompletableFuture = "java.util.concurrent.CompletableFuture" {
+    static fn supplyAsync(supplier: &dyn PhoenixSupplier, executor: PhoenixExecutor) -> PhoenixCompletableFuture;
+    fn thenApplyAsync(&self, fn_: &dyn PhoenixFunction, executor: PhoenixExecutor) -> PhoenixCompletableFuture;
+    fn get(&self) -> PhoenixObject;
+    fn cancel(&self, mayInterruptIfRunning: Bool) -> Bool;
+    fn isCancelled(&self) -> Bool;
+    fn isDone(&self) -> Bool;
+}
+
+struct PhoenixPool {
+    exec: PhoenixExecutorService,
+}
+
+impl PhoenixPool {
+    static fn new(threads: Int) -> PhoenixPool {
+        return PhoenixPool { exec: PhoenixExecutors::newFixedThreadPool(threads) };
+    }
+
+    fn spawn(&self, task: &dyn PhoenixCallable) -> PhoenixTask {
+        return PhoenixTask { raw: self.exec.submit(task) };
+    }
+
+    // Graceful: lets every already-submitted task finish, refuses new ones. The common case --
+    // pairs with `join_all_and_shutdown`'s own contract, and with the plain "you must call this
+    // or the process never exits" rule every real `FixedThreadPool` puts on its caller.
+    fn shutdown(&self) {
+        self.exec.shutdown();
+    }
+
+    // Forceful: interrupts every currently-running task and discards every queued-but-not-yet-
+    // started one, returning THEM (as a `PhoenixTaskList` -- see this file's own header on the
+    // real `java.util.List` descriptor gap that binding fixed) rather than silently dropping
+    // them, mirroring `ExecutorService.shutdownNow()`'s own real return value. A real,
+    // previously-missing peer to `shutdown()`: the only way to reach this behavior used to be
+    // `rebirth`, which ALSO hands back a brand-new pool whether the caller wanted one or not --
+    // this is the same forceful stop on its own, without that side effect.
+    fn shutdown_now(&self) -> PhoenixTaskList {
+        return self.exec.shutdownNow();
+    }
+
+    // The "rebirth" a pool needs after something in it threw: forcefully stops whatever's left
+    // (via `shutdown_now`, above -- its own returned, discarded task list is the real, accepted
+    // cost of NOT threading it back out through `rebirth`'s own `Unit` return, since a caller
+    // that actually needs that list should call `shutdown_now` directly instead) and replaces
+    // `self.exec` with a fresh pool in place, so the caller doesn't have to reconstruct the whole
+    // `PhoenixPool` value itself.
+    fn rebirth(&mut self, threads: Int) {
+        self.shutdown_now();
+        self.exec = PhoenixExecutors::newFixedThreadPool(threads);
+    }
+
+    // `tasks` were already submitted (via separate `spawn(...)` calls, before this is ever
+    // called) -- they're running concurrently on the pool regardless of what this fn does. The
+    // `while` loop below only serializes COLLECTING each result, in order, not the work itself:
+    // by the time `tasks.get(1).join()` runs, task 1 may already be long done, or task 0 may
+    // still be running on another thread -- either way, every task got its own real chance to
+    // run in parallel with every other one before any of this loop's own joins happen.
+    fn join_all_and_shutdown(&self, tasks: &Vec<PhoenixTask>) {
+        var i = 0;
+        while i < tasks.length() {
+            tasks.get(i).join();
+            i = i + 1;
+        }
+        self.shutdown();
+    }
+
+    // Real, INTENTIONAL design, not an oversight: `dep.join()` blocks the CALLING thread until
+    // `dep` finishes, and only THEN is `task` submitted -- `task` is not queued early or
+    // dispatched the instant `dep` completes the way a real async continuation (`spawn_chain`/
+    // `PhoenixChain::then`, below) would. Traded off deliberately against the other simple way to
+    // build this (blocking a POOL WORKER thread on `dep` instead): chaining many `spawn_after`
+    // calls back to back can't starve a small pool this way (every worker parked waiting on a
+    // task queued behind it, none of them ever getting a turn) -- but the caller also can't "fire
+    // a whole chain and walk away," since each link blocks until its own dependency is ready
+    // before the NEXT one is even submitted. Use `spawn_chain`/`.then(...)` instead when that
+    // matters.
+    fn spawn_after(&self, dep: &PhoenixTask, task: &dyn PhoenixCallable) -> PhoenixTask {
+        dep.join();
+        return self.spawn(task);
+    }
+
+    // The `deps: &Vec<PhoenixTask>` sibling of `spawn_after` -- same blocking-the-caller
+    // trade-off, just waiting on every dependency (via `join_all`) instead of one.
+    fn spawn_after_all(&self, deps: &Vec<PhoenixTask>, task: &dyn PhoenixCallable) -> PhoenixTask {
+        join_all(deps);
+        return self.spawn(task);
+    }
+
+    fn spawn_chain(&self, task: &dyn PhoenixSupplier) -> PhoenixChain {
+        return PhoenixChain { raw: PhoenixCompletableFuture::supplyAsync(task, self.exec as PhoenixExecutor), exec: self.exec };
+    }
+}
+
+struct PhoenixTask {
+    raw: PhoenixFuture,
+}
+
+impl PhoenixTask {
+    fn join(&self) -> PhoenixObject {
+        try {
+            return self.raw.get();
+        } catch (e: PhoenixExecutionException) {
+            throw e.getCause();
+        }
+    }
+
+    fn cancel(&self) -> Bool {
+        return self.raw.cancel(true);
+    }
+
+    fn is_cancelled(&self) -> Bool {
+        return self.raw.isCancelled();
+    }
+
+    fn is_done(&self) -> Bool {
+        return self.raw.isDone();
+    }
+}
+
+struct PhoenixChain {
+    raw: PhoenixCompletableFuture,
+    exec: PhoenixExecutorService,
+}
+
+impl PhoenixChain {
+    fn then(&self, next: &dyn PhoenixFunction) -> PhoenixChain {
+        return PhoenixChain { raw: self.raw.thenApplyAsync(next, self.exec as PhoenixExecutor), exec: self.exec };
+    }
+
+    fn join(&self) -> PhoenixObject {
+        try {
+            return self.raw.get();
+        } catch (e: PhoenixExecutionException) {
+            throw e.getCause();
+        }
+    }
+
+    fn cancel(&self) -> Bool {
+        return self.raw.cancel(true);
+    }
+
+    fn is_cancelled(&self) -> Bool {
+        return self.raw.isCancelled();
+    }
+
+    fn is_done(&self) -> Bool {
+        return self.raw.isDone();
+    }
+}
+
+// `tasks` empty -> a real empty `Vec<PhoenixObject>`, not `tasks.get(0)` exploding (or, worse,
+// silently returning a stale leftover value -- see this fn's own real, previously-disclosed
+// requirement that `tasks` be non-empty, now actually enforced instead of just asked for). Built
+// the same way this whole compiler's own internal `empty_*_vec` helpers build one: seed a
+// length-1 array (here, `null` -- `PhoenixObject` is a real reference type, so a `null` slot
+// costs nothing and is never read back), then report the real length as `0` directly via the
+// struct literal rather than `vec_of`, which always reports a length of (at least) 1.
+fn join_all(tasks: &Vec<PhoenixTask>) -> Vec<PhoenixObject> {
+    if tasks.length() == 0 {
+        return Vec { data: [null as PhoenixObject; 1], len: 0 };
+    }
+    var results = vec_of(tasks.get(0).join());
+    var i = 1;
+    while i < tasks.length() {
+        results.push(tasks.get(i).join());
+        i = i + 1;
+    }
+    return results;
+}

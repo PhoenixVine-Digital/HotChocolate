@@ -1,11 +1,17 @@
 # Documentation tooling ideas
 
-Split out of `IDEAS.md` — these all build directly on the structured
-`///` doc-comment feature that already shipped (see `IDEAS.md`'s own
-"Structured `///` doc comments" entry, and the README) rather than
-being a separate, unrelated wishlist. Kept here on its own because it's
-a coherent theme worth reading as a group: what `hc doc` could become
-next, roughly in the order it's worth building.
+**Status note: the prerequisites are done — nothing in this file itself
+has been built yet.** As of 2026-09-03, `selfhost/` has both real
+structured `///` doc comments (attachment, `@param`/`@returns`/
+`@example`/`@warning`/`@see`/`@deprecated` parsed into real sections,
+`@see` resolved against the live symbol table as a real compile error
+on a dead link) AND a real `hc doc <path> [outFile]` Markdown renderer
+(`SelfhostCLI doc`, default `api.md`) — see README's own "Structured
+`///` doc comments" section for both. Every entry below is now
+buildable on top of that renderer; none of them have actually been
+started. Kept here on its own because it's still a coherent theme worth
+reading as a group: what `hc doc` could become next, roughly in the
+order it'd be worth building.
 
 Same rules as `IDEAS.md`: enough context that picking one up later
 doesn't need re-deriving the reasoning from scratch. Move an entry into
@@ -148,7 +154,7 @@ deliberate phase-2 material ("no compiled/verified `@example` blocks"),
 and that's still the right call for v1 -- but it's worth re-scoping
 because it's cheaper than "build a test runner" sounds: `hc run` already
 compiles a program to a real classfile and executes it in a subprocess
-(`Main.kt`'s existing pipeline). A doctest is just that same pipeline
+(`selfhost/Driver.hotc`'s `run_cli` today). A doctest is just that same pipeline
 pointed at synthetic input -- take a fenced `` ```hc ``` `` block out of
 an `@example` tag, wrap it in a throwaway `fn main() { ... }`, run it
 through the exact same `compile`+launch path `hc run` already has, and
