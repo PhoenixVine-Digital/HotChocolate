@@ -9,12 +9,51 @@ import org.gradle.api.tasks.JavaExec
 import org.gradle.language.jvm.tasks.ProcessResources
 import java.io.File
 
-// JitPack's coordinates for this repo's own root module (the compiler itself -- `hc.MainKt`
-// lives there, not in this plugin module). See the README's "Published on JitPack" section for
-// how a tag turns into a resolvable version here.
+// JitPack's coordinates for this repo's own root module (the compiler itself -- `SelfhostCLI`
+// lives there, not in this plugin module). See ARCHITECTURE.md's own "Published on JitPack"
+// section for how a tag turns into a resolvable version here.
 private const val COMPILER_GROUP = "com.github.P-H-O-E-N-I-X-PackForge"
 private const val COMPILER_ARTIFACT = "HotChocolate"
 private const val JITPACK_URL = "https://jitpack.io"
+
+// **Fixed 2026-09-10 -- a real, previously-undiscovered break.** This whole file used to invoke
+// `hc.MainKt` with `args = listOf("build", path, outputDir)` -- the OLD, hand-written Kotlin
+// compiler's own entry point and CLI shape. The compiler has since fully migrated to a
+// self-hosted one (`SelfhostCLI`, written in Hot Chocolate itself -- see ARCHITECTURE.md's own
+// "Status" section), and `hc.MainKt` no longer exists in the repo at all -- any tag built from
+// current/recent HEAD has NO such class, so every `hcCompile*` task would fail immediately with
+// `ClassNotFoundException` the instant it ran. Found and fixed only once this plugin was
+// actually exercised end-to-end again for the first time since the migration (scaffolding a real
+// consuming project, Marshmallow) -- never caught by anything in THIS repo's own test suite,
+// since nothing here builds a real project through the published plugin.
+//
+// Three real, disclosed consequences of the fix, not just a class-name swap:
+// 1. **`SelfhostCLI`'s own CLI has no `"build"` keyword at all** (`selfhost/Driver.hotc`'s own
+//    `run_cli`) -- its real contract is positional: `[--target N] [--explain-schedule] [run]
+//    <path> [outPath]`; the ABSENCE of `"run"` is what "compile only" already means, no separate
+//    keyword needed. Sending literal `"build"` as the first arg under the OLD code would have
+//    made `SelfhostCLI` try to compile a source file literally named `build`.
+// 2. **`SelfhostCLI` writes every class relative to its own PROCESS WORKING DIRECTORY**, not to
+//    an argument -- only the single ENTRY class respects an explicit `outPath` (`compile_program`'s
+//    own `out_path` parameter); every struct/enum/generic-instantiation/lambda class it also
+//    emits (`gen_struct`/`gen_enum`/`gen_interface`/`gen_lambda`) writes to a bare, cwd-relative
+//    filename unconditionally. There is no "pass an output directory" argument to pass at all --
+//    the ONLY way to control where compiled classes land is the process's own working directory,
+//    which is why every `hcCompile*` task below now sets `workingDir` explicitly instead of
+//    passing `outputDir` as a positional arg (which used to silently do nothing beyond naming
+//    where the SINGLE entry class landed, mismatched against every other file the compile
+//    produced).
+// 3. **`--classpath` is not a recognized flag on the current CLI at all** (confirmed: `grep
+//    "--classpath" selfhost/Driver.hotc` returns nothing) -- it used to back real classpath-based
+//    `extern class`/`extern interface` SIGNATURE VERIFICATION (`Checker.hotc`'s own `verify_
+//    extern_signature`, catching a wrong declared param/return type as a compile error instead of
+//    a runtime `NoSuchMethodError`), proven to work via the compiler's own internal `--classpath`
+//    self-test (`run_classpath_verify_probe` in `Driver.hotc`) -- but that internal probe is
+//    never wired to `run_cli`'s own real argv parsing for an ORDINARY compile. Removed here
+//    rather than left in place doing nothing: a consuming project's `extern` declarations
+//    silently degrade to "trust the declaration, no verification" until `run_cli` grows a real
+//    `--classpath` flag wired to `verify_extern_signature` -- a real, disclosed, NOT-yet-fixed
+//    compiler-side gap, tracked separately from this plugin fix.
 
 // `hotChocolate { compilerHome = file(...); source(file("hc/foo.hc")); source(file("hc/bar.hc")) }`
 // -- a real Gradle DSL extension, not a description of one. Replaces the hand-copied
@@ -25,7 +64,7 @@ private const val JITPACK_URL = "https://jitpack.io"
 // per project.
 open class HotChocolateExtension(private val project: Project) {
     // Root of the Hot Chocolate compiler's installed distribution (contains `lib/*.jar` with
-    // `hc.MainKt` as the application's main class) -- e.g. `./gradlew installDist` run against a
+    // `SelfhostCLI` as the application's main class) -- e.g. `./gradlew installDist` run against a
     // sibling HotChocolate checkout. The local-dev escape hatch: set this when you're actually
     // working on the compiler itself and need a change to show up without waiting on a published
     // tag. Most consuming projects should use `version` (below) instead -- if both are set,
@@ -64,7 +103,7 @@ open class HotChocolateExtension(private val project: Project) {
 
     // `sourceDir(file("src/main/hc"))` -- compiles every `.hc` file directly inside the
     // directory (non-recursive) as ONE shared, `extern`-free-between-them compile, the Gradle-
-    // plugin side of the CLI's own `hc build <dir> <outDir>` (see the README's "Multi-file
+    // plugin side of the CLI's own directory-mode compile (see ARCHITECTURE.md's "Multi-file
     // projects"). Unlike `source(file)`, declaration order stops mattering entirely between
     // files in the same `sourceDir` -- every top-level name in the directory shares one flat
     // namespace, so a struct in one file references a struct in another directly, no
@@ -87,9 +126,10 @@ class HotChocolatePlugin : Plugin<Project> {
             if (home == null && ver == null) {
                 throw GradleException(
                     "hotChocolate { } needs either 'version = \"v0.1.5\"' (resolves the " +
-                            "published compiler from JitPack -- see HotChocolate's README, " +
-                            "'Published on JitPack') or 'compilerHome = file(...)' (a local " +
-                            "./gradlew installDist checkout, for working on the compiler itself)"
+                            "published compiler from JitPack -- see HotChocolate's " +
+                            "ARCHITECTURE.md, 'Published on JitPack') or 'compilerHome = " +
+                            "file(...)' (a local ./gradlew installDist checkout, for working " +
+                            "on the compiler itself)"
                 )
             }
             // `compilerHome` (a local installDist) always wins when both are set -- an explicit
@@ -136,8 +176,13 @@ class HotChocolatePlugin : Plugin<Project> {
                     t.inputs.file(srcFile)
                     t.outputs.dir(ext.outputDir)
                     t.classpath = compilerClasspath
-                    t.mainClass.set("hc.MainKt")
-                    t.args = listOf("build", srcFile.path, ext.outputDir.path)
+                    t.mainClass.set("SelfhostCLI")
+                    // `workingDir` (not an "output directory" argument -- there isn't one, see
+                    // this file's own header) is what makes every class this compile emits land
+                    // under `ext.outputDir`; the source path has to be ABSOLUTE since the process
+                    // no longer runs from the project's own directory.
+                    t.args = listOf(srcFile.absolutePath)
+                    t.workingDir = ext.outputDir
                     t.doFirst { ext.outputDir.mkdirs() }
                 }
                 previousTaskName = taskName
@@ -145,9 +190,9 @@ class HotChocolatePlugin : Plugin<Project> {
             }
             // Directory-mode sources compile after every individual `source(file)` (if any --
             // most projects will use only one form or the other, but nothing stops mixing them):
-            // one task per directory, each a single `hc build <dir> <outDir>` invocation covering
-            // every `.hc` file inside at once, chained after whatever came before the same way
-            // individual sources already are.
+            // one task per directory, each a single `SelfhostCLI <dir>` invocation (this file's
+            // own `workingDir` set to `ext.outputDir`) covering every `.hc` file inside at once,
+            // chained after whatever came before the same way individual sources already are.
             val dirCompileTaskNames = ext.sourceDirs.map { src ->
                 val dir = project.file(src)
                 val taskName = "hcCompile" + dir.name.replaceFirstChar { it.uppercase() }
@@ -160,8 +205,9 @@ class HotChocolatePlugin : Plugin<Project> {
                     t.inputs.dir(dir)
                     t.outputs.dir(ext.outputDir)
                     t.classpath = compilerClasspath
-                    t.mainClass.set("hc.MainKt")
-                    t.args = listOf("build", dir.path, ext.outputDir.path)
+                    t.mainClass.set("SelfhostCLI")
+                    t.args = listOf(dir.absolutePath)
+                    t.workingDir = ext.outputDir
                     t.doFirst { ext.outputDir.mkdirs() }
                 }
                 previousTaskName = taskName
@@ -173,41 +219,18 @@ class HotChocolatePlugin : Plugin<Project> {
                 project.tasks.named("compileJava") { it.dependsOn(lastCompileTask) }
                 val javaExt = project.extensions.getByType(JavaPluginExtension::class.java)
                 val mainSourceSet = javaExt.sourceSets.getByName("main")
-                // Captured before the `compileClasspath` reassignment below appends `ext
-                // .outputDir` itself -- passing the compiler its own not-yet-written output
-                // directory back as a `--classpath` entry would be circular and pointless (there's
-                // nothing in it to reflect against yet, and it invites a stale/self-referential
-                // read on a rebuild).
-                val realCompileClasspath = mainSourceSet.compileClasspath
-                for (taskName in fileCompileTaskNames + dirCompileTaskNames) {
-                    project.tasks.named(taskName, JavaExec::class.java) { t ->
-                        // `--classpath` is what backs the compiler's `verifyExternSignatures`
-                        // (compile-time checking of a hand-written `extern class`/`extern
-                        // interface` signature against the real method it names -- catches a
-                        // wrong return type or param type as a compile error instead of a runtime
-                        // `NoSuchMethodError`) and lazy/`use { }` extern reflection generally --
-                        // without this, every extern declaration in the project silently degrades
-                        // to "trust the declaration," exactly as it did before this classpath was
-                        // ever wired through. Appended in `doFirst` rather than set directly above
-                        // on `t.args` at task-registration time, so resolving this Configuration
-                        // into a real path list happens at task EXECUTION time -- once every other
-                        // project dependency is fully configured -- not eagerly during Gradle's
-                        // configuration phase, which risks resolving it before it's actually ready.
-                        //
-                        // Known limitation, not fixed here: a large Forge project's full
-                        // `compileClasspath` can be a lot of jar paths, and this is passed as a
-                        // literal OS process argument (`JavaExec`, not a manifest-based
-                        // classpath jar) -- workable in practice for a real Forge mod's dependency
-                        // count, but a project with an unusually large dependency graph could
-                        // theoretically approach Windows' ~32K-character command-line limit. Worth
-                        // revisiting (a `Class-Path`-manifest wrapper jar, the standard Java-world
-                        // fix for this) only if it actually bites a real project.
-                        t.doFirst {
-                            val classpathString = realCompileClasspath.filter { it.exists() }.asPath
-                            t.args = (t.args ?: emptyList()) + "--classpath" + classpathString
-                        }
-                    }
-                }
+                // A `--classpath`-style argument used to be appended here, backing the compiler's
+                // own `verifyExternSignatures` (compile-time checking of a hand-written `extern
+                // class`/`extern interface` signature against the real method it names, catching
+                // a wrong return/param type as a compile error instead of a runtime `NoSuchMethod
+                // Error`) -- removed, not just left broken, because the CURRENT self-hosted CLI
+                // doesn't parse a `--classpath` flag at all (see this file's own header, point 3)
+                // -- it would have been silently ignored either way, and leaving it in place would
+                // have implied a working feature that isn't. Real, disclosed consequence: every
+                // `extern` declaration in a project using this plugin degrades to "trust the
+                // declaration, no verification" until `run_cli` (`selfhost/Driver.hotc`) grows a
+                // real `--classpath` flag wired to `Checker.hotc`'s own `verify_extern_signature`
+                // -- tracked as a separate, NOT-yet-fixed compiler-side gap.
                 mainSourceSet.compileClasspath = mainSourceSet.compileClasspath
                     .plus(project.files(ext.outputDir).builtBy(lastCompileTask))
                 project.tasks.named("processResources", ProcessResources::class.java) { t ->
