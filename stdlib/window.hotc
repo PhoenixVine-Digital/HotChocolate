@@ -108,9 +108,12 @@ extern class GL11 = "org.lwjgl.opengl.GL11" {
     static fn glViewport(x: Int, y: Int, width: Int, height: Int) -> Unit;
 }
 
-// A thin, real convenience wrapper over the raw GLFW/GL calls above -- `Window::open(...)`
+// A thin, real convenience wrapper over the raw GLFW/GL calls above -- `Window::new(...)`
 // through `.close()` covers the ordinary create/loop/destroy lifecycle in a few calls instead of
-// the full dozen-call GLFW sequence every caller would otherwise repeat by hand.
+// the full dozen-call GLFW sequence every caller would otherwise repeat by hand. Named `new`, not
+// `open` -- `open` is a real reserved keyword in this language (`pub open module ...`
+// visibility), found the hard way: `Window::open(...)` failed with a real parse error
+// ("unexpected token 'open'") since `open` never lexes as an `IDENT` after `::` at all.
 struct Window {
     handle: Long,
 }
@@ -120,7 +123,7 @@ impl Window {
     // Minecraft-mod-style consumer targeting a different GL version needs the raw `GLFW::` calls
     // directly for now, same "convenience wrapper, not the only way in" precedent `PhoenixPool`
     // itself sets over raw `java.util.concurrent`.
-    static fn open(width: Int, height: Int, title: String) -> Window {
+    static fn new(width: Int, height: Int, title: String) -> Window {
         GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MAJOR, 3);
         GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MINOR, 3);
         GLFW::glfwWindowHint(GLFW::GLFW_OPENGL_PROFILE, GLFW::GLFW_OPENGL_CORE_PROFILE);
