@@ -1166,6 +1166,62 @@ SelfhostCLI --target 21 run examples/phoenix_flight_chain_async.hc
   (non-digits) crashes with Java's own `NumberFormatException` rather
   than a friendlier compiler error.
 
+### `--classpath`: real extern signature verification, not just trust
+
+**Fixed 2026-09-11** — `Checker.hotc`'s own `verify_extern_signature`
+had existed and genuinely worked (proven by the compiler's own
+internal self-test, `run_classpath_verify_probe`) since real classpath
+reflection was first ported into this subset, but was never reachable
+from an ordinary compile — every `extern class`/`extern interface` in
+a real project silently degraded to "trust the declaration, no
+verification," the exact gap that lets a wrong declared param/return
+type compile clean and fail only at RUNTIME with `NoSuchMethodError`.
+Found and fixed scaffolding Marshmallow's own extern-heavy next phase
+(windowing/graphics bindings) before it needed it.
+
+```
+SelfhostCLI --classpath build/libs/mymod.jar;libs/forge.jar run src/main/hc
+```
+
+- **A third, independently optional leading flag** — stacks with
+  `--target`/`--explain-schedule` the same way (shifting `off` further
+  before the source path). Paths are joined with the real platform
+  separator (`java.io.File.pathSeparator` — `;`/`:`, read via
+  reflection rather than hardcoded), matching exactly what Gradle's own
+  `FileCollection.getAsPath()` produces — `hc-gradle-plugin` prepends
+  it automatically from the consuming project's own real
+  `compileClasspath`, no manual wiring needed on a real project's side.
+- **An EMPTY classpath (the default, no flag given) still verifies
+  anything findable via the plain context classloader for free** —
+  every JDK-only `extern` (this compiler's own stdlib included —
+  `Math`/`ArrayList`/`Executors`/...) gets checked with zero extra
+  ceremony; a mod/engine-specific `extern` (Forge, LWJGL, ...) needs a
+  real `--classpath` to be checked at all. `class_exists_reflect`
+  itself is what silently skips a binary name it can't find on
+  whatever classpath was actually given, so calling this
+  unconditionally for every declared extern method is always safe —
+  never a false positive for a binding genuinely not on the classpath.
+- **Real, previously-hit ordering bug, found running this against the
+  compiler's OWN source**: verifying each extern's methods INLINE,
+  within the same loop that registers it, means a forward reference to
+  another extern declared LATER in the same file resolves incorrectly
+  — `JClassRefX::getMethods` declares `-> [JMethodRefX]`, and
+  `JMethodRefX` (declared after `JClassRefX`) wasn't registered yet at
+  verification time, so the array-element lookup fell through to `"?"`
+  and a completely correct declaration read as a false-positive error.
+  Fixed by splitting registration and verification into two separate
+  passes over the full `externs` list — register every one first, verify
+  only after all of them exist. Same "a checker field populated as a
+  side effect isn't ready until the whole pass finishes" class of bug
+  this project has hit before (see `ECS_IDEAS.md`'s own bug #2).
+- Verified end to end: a real `Probe.class` on a real `--classpath`,
+  one `extern` declaration matching its real signature (compiles
+  clean) and one deliberately wrong (`String` where the real method
+  takes `Int`) rejected with a real compile-time error naming the
+  mismatch — plus the full 50-file example regression sweep passing
+  unchanged, confirming the new unconditional verification introduces
+  no false positives against every existing example.
+
 ### Phoenix Flight: a background task pool
 
 **Fixed 2026-09-08** — see "Status" near the top of this doc, and

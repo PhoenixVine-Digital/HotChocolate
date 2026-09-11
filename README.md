@@ -80,7 +80,9 @@ working today, not aspirational:
   plus a seamless `extern class` wrapper over `java.lang.Math` itself,
   so the full JDK scalar-math API and real game/3D math both come from
   the same `use` line.
-- **Full JDK/Java interop** (`extern class`/`extern interface`), sealed
+- **Full JDK/Java interop** (`extern class`/`extern interface`,
+  compile-time `--classpath`-verified signatures — a wrong param/return
+  type is a compile error, not a runtime `NoSuchMethodError`), sealed
   interfaces + exhaustive `match`, a real `Result<T, E>` with `?`,
   string interpolation, nullable types, and more.
 
