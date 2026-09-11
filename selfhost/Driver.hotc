@@ -987,6 +987,11 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // mean anything, and the constants/alias it reuses are only ever declared over in
         // `window.hotc` itself.
         out = add_stdlib_topic_and_deps("window", out, target);
+        // `Shader::set_mat4`'s own `m: &Mat4` param (added 2026-09-11, alongside uniform
+        // support) references `math.hotc`'s own `Mat4` type directly -- same "declares a real
+        // type from another topic, needs that topic's own program merged in" reasoning every
+        // other cross-topic dependency here already follows.
+        out = add_stdlib_topic_and_deps("math", out, target);
     } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" {
         throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics");
     }

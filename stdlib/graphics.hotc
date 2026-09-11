@@ -92,6 +92,10 @@ extern class GL20 = "org.lwjgl.opengl.GL20" {
     static fn glUseProgram(program: Int) -> Unit;
     static fn glVertexAttribPointer(index: Int, size: Int, type: Int, normalized: Bool, stride: Int, pointer: Long) -> Unit;
     static fn glEnableVertexAttribArray(index: Int) -> Unit;
+    // Real declared param type for `name` is `CharSequence` too -- same `JCharSequenceWin` reuse
+    // as `glShaderSource`, right above.
+    static fn glGetUniformLocation(program: Int, name: JCharSequenceWin) -> Int;
+    static fn glUniformMatrix4fv(location: Int, transpose: Bool, value: JFloatBufferGfx) -> Unit;
 }
 
 extern class GL30 = "org.lwjgl.opengl.GL30" {
@@ -143,6 +147,27 @@ impl Shader {
 
     fn use_program(&self) {
         GL20::glUseProgram(self.program);
+    }
+
+    // Uploads `m` to the uniform named `name` (`uniform mat4 <name>;` in the vertex shader --
+    // the standard place a model/view/projection matrix lives). `math.hotc`'s own `Mat4` is
+    // row-major (see that file's own header); `glUniformMatrix4fv`'s `transpose` flag is exactly
+    // the real GL mechanism for feeding row-major data without manually re-ordering it into
+    // column-major first -- passing `true` here, and the SAME `m00, m01, ..., m33` field order
+    // `Mat4` already stores, is what makes this correct with zero extra math. Real, disclosed
+    // cost: allocates and uploads a fresh 16-float buffer on every call -- fine for "call once
+    // per draw," not yet optimized for a hot path calling this hundreds of times a frame.
+    fn set_mat4(&self, name: String, m: &Mat4) {
+        let loc = GL20::glGetUniformLocation(self.program, name as JCharSequenceWin);
+        var buf = BufferUtilsGfx::createFloatBuffer(16);
+        buf = buf.put([
+            m.m00, m.m01, m.m02, m.m03,
+            m.m10, m.m11, m.m12, m.m13,
+            m.m20, m.m21, m.m22, m.m23,
+            m.m30, m.m31, m.m32, m.m33,
+        ]);
+        buf = buf.flip();
+        GL20::glUniformMatrix4fv(loc, true, buf);
     }
 }
 
