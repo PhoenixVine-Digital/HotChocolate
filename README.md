@@ -86,12 +86,13 @@ working today, not aspirational:
   consuming project supplies on its own classpath. Verified with a
   real window on real hardware.
 - **`graphics`** (`use graphics;`) — real geometry on top of `window`:
-  `Shader::compile`/`Mesh::from_floats` for real GLSL shaders and VBO/VAO
-  uploads, `Shader::set_mat4` for uploading a `math.hotc` `Mat4` as a
-  uniform (real per-draw-call transforms — model/view/projection). Vulkan
-  is the real target before Marshmallow ships; see GRAPHICS_IDEAS.md.
-  Verified with a real spinning, perspective-projected triangle on real
-  hardware.
+  `Shader::compile`/`Mesh::from_floats`/`Mesh::from_indexed` (index
+  buffers) for real GLSL shaders and VBO/VAO/EBO uploads, `Shader::
+  set_mat4`/`set_int` for uniforms (real per-draw-call transforms and
+  sampler bindings), `Texture::load` for real GL textures from any
+  `javax.imageio`-supported image. Vulkan is the real target before
+  Marshmallow ships; see GRAPHICS_IDEAS.md. Verified with a real
+  textured, spinning cube and perspective camera on real hardware.
 - **Full JDK/Java interop** (`extern class`/`extern interface`,
   compile-time `--classpath`-verified signatures — a wrong param/return
   type is a compile error, not a runtime `NoSuchMethodError`), sealed

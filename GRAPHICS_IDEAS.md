@@ -1,26 +1,42 @@
 # Graphics/rendering — design doc
 
-**Status, 2026-09-11**: windowing, first-geometry, AND uniform/depth-testing
-milestones all landed. `stdlib/window.hotc` (`use window;`) gives real GLFW
-window creation/lifecycle, keyboard input, and minimal OpenGL (`GL11`)
-clearing/presenting, via LWJGL — depth testing is now always on, and
-`Window::clear` clears both the color and depth buffers. `stdlib/graphics.hotc`
-(`use graphics;`, depends on `window` AND `math`) adds real geometry:
-`Shader::compile(vertex_src, fragment_src)` compiles and links a real GLSL
-program; `Mesh::from_floats(vertices, vertex_count)` uploads a real VBO/VAO;
-`Shader::set_mat4(name, m)` uploads a `math.hotc` `Mat4` to a named uniform
-(`glGetUniformLocation`/`glUniformMatrix4fv`), so per-draw-call transforms
-(model/view/projection) are finally real instead of everything being stuck
-exactly where its vertices say it is. All verified with REAL rendering on
-real hardware (not just a compile check) through Marshmallow: a real
-spinning triangle with a real perspective camera (`Mat4::perspective`/
-`look_at`/`rotation_y`, composed and uploaded once per frame). See
-ARCHITECTURE.md's own "Standard library modules" section for the full
-technical writeup of what shipped (the `JCharSequenceWin` alias + `as` cast
-`glfwCreateWindow`'s/`glShaderSource`'s title/source params need to pass
-real `--classpath` signature verification, the `Window::new`-not-`open`
-naming trap, the `&self`-or-implicitly-static extern-method trap that hit
-`JFloatBufferGfx::put`/`::flip`, etc.).
+**Status, 2026-09-11**: windowing, first-geometry, uniform/depth-testing,
+index buffers, AND textures all landed. `stdlib/window.hotc` (`use window;`)
+gives real GLFW window creation/lifecycle, keyboard input, and minimal
+OpenGL (`GL11`) clearing/presenting, via LWJGL — depth testing is now
+always on, and `Window::clear` clears both the color and depth buffers.
+`stdlib/graphics.hotc` (`use graphics;`, depends on `window` AND `math`)
+adds real geometry: `Shader::compile(vertex_src, fragment_src)` compiles
+and links a real GLSL program; `Mesh::from_floats(vertices, vertex_count)`
+uploads a real VBO/VAO; `Mesh::from_indexed(vertices, indices)` adds a real
+EBO (`glDrawElements`, shared vertices across faces -- a cube's 8 corners,
+not 36 duplicated ones); `Shader::set_mat4(name, m)` uploads a `math.hotc`
+`Mat4` to a named uniform, so per-draw-call transforms (model/view/
+projection) are real instead of everything being stuck exactly where its
+vertices say it is; `Texture::load(path)` loads any `javax.imageio`-
+supported image and uploads it as a real GL texture (via the
+`GL_BGRA`/`GL_UNSIGNED_INT_8_8_8_8_REV` trick -- a Java `TYPE_INT_ARGB`
+pixel maps directly onto that GL format/type pairing on a little-endian
+machine, no per-channel byte unpacking needed, which HC has no bitshift
+operator for anyway); `Mesh::from_indexed_textured` adds a second fixed
+vertex layout (`x, y, z, u, v`, no per-vertex color) for textured meshes.
+All verified with REAL rendering on real hardware (not just a compile
+check) through Marshmallow: a real textured, spinning cube (24 unique
+vertices, proper per-face UV unwrap) with a real perspective camera, on
+top of a full-screen procedural nebula/starfield background shader and a
+mouse-look + WASD free camera. See ARCHITECTURE.md's own "Standard
+library modules" section for the full technical writeup of what shipped
+(the `JCharSequenceWin` alias + `as` cast `glfwCreateWindow`'s/
+`glShaderSource`'s title/source params need to pass real `--classpath`
+signature verification, the `Window::new`-not-`open` naming trap, the
+`&self`-or-implicitly-static extern-method trap that hit `JFloatBufferGfx::
+put`/`::flip`, and a real driver quirk found adding textures: a `#version
+150` vertex shader with an explicit `layout(location=...)` on an input
+failed on this machine's driver with "'location' : not supported for this
+version or the enabled extensions" -- bumping to `#version 330 core`
+(where the feature is unconditionally built in, not extension-gated)
+fixed it; the error's output ordering made it look like it belonged to
+whichever shader compiled NEXT, when it was actually always this one).
 
 **The one decision that matters most for everything else in this doc,
 made explicitly, not defaulted into**: **Vulkan is the real target before
@@ -70,13 +86,19 @@ much larger surface area.
   `Shader`/`Mesh` (shader compile/link, VBO/VAO upload, real draw calls),
   fixed vertex layout only (`x, y, z, r, g, b` interleaved).
 - ~~**Uniforms + depth testing**~~ — landed, 2026-09-11: `Shader::set_mat4`
-  (real `glGetUniformLocation`/`glUniformMatrix4fv`, only a `Mat4` uniform
-  for now -- no `Vec3`/`Float`/etc. uniform setters yet, added the moment a
-  real caller needs one), and depth testing always on (`Window::new`/
-  `Window::clear`). Still real, narrower follow-ups from here:
-  textures/samplers, a general vertex-format description (multiple layouts,
-  not just the one fixed shape), index buffers (EBO -- drawing with
-  `glDrawElements`, not just `glDrawArrays`), and blending state (depth
+  (real `glGetUniformLocation`/`glUniformMatrix4fv`), and depth testing
+  always on (`Window::new`/`Window::clear`).
+- ~~**Index buffers (EBO)**~~ — landed, 2026-09-11: `Mesh::from_indexed`
+  (real `glDrawElements`, shared vertices instead of duplicated ones).
+- ~~**Textures/samplers**~~ — landed, 2026-09-11: `Texture::load` (any
+  `javax.imageio`-supported format), `Shader::set_int` (a plain `Int`
+  uniform, also how a `sampler2D` gets told which texture unit to read
+  from), `Mesh::from_indexed_textured` (second fixed layout, `x, y, z,
+  u, v`). Still real, narrower follow-ups from here: a `Vec3`/`Float`
+  uniform setter beyond `set_mat4`/`set_int` (added the moment a real
+  caller needs one), multi-texture support (`Texture::bind` is hardcoded
+  to unit 0 only), a general vertex-format description (multiple layouts,
+  not just the two fixed shapes that exist now), and blending state (depth
   testing itself is done; blending -- transparency -- is not).
 - **The Vulkan migration itself** — not started. Real engineering, likely
   bigger than the OpenGL layer it replaces (see "Why OpenGL first," above,

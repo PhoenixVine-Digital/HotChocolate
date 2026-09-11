@@ -1116,18 +1116,49 @@ fn main() {
   links a real GLSL program (printing the real driver info log on
   failure); `Mesh::from_floats(vertices, vertex_count)` uploads a real
   VBO/VAO with a fixed `(x, y, z, r, g, b)` interleaved layout;
-  `Shader::set_mat4(name, m)` uploads a `math.hotc` `Mat4` to a named
-  uniform (`glGetUniformLocation`/`glUniformMatrix4fv`, `transpose=true`
-  to feed `Mat4`'s own row-major storage directly with no re-ordering) --
-  the piece that makes a per-draw-call model/view/projection transform
-  real instead of every mesh being stuck exactly where its vertices say
-  it is. Verified end to end with REAL rendering on real hardware via
-  Marshmallow: a real spinning triangle with a real perspective camera
-  (`Mat4::perspective`/`look_at`/`rotation_y`, composed once per frame and
-  uploaded via `set_mat4`). See GRAPHICS_IDEAS.md for the full design
-  (including why OpenGL now, Vulkan before ship) and its own "Explicitly
-  deferred" list for what's still missing (textures, index buffers,
-  blending, etc.). Naming a topic with dependencies (`use registry;`)
+  `Mesh::from_indexed(vertices, indices)` adds a real EBO
+  (`glDrawElements` -- shared vertices across faces, e.g. a cube's real 8
+  corners instead of 36 duplicated ones; the VAO remembers whatever EBO
+  was bound while it was bound, so `draw()` never needs to re-bind it
+  separately); `Shader::set_mat4(name, m)` uploads a `math.hotc` `Mat4` to
+  a named uniform (`glGetUniformLocation`/`glUniformMatrix4fv`,
+  `transpose=true` to feed `Mat4`'s own row-major storage directly with no
+  re-ordering) -- the piece that makes a per-draw-call model/view/
+  projection transform real instead of every mesh being stuck exactly
+  where its vertices say it is; `Texture::load(path)` loads any real image
+  file `javax.imageio` supports and uploads it as a real GL texture via
+  the `GL_BGRA`/`GL_UNSIGNED_INT_8_8_8_8_REV` trick (a Java
+  `TYPE_INT_ARGB` pixel, read one at a time via `BufferedImage.getRGB(x,
+  y)` into an `IntBuffer`, matches that exact GL format/type pairing
+  byte-for-byte on a little-endian machine -- no manual per-channel
+  unpacking needed, which HC has no bitshift operator for anyway);
+  `Shader::set_int(name, value)` uploads a plain `Int` uniform, also how a
+  `sampler2D` gets told which texture unit to sample (`Texture::bind` only
+  ever uses unit 0, a real disclosed scope cut -- multi-texture materials
+  need real unit management this doesn't do yet); `Mesh::
+  from_indexed_textured` adds a SECOND fixed vertex layout (`x, y, z, u,
+  v`, no per-vertex color -- the texture supplies color now) alongside
+  `from_floats`/`from_indexed`'s `(x, y, z, r, g, b)` shape. Verified end
+  to end with REAL rendering on real hardware via Marshmallow: a real
+  textured, spinning cube (24 unique vertices -- NOT the 8-shared-corner
+  version, since a real per-face UV unwrap needs each face's own
+  (0,0)-(1,1) mapping, which a shared corner can't have) with a real
+  perspective camera, over a full-screen procedural nebula/starfield
+  background shader and a mouse-look + WASD free camera. A real driver
+  quirk surfaced adding textures, worth recording: a `#version 150`
+  vertex shader with an explicit `layout(location=...)` on an INPUT
+  failed to compile on this machine's driver ("'location' : not
+  supported for this version or the enabled extensions"), even though
+  that's normally available at 150 via `GL_ARB_explicit_attrib_location`;
+  bumping to `#version 330 core` (where the feature is unconditionally
+  core, no extension needed) fixed it. The failure's own output ordering
+  made it look like it belonged to whichever shader compiled NEXT (a
+  red herring) -- it was always this one, regardless of compile order.
+  See GRAPHICS_IDEAS.md for the full design (including why OpenGL now,
+  Vulkan before ship) and its own "Explicitly deferred" list for what's
+  still missing (a `Vec3`/`Float` uniform setter, multi-texture support,
+  a general vertex-format description, blending). Naming a topic with
+  dependencies (`use registry;`)
   automatically pulls those in too — no need to separately write
   `use vec; use option;` as well, though doing so is harmless (a topic
   named more than once, directly or transitively, is only ever merged
