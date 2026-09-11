@@ -1079,7 +1079,37 @@ fn main() {
   Verified end to end (cross product, matrix identity/translation/
   rotation, quaternion-to-matrix, and `slerp` all cross-checked against
   each other and against hand-computed expected values) via
-  `examples/math_demo.hc`. Naming a topic with dependencies (`use registry;`)
+  `examples/math_demo.hc`. **`window`** (`stdlib/window.hotc`, added
+  2026-09-11 -- real GLFW windowing/input plus minimal OpenGL
+  clearing/presenting, via LWJGL) also has none, but is different in
+  kind from every other topic here: it's the first to bind against a
+  real THIRD-PARTY library, not a JDK class -- nothing in
+  `HotChocolate`'s own repo depends on LWJGL at all (it's a real
+  external Maven dependency the CONSUMING project, e.g. Marshmallow,
+  supplies on its own classpath), so `class_exists_reflect` finds
+  nothing for it with an empty `--classpath` and real `--classpath`
+  signature verification only ever engages once a consuming project's
+  own `compileClasspath` (auto-threaded by the `hc` Gradle plugin)
+  actually includes LWJGL. `glfwCreateWindow`'s own `title` param is
+  bound against its REAL declared type (`java.lang.CharSequence`, not
+  `String`) via a dedicated extern alias + explicit `as` cast at the
+  call site, matching the same "declared type must match the real
+  descriptor" convention Phoenix Flight established (`task.join() as
+  String`) -- this is exactly what makes that verification actually
+  pass instead of flagging a real mismatch the moment it's checked. A
+  thin `Window` struct (`new`/`should_close`/`clear`/`present`/
+  `is_key_down`/`close`) wraps the raw `GLFW::`/`GL11::` calls for the
+  ordinary create/loop/destroy lifecycle -- named `new`, not the more
+  obvious `open`, because `open` is a real reserved keyword in this
+  language (`pub open module ...` visibility) and using it produced a
+  real parse error the instant it was tried. Verified end to end with
+  a REAL window on real hardware (not just a compile check) via
+  Marshmallow: opens, renders a pulsing clear color every frame, closes
+  cleanly via Escape or the window's own close button. Real geometry
+  (shaders/VBOs/draw calls) is deliberately deferred to a separate,
+  not-yet-written `graphics.hotc` follow-up -- this topic is scoped to
+  "can we open a window and present a frame at all," the actual
+  windowing milestone. Naming a topic with dependencies (`use registry;`)
   automatically pulls those in too — no need to separately write
   `use vec; use option;` as well, though doing so is harmless (a topic
   named more than once, directly or transitively, is only ever merged

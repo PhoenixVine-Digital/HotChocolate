@@ -80,6 +80,11 @@ working today, not aspirational:
   plus a seamless `extern class` wrapper over `java.lang.Math` itself,
   so the full JDK scalar-math API and real game/3D math both come from
   the same `use` line.
+- **`window`** (`use window;`) — real windowing (GLFW), input, and
+  minimal OpenGL clearing/presenting, via LWJGL. Not a JDK binding —
+  the first stdlib topic backed by a real third-party library the
+  consuming project supplies on its own classpath. Verified with a
+  real window on real hardware.
 - **Full JDK/Java interop** (`extern class`/`extern interface`,
   compile-time `--classpath`-verified signatures — a wrong param/return
   type is a compile error, not a runtime `NoSuchMethodError`), sealed
