@@ -12,7 +12,19 @@ import java.io.File
 // JitPack's coordinates for this repo's own root module (the compiler itself -- `SelfhostCLI`
 // lives there, not in this plugin module). See ARCHITECTURE.md's own "Published on JitPack"
 // section for how a tag turns into a resolvable version here.
-private const val COMPILER_GROUP = "com.github.P-H-O-E-N-I-X-PackForge"
+//
+// **Fixed 2026-09-10**: the GitHub org this repo lives under renamed from
+// `P-H-O-E-N-I-X-PackForge` to `PhoenixVine-Digital` -- GitHub itself transparently redirects
+// `git clone`/`git push` against the OLD org name to the new one, but JitPack does NOT follow
+// that redirect when resolving a Maven coordinate: `com.github.P-H-O-E-N-I-X-PackForge:
+// HotChocolate:<tag>` simply fails to resolve post-rename, even for a tag that exists and
+// builds fine under the new org name. Found scaffolding Marshmallow (the first real consumer to
+// resolve this plugin from JitPack after the rename) -- every `hcCompile*`/plugin-application
+// step failed with "Plugin ... was not found in any of the following sources" until this
+// constant (and the matching `useModule(...)` mapping every consuming project's own
+// `settings.gradle.kts` needs -- see README.md/ARCHITECTURE.md's own JitPack setup examples,
+// and `hc-intellij-plugin`'s own new-project scaffolding template) were updated to match.
+private const val COMPILER_GROUP = "com.github.PhoenixVine-Digital"
 private const val COMPILER_ARTIFACT = "HotChocolate"
 private const val JITPACK_URL = "https://jitpack.io"
 
@@ -72,7 +84,7 @@ open class HotChocolateExtension(private val project: Project) {
     var compilerHome: File? = null
 
     // `version = "v0.1.5"` -- resolves the compiler as a real, already-published JitPack
-    // dependency (`com.github.P-H-O-E-N-I-X-PackForge:HotChocolate:v0.1.5`, see the README's
+    // dependency (`com.github.PhoenixVine-Digital:HotChocolate:v0.1.5`, see the README's
     // "Published on JitPack") instead of requiring a local `./gradlew installDist` against a
     // sibling checkout. This is the normal path for a consuming project: no local HotChocolate
     // checkout, no manual build step, just a pinned version like any other dependency --

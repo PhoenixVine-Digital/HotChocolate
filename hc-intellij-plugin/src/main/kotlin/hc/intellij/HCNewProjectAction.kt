@@ -62,7 +62,7 @@ internal fun settingsGradleContent(projectName: String): String = """
         resolutionStrategy {
             eachPlugin {
                 if (requested.id.id == "hc") {
-                    useModule("com.github.P-H-O-E-N-I-X-PackForge.HotChocolate:hc-gradle-plugin:${'$'}{requested.version}")
+                    useModule("com.github.PhoenixVine-Digital.HotChocolate:hc-gradle-plugin:${'$'}{requested.version}")
                 }
             }
         }
