@@ -64,6 +64,14 @@ object HCTokenTypes {
         "arena", "interface", "dyn", "enum", "match", "by", "sealed", "extern", "class", "module",
         "pub", "open", "extend", "static", "as", "try", "catch", "throw", "extends", "override",
         "is", "break", "continue", "dev",
+        // **Fixed 2026-09-11** -- `use`/`component`/`system` are real reserved keywords in the
+        // actual compiler (`Lexer.hotc`'s own `kw.register("use", USE)`/`("component",
+        // COMPONENT)`/`("system", SYSTEM)`), but this plugin's own lexer never learned them --
+        // every `use <topic>;` import and every ECS `component`/`system` declaration (both real,
+        // load-bearing language features, not fringe syntax) tokenized as a plain `IDENT`, fell
+        // through `HCPsiParser`'s own top-level dispatch with no matching branch, and got
+        // flagged as a real parse error in the IDE for code the actual compiler accepts cleanly.
+        "use", "component", "system",
     )
 
     val SYMBOLS: Map<String, HCTokenType> = mapOf(

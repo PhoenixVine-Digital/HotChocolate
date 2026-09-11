@@ -122,9 +122,12 @@ object HCPsiParser : PsiParser {
         b.atKw("pub").let { if (it) b.advanceLexer() }
         b.atKw("open").let { if (it) b.advanceLexer() }
         when {
+            b.atKw("use") -> useDecl(b)
             b.atKw("module") -> moduleDecl(b)
             b.atKw("struct") -> structDecl(b)
             b.atKw("arena") -> arenaStructDecl(b)
+            b.atKw("component") -> componentDecl(b)
+            b.atKw("system") -> systemDecl(b)
             b.atKw("fn") -> fnDecl(b)
             b.atKw("static") -> staticDecl(b)
             b.atKw("impl") -> implDecl(b)
@@ -136,6 +139,44 @@ object HCPsiParser : PsiParser {
             b.tokenType == HCTokenTypes.DOC_COMMENT -> b.advanceLexer()
             else -> {} // let the caller's zero-progress guard turn this into one error token
         }
+    }
+
+    // `use vec;` -- a bare topic name, no path/namespace syntax at all (see `Ast.hc`'s own
+    // `Program.uses` header and `Parser.hotc`'s own real `USE` branch, which this mirrors
+    // exactly). Real compiler-recognized topics as of this writing: `vec`/`option`/`result`/
+    // `registry`/`io`/`phoenix`/`phoenix_virtual`/`ecs`/`math` -- not enforced here at the
+    // PARSE level (same "trust it, let a later pass reject an unknown one" leniency this whole
+    // file already uses for other names).
+    private fun useDecl(b: PsiBuilder) = node(b, HCElementTypes.USE_DECL) {
+        expectKw(b, "use")
+        expect(b, HCTokenTypes.IDENT, "a stdlib topic name")
+        expect(b, HCTokenTypes.SEMI, "';'")
+    }
+
+    // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field
+    // syntax reuses `fieldList` directly, same shape a plain `struct`'s own fields already use
+    // (`Parser.hotc`'s own `component_decl` reuses `struct_fields()` for the identical reason).
+    private fun componentDecl(b: PsiBuilder) = node(b, HCElementTypes.COMPONENT_DECL) {
+        expectKw(b, "component")
+        expect(b, HCTokenTypes.IDENT, "a component name")
+        fieldList(b)
+    }
+
+    // `system Name { fn run(a: &mut A, b: &B) { ... } }` -- see `Ast.hc`'s own `SystemDecl`
+    // header. `run` never declares its own return type (always `Unit`) -- unlike `fnDecl`, no
+    // optional `-> Ret` here, matching `Parser.hotc`'s own `system_decl` exactly. `@after(...)`/
+    // `@before(...)`/`@profile` (if present) were already consumed generically by `leadingAnnotations`
+    // before this ever runs -- same "consumed generically, not individually validated" approach
+    // this whole file already takes for every other annotation/directive.
+    private fun systemDecl(b: PsiBuilder) = node(b, HCElementTypes.SYSTEM_DECL) {
+        expectKw(b, "system")
+        expect(b, HCTokenTypes.IDENT, "a system name")
+        expect(b, HCTokenTypes.LBRACE, "'{'")
+        expectKw(b, "fn")
+        expect(b, HCTokenTypes.IDENT, "'run'")
+        paramList(b)
+        block(b)
+        expect(b, HCTokenTypes.RBRACE, "'}'")
     }
 
     private fun moduleDecl(b: PsiBuilder) = node(b, HCElementTypes.MODULE_DECL) {
@@ -633,11 +674,27 @@ object HCPsiParser : PsiParser {
 
     private fun assignment(b: PsiBuilder) {
         val m = b.mark()
-        logicalOr(b)
+        elvis(b)
         if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "=") {
             b.advanceLexer()
             assignment(b)
             m.done(HCElementTypes.ASSIGN_EXPR)
+        } else {
+            m.drop()
+        }
+    }
+
+    // `x ?: default` -- Elvis, one precedence tier below `assignment`, above `logicalOr` --
+    // matches `Parser.hotc`'s own `elvis()` exactly. Right-associative (`a ?: b ?: c` is `a ?: (b
+    // ?: c)`), same convention `assignment` itself already uses for chained `=`.
+    private fun elvis(b: PsiBuilder) {
+        val m = b.mark()
+        logicalOr(b)
+        if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "?" && b.lookAhead(1) == HCTokenTypes.COLON) {
+            b.advanceLexer() // ?
+            b.advanceLexer() // :
+            elvis(b)
+            m.done(HCElementTypes.ELVIS_EXPR)
         } else {
             m.drop()
         }
@@ -702,7 +759,28 @@ object HCPsiParser : PsiParser {
             m.done(HCElementTypes.BORROW_EXPR)
             return
         }
+        tryPostfix(b)
+    }
+
+    // `expr?` -- the try operator, a tight postfix applying right after any `.field`/`.method()`/
+    // `[index]` chain (`callOrPrimary` already resolved) -- matches `Parser.hotc`'s own `try_
+    // postfix()` exactly, including the SAME `?:` guard: `x ?: y`'s own `?` belongs to `elvis`
+    // (above `assignment`), not here, so a `?` immediately followed by `:` is left alone for
+    // `elvis` to consume instead of being wrapped into a dangling `TRY_OP_EXPR`. `x?.y`'s own `?`
+    // is ALREADY consumed by `callOrPrimary`'s own postfix loop (the `?` + `.` branch) by the time
+    // this loop ever runs, so it never reaches here unconsumed either. `expr??` (double try)
+    // parses fine as two nested `TRY_OP_EXPR` nodes -- same "correct by the desugaring rule, just
+    // unusual" shape the real compiler's own design doc calls out explicitly.
+    private fun tryPostfix(b: PsiBuilder) {
+        var marker = b.mark()
         callOrPrimary(b)
+        while (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "?" && b.lookAhead(1) != HCTokenTypes.COLON) {
+            b.advanceLexer()
+            val precede = marker.precede()
+            marker.done(HCElementTypes.TRY_OP_EXPR)
+            marker = precede
+        }
+        marker.drop()
     }
 
     // `foo(...)` (a bare call) only ever applies to the VERY FIRST link in the chain, and only
@@ -753,6 +831,21 @@ object HCPsiParser : PsiParser {
                     expect(b, HCTokenTypes.RBRACKET, "']'")
                     val precede = marker.precede()
                     marker.done(HCElementTypes.INDEX_EXPR)
+                    marker = precede
+                    isBareIdent = false
+                }
+                // `x?.field` / `x?.method(args)` -- safe navigation, matches `Parser.hotc`'s own
+                // postfix-loop `QUESTION` + `DOT` branch exactly. Consumed HERE, alongside plain
+                // `.`, NOT deferred to `tryPostfix`'s own `?` loop -- by the time that loop runs,
+                // this branch has already eaten it.
+                b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "?" && b.lookAhead(1) == HCTokenTypes.DOT -> {
+                    b.advanceLexer() // ?
+                    b.advanceLexer() // .
+                    expect(b, HCTokenTypes.IDENT, "a field/method name")
+                    val isCall = b.tokenType == HCTokenTypes.LPAREN
+                    if (isCall) argList(b)
+                    val precede = marker.precede()
+                    marker.done(if (isCall) HCElementTypes.SAFE_CALL_EXPR else HCElementTypes.SAFE_FIELD_ACCESS_EXPR)
                     marker = precede
                     isBareIdent = false
                 }
@@ -948,6 +1041,54 @@ object HCPsiParser : PsiParser {
         val m = b.mark()
         b.advanceLexer() // the identifier itself
         when {
+            // `Name<Arg> { ... }` -- a single-type-argument generic struct/enum-variant literal
+            // (`Vec<Int> { ... }`). Non-consuming lookahead from the current `<`, same bounded
+            // shape `Parser.hotc`'s own `looks_like_generic_lit` checks (`LT IDENT GT LBRACE`,
+            // matched here as `lookAhead(1)`/`lookAheadIsOp(2, ">")`/`lookAhead(3)`), so this
+            // never misparses `x < y` (a real less-than comparison) as the start of one.
+            b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<" &&
+                b.lookAhead(1) == HCTokenTypes.IDENT && b.lookAheadIsOp(2, ">") && b.lookAhead(3) == HCTokenTypes.LBRACE -> {
+                b.advanceLexer() // <
+                expect(b, HCTokenTypes.IDENT, "a type argument")
+                expectOp(b, ">")
+                structLitFields(b)
+                m.done(HCElementTypes.STRUCT_LIT_EXPR)
+            }
+            // `Base<Arg>::Variant { ... }` -- explicitly-qualified generic-enum-variant
+            // construction (`Option<Int>::Some { ... }`). Checked before the plain `<Arg>` shape
+            // above's own STRUCT_LIT reading would ever get a chance to misfire, matching
+            // `Parser.hotc`'s own `looks_like_generic_variant` (`LT IDENT GT COLONCOLON IDENT
+            // LBRACE`, 6 tokens from the current `<`).
+            b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<" &&
+                b.lookAhead(1) == HCTokenTypes.IDENT && b.lookAheadIsOp(2, ">") && b.lookAhead(3) == HCTokenTypes.COLONCOLON &&
+                b.lookAhead(4) == HCTokenTypes.IDENT && b.lookAhead(5) == HCTokenTypes.LBRACE -> {
+                b.advanceLexer() // <
+                expect(b, HCTokenTypes.IDENT, "a type argument")
+                expectOp(b, ">")
+                expect(b, HCTokenTypes.COLONCOLON, "'::'")
+                expect(b, HCTokenTypes.IDENT, "a variant name")
+                structLitFields(b)
+                m.done(HCElementTypes.STRUCT_LIT_EXPR)
+            }
+            // `Base<Arg1, Arg2>::Variant { ... }` -- the two-type-argument shape (`Result<Int,
+            // String>::Ok { ... }`, see `Ast.hc`'s own `EnumDecl.type_param2` header). Mutually
+            // exclusive with the one-arg shape above purely by TOKEN SHAPE (position 2 is `,`
+            // here, `>` there) -- matches `Parser.hotc`'s own `looks_like_generic_variant2` (`LT
+            // IDENT COMMA IDENT GT COLONCOLON IDENT LBRACE`, 8 tokens from the current `<`).
+            b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<" &&
+                b.lookAhead(1) == HCTokenTypes.IDENT && b.lookAhead(2) == HCTokenTypes.COMMA && b.lookAhead(3) == HCTokenTypes.IDENT &&
+                b.lookAheadIsOp(4, ">") && b.lookAhead(5) == HCTokenTypes.COLONCOLON &&
+                b.lookAhead(6) == HCTokenTypes.IDENT && b.lookAhead(7) == HCTokenTypes.LBRACE -> {
+                b.advanceLexer() // <
+                expect(b, HCTokenTypes.IDENT, "a type argument")
+                expect(b, HCTokenTypes.COMMA, "','")
+                expect(b, HCTokenTypes.IDENT, "a type argument")
+                expectOp(b, ">")
+                expect(b, HCTokenTypes.COLONCOLON, "'::'")
+                expect(b, HCTokenTypes.IDENT, "a variant name")
+                structLitFields(b)
+                m.done(HCElementTypes.STRUCT_LIT_EXPR)
+            }
             b.tokenType == HCTokenTypes.COLONCOLON && looksLikeVariantStructLiteral(b) -> {
                 b.advanceLexer() // ::
                 expect(b, HCTokenTypes.IDENT, "a variant name")
@@ -984,6 +1125,21 @@ object HCPsiParser : PsiParser {
         val m = mark()
         repeat(steps) { advanceLexer() }
         val matches = atKw(text)
+        m.rollbackTo()
+        return matches
+    }
+
+    // Same idea as `lookAheadIsKw` right above, for an `OPERATOR`-typed token's own TEXT --
+    // `lookAhead(steps)` alone only ever gives a TOKEN TYPE, and `<`/`>` share the single
+    // `OPERATOR` type here (see `HCTokenTypes.OPERATORS`), so distinguishing "is the token N
+    // steps ahead specifically `>`" needs this. Used by `identLed`'s own `<Arg>`/`<Arg1, Arg2>`
+    // generic-literal/qualified-variant lookaheads, below.
+    private fun PsiBuilder.lookAheadIsOp(steps: Int, text: String): Boolean {
+        val t = lookAhead(steps)
+        if (t != HCTokenTypes.OPERATOR) return false
+        val m = mark()
+        repeat(steps) { advanceLexer() }
+        val matches = tokenType == HCTokenTypes.OPERATOR && tokenText == text
         m.rollbackTo()
         return matches
     }

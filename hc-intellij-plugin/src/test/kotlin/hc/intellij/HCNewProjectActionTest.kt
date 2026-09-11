@@ -10,7 +10,7 @@ class HCNewProjectActionTest : BasePlatformTestCase() {
         assertTrue(content.contains("rootProject.name = \"my-cool-project\""))
         assertTrue(content.contains("maven { url = uri(\"https://jitpack.io\") }"))
         assertTrue(content.contains("if (requested.id.id == \"hc\")"))
-        assertTrue(content.contains("useModule(\"com.github.P-H-O-E-N-I-X-PackForge.HotChocolate:hc-gradle-plugin:\${requested.version}\")"))
+        assertTrue(content.contains("useModule(\"com.github.PhoenixVine-Digital.HotChocolate:hc-gradle-plugin:\${requested.version}\")"))
     }
 
     fun `test build gradle content applies the requested compiler version consistently`() {
