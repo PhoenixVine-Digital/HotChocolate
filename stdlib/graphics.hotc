@@ -42,9 +42,18 @@
 // allocates a real native-backed buffer of the given element count; `.put([Float])` copies real
 // data in, `.flip()` resets its position for reading (the standard NIO buffer write-then-flip
 // idiom every LWJGL upload uses).
+// Real, previously-hit trap: an extern method with NO `&self` parameter is implicitly STATIC
+// (`Parser.hotc`'s own `extern_method`, "no receiver at all -- implicitly static... even
+// without the `static` keyword") -- `put`/`flip` here are genuine INSTANCE methods (`buf.put(
+// ...)`, not `JFloatBufferGfx::put(...)`), so the `&self` below isn't optional decoration, it's
+// what makes `is_static` come out `false` at all. Missing it compiled clean with an EMPTY
+// `--classpath` (the check only ever fires once a real classpath makes `class_exists_reflect`
+// find `java.nio.FloatBuffer` at all -- see `Checker.hotc`'s own header on that), then failed
+// real `--classpath` verification with a genuinely confusing "doesn't match any real overload"
+// error the instant LWJGL's own classpath made the check actually run.
 extern class JFloatBufferGfx = "java.nio.FloatBuffer" {
-    fn put(values: [Float]) -> JFloatBufferGfx;
-    fn flip() -> JFloatBufferGfx;
+    fn put(&self, values: [Float]) -> JFloatBufferGfx;
+    fn flip(&self) -> JFloatBufferGfx;
 }
 
 extern class BufferUtilsGfx = "org.lwjgl.BufferUtils" {
