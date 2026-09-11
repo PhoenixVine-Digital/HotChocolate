@@ -1,15 +1,20 @@
 # Graphics/rendering — design doc
 
-**Status, 2026-09-11**: windowing milestone landed — `stdlib/window.hotc`
-(`use window;`) gives real GLFW window creation/lifecycle, keyboard input,
-and minimal OpenGL (`GL11`) clearing/presenting, via LWJGL. Verified with a
-REAL window on real hardware (not just a compile check) through Marshmallow:
-opens, renders a pulsing clear color every frame, closes cleanly via Escape
-or the window's own close button. See ARCHITECTURE.md's own "Standard
-library modules" section for the full technical writeup of what shipped
-(the `JCharSequenceWin` alias + `as` cast `glfwCreateWindow`'s title param
-needs to pass real `--classpath` signature verification, the `Window::new`-
-not-`open` naming trap, etc.).
+**Status, 2026-09-11**: windowing AND first-geometry milestones both landed.
+`stdlib/window.hotc` (`use window;`) gives real GLFW window creation/
+lifecycle, keyboard input, and minimal OpenGL (`GL11`) clearing/presenting,
+via LWJGL. `stdlib/graphics.hotc` (`use graphics;`, depends on `window`)
+adds real geometry: `Shader::compile(vertex_src, fragment_src)` compiles
+and links a real GLSL program; `Mesh::from_floats(vertices, vertex_count)`
+uploads a real VBO/VAO. Both verified with REAL rendering on real hardware
+(not just a compile check) through Marshmallow: a real colored triangle,
+compiled shaders, real vertex buffers, drawn every frame. See
+ARCHITECTURE.md's own "Standard library modules" section for the full
+technical writeup of what shipped (the `JCharSequenceWin` alias + `as` cast
+`glfwCreateWindow`'s/`glShaderSource`'s title/source params need to pass
+real `--classpath` signature verification, the `Window::new`-not-`open`
+naming trap, the `&self`-or-implicitly-static extern-method trap that hit
+`JFloatBufferGfx::put`/`::flip`, etc.).
 
 **The one decision that matters most for everything else in this doc,
 made explicitly, not defaulted into**: **Vulkan is the real target before
@@ -55,10 +60,15 @@ much larger surface area.
 
 ## Explicitly deferred (not silently dropped — tracked here)
 
-- **Real geometry** — shaders (compile/link a vertex+fragment program),
-  vertex buffers/arrays (VBO/VAO), actual draw calls. This is `graphics
-  .hotc`, the literal next layer once this doc's own backend-agnostic-shape
-  commitment above is kept in mind while designing it.
+- ~~**Real geometry**~~ — landed, 2026-09-11: `graphics.hotc`'s own
+  `Shader`/`Mesh` (shader compile/link, VBO/VAO upload, real draw calls),
+  fixed vertex layout only (`x, y, z, r, g, b` interleaved). Still real,
+  narrower follow-ups from here: textures/samplers, uniforms (no uniform
+  bindings exist yet -- everything so far is vertex-attribute-driven, no
+  per-draw-call constant data like a transform matrix), a general vertex-
+  format description (multiple layouts, not just the one fixed shape),
+  index buffers (EBO -- drawing with `glDrawElements`, not just
+  `glDrawArrays`), and depth/blending state.
 - **The Vulkan migration itself** — not started. Real engineering, likely
   bigger than the OpenGL layer it replaces (see "Why OpenGL first," above,
   for the real size gap). See "Open questions" below for what actually
