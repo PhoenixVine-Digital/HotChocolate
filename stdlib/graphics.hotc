@@ -1,0 +1,179 @@
+// Graphics -- real geometry: shader compile/link, vertex buffers, draw calls. Opt-in via
+// `use graphics;` (see ARCHITECTURE.md's own "Standard library modules" section and
+// GRAPHICS_IDEAS.md for the full design). Depends on `window` (a GL context has to already
+// exist -- created via `Window::new(...)` -- before any call here means anything).
+//
+// **The one design rule this file exists to follow** (see GRAPHICS_IDEAS.md's own "Why OpenGL
+// first anyway" section): `Shader`/`Mesh` describe WHAT to draw -- source, vertex data, a draw
+// call -- not raw `GL15`/`GL20`/`GL30` calls sprinkled through caller code. The real payoff:
+// swapping the backend to Vulkan later means rewriting what's INSIDE this file, not every call
+// site that asked to draw something.
+//
+// ```
+// use graphics;
+//
+// fn main() {
+//     GLFW::glfwInit();
+//     let window = Window::new(800, 600, "Marshmallow");
+//
+//     let shader = Shader::compile(
+//         "#version 330 core\nlayout (location = 0) in vec3 aPos;\nlayout (location = 1) in vec3 aColor;\nout vec3 vColor;\nvoid main() { gl_Position = vec4(aPos, 1.0); vColor = aColor; }",
+//         "#version 330 core\nin vec3 vColor;\nout vec4 FragColor;\nvoid main() { FragColor = vec4(vColor, 1.0); }",
+//     );
+//     let triangle = Mesh::from_floats([
+//         // x, y, z,      r, g, b
+//         0.0f, 0.5f, 0.0f,   1.0f, 0.0f, 0.0f,
+//         -0.5f, -0.5f, 0.0f,  0.0f, 1.0f, 0.0f,
+//         0.5f, -0.5f, 0.0f,  0.0f, 0.0f, 1.0f,
+//     ], 3);
+//
+//     while !window.should_close() {
+//         window.clear(0.1f, 0.1f, 0.15f);
+//         shader.use_program();
+//         triangle.draw();
+//         window.present();
+//     }
+//     window.close();
+// }
+// ```
+
+// `java.nio.FloatBuffer` -- what `glBufferData`'s own real overload takes (LWJGL has no
+// convenience overload accepting a bare `[Float]` directly for this one). `BufferUtilsGfx`
+// allocates a real native-backed buffer of the given element count; `.put([Float])` copies real
+// data in, `.flip()` resets its position for reading (the standard NIO buffer write-then-flip
+// idiom every LWJGL upload uses).
+extern class JFloatBufferGfx = "java.nio.FloatBuffer" {
+    fn put(values: [Float]) -> JFloatBufferGfx;
+    fn flip() -> JFloatBufferGfx;
+}
+
+extern class BufferUtilsGfx = "org.lwjgl.BufferUtils" {
+    static fn createFloatBuffer(size: Int) -> JFloatBufferGfx;
+}
+
+extern class GL15 = "org.lwjgl.opengl.GL15" {
+    static GL_ARRAY_BUFFER: Int;
+    static GL_STATIC_DRAW: Int;
+
+    static fn glGenBuffers() -> Int;
+    static fn glBindBuffer(target: Int, buffer: Int) -> Unit;
+    static fn glBufferData(target: Int, data: JFloatBufferGfx, usage: Int) -> Unit;
+}
+
+extern class GL20 = "org.lwjgl.opengl.GL20" {
+    static GL_VERTEX_SHADER: Int;
+    static GL_FRAGMENT_SHADER: Int;
+    static GL_COMPILE_STATUS: Int;
+    static GL_LINK_STATUS: Int;
+
+    static fn glCreateShader(type: Int) -> Int;
+    // Real declared param type is `CharSequence`, not `String` -- reused from `window.hotc`'s
+    // own `JCharSequenceWin` (brought in via this topic's `window` dependency) rather than a
+    // second alias, same real descriptor `glfwCreateWindow`'s own title param needs.
+    static fn glShaderSource(shader: Int, source: JCharSequenceWin) -> Unit;
+    static fn glCompileShader(shader: Int) -> Unit;
+    static fn glGetShaderi(shader: Int, pname: Int) -> Int;
+    static fn glGetShaderInfoLog(shader: Int) -> String;
+    static fn glDeleteShader(shader: Int) -> Unit;
+    static fn glCreateProgram() -> Int;
+    static fn glAttachShader(program: Int, shader: Int) -> Unit;
+    static fn glLinkProgram(program: Int) -> Unit;
+    static fn glGetProgrami(program: Int, pname: Int) -> Int;
+    static fn glGetProgramInfoLog(program: Int) -> String;
+    static fn glUseProgram(program: Int) -> Unit;
+    static fn glVertexAttribPointer(index: Int, size: Int, type: Int, normalized: Bool, stride: Int, pointer: Long) -> Unit;
+    static fn glEnableVertexAttribArray(index: Int) -> Unit;
+}
+
+extern class GL30 = "org.lwjgl.opengl.GL30" {
+    static fn glGenVertexArrays() -> Int;
+    static fn glBindVertexArray(array: Int) -> Unit;
+}
+
+// Compiles and links a real vertex+fragment GLSL program -- `use_program()` right before drawing
+// with it is the only other call a caller needs. Compile/link failures print the REAL GLSL
+// compiler/linker info log (not just "it failed") and leave `program` as whatever `glCreateShader`/
+// `glCreateProgram` returned (0 on total failure, a real-but-broken handle on a partial one) --
+// real, disclosed scope cut: this doesn't throw a real HC exception on failure (there's no
+// dedicated graphics-error type yet), so a caller that ignores the printed log and calls
+// `use_program()`/draws anyway gets whatever the driver does with a broken program (typically:
+// nothing visible, no crash).
+struct Shader {
+    program: Int,
+}
+
+impl Shader {
+    static fn compile(vertex_src: String, fragment_src: String) -> Shader {
+        let vs = GL20::glCreateShader(GL20::GL_VERTEX_SHADER);
+        GL20::glShaderSource(vs, vertex_src as JCharSequenceWin);
+        GL20::glCompileShader(vs);
+        if GL20::glGetShaderi(vs, GL20::GL_COMPILE_STATUS) == GL11::GL_FALSE {
+            print("vertex shader compile error: " + GL20::glGetShaderInfoLog(vs));
+        }
+
+        let fs = GL20::glCreateShader(GL20::GL_FRAGMENT_SHADER);
+        GL20::glShaderSource(fs, fragment_src as JCharSequenceWin);
+        GL20::glCompileShader(fs);
+        if GL20::glGetShaderi(fs, GL20::GL_COMPILE_STATUS) == GL11::GL_FALSE {
+            print("fragment shader compile error: " + GL20::glGetShaderInfoLog(fs));
+        }
+
+        let program = GL20::glCreateProgram();
+        GL20::glAttachShader(program, vs);
+        GL20::glAttachShader(program, fs);
+        GL20::glLinkProgram(program);
+        if GL20::glGetProgrami(program, GL20::GL_LINK_STATUS) == GL11::GL_FALSE {
+            print("shader link error: " + GL20::glGetProgramInfoLog(program));
+        }
+        // Real GL convention once linked: the shader objects themselves are no longer needed --
+        // the PROGRAM holds everything a draw call actually uses.
+        GL20::glDeleteShader(vs);
+        GL20::glDeleteShader(fs);
+        return Shader { program: program };
+    }
+
+    fn use_program(&self) {
+        GL20::glUseProgram(self.program);
+    }
+}
+
+// A real vertex buffer + vertex array, interleaved `(x, y, z, r, g, b)` per vertex -- position
+// (`location = 0`, 3 floats) then color (`location = 1`, 3 floats), the standard "hello
+// triangle" layout matching this file's own doc-comment example above. Real, disclosed scope
+// cut: this ONE fixed layout only -- a general vertex-format description (arbitrary attribute
+// counts/types/offsets) is real, separate design work for whenever a second layout is actually
+// needed, not guessed at now.
+struct Mesh {
+    vao: Int,
+    vertex_count: Int,
+}
+
+impl Mesh {
+    // `vertices` is a flat `(x, y, z, r, g, b)`-per-vertex array; `vertex_count` is the number
+    // of VERTICES (not floats -- `vertices.length` is always `vertex_count * 6`).
+    static fn from_floats(vertices: [Float], vertex_count: Int) -> Mesh {
+        let vao = GL30::glGenVertexArrays();
+        GL30::glBindVertexArray(vao);
+
+        let vbo = GL15::glGenBuffers();
+        GL15::glBindBuffer(GL15::GL_ARRAY_BUFFER, vbo);
+        var buf = BufferUtilsGfx::createFloatBuffer(vertices.length);
+        buf = buf.put(vertices);
+        buf = buf.flip();
+        GL15::glBufferData(GL15::GL_ARRAY_BUFFER, buf, GL15::GL_STATIC_DRAW);
+
+        // Stride: 6 floats * 4 bytes = 24 bytes per vertex. Position at byte offset 0, color at
+        // byte offset 12 (3 floats in).
+        GL20::glVertexAttribPointer(0, 3, GL11::GL_FLOAT, false, 24, 0 as Long);
+        GL20::glEnableVertexAttribArray(0);
+        GL20::glVertexAttribPointer(1, 3, GL11::GL_FLOAT, false, 24, 12 as Long);
+        GL20::glEnableVertexAttribArray(1);
+
+        return Mesh { vao: vao, vertex_count: vertex_count };
+    }
+
+    fn draw(&self) {
+        GL30::glBindVertexArray(self.vao);
+        GL11::glDrawArrays(GL11::GL_TRIANGLES, 0, self.vertex_count);
+    }
+}

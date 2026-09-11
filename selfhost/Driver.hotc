@@ -981,8 +981,14 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // `use phoenix_virtual;` alone (no `use phoenix;`) still needs `phoenix`'s own program
         // merged in for those types to exist at all.
         out = add_stdlib_topic_and_deps("phoenix", out, target);
-    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" {
-        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window");
+    } else if topic == "graphics" {
+        // `graphics.hotc`'s own `JCharSequenceWin`/`GL11` reuse (see that file's own header) --
+        // a real GL context needs to already exist (via `Window::new(...)`) for any of it to
+        // mean anything, and the constants/alias it reuses are only ever declared over in
+        // `window.hotc` itself.
+        out = add_stdlib_topic_and_deps("window", out, target);
+    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" {
+        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics");
     }
     out.push(topic);
     return out;

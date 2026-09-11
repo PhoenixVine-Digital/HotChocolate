@@ -102,10 +102,19 @@ extern class GL = "org.lwjgl.opengl.GL" {
 extern class GL11 = "org.lwjgl.opengl.GL11" {
     static GL_COLOR_BUFFER_BIT: Int;
     static GL_DEPTH_BUFFER_BIT: Int;
+    // General-purpose GL constants (not clear/viewport-specific) -- kept here rather than
+    // re-declared under a second alias in `graphics.hotc` (which depends on this topic and
+    // reuses `GL11` directly), same "one real binding, shared" reasoning `JCharSequenceWin`
+    // below already gets reused for instead of a second copy.
+    static GL_TRUE: Int;
+    static GL_FALSE: Int;
+    static GL_FLOAT: Int;
+    static GL_TRIANGLES: Int;
 
     static fn glClearColor(r: Float, g: Float, b: Float, a: Float) -> Unit;
     static fn glClear(mask: Int) -> Unit;
     static fn glViewport(x: Int, y: Int, width: Int, height: Int) -> Unit;
+    static fn glDrawArrays(mode: Int, first: Int, count: Int) -> Unit;
 }
 
 // A thin, real convenience wrapper over the raw GLFW/GL calls above -- `Window::new(...)`
