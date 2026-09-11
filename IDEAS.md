@@ -25,7 +25,10 @@ existing `extern class` FFI, no new compiler feature) lives in
 `PHOENIX_FLIGHT_IDEAS.md`, cross-referenced from this file's own "ECS
 with ownership-derived system scheduling" entry — that's the one place
 a real language feature (compiler-verified parallel-safety) is still
-genuinely needed.
+genuinely needed. Windowing/rendering (`stdlib/window.hotc`, the
+eventual `graphics.hotc`, and the explicitly-decided OpenGL-now/
+Vulkan-before-ship backend plan) lives in `GRAPHICS_IDEAS.md`, same
+spun-out-once-it-became-real pattern as the other two.
 
 ## High leverage, do these next
 
