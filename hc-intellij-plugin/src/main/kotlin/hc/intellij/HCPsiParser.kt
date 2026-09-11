@@ -323,10 +323,15 @@ object HCPsiParser : PsiParser {
 
     // `impl [<T>] Name1 [<Args>] [for Name2 [<Args>]] [by field] { methods }` -- `for` makes this
     // an interface implementation (`Name1` the interface, `Name2` the struct); `by field` is
-    // delegation (see the real compiler's own `implDecl` for both). A method inside the body is
-    // "static" purely by NOT declaring a `self`/`&self`/`&mut self` first parameter -- there's no
-    // separate `static` keyword inside `impl` at all (unlike the self-hosted subset's own
-    // simplified mirror grammar, which this file initially, incorrectly, assumed matched exactly).
+    // delegation (see the real compiler's own `implDecl` for both). A method inside the body CAN
+    // start with a leading `static` keyword (`static fn new(...) -> Self { ... }`, the ordinary
+    // constructor pattern every stdlib struct uses) -- the real compiler's own `impl_decl`
+    // (`selfhost/parser/Parser.hotc`) explicitly branches on `self.check(STATIC)` to route into
+    // `static_method_decl()` vs `method_decl()`, confirming this is real, common syntax, not an
+    // edge case. A method WITHOUT `static` is still only "static" in the deeper checker sense by
+    // not declaring a `self`/`&self`/`&mut self` first parameter (no keyword needed there
+    // either) -- but the keyword itself, when present, is real and must be consumed here, same as
+    // `externMember`'s own identical `if (b.atKw("static")) b.advanceLexer()` right below.
     private fun implDecl(b: PsiBuilder) = node(b, HCElementTypes.IMPL_DECL) {
         expectKw(b, "impl")
         typeParamList(b)
@@ -346,6 +351,7 @@ object HCPsiParser : PsiParser {
             val before = b.currentOffset
             leadingAnnotations(b)
             if (b.atKw("override")) b.advanceLexer()
+            if (b.atKw("static")) b.advanceLexer()
             if (b.atKw("fn")) fnDecl(b)
             if (b.currentOffset == before) { b.error("expected a method"); b.advanceLexer() }
         }
@@ -437,6 +443,13 @@ object HCPsiParser : PsiParser {
             expect(b, HCTokenTypes.IDENT, "an alias name")
             expectOp(b, "=")
             expect(b, HCTokenTypes.STRING, "a binary class name")
+            // Optional TRAILING `interface` marker (`extern class Name = "..." interface { }`,
+            // e.g. `JCharSequenceWin`/`PhoenixTaskList`) -- changes instance-call dispatch to
+            // INVOKEINTERFACE; unrelated to the LEADING `extern interface Name = "..." { }` form
+            // above, which is a different declaration kind entirely. Mirrors the real compiler's
+            // own `extern_class_decl` (`selfhost/parser/Parser.hotc`), which checks for this
+            // right here, before ever looking at what follows for the body.
+            if (b.atKw("interface")) b.advanceLexer()
             when {
                 b.tokenType == HCTokenTypes.LBRACE -> {
                     b.advanceLexer()
@@ -462,13 +475,33 @@ object HCPsiParser : PsiParser {
         }
     }
 
-    private fun externMember(b: PsiBuilder) = node(b, HCElementTypes.EXTERN_METHOD_DECL) {
-        if (b.atKw("static")) b.advanceLexer()
-        expectKw(b, "fn")
-        expect(b, HCTokenTypes.IDENT, "a method name")
-        paramList(b)
-        if (b.tokenType == HCTokenTypes.ARROW) { b.advanceLexer(); typeRef(b) }
-        expect(b, HCTokenTypes.SEMI, "';'")
+    // A member is a FIELD (`[static] NAME: Type;`, e.g. `static GL_DEPTH_TEST: Int;`) whenever the
+    // token after an optional leading `static` is NOT `fn` -- mirrors the real compiler's own
+    // `is_extern_field_next` (`selfhost/parser/Parser.hotc`) exactly: peek past `static`, check
+    // for `fn`, and only THEN commit to a method parse. Missing this (an unconditional `expectKw
+    // (b, "fn")` right after `static`) is a real bug that broke every `extern class` with a
+    // static field -- which is most of them (`GL11`'s own `GL_COLOR_BUFFER_BIT`, etc.) --
+    // producing "expected 'fn'" and cascading errors through the rest of the file.
+    private fun externMember(b: PsiBuilder) {
+        val isField = if (b.atKw("static")) !b.lookAheadIsKw(1, "fn") else !b.atKw("fn")
+        if (isField) {
+            node(b, HCElementTypes.EXTERN_FIELD_DECL) {
+                if (b.atKw("static")) b.advanceLexer()
+                expect(b, HCTokenTypes.IDENT, "a field name")
+                expect(b, HCTokenTypes.COLON, "':'")
+                typeRef(b)
+                expect(b, HCTokenTypes.SEMI, "';'")
+            }
+            return
+        }
+        node(b, HCElementTypes.EXTERN_METHOD_DECL) {
+            if (b.atKw("static")) b.advanceLexer()
+            expectKw(b, "fn")
+            expect(b, HCTokenTypes.IDENT, "a method name")
+            paramList(b)
+            if (b.tokenType == HCTokenTypes.ARROW) { b.advanceLexer(); typeRef(b) }
+            expect(b, HCTokenTypes.SEMI, "';'")
+        }
     }
 
     // === Blocks / statements ===
@@ -723,7 +756,18 @@ object HCPsiParser : PsiParser {
     }
 
     private fun logicalOr(b: PsiBuilder) = binaryLevel(b, setOf("||"), ::logicalAnd)
-    private fun logicalAnd(b: PsiBuilder) = binaryLevel(b, setOf("&&"), ::equality)
+    private fun logicalAnd(b: PsiBuilder) = binaryLevel(b, setOf("&&"), ::bitwiseOr)
+    // Bitwise `|`/`&` -- two real, missing precedence levels (between `&&` and `==`, exactly
+    // matching the real compiler's own `logical_and`/`bitwise_or`/`bitwise_and`/`equality` chain
+    // in `selfhost/parser/Parser.hotc`). Real gap found on `window.hotc`'s own `GL11::glClear(
+    // GL11::GL_COLOR_BUFFER_BIT | GL11::GL_DEPTH_BUFFER_BIT)` -- a bare infix `|` in expression
+    // position had no precedence level to be recognized at all, so it fell through to "expected
+    // ')'" and cascaded. Binary `&` here is unambiguous with the UNARY reference `&expr`/`&mut
+    // expr` `unary()` handles below (line ~787 at time of writing): this level only ever fires
+    // once a LEFT operand is already parsed and the parser is looking for an infix operator, a
+    // position a leading unary `&` never appears in.
+    private fun bitwiseOr(b: PsiBuilder) = binaryLevel(b, setOf("|"), ::bitwiseAnd)
+    private fun bitwiseAnd(b: PsiBuilder) = binaryLevel(b, setOf("&"), ::equality)
     private fun equality(b: PsiBuilder) = binaryLevel(b, setOf("==", "!="), ::comparison)
     private fun comparison(b: PsiBuilder) = binaryLevel(b, setOf("<", "<=", ">", ">="), ::term)
     private fun term(b: PsiBuilder) = binaryLevel(b, setOf("+", "-"), ::factor)

@@ -77,13 +77,43 @@ class HCParserTest : BasePlatformTestCase() {
         }
     }
 
-    private fun findExamplesDir(): File {
+    // Same sweep as the real-example-programs test above, but over `stdlib/*.hotc` -- NOT covered
+    // by that one (it only walks `examples/`). This is exactly the class of file that broke and
+    // went uncaught: every `extern class` with a `static NAME: Type;` FIELD (not a method) --
+    // `window.hotc`'s own `GL11::GL_COLOR_BUFFER_BIT`, etc. -- tripped `externMember`'s missing
+    // static-field lookahead (see that function's own header) with zero examples/ coverage to
+    // catch it, since no example file happens to declare an `extern class` with a static field.
+    fun `test real stdlib files parse with no syntax errors`() {
+        val stdlibDir = findRepoDir("stdlib")
+        val files = stdlibDir.walkTopDown()
+            .filter { it.isFile && (it.extension == "hc" || it.extension == "hotc") }
+            .toList()
+        assertTrue("expected to find stdlib .hc/.hotc files under $stdlibDir", files.isNotEmpty())
+
+        val failures = StringBuilder()
+        for (f in files) {
+            val psiFile = PsiFileFactory.getInstance(project).createFileFromText(f.name, HCLanguage, f.readText())
+            val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+            if (errors.isNotEmpty()) {
+                failures.append("${f.path}:\n")
+                for (e in errors) {
+                    val line = psiFile.viewProvider.document?.getLineNumber(e.textOffset)?.plus(1)
+                    failures.append("  line $line: ${e.errorDescription} (near '${e.text.take(20)}')\n")
+                }
+            }
+        }
+        assertTrue("real stdlib files with unexpected parse errors:\n$failures", failures.isEmpty())
+    }
+
+    private fun findExamplesDir(): File = findRepoDir("examples")
+
+    private fun findRepoDir(name: String): File {
         var dir = File(".").absoluteFile
         repeat(5) {
-            val candidate = File(dir, "examples")
+            val candidate = File(dir, name)
             if (candidate.isDirectory) return candidate
             dir = dir.parentFile ?: return@repeat
         }
-        throw IllegalStateException("could not locate the repo's examples/ directory from ${File(".").absolutePath}")
+        throw IllegalStateException("could not locate the repo's $name/ directory from ${File(".").absolutePath}")
     }
 }

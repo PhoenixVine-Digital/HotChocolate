@@ -16,6 +16,7 @@ object HCElementTypes {
     val ENUM_VARIANT = HCElementType("ENUM_VARIANT")
     val EXTERN_CLASS_DECL = HCElementType("EXTERN_CLASS_DECL")
     val EXTERN_METHOD_DECL = HCElementType("EXTERN_METHOD_DECL")
+    val EXTERN_FIELD_DECL = HCElementType("EXTERN_FIELD_DECL")
     val INTERFACE_DECL = HCElementType("INTERFACE_DECL")
     val INTERFACE_METHOD_SIG = HCElementType("INTERFACE_METHOD_SIG")
     val EXTEND_DECL = HCElementType("EXTEND_DECL")
