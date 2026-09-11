@@ -8,6 +8,7 @@ import org.gradle.api.plugins.JavaPluginExtension
 import org.gradle.api.tasks.JavaExec
 import org.gradle.language.jvm.tasks.ProcessResources
 import java.io.File
+import java.util.zip.ZipFile
 
 // JitPack's coordinates for this repo's own root module (the compiler itself -- `SelfhostCLI`
 // lives there, not in this plugin module). See ARCHITECTURE.md's own "Published on JitPack"
@@ -149,6 +150,35 @@ open class HotChocolateExtension(private val project: Project) {
     }
 }
 
+// **Fixed 2026-09-11 -- the fourth real break found scaffolding Marshmallow.** `stdlib_topic_
+// path` (`Driver.hotc`) resolves every stdlib topic via a path relative to `SelfhostCLI`'s own
+// PROCESS WORKING DIRECTORY (`"stdlib/" + topic + ".hotc"`), with no other fallback -- and this
+// fires even for a program with ZERO `use` lines, since the "no `use` at all" default still
+// injects the original five topics. The compiler jar now bundles those `.hotc` SOURCE files
+// (see the root `build.gradle.kts`'s own `jar` task fix), but bundled-in-a-jar and "present as a
+// real file next to the compile's own `workingDir`" are two different things -- this extracts
+// every `stdlib/*.hotc` entry out of the resolved compiler classpath into `destDir` (== `ext.
+// outputDir`, the same directory every `hcCompile*` task's own `workingDir` is already set to)
+// before the compiler ever runs. Idempotent and cheap enough to just always do, rather than try
+// to detect whether it's already been done for this particular `destDir`.
+private fun extractStdlibResources(classpath: FileCollection, destDir: File) {
+    for (file in classpath.files) {
+        if (!file.isFile || !file.name.endsWith(".jar")) continue
+        ZipFile(file).use { zip ->
+            val entries = zip.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                if (entry.isDirectory || !entry.name.startsWith("stdlib/")) continue
+                val outFile = File(destDir, entry.name)
+                outFile.parentFile.mkdirs()
+                zip.getInputStream(entry).use { input ->
+                    outFile.outputStream().use { output -> input.copyTo(output) }
+                }
+            }
+        }
+    }
+}
+
 class HotChocolatePlugin : Plugin<Project> {
     override fun apply(project: Project) {
         val ext = project.extensions.create("hotChocolate", HotChocolateExtension::class.java, project)
@@ -217,7 +247,7 @@ class HotChocolatePlugin : Plugin<Project> {
                     // no longer runs from the project's own directory.
                     t.args = listOf(srcFile.absolutePath)
                     t.workingDir = ext.outputDir
-                    t.doFirst { ext.outputDir.mkdirs() }
+                    t.doFirst { ext.outputDir.mkdirs(); extractStdlibResources(compilerClasspath, ext.outputDir) }
                 }
                 previousTaskName = taskName
                 taskName
@@ -242,7 +272,7 @@ class HotChocolatePlugin : Plugin<Project> {
                     t.mainClass.set("SelfhostCLI")
                     t.args = listOf(dir.absolutePath)
                     t.workingDir = ext.outputDir
-                    t.doFirst { ext.outputDir.mkdirs() }
+                    t.doFirst { ext.outputDir.mkdirs(); extractStdlibResources(compilerClasspath, ext.outputDir) }
                 }
                 previousTaskName = taskName
                 taskName
