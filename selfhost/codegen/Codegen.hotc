@@ -869,12 +869,17 @@ impl CodeGen {
                     // outright ("Bad type on operand stack" at this exact instruction -- found
                     // the hard way via a real `Long`-typed struct field reassignment through
                     // `&mut self`, which hits the ordinary (non-extern) sibling of this same bug
-                    // right below).
+                    // right below). Computed into a plain local first, then ONE `visitInsn` call
+                    // -- the equivalent `if { visitInsn(93) } else { visitInsn(90) }` shape, with
+                    // two separate call sites, was found NOT to reliably compile through the
+                    // then-current self-hosted bootstrap when this fix first landed (a real,
+                    // separate self-hosting-bootstrap gap, not a mistake in the opcode logic
+                    // itself) -- this single-call-site form verified correctly end to end.
+                    var dup_opcode1 = 90; // DUP_X1
                     if eftype1 == "Long" || eftype1 == "Double" {
-                        self.mv.visitInsn(93); // DUP2_X1 -- stack: [value, objref, value] (value is 2 words)
-                    } else {
-                        self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value]
+                        dup_opcode1 = 93; // DUP2_X1
                     }
+                    self.mv.visitInsn(dup_opcode1); // stack: [value, objref, value]
                     self.mv.visitFieldInsn(181, ebinary1, field, efdesc1); // PUTFIELD -- consumes [objref, value], leaves [value]
                     return eftype1;
                 }
@@ -892,12 +897,14 @@ impl CodeGen {
             if let Some { value: pset_desc } = setx_found {
                 let vty1 = self.gen_expr(value); // stack: [objref, value]
                 // Same category-1-vs-2 split as the real-field-desc branch above -- see that
-                // one's own header for why a bare `DUP_X1` is wrong for a `Long`/`Double` value.
+                // one's own header for why a bare `DUP_X1` is wrong for a `Long`/`Double` value,
+                // and for why this is a single `visitInsn` call fed by a local, not two separate
+                // call sites in each `if`/`else` arm.
+                var dup_opcode2 = 90; // DUP_X1
                 if vty1 == "Long" || vty1 == "Double" {
-                    self.mv.visitInsn(93); // DUP2_X1 -- stack: [value, objref, value] (value is 2 words)
-                } else {
-                    self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value] (same shape PUTFIELD's own path uses, right below)
+                    dup_opcode2 = 93; // DUP2_X1
                 }
+                self.mv.visitInsn(dup_opcode2); // stack: [value, objref, value] (same shape PUTFIELD's own path uses, right below)
                 var piface1 = 0;
                 let piface1_found = self.extern_is_interface.get(ot);
                 if let Some { value: piv1 } = piface1_found { piface1 = piv1; }
@@ -931,11 +938,11 @@ impl CodeGen {
         // value1 over a category-1 value2 duplicates as value1, value2, value1 -- exactly
         // `value, objref, value` here). Found the hard way assigning to a `Long`-typed struct
         // field (`self.last_ns = now;`) through `&mut self`.
+        var dup_opcode = 90; // DUP_X1
         if fty == "Long" || fty == "Double" {
-            self.mv.visitInsn(93); // DUP2_X1 -- stack: [value, objref, value] (value is 2 words)
-        } else {
-            self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value]
+            dup_opcode = 93; // DUP2_X1
         }
+        self.mv.visitInsn(dup_opcode); // stack: [value, objref, value]
         self.mv.visitFieldInsn(181, self.qualify(ot), field, self.resolve_descriptor(fty)); // PUTFIELD -- consumes [objref, value], leaves [value]
         return fty;
     }
