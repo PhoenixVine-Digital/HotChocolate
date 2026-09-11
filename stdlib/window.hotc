@@ -1,0 +1,168 @@
+// Window -- real windowing (GLFW) and minimal rendering (OpenGL) bindings, via LWJGL. Opt-in via
+// `use window;` (see ARCHITECTURE.md's own "Standard library modules" section). No dependency on
+// any other stdlib topic.
+//
+// **Real, disclosed scope, v1**: enough to open a real window, run a real event/render loop,
+// read keyboard state, and clear/present a frame -- the actual "can we see anything at all"
+// milestone. Real geometry (shaders, vertex buffers, draw calls) is deliberately NOT here yet --
+// that's its own, separately-scoped follow-up (`graphics.hotc`, not yet written), once this
+// milestone is proven. Nothing here binds to a JDK class -- LWJGL itself is a real, external
+// Maven dependency the CONSUMING project (e.g. Marshmallow) supplies on its own classpath; this
+// file only declares the real signatures LWJGL's own `org.lwjgl.glfw.GLFW`/`org.lwjgl.opengl.GL`/
+// `GL11` classes already have.
+//
+// ```
+// use window;
+//
+// fn main() {
+//     if !GLFW::glfwInit() {
+//         print("GLFW init failed");
+//         return;
+//     }
+//     GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MAJOR, 3);
+//     GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MINOR, 3);
+//     GLFW::glfwWindowHint(GLFW::GLFW_OPENGL_PROFILE, GLFW::GLFW_OPENGL_CORE_PROFILE);
+//     let window = GLFW::glfwCreateWindow(800, 600, "Marshmallow" as JCharSequenceWin, 0 as Long, 0 as Long);
+//     GLFW::glfwMakeContextCurrent(window);
+//     GL::createCapabilities();
+//     GLFW::glfwShowWindow(window);
+//     while !GLFW::glfwWindowShouldClose(window) {
+//         GL11::glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
+//         GL11::glClear(GL11::GL_COLOR_BUFFER_BIT);
+//         GLFW::glfwSwapBuffers(window);
+//         GLFW::glfwPollEvents();
+//         if GLFW::glfwGetKey(window, GLFW::GLFW_KEY_ESCAPE) == GLFW::GLFW_PRESS {
+//             GLFW::glfwSetWindowShouldClose(window, true);
+//         }
+//     }
+//     GLFW::glfwDestroyWindow(window);
+//     GLFW::glfwTerminate();
+// }
+// ```
+
+// `java.lang.CharSequence` -- the REAL declared param type `glfwCreateWindow`'s own title
+// parameter has (not `String`, even though a `String` is what every real caller actually
+// passes). Binding this under its own alias, with an explicit `as JCharSequenceWin` cast at the
+// call site, matches the exact same "declared type must match the real descriptor, cast to widen"
+// convention `PhoenixObject`/Phoenix Flight already established (`task.join() as String`, `||
+// ... as PhoenixObject`) -- declaring the param as plain `String` instead would compile fine
+// with NO `--classpath` given, but fail real signature verification (a real, disclosed
+// `NoSuchMethodError`-preventing check -- see ARCHITECTURE.md's own `--classpath` section) the
+// moment a consuming project's own `compileClasspath` (which the `hc` Gradle plugin
+// automatically threads through) actually includes LWJGL.
+extern class JCharSequenceWin = "java.lang.CharSequence" interface {}
+
+// Opaque -- `GL::createCapabilities()`'s own return value is never read, only called for its
+// real side effect (loading the real OpenGL function pointers for the current context). Same
+// "declared shape, trusted, nothing more" scope cut `PhoenixExecutor`'s own empty body already
+// uses.
+extern class JGLCapabilitiesWin = "org.lwjgl.opengl.GLCapabilities" {}
+
+extern class GLFW = "org.lwjgl.glfw.GLFW" {
+    static GLFW_TRUE: Int;
+    static GLFW_FALSE: Int;
+    static GLFW_RESIZABLE: Int;
+    static GLFW_CONTEXT_VERSION_MAJOR: Int;
+    static GLFW_CONTEXT_VERSION_MINOR: Int;
+    static GLFW_OPENGL_PROFILE: Int;
+    static GLFW_OPENGL_CORE_PROFILE: Int;
+    static GLFW_PRESS: Int;
+    static GLFW_RELEASE: Int;
+    static GLFW_REPEAT: Int;
+    static GLFW_KEY_ESCAPE: Int;
+    static GLFW_KEY_SPACE: Int;
+    static GLFW_KEY_W: Int;
+    static GLFW_KEY_A: Int;
+    static GLFW_KEY_S: Int;
+    static GLFW_KEY_D: Int;
+    static GLFW_KEY_UP: Int;
+    static GLFW_KEY_DOWN: Int;
+    static GLFW_KEY_LEFT: Int;
+    static GLFW_KEY_RIGHT: Int;
+
+    static fn glfwInit() -> Bool;
+    static fn glfwTerminate() -> Unit;
+    static fn glfwWindowHint(hint: Int, value: Int) -> Unit;
+    static fn glfwCreateWindow(width: Int, height: Int, title: JCharSequenceWin, monitor: Long, share: Long) -> Long;
+    static fn glfwMakeContextCurrent(window: Long) -> Unit;
+    static fn glfwShowWindow(window: Long) -> Unit;
+    static fn glfwWindowShouldClose(window: Long) -> Bool;
+    static fn glfwSetWindowShouldClose(window: Long, value: Bool) -> Unit;
+    static fn glfwPollEvents() -> Unit;
+    static fn glfwSwapBuffers(window: Long) -> Unit;
+    static fn glfwSwapInterval(interval: Int) -> Unit;
+    static fn glfwDestroyWindow(window: Long) -> Unit;
+    static fn glfwGetKey(window: Long, key: Int) -> Int;
+}
+
+extern class GL = "org.lwjgl.opengl.GL" {
+    static fn createCapabilities() -> JGLCapabilitiesWin;
+}
+
+extern class GL11 = "org.lwjgl.opengl.GL11" {
+    static GL_COLOR_BUFFER_BIT: Int;
+    static GL_DEPTH_BUFFER_BIT: Int;
+
+    static fn glClearColor(r: Float, g: Float, b: Float, a: Float) -> Unit;
+    static fn glClear(mask: Int) -> Unit;
+    static fn glViewport(x: Int, y: Int, width: Int, height: Int) -> Unit;
+}
+
+// A thin, real convenience wrapper over the raw GLFW/GL calls above -- `Window::open(...)`
+// through `.close()` covers the ordinary create/loop/destroy lifecycle in a few calls instead of
+// the full dozen-call GLFW sequence every caller would otherwise repeat by hand.
+struct Window {
+    handle: Long,
+}
+
+impl Window {
+    // Real, disclosed scope cut: always requests an OpenGL 3.3 core-profile context. A real
+    // Minecraft-mod-style consumer targeting a different GL version needs the raw `GLFW::` calls
+    // directly for now, same "convenience wrapper, not the only way in" precedent `PhoenixPool`
+    // itself sets over raw `java.util.concurrent`.
+    static fn open(width: Int, height: Int, title: String) -> Window {
+        GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MAJOR, 3);
+        GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MINOR, 3);
+        GLFW::glfwWindowHint(GLFW::GLFW_OPENGL_PROFILE, GLFW::GLFW_OPENGL_CORE_PROFILE);
+        GLFW::glfwWindowHint(GLFW::GLFW_RESIZABLE, GLFW::GLFW_TRUE);
+        let handle = GLFW::glfwCreateWindow(width, height, title as JCharSequenceWin, 0 as Long, 0 as Long);
+        GLFW::glfwMakeContextCurrent(handle);
+        GL::createCapabilities();
+        GLFW::glfwSwapInterval(1);
+        GLFW::glfwShowWindow(handle);
+        return Window { handle: handle };
+    }
+
+    fn should_close(&self) -> Bool {
+        return GLFW::glfwWindowShouldClose(self.handle);
+    }
+
+    fn request_close(&self) {
+        GLFW::glfwSetWindowShouldClose(self.handle, true);
+    }
+
+    // Clears the frame to `(r, g, b)` (opaque, `a` fixed at `1.0`) -- the common case; call
+    // `GL11::glClearColor`/`::glClear` directly for anything else (a custom alpha, depth-buffer
+    // clearing, ...).
+    fn clear(&self, r: Float, g: Float, b: Float) {
+        GL11::glClearColor(r, g, b, 1.0f);
+        GL11::glClear(GL11::GL_COLOR_BUFFER_BIT);
+    }
+
+    // Presents the just-cleared/drawn frame and processes queued input/window events -- the two
+    // real per-tick calls every GLFW render loop needs, bundled since neither ever makes sense
+    // without the other.
+    fn present(&self) {
+        GLFW::glfwSwapBuffers(self.handle);
+        GLFW::glfwPollEvents();
+    }
+
+    fn is_key_down(&self, key: Int) -> Bool {
+        return GLFW::glfwGetKey(self.handle, key) == GLFW::GLFW_PRESS;
+    }
+
+    fn close(&self) {
+        GLFW::glfwDestroyWindow(self.handle);
+        GLFW::glfwTerminate();
+    }
+}

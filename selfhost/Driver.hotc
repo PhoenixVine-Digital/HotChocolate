@@ -981,8 +981,8 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // `use phoenix_virtual;` alone (no `use phoenix;`) still needs `phoenix`'s own program
         // merged in for those types to exist at all.
         out = add_stdlib_topic_and_deps("phoenix", out, target);
-    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" {
-        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math");
+    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" {
+        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window");
     }
     out.push(topic);
     return out;
