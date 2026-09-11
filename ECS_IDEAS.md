@@ -1,5 +1,25 @@
 # ECS with ownership-derived scheduling — design doc
 
+**Status, 2026-09-11**: first real use in a real project, and a real gap found by it. Marshmallow
+(the game engine this compiler exists to serve) now spawns 5 real entities (`Transform` +
+`Renderable`, the latter holding owned `Mesh`/`Shader`/`Texture` struct values -- since those are
+just thin wrappers around GL integer handles, every entity sharing the same mesh/shader/texture
+shares the same underlying VAO/program/texture id, no duplicate GL resources per entity), animated
+by a `Rotate` system and drawn by an `@after(Rotate)` `Render` system. Confirmed working end to
+end on real hardware: 5 lit, textured cubes orbiting in a ring.
+
+**The real gap this surfaced**: `World` only ever exposes `spawn`/`run_all`/`add`/`remove`/
+`shutdown` -- there is no way for ordinary caller code to read a component's CURRENT value back
+out after a `run_all()` call, or to push fresh external state (mouse/keyboard input, a moving
+camera, anything computed outside the ECS world) INTO an already-spawned entity before the next
+`run_all()`. Marshmallow's own `Render` system works around this by hardcoding a fixed camera
+directly in the system body -- real, but not general: any system that needs a live value from
+outside the ECS world (a camera that moves, a delta-time value computed by the caller's own
+`FrameTimer`, anything) currently can't get one. This is a real, unsolved design question, not
+just a missing convenience method -- see a new "Still open" entry below for what a fix would
+actually need to answer (a resource/singleton mechanism, most likely, but exactly what shape one
+takes is genuinely open).
+
 **Status, 2026-09-10**: query filters landed -- `Without<Component>` on a `system`'s own `run`
 param excludes any archetype that HAS that component from that system's own matching set
 entirely (a pure, compile-time-only exclusion -- no new runtime state, no `&`/`&mut` needed on
@@ -611,3 +631,35 @@ without a big back-and-forth, but real picks nonetheless:
    NOT survive to be seen this tick -- the simpler of the two options this question raised, and
    the one that shipped), then any `&mut`-taking system's dispatch sets `true` for every row it
    touches as it runs.
+6. **A resource/singleton-injection mechanism** — the real gap Marshmallow's own first ECS use
+   surfaced (see the "Status" note at the top). Concretely needed: a way for `main()`'s own
+   per-frame external state (a live camera position, keyboard/mouse input, a `FrameTimer`'s own
+   delta time -- `stdlib/graphics.hotc`, added alongside this same session's work) to reach a
+   system's own `run` body, and/or a way for ordinary caller code to read a component's value
+   back out after `world.run_all()` returns (right now NEITHER direction exists -- `World` only
+   ever exposes `spawn`/`run_all`/`add`/`remove`/`shutdown`). Real prior art from other ECS
+   designs: a "resource" is a single, world-wide value (not per-entity) a system can request
+   alongside its ordinary `&`/`&mut` component params -- e.g. `fn run(t: &mut Transform, dt:
+   &DeltaTime)` where `DeltaTime` is set once per tick via something like `world.set_resource
+   (DeltaTime { seconds: timer.delta_seconds })` right before `run_all()`, and read (never
+   archetype-matched, since there's exactly one of it) by any system that names it. Real open
+   questions this raises, not yet answered:
+   - Is a resource declared with the SAME `component` keyword (relying on there being no
+     `Entity` row for it to distinguish it from an ordinary per-entity component), or a new,
+     separate keyword (`resource Name { fields }`)? The former reuses existing grammar/checker
+     machinery; the latter is more honest about "this is a different kind of thing, matched
+     differently."
+   - Read-only resources (`&DeltaTime`) are the easy, obviously-safe case -- ordinary borrow
+     rules apply, no new conflict analysis needed. A MUTABLE resource a system can read AND
+     write (as opposed to one only `main()` ever sets before `run_all()`) reopens the same
+     ownership-conflict analysis `check_systems` already does for components -- does a resource
+     participate in that same conflict graph, or get its own, simpler rule ("at most one system
+     may take it by `&mut` at all, full stop, since there's only ever one of it")?
+   - Does reading a component's value back out after `run_all()` need its own real query API on
+     `World` (`world.get::<Transform>(entity_id) -> Transform`, using the entity id `world.spawn`
+     already returns), independent of the resource question above -- or does solving resources
+     make that need go away in practice, since a caller who needs a value back could route it
+     through a mutable resource a LATER system writes into instead?
+   Real, disclosed scope note: nothing above is small — this is genuinely open design work, not a
+   "just add a method" gap, closer in size to the original archetype-storage decision than to any
+   single "Still open" item resolved above.

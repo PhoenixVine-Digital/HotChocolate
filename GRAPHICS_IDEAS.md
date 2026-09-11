@@ -1,5 +1,17 @@
 # Graphics/rendering — design doc
 
+**Status, 2026-09-11 (later)**: real Blinn-Phong lighting landed --
+`Mesh::from_indexed_lit` (a third fixed vertex layout, `x, y, z, nx, ny,
+nz, u, v`) plus `Shader::set_vec3` (light direction/color, view position).
+Basic "gamelib" tooling landed too: `TextureCache::get_or_load(path)`
+(loads each path at most once, sharing the GL handle on repeat requests)
+and `FrameTimer::tick()` (frame-rate-independent delta time + a
+once-per-second FPS estimate, via `java.lang.System.nanoTime()`).
+Verified via Marshmallow: the hand-coded cube is now really lit (ambient/
+diffuse/specular over its existing texture), and a small ring of 5
+ECS-driven entities (see ECS_IDEAS.md's own "Status" note) reuses the
+same `Mesh`/`Shader`/`Texture` instances across every entity.
+
 **Status, 2026-09-11**: windowing, first-geometry, uniform/depth-testing,
 index buffers, AND textures all landed. `stdlib/window.hotc` (`use window;`)
 gives real GLFW window creation/lifecycle, keyboard input, and minimal
@@ -94,12 +106,29 @@ much larger surface area.
   `javax.imageio`-supported format), `Shader::set_int` (a plain `Int`
   uniform, also how a `sampler2D` gets told which texture unit to read
   from), `Mesh::from_indexed_textured` (second fixed layout, `x, y, z,
-  u, v`). Still real, narrower follow-ups from here: a `Vec3`/`Float`
-  uniform setter beyond `set_mat4`/`set_int` (added the moment a real
-  caller needs one), multi-texture support (`Texture::bind` is hardcoded
-  to unit 0 only), a general vertex-format description (multiple layouts,
-  not just the two fixed shapes that exist now), and blending state (depth
-  testing itself is done; blending -- transparency -- is not).
+  u, v`).
+- ~~**A `Vec3` uniform setter**~~ — landed, 2026-09-11: `Shader::set_vec3`,
+  the piece real lighting needed (light direction/color, view position).
+- ~~**Basic lighting**~~ — landed, 2026-09-11: `Mesh::from_indexed_lit`
+  (third fixed layout, `x, y, z, nx, ny, nz, u, v`) plus a real ambient/
+  diffuse/Blinn-Phong-specular fragment shader (Marshmallow's own, not a
+  stdlib addition -- lighting MATH lives in caller GLSL, same as every
+  other shader body this stdlib never generates for you).
+- ~~**Basic resource/profiling tooling**~~ — landed, 2026-09-11:
+  `TextureCache::get_or_load` (load-once, share-the-handle caching) and
+  `FrameTimer::tick()` (delta time + once-per-second FPS). Real, disclosed
+  scope cuts: `TextureCache` is linear-search (fine for a handful-to-
+  dozens of distinct textures, not hundreds+); no equivalent cache exists
+  yet for `Shader`/`Mesh` (only `Texture` has a real caller-visible need
+  for one so far -- shaders/meshes are typically compiled/uploaded once
+  at startup already, not re-requested by path like a texture asset is).
+  `@profile` (ECS-system-level timing) already existed separately, from
+  earlier ECS work -- see ECS_IDEAS.md.
+- Still real, narrower follow-ups from here: multi-texture support
+  (`Texture::bind` is hardcoded to unit 0 only), a general vertex-format
+  description (multiple layouts, not just the three fixed shapes that
+  exist now), and blending state (depth testing itself is done; blending
+  -- transparency -- is not).
 - **The Vulkan migration itself** — not started. Real engineering, likely
   bigger than the OpenGL layer it replaces (see "Why OpenGL first," above,
   for the real size gap). See "Open questions" below for what actually
