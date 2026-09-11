@@ -4110,9 +4110,29 @@ needed for these specifically:
 
 ```kotlin
 dependencies {
-    implementation("com.github.P-H-O-E-N-I-X-PackForge:HotChocolate:v0.1.5")
+    implementation("com.github.PhoenixVine-Digital.HotChocolate:hotchocolate:v0.1.12")
 }
 ```
+
+**Fixed 2026-09-11** — the coordinate above is corrected on two fronts,
+both found scaffolding Marshmallow (the first real end-to-end exercise
+of this JitPack path since the self-hosted migration): the GROUP needs
+the repo name folded in (`com.github.<user>.<repo>`, JitPack's own
+multi-module convention — this repo has been multi-module since
+`hc-gradle-plugin`/`hc-intellij-plugin` were split out, so the ROOT
+module needs it too, not just the submodules), and the ARTIFACT id is
+`hotchocolate` (lowercase, matching this repo's own `rootProject.name`
+in `settings.gradle.kts` exactly — JitPack coordinate lookup is
+case-sensitive). A second, more serious bug landed in the very same
+fix: the plain `jar` task only ever packaged `sourceSets.main.output`
+(just `CodegenShim.class` since the self-hosted migration) — the real
+compiler classes (`SelfhostCLI`, all of `hc/selfhost/**`) come from the
+checked-in `selfhost/bootstrap` seed, wired onto the local
+`runtimeClasspath` for `./gradlew run` but never folded into the `jar`
+task itself, so EVERY tag published since the migration produced a
+real, resolvable, but silently compiler-less artifact. Confirmed via
+`jar tf` both before (143 → 6 entries, no `SelfhostCLI.class`) and
+after the fix.
 
 built on demand by JitPack from any pushed tag (`git tag vX.Y.Z && git
 push origin vX.Y.Z`, then JitPack builds it the first time someone

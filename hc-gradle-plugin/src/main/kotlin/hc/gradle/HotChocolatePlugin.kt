@@ -24,7 +24,19 @@ import java.io.File
 // constant (and the matching `useModule(...)` mapping every consuming project's own
 // `settings.gradle.kts` needs -- see README.md/ARCHITECTURE.md's own JitPack setup examples,
 // and `hc-intellij-plugin`'s own new-project scaffolding template) were updated to match.
-private const val COMPILER_GROUP = "com.github.PhoenixVine-Digital"
+// **Fixed 2026-09-11 -- a third, independent real bug, found the same way as the other two on
+// this same pass**: this constant was missing the REPO name segment JitPack's own multi-module
+// coordinate convention needs (`hc-gradle-plugin`'s own `useModule(...)` mapping, in
+// `settings.gradle.kts`, already had it right -- `com.github.<user>.<repo>:<module>:<version>`,
+// the repo name folded into the GROUP, not a separate path segment -- this constant just never
+// matched it). `"com.github.PhoenixVine-Digital"` alone resolves to
+// `jitpack.io/com/github/PhoenixVine-Digital/hotchocolate/...` -- missing the `/HotChocolate/`
+// segment the real artifact is actually published under
+// (`jitpack.io/com/github/PhoenixVine-Digital/HotChocolate/hotchocolate/...`) -- confirmed via a
+// real Gradle resolution failure ("Read timed out" against the WRONG URL, not a 404 -- JitPack's
+// own reverse-proxy has no route registered for a group that never resolves to a real repo at
+// all) after the other two fixes on this same pass were already verified working.
+private const val COMPILER_GROUP = "com.github.PhoenixVine-Digital.HotChocolate"
 // **Fixed 2026-09-11 -- a second, independent real bug** found the same way as the org-rename
 // one above (actually resolving this plugin end to end for the first time, scaffolding
 // Marshmallow): the repo's OWN root `settings.gradle.kts` sets `rootProject.name = "hotchocolate"`
@@ -94,7 +106,7 @@ open class HotChocolateExtension(private val project: Project) {
     var compilerHome: File? = null
 
     // `version = "v0.1.5"` -- resolves the compiler as a real, already-published JitPack
-    // dependency (`com.github.PhoenixVine-Digital:HotChocolate:v0.1.5`, see the README's
+    // dependency (`com.github.PhoenixVine-Digital.HotChocolate:hotchocolate:v0.1.5`, see the README's
     // "Published on JitPack") instead of requiring a local `./gradlew installDist` against a
     // sibling checkout. This is the normal path for a consuming project: no local HotChocolate
     // checkout, no manual build step, just a pinned version like any other dependency --
