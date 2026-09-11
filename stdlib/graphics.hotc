@@ -113,6 +113,7 @@ extern class GL20 = "org.lwjgl.opengl.GL20" {
     // Sets an `Int` (or `sampler2D`) uniform -- for a sampler, `value` is a TEXTURE UNIT index
     // (0 for the only unit this file's own `Texture::bind` ever uses), not a texture id itself.
     static fn glUniform1i(location: Int, value: Int) -> Unit;
+    static fn glUniform3f(location: Int, v0: Float, v1: Float, v2: Float) -> Unit;
 }
 
 extern class GL30 = "org.lwjgl.opengl.GL30" {
@@ -223,6 +224,14 @@ impl Shader {
     fn set_int(&self, name: String, value: Int) {
         let loc = GL20::glGetUniformLocation(self.program, name as JCharSequenceWin);
         GL20::glUniform1i(loc, value);
+    }
+
+    // Uploads a `vec3` uniform -- a light direction/color, a camera/view position, or any other
+    // 3-float constant a shader needs per draw call (not just lighting, though that's the first
+    // real caller).
+    fn set_vec3(&self, name: String, v: &Vec3) {
+        let loc = GL20::glGetUniformLocation(self.program, name as JCharSequenceWin);
+        GL20::glUniform3f(loc, v.x, v.y, v.z);
     }
 }
 
@@ -382,6 +391,43 @@ impl Mesh {
         GL20::glEnableVertexAttribArray(0);
         GL20::glVertexAttribPointer(1, 2, GL11::GL_FLOAT, false, 20, 12 as Long);
         GL20::glEnableVertexAttribArray(1);
+
+        let ebo = GL15::glGenBuffers();
+        GL15::glBindBuffer(GL15::GL_ELEMENT_ARRAY_BUFFER, ebo);
+        var ibuf = BufferUtilsGfx::createIntBuffer(indices.length);
+        ibuf = ibuf.put(indices);
+        ibuf = ibuf.flip();
+        GL15::glBufferData(GL15::GL_ELEMENT_ARRAY_BUFFER, ibuf, GL15::GL_STATIC_DRAW);
+
+        return Mesh { vao: vao, vertex_count: 0, index_count: indices.length };
+    }
+
+    // A THIRD fixed layout, for lit + textured meshes: interleaved `(x, y, z, nx, ny, nz, u, v)`
+    // per vertex -- position (`location = 0`, 3 floats), normal (`location = 1`, 3 floats), then
+    // texture coordinate (`location = 2`, 2 floats). Real, disclosed scope cut: same "one fixed
+    // layout, no general vertex-format description yet" stance every other `Mesh::from_*`
+    // constructor already takes -- a real caller needing lighting WITHOUT a texture, or a texture
+    // WITHOUT lighting, still uses `from_indexed_textured`/`from_indexed` directly; this is a
+    // third fixed shape for the "both" case, not a step toward arbitrary layouts.
+    static fn from_indexed_lit(vertices: [Float], indices: [Int]) -> Mesh {
+        let vao = GL30::glGenVertexArrays();
+        GL30::glBindVertexArray(vao);
+
+        let vbo = GL15::glGenBuffers();
+        GL15::glBindBuffer(GL15::GL_ARRAY_BUFFER, vbo);
+        var vbuf = BufferUtilsGfx::createFloatBuffer(vertices.length);
+        vbuf = vbuf.put(vertices);
+        vbuf = vbuf.flip();
+        GL15::glBufferData(GL15::GL_ARRAY_BUFFER, vbuf, GL15::GL_STATIC_DRAW);
+
+        // Stride: 8 floats * 4 bytes = 32 bytes per vertex. Position at byte offset 0, normal at
+        // byte offset 12 (3 floats in), UV at byte offset 24 (6 floats in).
+        GL20::glVertexAttribPointer(0, 3, GL11::GL_FLOAT, false, 32, 0 as Long);
+        GL20::glEnableVertexAttribArray(0);
+        GL20::glVertexAttribPointer(1, 3, GL11::GL_FLOAT, false, 32, 12 as Long);
+        GL20::glEnableVertexAttribArray(1);
+        GL20::glVertexAttribPointer(2, 2, GL11::GL_FLOAT, false, 32, 24 as Long);
+        GL20::glEnableVertexAttribArray(2);
 
         let ebo = GL15::glGenBuffers();
         GL15::glBindBuffer(GL15::GL_ELEMENT_ARRAY_BUFFER, ebo);
