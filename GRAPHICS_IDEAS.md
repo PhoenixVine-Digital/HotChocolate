@@ -1,14 +1,20 @@
 # Graphics/rendering — design doc
 
-**Status, 2026-09-11**: windowing AND first-geometry milestones both landed.
-`stdlib/window.hotc` (`use window;`) gives real GLFW window creation/
-lifecycle, keyboard input, and minimal OpenGL (`GL11`) clearing/presenting,
-via LWJGL. `stdlib/graphics.hotc` (`use graphics;`, depends on `window`)
-adds real geometry: `Shader::compile(vertex_src, fragment_src)` compiles
-and links a real GLSL program; `Mesh::from_floats(vertices, vertex_count)`
-uploads a real VBO/VAO. Both verified with REAL rendering on real hardware
-(not just a compile check) through Marshmallow: a real colored triangle,
-compiled shaders, real vertex buffers, drawn every frame. See
+**Status, 2026-09-11**: windowing, first-geometry, AND uniform/depth-testing
+milestones all landed. `stdlib/window.hotc` (`use window;`) gives real GLFW
+window creation/lifecycle, keyboard input, and minimal OpenGL (`GL11`)
+clearing/presenting, via LWJGL — depth testing is now always on, and
+`Window::clear` clears both the color and depth buffers. `stdlib/graphics.hotc`
+(`use graphics;`, depends on `window` AND `math`) adds real geometry:
+`Shader::compile(vertex_src, fragment_src)` compiles and links a real GLSL
+program; `Mesh::from_floats(vertices, vertex_count)` uploads a real VBO/VAO;
+`Shader::set_mat4(name, m)` uploads a `math.hotc` `Mat4` to a named uniform
+(`glGetUniformLocation`/`glUniformMatrix4fv`), so per-draw-call transforms
+(model/view/projection) are finally real instead of everything being stuck
+exactly where its vertices say it is. All verified with REAL rendering on
+real hardware (not just a compile check) through Marshmallow: a real
+spinning triangle with a real perspective camera (`Mat4::perspective`/
+`look_at`/`rotation_y`, composed and uploaded once per frame). See
 ARCHITECTURE.md's own "Standard library modules" section for the full
 technical writeup of what shipped (the `JCharSequenceWin` alias + `as` cast
 `glfwCreateWindow`'s/`glShaderSource`'s title/source params need to pass
@@ -62,13 +68,16 @@ much larger surface area.
 
 - ~~**Real geometry**~~ — landed, 2026-09-11: `graphics.hotc`'s own
   `Shader`/`Mesh` (shader compile/link, VBO/VAO upload, real draw calls),
-  fixed vertex layout only (`x, y, z, r, g, b` interleaved). Still real,
-  narrower follow-ups from here: textures/samplers, uniforms (no uniform
-  bindings exist yet -- everything so far is vertex-attribute-driven, no
-  per-draw-call constant data like a transform matrix), a general vertex-
-  format description (multiple layouts, not just the one fixed shape),
-  index buffers (EBO -- drawing with `glDrawElements`, not just
-  `glDrawArrays`), and depth/blending state.
+  fixed vertex layout only (`x, y, z, r, g, b` interleaved).
+- ~~**Uniforms + depth testing**~~ — landed, 2026-09-11: `Shader::set_mat4`
+  (real `glGetUniformLocation`/`glUniformMatrix4fv`, only a `Mat4` uniform
+  for now -- no `Vec3`/`Float`/etc. uniform setters yet, added the moment a
+  real caller needs one), and depth testing always on (`Window::new`/
+  `Window::clear`). Still real, narrower follow-ups from here:
+  textures/samplers, a general vertex-format description (multiple layouts,
+  not just the one fixed shape), index buffers (EBO -- drawing with
+  `glDrawElements`, not just `glDrawArrays`), and blending state (depth
+  testing itself is done; blending -- transparency -- is not).
 - **The Vulkan migration itself** — not started. Real engineering, likely
   bigger than the OpenGL layer it replaces (see "Why OpenGL first," above,
   for the real size gap). See "Open questions" below for what actually

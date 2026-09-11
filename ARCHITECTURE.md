@@ -1105,11 +1105,29 @@ fn main() {
   real parse error the instant it was tried. Verified end to end with
   a REAL window on real hardware (not just a compile check) via
   Marshmallow: opens, renders a pulsing clear color every frame, closes
-  cleanly via Escape or the window's own close button. Real geometry
-  (shaders/VBOs/draw calls) is deliberately deferred to a separate,
-  not-yet-written `graphics.hotc` follow-up -- this topic is scoped to
-  "can we open a window and present a frame at all," the actual
-  windowing milestone. Naming a topic with dependencies (`use registry;`)
+  cleanly via Escape or the window's own close button. Depth testing is
+  always on (`Window::new` enables `GL_DEPTH_TEST`, `Window::clear` clears
+  both the color and depth buffers) -- a real, disclosed scope decision
+  (2026-09-11): correctly ordering overlapping 3D geometry is the normal
+  case a game engine wants, not the exception. Real geometry (shaders/
+  VBOs/draw calls) is a separate follow-up topic, **`graphics`**
+  (`stdlib/graphics.hotc`, depends on `window` AND `math`, added
+  2026-09-11): `Shader::compile(vertex_src, fragment_src)` compiles and
+  links a real GLSL program (printing the real driver info log on
+  failure); `Mesh::from_floats(vertices, vertex_count)` uploads a real
+  VBO/VAO with a fixed `(x, y, z, r, g, b)` interleaved layout;
+  `Shader::set_mat4(name, m)` uploads a `math.hotc` `Mat4` to a named
+  uniform (`glGetUniformLocation`/`glUniformMatrix4fv`, `transpose=true`
+  to feed `Mat4`'s own row-major storage directly with no re-ordering) --
+  the piece that makes a per-draw-call model/view/projection transform
+  real instead of every mesh being stuck exactly where its vertices say
+  it is. Verified end to end with REAL rendering on real hardware via
+  Marshmallow: a real spinning triangle with a real perspective camera
+  (`Mat4::perspective`/`look_at`/`rotation_y`, composed once per frame and
+  uploaded via `set_mat4`). See GRAPHICS_IDEAS.md for the full design
+  (including why OpenGL now, Vulkan before ship) and its own "Explicitly
+  deferred" list for what's still missing (textures, index buffers,
+  blending, etc.). Naming a topic with dependencies (`use registry;`)
   automatically pulls those in too — no need to separately write
   `use vec; use option;` as well, though doing so is harmless (a topic
   named more than once, directly or transitively, is only ever merged
