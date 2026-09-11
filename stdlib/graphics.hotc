@@ -448,3 +448,91 @@ impl Mesh {
         }
     }
 }
+
+// A real resource cache -- loads each texture path AT MOST ONCE per `TextureCache` instance,
+// returning the already-loaded `Texture` (the same GL handle, shared) on every repeat request
+// instead of re-decoding the image file and re-uploading a new GL texture every time a caller
+// asks for the same path (e.g. the same tile/sprite texture requested once per entity that uses
+// it, instead of once ever). Real, disclosed scope cut: linear search over every cached path per
+// lookup -- fine for the handful-to-dozens of distinct textures a real game asset list actually
+// has, not optimized for hundreds+.
+struct TextureCache {
+    paths: Vec<String>,
+    textures: Vec<Texture>,
+}
+
+impl TextureCache {
+    static fn new() -> TextureCache {
+        // `Vec<T>` has no zero-argument constructor (its own backing array needs a real seed
+        // value to size itself from -- see `vec.hotc`'s own `vec_of`) -- bootstrap with a throwaway
+        // element, then `clear()` it back to empty before this cache is ever used for real.
+        var paths = vec_of("");
+        paths.clear();
+        var textures = vec_of(Texture { id: 0 });
+        textures.clear();
+        return TextureCache { paths: paths, textures: textures };
+    }
+
+    fn get_or_load(&mut self, path: String) -> Texture {
+        var i = 0;
+        while i < self.paths.length() {
+            if self.paths.get(i) == path {
+                return self.textures.get(i);
+            }
+            i = i + 1;
+        }
+        let tex = Texture::load(path);
+        self.paths.push(path);
+        self.textures.push(tex);
+        return tex;
+    }
+}
+
+// `java.lang.System.nanoTime()` under a dedicated alias -- same "one real binding, not a raw
+// `System` alias floating around for anything else" scope this file already keeps everything
+// else to.
+extern class SystemClockGfx = "java.lang.System" {
+    static fn nanoTime() -> Long;
+}
+
+// Real per-frame timing: frame-rate-independent delta time (seconds) and a running FPS estimate,
+// refreshed once per second of real time (not every single frame -- an FPS number that changes
+// every frame is too noisy to read). Call `tick()` exactly once per frame, anywhere consistent
+// (right after `window.present()` or right before `window.clear()` both work, as long as it's
+// once).
+struct FrameTimer {
+    last_ns: Long,
+    delta_seconds: Float,
+    fps: Float,
+    frame_count: Int,
+    fps_accum_seconds: Float,
+}
+
+impl FrameTimer {
+    static fn new() -> FrameTimer {
+        return FrameTimer {
+            last_ns: SystemClockGfx::nanoTime(),
+            delta_seconds: 0.0f,
+            fps: 0.0f,
+            frame_count: 0,
+            fps_accum_seconds: 0.0f,
+        };
+    }
+
+    // Updates `delta_seconds`/`fps` and returns the new delta -- callers that only care about one
+    // of the two can ignore the return value and read `.delta_seconds`/`.fps` directly instead.
+    fn tick(&mut self) -> Float {
+        let now = SystemClockGfx::nanoTime();
+        let elapsed_ns = now - self.last_ns;
+        self.last_ns = now;
+        self.delta_seconds = (elapsed_ns as Float) / 1000000000.0f;
+        self.frame_count = self.frame_count + 1;
+        self.fps_accum_seconds = self.fps_accum_seconds + self.delta_seconds;
+        if self.fps_accum_seconds >= 1.0f {
+            self.fps = (self.frame_count as Float) / self.fps_accum_seconds;
+            self.frame_count = 0;
+            self.fps_accum_seconds = 0.0f;
+        }
+        return self.delta_seconds;
+    }
+}

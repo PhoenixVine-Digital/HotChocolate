@@ -992,6 +992,10 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // type from another topic, needs that topic's own program merged in" reasoning every
         // other cross-topic dependency here already follows.
         out = add_stdlib_topic_and_deps("math", out, target);
+        // `TextureCache`'s own `paths: Vec<String>`/`textures: Vec<Texture>` fields (added
+        // 2026-09-11, alongside `FrameTimer`) need `vec.hotc`'s real `Vec<T>`/`vec_of` --
+        // same reasoning as the `math` dependency right above, just for `vec` instead.
+        out = add_stdlib_topic_and_deps("vec", out, target);
     } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" {
         throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics");
     }
