@@ -862,7 +862,19 @@ impl CodeGen {
             if let Some { value: efdesc1 } = efdesc_found1 {
                 if let Some { value: eftype1 } = eftype_found1 {
                     self.gen_expr(value); // stack: [objref, value]
-                    self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value]
+                    // `value` is category-2 (64-bit: `Long`/`Double`) for THIS field just as
+                    // often as category-1 -- a bare `DUP_X1` (opcode 90) only ever preserves a
+                    // category-1 value across the 1-deep `objref` underneath it; a category-2
+                    // value needs `DUP2_X1` (93) instead, or the JVM verifier rejects the class
+                    // outright ("Bad type on operand stack" at this exact instruction -- found
+                    // the hard way via a real `Long`-typed struct field reassignment through
+                    // `&mut self`, which hits the ordinary (non-extern) sibling of this same bug
+                    // right below).
+                    if eftype1 == "Long" || eftype1 == "Double" {
+                        self.mv.visitInsn(93); // DUP2_X1 -- stack: [value, objref, value] (value is 2 words)
+                    } else {
+                        self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value]
+                    }
                     self.mv.visitFieldInsn(181, ebinary1, field, efdesc1); // PUTFIELD -- consumes [objref, value], leaves [value]
                     return eftype1;
                 }
@@ -879,7 +891,13 @@ impl CodeGen {
             let setx_found = self.extern_method_descs.get(ot + "#set" + cap1 + "#1");
             if let Some { value: pset_desc } = setx_found {
                 let vty1 = self.gen_expr(value); // stack: [objref, value]
-                self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value] (same shape PUTFIELD's own path uses, right below)
+                // Same category-1-vs-2 split as the real-field-desc branch above -- see that
+                // one's own header for why a bare `DUP_X1` is wrong for a `Long`/`Double` value.
+                if vty1 == "Long" || vty1 == "Double" {
+                    self.mv.visitInsn(93); // DUP2_X1 -- stack: [value, objref, value] (value is 2 words)
+                } else {
+                    self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value] (same shape PUTFIELD's own path uses, right below)
+                }
                 var piface1 = 0;
                 let piface1_found = self.extern_is_interface.get(ot);
                 if let Some { value: piv1 } = piface1_found { piface1 = piv1; }
@@ -904,7 +922,20 @@ impl CodeGen {
         }
         let fty = self.field_type_of(ot, field);
         self.gen_expr(value); // stack: [objref, value]
-        self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value]
+        // A `Long`/`Double`-typed field is a real, previously-undetected gap here: `value` is
+        // category-2 (64-bit), so a bare `DUP_X1` (90) -- which only ever correctly preserves a
+        // category-1 value across the 1-deep `objref` underneath it -- produces a real,
+        // verifier-rejected class ("Bad type on operand stack ... long_2nd ... not assignable to
+        // category1 type" at this exact `DUP_X1`). `DUP2_X1` (93) is the real fix for a
+        // category-2 value in this exact stack shape (JVM spec `dup2_x1` Form 2: a category-2
+        // value1 over a category-1 value2 duplicates as value1, value2, value1 -- exactly
+        // `value, objref, value` here). Found the hard way assigning to a `Long`-typed struct
+        // field (`self.last_ns = now;`) through `&mut self`.
+        if fty == "Long" || fty == "Double" {
+            self.mv.visitInsn(93); // DUP2_X1 -- stack: [value, objref, value] (value is 2 words)
+        } else {
+            self.mv.visitInsn(90); // DUP_X1 -- stack: [value, objref, value]
+        }
         self.mv.visitFieldInsn(181, self.qualify(ot), field, self.resolve_descriptor(fty)); // PUTFIELD -- consumes [objref, value], leaves [value]
         return fty;
     }
