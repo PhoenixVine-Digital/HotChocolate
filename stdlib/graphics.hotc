@@ -57,10 +57,13 @@ extern class JFloatBufferGfx = "java.nio.FloatBuffer" {
 }
 
 // `java.nio.IntBuffer` -- same real NIO write-then-flip idiom `JFloatBufferGfx` above already
-// uses, for index data (`Mesh::from_indexed`'s own EBO upload) instead of vertex data. Same
-// `&self`-or-implicitly-static trap applies here too -- see `JFloatBufferGfx`'s own header.
+// uses, for index data (`Mesh::from_indexed`'s own EBO upload) and, via the single-value `put`
+// overload, packed-pixel texture data (`Texture::load`'s own upload -- see that struct's own
+// header for why one `Int` at a time). Same `&self`-or-implicitly-static trap applies here too --
+// see `JFloatBufferGfx`'s own header.
 extern class JIntBufferGfx = "java.nio.IntBuffer" {
     fn put(&self, values: [Int]) -> JIntBufferGfx;
+    fn put(&self, value: Int) -> JIntBufferGfx;
     fn flip(&self) -> JIntBufferGfx;
 }
 
@@ -107,11 +110,45 @@ extern class GL20 = "org.lwjgl.opengl.GL20" {
     // as `glShaderSource`, right above.
     static fn glGetUniformLocation(program: Int, name: JCharSequenceWin) -> Int;
     static fn glUniformMatrix4fv(location: Int, transpose: Bool, value: JFloatBufferGfx) -> Unit;
+    // Sets an `Int` (or `sampler2D`) uniform -- for a sampler, `value` is a TEXTURE UNIT index
+    // (0 for the only unit this file's own `Texture::bind` ever uses), not a texture id itself.
+    static fn glUniform1i(location: Int, value: Int) -> Unit;
 }
 
 extern class GL30 = "org.lwjgl.opengl.GL30" {
     static fn glGenVertexArrays() -> Int;
     static fn glBindVertexArray(array: Int) -> Unit;
+}
+
+// A second alias over the SAME real `org.lwjgl.opengl.GL11` class `window.hotc`'s own `GL11`
+// binds -- only for `glTexImage2D`, whose real declared param type here (`JIntBufferGfx`) is
+// declared in THIS file, not `window.hotc` (which has no dependency on `graphics` to reach it) --
+// every other texture constant/method that doesn't need that type lives on `window.hotc`'s own
+// `GL11` instead (see that file's own header on this split).
+extern class GL11Tex = "org.lwjgl.opengl.GL11" {
+    static fn glTexImage2D(target: Int, level: Int, internalformat: Int, width: Int, height: Int, border: Int, format: Int, type: Int, pixels: JIntBufferGfx) -> Unit;
+}
+
+// `org.lwjgl.opengl.GL12` -- only for the `GL_BGRA`/`GL_UNSIGNED_INT_8_8_8_8_REV` pair
+// `Texture::load` needs (see that struct's own header for what they're for); nothing else here
+// needs GL12 at all.
+extern class GL12Tex = "org.lwjgl.opengl.GL12" {
+    static GL_BGRA: Int;
+    static GL_UNSIGNED_INT_8_8_8_8_REV: Int;
+}
+
+extern class JFileTex = "java.io.File" {
+    fn new(pathname: String) -> Self;
+}
+
+extern class ImageIOTex = "javax.imageio.ImageIO" {
+    static fn read(file: JFileTex) -> JBufferedImageTex;
+}
+
+extern class JBufferedImageTex = "java.awt.image.BufferedImage" {
+    fn getWidth(&self) -> Int;
+    fn getHeight(&self) -> Int;
+    fn getRGB(&self, x: Int, y: Int) -> Int;
 }
 
 // Compiles and links a real vertex+fragment GLSL program -- `use_program()` right before drawing
@@ -179,6 +216,68 @@ impl Shader {
         ]);
         buf = buf.flip();
         GL20::glUniformMatrix4fv(loc, true, buf);
+    }
+
+    // Uploads a plain `Int` uniform -- the general form; also how a `sampler2D` gets told which
+    // texture unit to read from (see `Texture::bind`'s own header).
+    fn set_int(&self, name: String, value: Int) {
+        let loc = GL20::glGetUniformLocation(self.program, name as JCharSequenceWin);
+        GL20::glUniform1i(loc, value);
+    }
+}
+
+// Loads a real image file (any format `javax.imageio.ImageIO` supports -- PNG/JPG/etc, no
+// LWJGL/STB dependency needed for this) into a real GL texture. Real, disclosed scope cut: reads
+// one pixel at a time via `BufferedImage.getRGB(x, y)` -- the real bulk overload
+// (`getRGB(x, y, w, h, rgbArray, offset, scansize)`) needs either a pre-sized `[Int]` HC has no
+// way to allocate yet (no dynamic-array-allocation primitive exists) or a `null` array argument
+// this file doesn't rely on either -- fine for a load-once operation, not a hot path.
+//
+// Uploaded via the well-known `GL_BGRA`/`GL_UNSIGNED_INT_8_8_8_8_REV` trick: a Java
+// `TYPE_INT_ARGB` pixel packed into one `Int` (`0xAARRGGBB`), written unmodified into an
+// `IntBuffer`, matches that exact GL format/type pairing byte-for-byte on a little-endian
+// machine -- no manual per-channel unpacking needed on the HC side (which has no bitshift
+// operator to do that with even if it were needed).
+struct Texture {
+    id: Int,
+}
+
+impl Texture {
+    static fn load(path: String) -> Texture {
+        let file = JFileTex::new(path);
+        let image = ImageIOTex::read(file);
+        let width = image.getWidth();
+        let height = image.getHeight();
+
+        var buf = BufferUtilsGfx::createIntBuffer(width * height);
+        var y = 0;
+        while y < height {
+            var x = 0;
+            while x < width {
+                buf = buf.put(image.getRGB(x, y));
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        buf = buf.flip();
+
+        let id = GL11::glGenTextures();
+        GL11::glBindTexture(GL11::GL_TEXTURE_2D, id);
+        GL11::glTexParameteri(GL11::GL_TEXTURE_2D, GL11::GL_TEXTURE_MIN_FILTER, GL11::GL_LINEAR);
+        GL11::glTexParameteri(GL11::GL_TEXTURE_2D, GL11::GL_TEXTURE_MAG_FILTER, GL11::GL_LINEAR);
+        GL11::glTexParameteri(GL11::GL_TEXTURE_2D, GL11::GL_TEXTURE_WRAP_S, GL11::GL_REPEAT);
+        GL11::glTexParameteri(GL11::GL_TEXTURE_2D, GL11::GL_TEXTURE_WRAP_T, GL11::GL_REPEAT);
+        GL11Tex::glTexImage2D(GL11::GL_TEXTURE_2D, 0, GL11::GL_RGBA, width, height, 0, GL12Tex::GL_BGRA, GL12Tex::GL_UNSIGNED_INT_8_8_8_8_REV, buf);
+
+        return Texture { id: id };
+    }
+
+    // Binds this texture to texture unit 0 -- the only unit this file supports (a real, disclosed
+    // scope cut: multi-texture materials need real unit management this doesn't do yet). Callers
+    // pair this with `shader.set_int("<sampler name>", 0)` once (the unit number never changes
+    // here), then just `bind()` per draw call.
+    fn bind(&self) {
+        GL11::glBindTexture(GL11::GL_TEXTURE_2D, self.id);
     }
 }
 
@@ -250,6 +349,40 @@ impl Mesh {
         // Real GL state: an EBO bound while its VAO is bound gets remembered BY that VAO --
         // re-binding the VAO later (in `draw()`) implicitly re-binds this EBO too, no separate
         // tracking needed on the HC side.
+        let ebo = GL15::glGenBuffers();
+        GL15::glBindBuffer(GL15::GL_ELEMENT_ARRAY_BUFFER, ebo);
+        var ibuf = BufferUtilsGfx::createIntBuffer(indices.length);
+        ibuf = ibuf.put(indices);
+        ibuf = ibuf.flip();
+        GL15::glBufferData(GL15::GL_ELEMENT_ARRAY_BUFFER, ibuf, GL15::GL_STATIC_DRAW);
+
+        return Mesh { vao: vao, vertex_count: 0, index_count: indices.length };
+    }
+
+    // A SECOND fixed layout, for textured meshes: interleaved `(x, y, z, u, v)` per vertex --
+    // position (`location = 0`, 3 floats) then texture coordinate (`location = 1`, 2 floats), no
+    // per-vertex color (the bound `Texture` supplies color now). Real, disclosed scope cut: same
+    // "one fixed layout, no general vertex-format description yet" stance `from_floats`/
+    // `from_indexed` already take -- this is a second FIXED shape for the textured case, not a
+    // step toward arbitrary layouts.
+    static fn from_indexed_textured(vertices: [Float], indices: [Int]) -> Mesh {
+        let vao = GL30::glGenVertexArrays();
+        GL30::glBindVertexArray(vao);
+
+        let vbo = GL15::glGenBuffers();
+        GL15::glBindBuffer(GL15::GL_ARRAY_BUFFER, vbo);
+        var vbuf = BufferUtilsGfx::createFloatBuffer(vertices.length);
+        vbuf = vbuf.put(vertices);
+        vbuf = vbuf.flip();
+        GL15::glBufferData(GL15::GL_ARRAY_BUFFER, vbuf, GL15::GL_STATIC_DRAW);
+
+        // Stride: 5 floats * 4 bytes = 20 bytes per vertex. Position at byte offset 0, UV at
+        // byte offset 12 (3 floats in).
+        GL20::glVertexAttribPointer(0, 3, GL11::GL_FLOAT, false, 20, 0 as Long);
+        GL20::glEnableVertexAttribArray(0);
+        GL20::glVertexAttribPointer(1, 2, GL11::GL_FLOAT, false, 20, 12 as Long);
+        GL20::glEnableVertexAttribArray(1);
+
         let ebo = GL15::glGenBuffers();
         GL15::glBindBuffer(GL15::GL_ELEMENT_ARRAY_BUFFER, ebo);
         var ibuf = BufferUtilsGfx::createIntBuffer(indices.length);

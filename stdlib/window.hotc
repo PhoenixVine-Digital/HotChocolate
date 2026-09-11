@@ -112,6 +112,18 @@ extern class GL11 = "org.lwjgl.opengl.GL11" {
     static GL_TRIANGLES: Int;
     static GL_DEPTH_TEST: Int;
     static GL_UNSIGNED_INT: Int;
+    // Texture constants -- the upload call itself (`glTexImage2D`) needs `graphics.hotc`'s own
+    // `JIntBufferGfx` type, so it lives under a second `GL11` alias over there (see that file's
+    // own `GL11Tex`); these plain-`Int` constants and the methods below don't need any
+    // graphics-specific type, so they stay here rather than getting redeclared too.
+    static GL_TEXTURE_2D: Int;
+    static GL_RGBA: Int;
+    static GL_TEXTURE_MIN_FILTER: Int;
+    static GL_TEXTURE_MAG_FILTER: Int;
+    static GL_LINEAR: Int;
+    static GL_TEXTURE_WRAP_S: Int;
+    static GL_TEXTURE_WRAP_T: Int;
+    static GL_REPEAT: Int;
 
     static fn glClearColor(r: Float, g: Float, b: Float, a: Float) -> Unit;
     static fn glClear(mask: Int) -> Unit;
@@ -123,6 +135,9 @@ extern class GL11 = "org.lwjgl.opengl.GL11" {
     // not a real pointer -- `Mesh::from_indexed` always uploads the whole index buffer and draws
     // from offset 0, so every real caller here passes `0 as Long`.
     static fn glDrawElements(mode: Int, count: Int, type: Int, indices: Long) -> Unit;
+    static fn glGenTextures() -> Int;
+    static fn glBindTexture(target: Int, texture: Int) -> Unit;
+    static fn glTexParameteri(target: Int, pname: Int, param: Int) -> Unit;
 }
 
 // A thin, real convenience wrapper over the raw GLFW/GL calls above -- `Window::new(...)`
