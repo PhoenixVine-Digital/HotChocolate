@@ -78,17 +78,15 @@ private const val JITPACK_URL = "https://jitpack.io"
 //    passing `outputDir` as a positional arg (which used to silently do nothing beyond naming
 //    where the SINGLE entry class landed, mismatched against every other file the compile
 //    produced).
-// 3. **`--classpath` is not a recognized flag on the current CLI at all** (confirmed: `grep
-//    "--classpath" selfhost/Driver.hotc` returns nothing) -- it used to back real classpath-based
-//    `extern class`/`extern interface` SIGNATURE VERIFICATION (`Checker.hotc`'s own `verify_
-//    extern_signature`, catching a wrong declared param/return type as a compile error instead of
-//    a runtime `NoSuchMethodError`), proven to work via the compiler's own internal `--classpath`
-//    self-test (`run_classpath_verify_probe` in `Driver.hotc`) -- but that internal probe is
-//    never wired to `run_cli`'s own real argv parsing for an ORDINARY compile. Removed here
-//    rather than left in place doing nothing: a consuming project's `extern` declarations
-//    silently degrade to "trust the declaration, no verification" until `run_cli` grows a real
-//    `--classpath` flag wired to `verify_extern_signature` -- a real, disclosed, NOT-yet-fixed
-//    compiler-side gap, tracked separately from this plugin fix.
+// 3. **`--classpath` was not a recognized flag on the CLI at the time of this fix** -- it backs
+//    real classpath-based `extern class`/`extern interface` SIGNATURE VERIFICATION (`Checker
+//    .hotc`'s own `verify_extern_signature`, catching a wrong declared param/return type as a
+//    compile error instead of a runtime `NoSuchMethodError`), proven to work via the compiler's
+//    own internal `--classpath` self-test (`run_classpath_verify_probe` in `Driver.hotc`) but not
+//    yet wired to `run_cli`'s own real argv parsing. Removed HERE at the time, rather than left in
+//    place doing nothing. **Restored 2026-09-11**, now that `run_cli` genuinely parses `--classpath
+//    <paths>` and threads it into `verify_extern_signature` for every declared extern method --
+//    see this file's own later `--classpath`-prepending `doFirst` block for the real wiring.
 
 // `hotChocolate { compilerHome = file(...); source(file("hc/foo.hc")); source(file("hc/bar.hc")) }`
 // -- a real Gradle DSL extension, not a description of one. Replaces the hand-copied
@@ -283,18 +281,29 @@ class HotChocolatePlugin : Plugin<Project> {
                 project.tasks.named("compileJava") { it.dependsOn(lastCompileTask) }
                 val javaExt = project.extensions.getByType(JavaPluginExtension::class.java)
                 val mainSourceSet = javaExt.sourceSets.getByName("main")
-                // A `--classpath`-style argument used to be appended here, backing the compiler's
-                // own `verifyExternSignatures` (compile-time checking of a hand-written `extern
-                // class`/`extern interface` signature against the real method it names, catching
-                // a wrong return/param type as a compile error instead of a runtime `NoSuchMethod
-                // Error`) -- removed, not just left broken, because the CURRENT self-hosted CLI
-                // doesn't parse a `--classpath` flag at all (see this file's own header, point 3)
-                // -- it would have been silently ignored either way, and leaving it in place would
-                // have implied a working feature that isn't. Real, disclosed consequence: every
-                // `extern` declaration in a project using this plugin degrades to "trust the
-                // declaration, no verification" until `run_cli` (`selfhost/Driver.hotc`) grows a
-                // real `--classpath` flag wired to `Checker.hotc`'s own `verify_extern_signature`
-                // -- tracked as a separate, NOT-yet-fixed compiler-side gap.
+                // **Fixed 2026-09-11 -- restored, now that it's real.** `run_cli` (`selfhost/
+                // Driver.hotc`) grew a genuine `--classpath <paths>` flag, wired to `Checker.hotc`'s
+                // own `verify_extern_signature` -- compile-time checking of a hand-written `extern
+                // class`/`extern interface` signature against the real method it names, catching a
+                // wrong return/param type as a compile error instead of a runtime `NoSuchMethodError`.
+                // Captured before the `compileClasspath` reassignment right below appends `ext.
+                // outputDir` itself -- passing the compiler its own not-yet-written output directory
+                // back as a `--classpath` entry would be circular and pointless. `--classpath` is a
+                // LEADING flag on the current CLI (stacks with `--target`/`--explain-schedule` the
+                // same way, before the source path) -- resolved into a real path list in `doFirst`
+                // (once every other project dependency is fully configured, not eagerly during
+                // Gradle's configuration phase) and PREPENDED, not appended, to each task's own args.
+                val realCompileClasspath = mainSourceSet.compileClasspath
+                for (taskName in fileCompileTaskNames + dirCompileTaskNames) {
+                    project.tasks.named(taskName, JavaExec::class.java) { t ->
+                        t.doFirst {
+                            val classpathString = realCompileClasspath.filter { it.exists() }.asPath
+                            if (classpathString.isNotEmpty()) {
+                                t.args = listOf("--classpath", classpathString) + (t.args ?: emptyList())
+                            }
+                        }
+                    }
+                }
                 mainSourceSet.compileClasspath = mainSourceSet.compileClasspath
                     .plus(project.files(ext.outputDir).builtBy(lastCompileTask))
                 project.tasks.named("processResources", ProcessResources::class.java) { t ->

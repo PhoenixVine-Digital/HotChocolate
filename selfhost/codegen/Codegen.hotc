@@ -7921,7 +7921,7 @@ fn build_flush_transitions_stmts_ecs(add_types: &Vec<String>, remove_types: &Vec
     return body;
 }
 
-pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool) -> Vec<String> {
+pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool, classpath: Vec<String>) -> Vec<String> {
     // `arena struct` -- see README's own "Off-heap data" section: built on `java.lang.foreign`,
     // stable only since JDK 22 (still preview at 21). Gated at `25` -- the only discrete
     // `--target` level this compiler actually has (17/21/25, no "22") that's genuinely >= 22 --
@@ -8043,6 +8043,42 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         let xd = externs.get(xi0);
         checker.register_extern(xd.name, xd.binary_name, xd.methods, xd.fields);
         xi0 = xi0 + 1;
+    }
+    // Real classpath-based signature verification (`Checker.hotc`'s own `verify_extern_
+    // signature`, proven correct via the compiler's own internal probe -- see `Driver.hotc`'s
+    // own `run_classpath_verify_probe` -- but never reachable from an ordinary compile before
+    // this). An EMPTY `classpath` (the default, no `--classpath` given) still checks anything
+    // findable via the plain context classloader for free -- every JDK-only `extern` gets
+    // verified with zero extra ceremony; `class_exists_reflect` itself is what silently skips a
+    // binary name it can't find on WHATEVER classpath was actually given, so calling this
+    // unconditionally for every declared method is always safe, never a false positive.
+    //
+    // A SEPARATE loop, run only after EVERY extern above has already been registered -- not
+    // fused into the registration loop itself. Real, previously-hit ordering bug found running
+    // this against the compiler's OWN source: `JClassRefX::getMethods` declares `-> [JMethodRefX]`,
+    // and `declared_type_to_key`'s own array-element lookup resolves `JMethodRefX` through
+    // `self.externs` (populated by `register_extern`) -- verifying `JClassRefX` INLINE, in the
+    // same pass that registers each extern one at a time, means `JMethodRefX` (declared AFTER
+    // `JClassRefX` in this file) isn't registered yet, so the lookup fails, `declared_type_to_key`
+    // falls through to `"?"`, and a completely correct declaration reads as unresolvable. Same
+    // "a checker field populated as a side effect isn't ready until the whole pass finishes"
+    // class of bug this project has hit before (see `ECS_IDEAS.md`'s own bug #2).
+    var xi1 = 0;
+    while xi1 < xn {
+        let xd2 = externs.get(xi1);
+        var mi0 = 0;
+        while mi0 < xd2.methods.length() {
+            let m = xd2.methods.get(mi0);
+            var ptypes = empty_str_vec4();
+            var pi0 = 0;
+            while pi0 < m.params.length() {
+                ptypes.push(m.params.get(pi0).type_name);
+                pi0 = pi0 + 1;
+            }
+            checker.verify_extern_signature(xd2.name, xd2.binary_name, m.name, ptypes, m.ret_type, m.is_static, m.is_ctor, &classpath);
+            mi0 = mi0 + 1;
+        }
+        xi1 = xi1 + 1;
     }
     let stn = statics.length();
     var sti0 = 0;

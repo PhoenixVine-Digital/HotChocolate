@@ -96,6 +96,37 @@ extern class JSystemCli = "java.lang.System" {
 extern class JInteger = "java.lang.Integer" {
     static fn parseInt(s: String) -> Int;
 }
+
+// `java.io.File.pathSeparator` -- the real, platform-correct separator (`;` on Windows, `:`
+// elsewhere) a `--classpath` argument's own multiple entries are joined with, matching exactly
+// what `FileCollection.getAsPath()` already produces on the Gradle-plugin side (`hc-gradle-
+// plugin`'s own `HotChocolatePlugin.kt`). Read once via reflection rather than hardcoded, so this
+// doesn't quietly break if it's ever run somewhere neither convention holds.
+extern class JFilePathSepCli = "java.io.File" {
+    static pathSeparator: String;
+}
+
+// Splits `s` on every occurrence of the single-character separator `sep` (a codepoint) -- a
+// manual left-to-right scan, same convention `last_index_of_char` (right above) already uses,
+// rather than a new `String.split` extern binding (untested "extern method returning an array
+// type" territory this compiler has no existing precedent for -- see this whole file's `[String]`-
+// avoidance elsewhere). Real, disclosed simplification: single-codepoint separators only, which
+// is all either a real OS path-separator or any other reasonable `--classpath`-style delimiter
+// ever needs.
+fn split_on_char(s: String, sep: Int) -> Vec<String> {
+    var parts = empty_str_vec4();
+    var start = 0;
+    var i = 0;
+    while i < s.length() {
+        if s.codePointAt(i) == sep {
+            parts.push(s.substring(start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    parts.push(s.substring(start, s.length()));
+    return parts;
+}
 extern class JProcessBuilderCli = "java.lang.ProcessBuilder" {
     fn new(cmd: [String]) -> Self;
     fn inheritIO(&mut self) -> JProcessBuilderCli;
@@ -357,7 +388,7 @@ fn render_doc_markdown(struct_names: Vec<String>, struct_docs: Vec<DocComment>, 
 // `off` -- how many leading argv slots `run_cli`'s own `--target` handling already consumed (0
 // if it wasn't present) -- every OTHERWISE-fixed-position `args[N]` access here shifts by it,
 // since `[String]` has no slicing operation to hand this fn a shorter view instead.
-fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool) {
+fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, classpath: Vec<String>) {
     let doc_path = args[off + 1];
     var doc_out = "api.md";
     if args.length > off + 2 { doc_out = args[off + 2]; }
@@ -382,7 +413,7 @@ fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool) {
         dprog.struct_annotation_names, dprog.struct_annotation_data, dprog.fn_annotation_names, dprog.fn_annotation_data,
         dprog.extend_decls, dprog.must_use_fn_names,
         dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data, dprog.sendable_struct_names,
-        dprog.components, dprog.systems, target, explain_schedule,
+        dprog.components, dprog.systems, target, explain_schedule, classpath,
     );
     if report_errors(derrors) {
         let md = render_doc_markdown(dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data);
@@ -422,8 +453,27 @@ pub fn run_cli(args: [String]) {
         explain_schedule = true;
         off = off + 1;
     }
+    // `--classpath <paths>` -- a third, independently optional leading flag, PATHS joined with
+    // the real platform separator (`java.io.File.pathSeparator` -- `;`/`:`), matching exactly
+    // what Gradle's own `FileCollection.getAsPath()` produces (`hc-gradle-plugin`'s own real
+    // caller). Threads a REAL classpath into `Checker.hotc`'s own `verify_extern_signature` --
+    // proven correct via the compiler's own internal probe (`run_classpath_verify_probe`, below)
+    // but never reachable from an ordinary compile before this: every `extern class`/`extern
+    // interface` in a real project used to silently degrade to "trust the declaration, no
+    // verification" regardless of what a consumer passed. An EMPTY classpath (the default, no
+    // flag given) still verifies anything findable via the plain context classloader for free --
+    // every JDK-only `extern` (this compiler's own stdlib, `Math`/`ArrayList`/`Executors`/...)
+    // gets checked with zero extra ceremony; a mod/engine-specific `extern` (Forge, LWJGL, ...)
+    // needs a real `--classpath` to be checked at all, same as `class_exists_reflect`'s own
+    // documented behavior.
+    var classpath = empty_str_vec4();
+    if args[off] == "--classpath" {
+        let sep = JFilePathSepCli::pathSeparator;
+        classpath = split_on_char(args[off + 1], sep.codePointAt(0));
+        off = off + 2;
+    }
     if args[off] == "doc" {
-        run_doc_cli(args, off, target, explain_schedule);
+        run_doc_cli(args, off, target, explain_schedule, classpath);
         return;
     }
     // `SelfhostCLI run <path>` (compile AND execute, mirroring `hc run` -- the shape
@@ -475,7 +525,7 @@ pub fn run_cli(args: [String]) {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, target, explain_schedule,
+        prog.components, prog.systems, target, explain_schedule, classpath,
     );
     if report_errors(errors) {
         print("wrote " + out_path);
@@ -542,7 +592,7 @@ pub fn run_selfcompile_cli_prep() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors2) {
         print("wrote SelfhostCLI.class -- run it standalone with a real target path to compile any .hotc file or project directory.");
@@ -694,7 +744,7 @@ pub fn run_bootstrap_demo(path: String) {
 
     var args = vec_of(3);
     args.push(4);
-    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, prog_interfaces, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class", prog_struct_ann_names, prog_struct_ann_data, prog_fn_ann_names, prog_fn_ann_data, prog_extend_decls, prog_must_use_fn_names, prog_struct_doc_names, prog_struct_doc_data, prog_fn_doc_names, prog_fn_doc_data, merge_str_vec(prelude_prog.sendable_struct_names, real_prog.sendable_struct_names), merge_component_decl_vec(prelude_prog.components, real_prog.components), merge_system_decl_vec(prelude_prog.systems, real_prog.systems), 17, false); // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, prog_interfaces, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class", prog_struct_ann_names, prog_struct_ann_data, prog_fn_ann_names, prog_fn_ann_data, prog_extend_decls, prog_must_use_fn_names, prog_struct_doc_names, prog_struct_doc_data, prog_fn_doc_names, prog_fn_doc_data, merge_str_vec(prelude_prog.sendable_struct_names, real_prog.sendable_struct_names), merge_component_decl_vec(prelude_prog.components, real_prog.components), merge_system_decl_vec(prelude_prog.systems, real_prog.systems), 17, false, empty_str_vec4()); // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     if report_errors(errors) {
         print("wrote SelfhostDemoProgram.class (combo(3, 4) should print 18 when run)");
     }
@@ -1010,7 +1060,7 @@ pub fn run_selfcompile_probe() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors) {
         print("SELF-HOSTING MILESTONE: the self-hosted compiler successfully checked+compiled its own full source (ast+types+lexer+parser+checker+codegen)!");
@@ -1070,7 +1120,7 @@ pub fn run_selfcompile_stage2() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors) {
         print("wrote SelfhostStage2Compiler.class -- run it with a real target .hotc/.hcsrc path as argv[0] to test the true fixed point.");
@@ -1140,7 +1190,7 @@ pub fn run_selfcompile_stage3_prep() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors) {
         print("wrote SelfhostSelfReplicator.class -- run it standalone (no args) to rebuild SelfhostStage2Compiler.class with zero Kotlin involved.");
