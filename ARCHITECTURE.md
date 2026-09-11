@@ -4110,29 +4110,64 @@ needed for these specifically:
 
 ```kotlin
 dependencies {
-    implementation("com.github.PhoenixVine-Digital.HotChocolate:hotchocolate:v0.1.12")
+    implementation("com.github.PhoenixVine-Digital.HotChocolate:hotchocolate:v0.1.14")
 }
 ```
 
-**Fixed 2026-09-11** — the coordinate above is corrected on two fronts,
-both found scaffolding Marshmallow (the first real end-to-end exercise
-of this JitPack path since the self-hosted migration): the GROUP needs
-the repo name folded in (`com.github.<user>.<repo>`, JitPack's own
-multi-module convention — this repo has been multi-module since
-`hc-gradle-plugin`/`hc-intellij-plugin` were split out, so the ROOT
-module needs it too, not just the submodules), and the ARTIFACT id is
-`hotchocolate` (lowercase, matching this repo's own `rootProject.name`
-in `settings.gradle.kts` exactly — JitPack coordinate lookup is
-case-sensitive). A second, more serious bug landed in the very same
-fix: the plain `jar` task only ever packaged `sourceSets.main.output`
-(just `CodegenShim.class` since the self-hosted migration) — the real
-compiler classes (`SelfhostCLI`, all of `hc/selfhost/**`) come from the
-checked-in `selfhost/bootstrap` seed, wired onto the local
-`runtimeClasspath` for `./gradlew run` but never folded into the `jar`
-task itself, so EVERY tag published since the migration produced a
-real, resolvable, but silently compiler-less artifact. Confirmed via
-`jar tf` both before (143 → 6 entries, no `SelfhostCLI.class`) and
-after the fix.
+**Fixed 2026-09-11 — four real, independent bugs, all found the same
+way: scaffolding Marshmallow, the first real end-to-end exercise of
+this JitPack path (both the raw coordinate above AND the `hc` Gradle
+plugin) since the self-hosted migration.** Nothing in this repo's own
+build/test process had ever actually consumed its own published
+artifact, so all four had been silently broken for a while:
+
+1. **Wrong org.** The GitHub org renamed from `P-H-O-E-N-I-X-PackForge`
+   to `PhoenixVine-Digital` — GitHub redirects `git clone`/`push`
+   against the old name, but JitPack does not follow that redirect
+   when resolving a Maven coordinate.
+2. **Missing repo-name segment in the group.** JitPack's multi-module
+   convention folds the repo name into the GROUP
+   (`com.github.<user>.<repo>:<module>:<version>`) — this repo has
+   been multi-module since `hc-gradle-plugin`/`hc-intellij-plugin`
+   were split out, so the ROOT module needs it too, not just the
+   submodules. `com.github.PhoenixVine-Digital` alone resolves to a
+   URL with no route registered at all (a real Gradle "Read timed
+   out," not a 404).
+3. **Wrong artifact casing.** The artifact id is `hotchocolate`
+   (lowercase, matching this repo's own `rootProject.name` in
+   `settings.gradle.kts` exactly) — JitPack coordinate lookup is
+   case-sensitive, so the capitalized `HotChocolate` 404s.
+4. **The published jar never contained the compiler, or the stdlib.**
+   The plain `jar` task only ever packages `sourceSets.main.output`
+   (just `CodegenShim.class` since the self-hosted migration) — the
+   real compiler classes (`SelfhostCLI`, all of `hc/selfhost/**`) come
+   from the checked-in `selfhost/bootstrap` seed, and every stdlib
+   topic's own `.hotc` SOURCE file (`stdlib/*.hotc`) comes from the
+   plain `stdlib/` directory — both wired onto the local
+   `runtimeClasspath`/resolved relative to the repo's own checkout for
+   `./gradlew run`, but neither ever folded into the `jar` task's own
+   output. `Driver.hotc`'s own `stdlib_topic_path` resolves every
+   stdlib topic relative to the compiler PROCESS'S OWN WORKING
+   DIRECTORY with no other fallback — and fires even for a program
+   with zero `use` lines, since the "no `use` at all" default still
+   injects the original five topics — so no external consuming
+   project could have compiled ANYTHING through this artifact, not
+   even a program using no stdlib features of its own. Confirmed via
+   `jar tf` before/after (143 → 6 entries missing `SelfhostCLI.class`
+   entirely; 0 → 9 real `stdlib/*.hotc` entries once both were fixed).
+   Fixed by folding both `selfhost/bootstrap` and `stdlib/` into the
+   `jar` task directly, and having the Gradle plugin extract the
+   bundled `stdlib/*.hotc` entries next to each real compile's own
+   `workingDir` before invoking the compiler (`stdlib_topic_path`'s own
+   filesystem-relative lookup isn't something a consuming project's
+   `hcCompile*` task can just leave to chance).
+
+Verified end to end against the fully-fixed `v0.1.14`: a fresh
+Marshmallow project (a real, separate consumer, zero local
+HotChocolate checkout) resolved the plugin, the compiler, and the
+`stdlib` bundle entirely from JitPack, compiled a real `.hc` source
+file, and ran it — confirmed reproducible from a clean `.gradle`/
+`build` state, not just a cached first success.
 
 built on demand by JitPack from any pushed tag (`git tag vX.Y.Z && git
 push origin vX.Y.Z`, then JitPack builds it the first time someone
