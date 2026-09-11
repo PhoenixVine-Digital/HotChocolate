@@ -111,6 +111,7 @@ extern class GL11 = "org.lwjgl.opengl.GL11" {
     static GL_FLOAT: Int;
     static GL_TRIANGLES: Int;
     static GL_DEPTH_TEST: Int;
+    static GL_UNSIGNED_INT: Int;
 
     static fn glClearColor(r: Float, g: Float, b: Float, a: Float) -> Unit;
     static fn glClear(mask: Int) -> Unit;
@@ -118,6 +119,10 @@ extern class GL11 = "org.lwjgl.opengl.GL11" {
     static fn glDrawArrays(mode: Int, first: Int, count: Int) -> Unit;
     static fn glEnable(cap: Int) -> Unit;
     static fn glDisable(cap: Int) -> Unit;
+    // `indices` is a byte OFFSET into whatever's currently bound to `GL_ELEMENT_ARRAY_BUFFER`,
+    // not a real pointer -- `Mesh::from_indexed` always uploads the whole index buffer and draws
+    // from offset 0, so every real caller here passes `0 as Long`.
+    static fn glDrawElements(mode: Int, count: Int, type: Int, indices: Long) -> Unit;
 }
 
 // A thin, real convenience wrapper over the raw GLFW/GL calls above -- `Window::new(...)`

@@ -56,17 +56,28 @@ extern class JFloatBufferGfx = "java.nio.FloatBuffer" {
     fn flip(&self) -> JFloatBufferGfx;
 }
 
+// `java.nio.IntBuffer` -- same real NIO write-then-flip idiom `JFloatBufferGfx` above already
+// uses, for index data (`Mesh::from_indexed`'s own EBO upload) instead of vertex data. Same
+// `&self`-or-implicitly-static trap applies here too -- see `JFloatBufferGfx`'s own header.
+extern class JIntBufferGfx = "java.nio.IntBuffer" {
+    fn put(&self, values: [Int]) -> JIntBufferGfx;
+    fn flip(&self) -> JIntBufferGfx;
+}
+
 extern class BufferUtilsGfx = "org.lwjgl.BufferUtils" {
     static fn createFloatBuffer(size: Int) -> JFloatBufferGfx;
+    static fn createIntBuffer(size: Int) -> JIntBufferGfx;
 }
 
 extern class GL15 = "org.lwjgl.opengl.GL15" {
     static GL_ARRAY_BUFFER: Int;
+    static GL_ELEMENT_ARRAY_BUFFER: Int;
     static GL_STATIC_DRAW: Int;
 
     static fn glGenBuffers() -> Int;
     static fn glBindBuffer(target: Int, buffer: Int) -> Unit;
     static fn glBufferData(target: Int, data: JFloatBufferGfx, usage: Int) -> Unit;
+    static fn glBufferData(target: Int, data: JIntBufferGfx, usage: Int) -> Unit;
 }
 
 extern class GL20 = "org.lwjgl.opengl.GL20" {
@@ -177,9 +188,15 @@ impl Shader {
 // cut: this ONE fixed layout only -- a general vertex-format description (arbitrary attribute
 // counts/types/offsets) is real, separate design work for whenever a second layout is actually
 // needed, not guessed at now.
+//
+// `index_count` is `0` for a `from_floats`-built mesh (drawn with `glDrawArrays`, every vertex
+// used exactly once, in order) and the real index count for a `from_indexed`-built one (drawn
+// with `glDrawElements`) -- `draw()` branches on it rather than adding a second struct, since
+// every other field (`vao`) and every other method already means the same thing either way.
 struct Mesh {
     vao: Int,
     vertex_count: Int,
+    index_count: Int,
 }
 
 impl Mesh {
@@ -203,11 +220,52 @@ impl Mesh {
         GL20::glVertexAttribPointer(1, 3, GL11::GL_FLOAT, false, 24, 12 as Long);
         GL20::glEnableVertexAttribArray(1);
 
-        return Mesh { vao: vao, vertex_count: vertex_count };
+        return Mesh { vao: vao, vertex_count: vertex_count, index_count: 0 };
+    }
+
+    // Same interleaved `(x, y, z, r, g, b)` vertex layout as `from_floats`, but `vertices` holds
+    // only the UNIQUE vertices (e.g. a cube's real 8 corners, not 36 duplicated ones) and
+    // `indices` describes which vertices each triangle actually uses -- the standard way to
+    // share vertices between faces instead of duplicating them per-triangle. `indices.length` is
+    // always a multiple of 3 (one triangle per 3 indices), and every value in it must be a valid
+    // index into `vertices` (0 .. vertex-count - 1) -- out-of-range values are a real, disclosed
+    // scope cut: this doesn't validate that, same trust-the-caller stance `from_floats` already
+    // takes on its own `vertex_count` param.
+    static fn from_indexed(vertices: [Float], indices: [Int]) -> Mesh {
+        let vao = GL30::glGenVertexArrays();
+        GL30::glBindVertexArray(vao);
+
+        let vbo = GL15::glGenBuffers();
+        GL15::glBindBuffer(GL15::GL_ARRAY_BUFFER, vbo);
+        var vbuf = BufferUtilsGfx::createFloatBuffer(vertices.length);
+        vbuf = vbuf.put(vertices);
+        vbuf = vbuf.flip();
+        GL15::glBufferData(GL15::GL_ARRAY_BUFFER, vbuf, GL15::GL_STATIC_DRAW);
+
+        GL20::glVertexAttribPointer(0, 3, GL11::GL_FLOAT, false, 24, 0 as Long);
+        GL20::glEnableVertexAttribArray(0);
+        GL20::glVertexAttribPointer(1, 3, GL11::GL_FLOAT, false, 24, 12 as Long);
+        GL20::glEnableVertexAttribArray(1);
+
+        // Real GL state: an EBO bound while its VAO is bound gets remembered BY that VAO --
+        // re-binding the VAO later (in `draw()`) implicitly re-binds this EBO too, no separate
+        // tracking needed on the HC side.
+        let ebo = GL15::glGenBuffers();
+        GL15::glBindBuffer(GL15::GL_ELEMENT_ARRAY_BUFFER, ebo);
+        var ibuf = BufferUtilsGfx::createIntBuffer(indices.length);
+        ibuf = ibuf.put(indices);
+        ibuf = ibuf.flip();
+        GL15::glBufferData(GL15::GL_ELEMENT_ARRAY_BUFFER, ibuf, GL15::GL_STATIC_DRAW);
+
+        return Mesh { vao: vao, vertex_count: 0, index_count: indices.length };
     }
 
     fn draw(&self) {
         GL30::glBindVertexArray(self.vao);
-        GL11::glDrawArrays(GL11::GL_TRIANGLES, 0, self.vertex_count);
+        if self.index_count > 0 {
+            GL11::glDrawElements(GL11::GL_TRIANGLES, self.index_count, GL11::GL_UNSIGNED_INT, 0 as Long);
+        } else {
+            GL11::glDrawArrays(GL11::GL_TRIANGLES, 0, self.vertex_count);
+        }
     }
 }
