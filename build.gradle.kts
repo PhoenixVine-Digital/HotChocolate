@@ -33,6 +33,24 @@ java {
 val selfhostBootstrap = files("selfhost/bootstrap")
 sourceSets.main.get().runtimeClasspath += selfhostBootstrap
 
+// **Fixed 2026-09-11 -- a real, previously-undiscovered break in "Published on JitPack" itself.**
+// Adding `selfhostBootstrap` to `runtimeClasspath` (above) is what makes `./gradlew run` find
+// `SelfhostCLI` locally, but it does NOT put those classes INTO the plain `jar` task's own
+// output -- `jar` only ever packages `sourceSets.main.output` (the real, `javac`/`kotlinc`-
+// compiled classes, which since the self-hosted migration is just `CodegenShim.class` -- every
+// OTHER class, including `SelfhostCLI` itself and all of `hc/selfhost/**`, comes from the
+// checked-in bootstrap seed, not from this module's own compiled sources). JitPack builds and
+// publishes exactly this `jar` task's output as the Maven artifact -- so every tag published
+// since the migration produced a real, resolvable, but COMPILER-LESS jar (confirmed: `jar tf
+// build/libs/*.jar` before this fix listed only `CodegenShim.class`), silently broken the whole
+// time `version = "..."` has been documented as the normal way to consume this compiler.
+// Confirmed this was the actual root cause of `ClassNotFoundException: SelfhostCLI` scaffolding
+// Marshmallow (the first real end-to-end exercise of the JitPack path since the migration) --
+// fixed by explicitly folding the bootstrap seed into the `jar` task's own contents too.
+tasks.named<Jar>("jar") {
+    from(selfhostBootstrap)
+}
+
 application {
     mainClass.set("SelfhostCLI")
 }

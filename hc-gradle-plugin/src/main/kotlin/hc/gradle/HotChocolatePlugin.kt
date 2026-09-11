@@ -25,7 +25,17 @@ import java.io.File
 // `settings.gradle.kts` needs -- see README.md/ARCHITECTURE.md's own JitPack setup examples,
 // and `hc-intellij-plugin`'s own new-project scaffolding template) were updated to match.
 private const val COMPILER_GROUP = "com.github.PhoenixVine-Digital"
-private const val COMPILER_ARTIFACT = "HotChocolate"
+// **Fixed 2026-09-11 -- a second, independent real bug** found the same way as the org-rename
+// one above (actually resolving this plugin end to end for the first time, scaffolding
+// Marshmallow): the repo's OWN root `settings.gradle.kts` sets `rootProject.name = "hotchocolate"`
+// (lowercase) -- Gradle's own Maven-publish machinery uses that verbatim as the artifact id, and
+// JitPack's own coordinate lookup is case-SENSITIVE, so requesting the capitalized
+// "HotChocolate" 404s while the real, lowercase "hotchocolate" resolves (confirmed directly
+// against JitPack's own URLs). Whatever CLI resolution "worked" against this constant before
+// must have been against `compilerHome` (the local-checkout path, which never goes through this
+// constant at all) -- nothing had exercised the `version =` / JitPack path end-to-end since
+// before the self-hosted migration, so this had been silently broken for a while.
+private const val COMPILER_ARTIFACT = "hotchocolate"
 private const val JITPACK_URL = "https://jitpack.io"
 
 // **Fixed 2026-09-10 -- a real, previously-undiscovered break.** This whole file used to invoke
