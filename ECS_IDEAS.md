@@ -1,5 +1,28 @@
 # ECS with ownership-derived scheduling — design doc
 
+**Status, 2026-09-15 (later)**: a real, previously-latent hazard found adding a SECOND rendering
+system to Marshmallow's ECS use (a `PlayerMove`/`PlayerRender` pair, driven by a new `Input`
+resource's own arrow-key fields, alongside the existing `Rotate`/`Render` ring). `Render` and
+`PlayerRender` share only READ-only access to `Renderable`/`Camera` (`&Renderable`/`&Camera`, no
+`&mut` on either side anywhere) -- a real, correct "no conflict" call by `systems_conflict_ecs`,
+which is exactly why the scheduler was happy to run one of them on a real background thread via
+Phoenix Flight's own parallel dispatch (Phase B) while the other ran on the main thread. Real
+OpenGL calls made from inside a system's own body (`Shader::use_program`, `Mesh::draw`, ...) are
+NOT thread-safe at all -- a GL context only ever works on the thread that created it -- so this
+produced a real LWJGL fatal abort ("No context is current") the instant both rendering systems'
+own draw calls landed in the same parallel wave. **This is a real, general hazard for ANY future
+system that makes OpenGL calls, not specific to this one pair**: the ownership-conflict analysis
+this whole scheduler is built on has NO CONCEPT of "also touches a thread-affine external
+resource" -- it only ever reasons about HC-visible `&`/`&mut` component access, which is
+genuinely silent about a system's own body calling into `window`/`graphics`. Worked around in
+Marshmallow with a deliberate, fully sequential `@after` chain across all four systems involved
+(a real, disclosed trade of potential parallelism this scene doesn't need for correctness) --
+NOT fixed at the compiler level. A real fix would need some way to mark a system (or a whole
+scheduling GROUP) as "never runs on any thread but the main one," independent of whether its own
+component access would otherwise permit parallelism -- a genuinely new kind of scheduling
+constraint this doc doesn't have an answer for yet. Worth a new "Still open" entry once this
+becomes a real blocker rather than a one-off worked around by hand.
+
 **Status, 2026-09-15**: the resource-injection gap this doc's own "Still open" #6 raised is
 landed. `resource Name { fields }` declares a single, world-wide value (own registry,
 `Checker.hotc`'s `resources`, never archetype-matched); `world.set_resource(Name { ... })` writes
@@ -696,3 +719,30 @@ without a big back-and-forth, but real picks nonetheless:
    practice it hasn't needed solving: every real use so far (Marshmallow's `Camera`) is `main()`
    pushing state IN, never reading component state back OUT, so resources answered the actual
    need without requiring the harder half.
+7. **A "never runs off the main thread" scheduling constraint** — the real gap found adding a
+   second OpenGL-calling system (see the "Status" note at the top, 2026-09-15). The ownership-
+   conflict analysis this whole scheduler is built on only ever reasons about HC-visible `&`/
+   `&mut` component access -- it has NO concept of "this system's own body also touches a
+   thread-affine external resource" (a GL context, here, but the same hazard applies to anything
+   else that's only safe from one specific thread). Two systems with zero component conflict
+   between them can still be UNSAFE to run in parallel for a reason the conflict graph can never
+   see. Real open questions, not yet answered:
+   - A per-system marker (`@main_thread` or similar) that forces a system into its own,
+     never-parallel group regardless of what its conflict analysis would otherwise permit --
+     simplest to specify, but silently loses real parallelism for systems that merely SHARE a
+     thread-affine resource by convention (every rendering system, say) unless the AUTHOR
+     remembers to mark each one.
+   - Should `window`/`graphics`'s own stdlib functions carry some real, checker-visible
+     "main-thread-only" fact that AUTOMATICALLY marks any system calling into them, so a caller
+     doesn't have to remember the annotation by hand? This is more robust but needs a real way
+     for the checker to know a called FUNCTION (not just a directly-borrowed component) has this
+     property, and to propagate it through arbitrary call chains inside a system's own body --
+     genuinely new analysis, not a small addition.
+   - Is "main thread" even the right generalization, or does this need to be "this GROUP of
+     systems must all run on the SAME thread as each other" (not necessarily the main one) for
+     other thread-affine resources that aren't tied to the main thread specifically? Marshmallow's
+     own case happens to need the main thread specifically (GLFW/GL context creation is itself
+     main-thread-bound), but a fully general answer shouldn't assume that's always true.
+   Worked around in Marshmallow by hand (a single, deliberate, fully sequential `@after` chain
+   across every system that touches OpenGL) -- real, but not a fix; the NEXT program that adds a
+   second independent rendering system without knowing about this will hit the exact same crash.
