@@ -95,6 +95,11 @@ working today, not aspirational:
   `javax.imageio`-supported image. Vulkan is the real target before
   Marshmallow ships; see GRAPHICS_IDEAS.md. Verified with a real
   textured, spinning cube and perspective camera on real hardware.
+- **`audio`** (`use audio;`) — `Sound::load(path)`/`play()`/`stop()` via
+  `javax.sound.sampled`, pure JDK — no LWJGL/native dependency, unlike
+  `window`/`graphics`. WAV/AIFF/AU only (no MP3/OGG without a third-party
+  decoder), fire-and-forget playback. No dependency on any other stdlib
+  topic.
 - **Full JDK/Java interop** (`extern class`/`extern interface`,
   compile-time `--classpath`-verified signatures — a wrong param/return
   type is a compile error, not a runtime `NoSuchMethodError`), sealed
