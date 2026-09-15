@@ -845,6 +845,15 @@ pub struct Program {
     // own design doc, and `ComponentDecl`/`SystemDecl`'s own headers right above `Program` here.
     components: Vec<ComponentDecl>,
     systems: Vec<SystemDecl>,
+    // `resource Name { fields }` -- a single, world-wide value a system can request alongside its
+    // ordinary `&`/`&mut` component params (`ECS_IDEAS.md`'s own "Still open" #6: the real gap
+    // found wiring Marshmallow's ECS ring up to a live camera/input/delta-time -- no component or
+    // resource, before this, ever let external per-frame state reach a system's `run` body at
+    // all). Reuses `ComponentDecl`'s own AST shape (name + fields, no methods, no generics) --
+    // same fields, different REGISTRY (`Checker.hotc`'s own `resources`, kept separate from
+    // `components` so a resource is never accidentally archetype-matched, and a component is
+    // never accidentally treated as a world-wide singleton).
+    resources: Vec<ComponentDecl>,
 }
 
 // `/// text` lines immediately before a `struct`/`fn`, parsed into structured sections rather than

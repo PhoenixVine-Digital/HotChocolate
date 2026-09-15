@@ -979,6 +979,27 @@ impl CodeGen {
     }
 
     fn finish_method_call(&mut self, rt: String, method: String, args: Vec<Expr>) -> String {
+        // `world.set_resource(DeltaTime { seconds: 0.016 })` -- `Checker.hotc`'s own `World#
+        // set_resource` gate already validated the single argument is a real resource struct
+        // literal. Real bytecode: pop the unused `World` receiver (same real, previously-hit
+        // stack-leak fix `World#spawn` right below already needed -- `World` itself carries no
+        // state, see `stdlib/ecs.hotc`'s own header), evaluate the resource value, PUTSTATIC it
+        // straight into `__resource_<Name>` (the field `compile_program`'s own resource-field-
+        // declaration loop already declared, one per distinct `resource` type in the program --
+        // see `resource_field_name_ecs`'s own header).
+        if rt == "World" && method == "set_resource" {
+            self.mv.visitInsn(87); // POP the unused receiver
+            let arg0 = args.get(0);
+            var res_name = "";
+            match arg0 {
+                StructLit { name, field_names, field_values, generic_base } => { res_name = name; }
+                _ => {}
+            }
+            let arg0_2 = args.get(0); // fresh copy -- the `match` above already consumed the first one
+            self.gen_expr(arg0_2);
+            self.mv.visitFieldInsn(179, self.owner, resource_field_name_ecs(res_name), self.resolve_descriptor(res_name)); // PUTSTATIC
+            return "Unit";
+        }
         // `world.spawn(Transform { ... }, Velocity { ... }, ...)` -- see `ECS_IDEAS.md`'s own
         // design doc. `Checker.hotc`'s own `World#spawn` gate already validated every arg is a
         // real component struct literal by the time this ever runs, so they're trusted here
@@ -4494,9 +4515,18 @@ pub fn gen_static_init(cw: &mut ClassWriter2, owner: String, statics: &Vec<Stati
     var i = 0;
     while i < statics.length() {
         let s = statics.get(i);
-        let s2 = statics.get(i); // fresh copy -- `.value` is only safe to read once
-        gen.gen_expr(s2.value);
-        gen.mv.visitFieldInsn(179, gen.owner, s.name, gen.resolve_descriptor(s.type_name)); // PUTSTATIC
+        // `__resource_<Name>` (see `resource_field_name_ecs`'s own header) is a real entry in
+        // THIS list (so `build_program_info`'s own `static_names`/`static_type_names` -- and
+        // this fn's field-declaration sibling loop in `compile_program` -- pick it up with zero
+        // special-casing), but its own `.value` here is a meaningless throwaway (`BoolLit
+        // {false}`, never the field's real type) -- PUTSTATIC-ing it would be a real type
+        // mismatch. Skipped here, and ONLY here: this field is deliberately left at the JVM's
+        // own default (`null`) until a real `world.set_resource(...)` call first sets it.
+        if !str_starts_with(s.name, "__resource_") {
+            let s2 = statics.get(i); // fresh copy -- `.value` is only safe to read once
+            gen.gen_expr(s2.value);
+            gen.mv.visitFieldInsn(179, gen.owner, s.name, gen.resolve_descriptor(s.type_name)); // PUTSTATIC
+        }
         i = i + 1;
     }
     gen.mv.visitInsn(177); // RETURN
@@ -7252,15 +7282,28 @@ fn real_run_params_ecs(run_params: &Vec<Param>) -> Vec<Param> {
 // component-borrow param's own type name, PLUS every `Changed<T>` filter's inner name (an
 // archetype has to actually HAVE `T` for `T`'s own change-flag to exist at all) -- but NOT a
 // `Without<T>` filter's inner name, which must be ABSENT instead (see `excluded_components_of_
-// system_ecs`, right below `sig_has_any_ecs`).
-fn required_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
+// system_ecs`, right below `sig_has_any_ecs`), and NOT a resource-typed param either -- a
+// resource is a single, world-wide value (fetched from a real top-level static, see
+// `synthesize_system_call_stmts_ecs`), never a per-entity archetype field, so it must never make
+// it into "what does an archetype need to have" at all. Real, disclosed scope cut: a system
+// naming ONLY resource params (no real component borrow at all) still gets archetype-matched
+// against `needed == []`, which is trivially true for every archetype that exists -- it would run
+// once per ENTITY across every archetype rather than once per `run_all()` call, which is almost
+// certainly not what a pure-resource ("global") system wants. Not a real, reachable shape yet
+// (every system built so far pairs a resource with at least one real component), so left
+// unguarded rather than designed around speculatively.
+fn required_components_of_system_ecs(run_params: &Vec<Param>, resource_names: &Vec<String>) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < run_params.length() {
         let p = run_params.get(i);
         if is_changed_filter_ecs(p.type_name) {
             out.push(mono_arg_cg(p.type_name));
-        } else if !is_query_filter_param_ecs(p.type_name) {
+        } else if is_query_filter_param_ecs(p.type_name) {
+            // Without<T> -- excluded above already, nothing to add here either.
+        } else if str_vec_index_of_ecs(resource_names, p.type_name) != -1 {
+            // A resource -- see this fn's own header.
+        } else {
             out.push(p.type_name);
         }
         i = i + 1;
@@ -7314,31 +7357,50 @@ fn synthesize_system_fn_ecs(sysd: SystemDecl) -> FnDecl {
     return FnDecl { name: system_fn_name_ecs(sysd.name), params: real_run_params_ecs(&sysd.run_params), ret_type: none_string2(), body: sysd.run_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
 }
 
-// One call to a system's own synthesized `run` fn, reading every argument straight off one row
-// of ONE specific matching archetype: `<archetype>.c{idx}.get(<loop_var>)` per param, in the
-// system's own declared param order, PLUS -- right after the call -- one `<archetype>.
-// c{idx}_changed.set(<loop_var>, true);` per REAL `&mut` param (see `archetype_field_changed_
-// name_ecs`'s own header: writing through a `&mut` param is exactly the "changed" event this
-// flag tracks). `sig` is that specific archetype's own signature (already confirmed a superset
-// of everything this system needs by `sig_has_all_ecs`), so `idx` -- looked up fresh per param
-// since two different archetypes matching the same system can place its components at different
-// positions -- always resolves.
-fn synthesize_system_call_stmts_ecs(sysd: &SystemDecl, sig: &Vec<String>, static_name: String, loop_var: String) -> Vec<Stmt> {
+// The real top-level static field name a `resource Name { ... }`'s own world-wide value lives
+// in -- same `__`-prefixed, no-collision-with-user-declared-names convention `__next_entity_id`/
+// `__world_pool` already use. Declared once per distinct resource TYPE actually named by any
+// system's `run` params (`compile_program`'s own resource-field-declaration loop), regardless of
+// how many systems read/write it -- there's only ever one value per resource type, program-wide.
+fn resource_field_name_ecs(resource_name: String) -> String {
+    return "__resource_" + resource_name;
+}
+
+// One call to a system's own synthesized `run` fn, reading every argument either straight off
+// one row of ONE specific matching archetype (`<archetype>.c{idx}.get(<loop_var>)`, the ordinary
+// per-entity component case) OR straight off a real top-level static (`__resource_<Name>`, see
+// `resource_field_name_ecs`'s own header) for a resource-typed param -- the SAME static, read
+// fresh on every call, for every row, since a resource is one world-wide value, not something an
+// archetype row ever stores. PLUS -- right after the call -- one `<archetype>.c{idx}_changed.set
+// (<loop_var>, true);` per REAL `&mut` COMPONENT param (see `archetype_field_changed_name_ecs`'s
+// own header: writing through a `&mut` param is exactly the "changed" event this flag tracks) --
+// a resource-typed `&mut` param never gets one, since `Changed<T>` change-tracking is a real,
+// disclosed component-only feature; a resource has no per-row flag to set at all. `sig` is that
+// specific archetype's own signature (already confirmed a superset of everything this system's
+// own REAL component needs by `sig_has_all_ecs` -- resource params are never part of `sig` at
+// all, see `required_components_of_system_ecs`'s own header), so `idx` -- looked up fresh per
+// component param since two different archetypes matching the same system can place its
+// components at different positions -- always resolves for those.
+fn synthesize_system_call_stmts_ecs(sysd: &SystemDecl, sig: &Vec<String>, static_name: String, loop_var: String, resource_names: &Vec<String>) -> Vec<Stmt> {
     var call_args = empty_expr_vec_cg();
     let real_params = real_run_params_ecs(&sysd.run_params);
     var mark_stmts = empty_stmt_vec2();
     var pi = 0;
     while pi < real_params.length() {
         let p = real_params.get(pi);
-        let idx = str_vec_index_of_ecs(sig, p.type_name);
-        let field_name = archetype_field_name_ecs(idx);
-        let row_get = MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: field_name }, method: "get", args: vec_of(Ident { name: loop_var }) };
-        call_args.push(row_get);
-        if p.is_mut_ref {
-            var mark_args = vec_of(Ident { name: loop_var });
-            mark_args.push(BoolLit { value: true });
-            let mark = ExprStmt { expr: MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: archetype_field_changed_name_ecs(idx) }, method: "set", args: mark_args }, line: 0 };
-            mark_stmts.push(mark);
+        if str_vec_index_of_ecs(resource_names, p.type_name) != -1 {
+            call_args.push(Ident { name: resource_field_name_ecs(p.type_name) });
+        } else {
+            let idx = str_vec_index_of_ecs(sig, p.type_name);
+            let field_name = archetype_field_name_ecs(idx);
+            let row_get = MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: field_name }, method: "get", args: vec_of(Ident { name: loop_var }) };
+            call_args.push(row_get);
+            if p.is_mut_ref {
+                var mark_args = vec_of(Ident { name: loop_var });
+                mark_args.push(BoolLit { value: true });
+                let mark = ExprStmt { expr: MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: archetype_field_changed_name_ecs(idx) }, method: "set", args: mark_args }, line: 0 };
+                mark_stmts.push(mark);
+            }
         }
         pi = pi + 1;
     }
@@ -7356,11 +7418,11 @@ fn synthesize_system_call_stmts_ecs(sysd: &SystemDecl, sig: &Vec<String>, static
 // where even one such flag reads `false` this tick is skipped entirely, never even calling
 // `run`. `loop_idx` only exists to keep every such loop's own induction variable name distinct
 // within the one, flat (never nested) `__world_run_all` body.
-fn synthesize_archetype_loop_stmt_ecs(sysd: &SystemDecl, sig: &Vec<String>, loop_idx: Int) -> Stmt {
+fn synthesize_archetype_loop_stmt_ecs(sysd: &SystemDecl, sig: &Vec<String>, loop_idx: Int, resource_names: &Vec<String>) -> Stmt {
     let static_name = archetype_static_name_ecs(sig);
     let loop_var = "__ecs_row" + JString::valueOf(loop_idx);
     let n_expr = MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: "entities" }, method: "length", args: empty_expr_vec_cg() };
-    let call_stmts = synthesize_system_call_stmts_ecs(sysd, sig, static_name, loop_var);
+    let call_stmts = synthesize_system_call_stmts_ecs(sysd, sig, static_name, loop_var, resource_names);
     let changed_names = changed_components_of_system_ecs(&sysd.run_params);
     var body_stmts = empty_stmt_vec2();
     if changed_names.length() > 0 {
@@ -7433,13 +7495,13 @@ fn synthesize_profile_clock_extern_ecs() -> ExternClassDecl {
     return ExternClassDecl { name: "__ProfileClock", binary_name: "java.lang.System", methods: vec_of(m), fields: fields, is_interface: false };
 }
 
-fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int) -> Vec<Stmt> {
+fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> Vec<Stmt> {
     var body = empty_stmt_vec2();
     if profiled {
         let t0_call = StaticCall { type_name: "__ProfileClock", method: "nanoTime", args: empty_expr_vec_cg() };
         body.push(Let { name: "__prof_t0", mutable: false, init: t0_call, declared_type: none_string2(), line: 0 });
     }
-    let needed = required_components_of_system_ecs(&sysd.run_params);
+    let needed = required_components_of_system_ecs(&sysd.run_params, resource_names);
     let excluded = excluded_components_of_system_ecs(&sysd.run_params);
     var loop_idx = 0;
     var ai = 0;
@@ -7449,7 +7511,7 @@ fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<
         // holding even one excluded component is skipped for this system entirely, regardless of
         // whether it also satisfies `needed`.
         if sig_has_all_ecs(&sig, &needed) && !sig_has_any_ecs(&sig, &excluded) {
-            body.push(synthesize_archetype_loop_stmt_ecs(sysd, &sig, loop_idx));
+            body.push(synthesize_archetype_loop_stmt_ecs(sysd, &sig, loop_idx, resource_names));
             loop_idx = loop_idx + 1;
         }
         ai = ai + 1;
@@ -7479,8 +7541,8 @@ fn system_dispatch_fn_name_ecs(sys_name: String) -> String {
 // as PhoenixObject)` (a real reference value to cast, mirroring `stdlib/phoenix.hotc`'s own
 // documented `"{...}" as PhoenixObject` idiom) without needing a second wrapper fn just to
 // manufacture one.
-fn synthesize_system_dispatch_fn_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int) -> FnDecl {
-    return FnDecl { name: system_dispatch_fn_name_ecs(sysd.name), params: empty_param_vec2(), ret_type: some_string2("String"), body: build_system_dispatch_body_ecs(sysd, archetype_signatures, profiled, group_size), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+fn synthesize_system_dispatch_fn_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> FnDecl {
+    return FnDecl { name: system_dispatch_fn_name_ecs(sysd.name), params: empty_param_vec2(), ret_type: some_string2("String"), body: build_system_dispatch_body_ecs(sysd, archetype_signatures, profiled, group_size, resource_names), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
 }
 
 // `__world_run_all`'s own real body, Phase B (real parallel dispatch) -- see `ECS_IDEAS.md`'s
@@ -7959,7 +8021,7 @@ fn build_flush_transitions_stmts_ecs(add_types: &Vec<String>, remove_types: &Vec
     return body;
 }
 
-pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool, classpath: Vec<String>) -> Vec<String> {
+pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool, classpath: Vec<String>, resources: Vec<ComponentDecl>) -> Vec<String> {
     // `arena struct` -- see README's own "Off-heap data" section: built on `java.lang.foreign`,
     // stable only since JDK 22 (still preview at 21). Gated at `25` -- the only discrete
     // `--target` level this compiler actually has (17/21/25, no "22") that's genuinely >= 22 --
@@ -8033,6 +8095,36 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         // ORDINARY struct-registration/codegen pipeline like any other.
         structs.push(StructDecl { name: cd2.name, type_param: none_string2(), fields: cd2.fields, is_arena: false, module_name: none_string2(), super_class: none_string2() });
         ci0 = ci0 + 1;
+    }
+    // Same "register, then synthesize a real `StructDecl` so its fields flow through the
+    // ordinary struct codegen pipeline" shape components use right above, for `resource Name
+    // { ... }` -- into `checker.resources`, NOT `checker.components` (see that registry's own
+    // header for why the two must stay separate).
+    let rn0 = resources.length();
+    var ri0 = 0;
+    while ri0 < rn0 {
+        let rd = resources.get(ri0);
+        let rd2 = resources.get(ri0); // fresh copy -- `.fields` is only safe to read once
+        checker.register_resource(rd.name, rd.fields);
+        structs.push(StructDecl { name: rd2.name, type_param: none_string2(), fields: rd2.fields, is_arena: false, module_name: none_string2(), super_class: none_string2() });
+        // `__resource_<Name>` needs to be a real, known static from HERE on -- both to the
+        // checker (`register_static_decl`, so the synthesized system-dispatch call sites'
+        // `Ident` reference to it type-checks -- see `synthesize_system_call_stmts_ecs`'s own
+        // header) AND to `Codegen.hotc`'s OWN, separate `static_types` registry (populated from
+        // THIS `statics` list by `build_program_info`, independently of anything the checker
+        // tracks -- same "checker and codegen don't share registries" split as `component`
+        // needed its own `structs.push(...)` for, right above). Pushed onto the REAL `statics`
+        // list rather than tracked separately, so every ordinary mechanism (field declaration,
+        // `build_program_info`) picks it up automatically with zero special-casing -- the ONE
+        // exception is `gen_static_init`'s own per-static PUTSTATIC-with-value loop, which
+        // explicitly SKIPS any `__resource_`-prefixed entry (see that fn's own header) so this
+        // field is left at the JVM's own default (`null`) instead of getting this throwaway
+        // `.value` written into it.
+        let rd3 = resources.get(ri0); // fresh copy -- `rd`/`rd2` above are both already consumed
+        let resource_static = StaticDecl { name: resource_field_name_ecs(rd3.name), type_name: rd3.name, value: BoolLit { value: false } };
+        checker.register_static_decl(&resource_static);
+        statics.push(resource_static);
+        ri0 = ri0 + 1;
     }
     checker.check_systems(&systems);
     var wi0 = 0;
@@ -8258,11 +8350,18 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
     var sti1 = 0;
     while sti1 < stn {
         let s3 = statics.get(sti1);
-        let s4 = statics.get(sti1); // fresh copy -- `.value` is only safe to read once
-        let vt = checker.check_expr(s4.value);
-        let vn = ty_name(vt);
-        if vn != "?" && s3.type_name != vn {
-            checker.error("static '" + s3.name + "' declared as " + s3.type_name + " but initializer is " + vn);
+        // `__resource_<Name>` (see `resource_field_name_ecs`'s own header): a real entry in this
+        // list, but its own `.value` is a meaningless throwaway (`BoolLit{false}`, never the
+        // field's real type) -- checking it against the declared type here would always fail.
+        // Skipped here for the same reason `gen_static_init`'s own per-static PUTSTATIC loop
+        // skips it: this field is deliberately left at the JVM's own default (`null`).
+        if !str_starts_with(s3.name, "__resource_") {
+            let s4 = statics.get(sti1); // fresh copy -- `.value` is only safe to read once
+            let vt = checker.check_expr(s4.value);
+            let vn = ty_name(vt);
+            if vn != "?" && s3.type_name != vn {
+                checker.error("static '" + s3.name + "' declared as " + s3.type_name + " but initializer is " + vn);
+            }
         }
         sti1 = sti1 + 1;
     }
@@ -8392,6 +8491,16 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         checker.register_extern(profile_extern.name, profile_extern.binary_name, profile_extern.methods, profile_extern.fields);
         externs.push(profile_extern);
     }
+    // Flat name list of every declared `resource` -- threaded down into the system-dispatch-body
+    // synthesis below so a resource-typed `run` param can be told apart from an ordinary
+    // component-typed one (fetched from a real top-level static, not a per-row archetype field --
+    // see `synthesize_system_call_stmts_ecs`'s own header).
+    var resource_names = empty_str_vec4();
+    var rni2 = 0;
+    while rni2 < resources.length() {
+        resource_names.push(resources.get(rni2).name);
+        rni2 = rni2 + 1;
+    }
     var sdi = 0;
     while sdi < systems.length() {
         let sysd_disp = systems.get(sdi);
@@ -8401,8 +8510,8 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         checker.fn_param_is_ref.register(dispatch_name, param_is_ref_of(empty_param_vec2()));
         checker.fn_param_is_mut_ref.register(dispatch_name, param_is_mut_ref_of(empty_param_vec2()));
         let group_size = group_size_for_system_ecs(&checker.system_groups, sysd_disp.name);
-        let dispatch_decl = synthesize_system_dispatch_fn_ecs(&sysd_disp, &closed_sigs, sysd_disp.has_profile, group_size);
-        let dispatch_decl2 = synthesize_system_dispatch_fn_ecs(&sysd_disp, &closed_sigs, sysd_disp.has_profile, group_size);
+        let dispatch_decl = synthesize_system_dispatch_fn_ecs(&sysd_disp, &closed_sigs, sysd_disp.has_profile, group_size, &resource_names);
+        let dispatch_decl2 = synthesize_system_dispatch_fn_ecs(&sysd_disp, &closed_sigs, sysd_disp.has_profile, group_size, &resource_names);
         checker.check_fn(dispatch_decl2);
         fns.push(dispatch_decl);
         sdi = sdi + 1;
@@ -8633,6 +8742,9 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         }
         smmei = smmei + 1;
     }
+    // `__resource_<Name>` fields (see `resource_field_name_ecs`'s own header) were already
+    // pushed onto `statics` itself (the resource-registration loop, earlier in this fn) -- this
+    // ordinary per-static field-declaration loop picks them up with zero special-casing.
     var sti = 0;
     while sti < statics.length() {
         let sd3 = statics.get(sti);

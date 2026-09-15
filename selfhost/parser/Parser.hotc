@@ -1729,6 +1729,7 @@ impl Parser {
         var sendable_struct_names = empty_str_vec();
         var components = empty_component_decl_vec();
         var systems = empty_system_decl_vec();
+        var resources = empty_component_decl_vec();
         while !self.check(EOF) {
             // `use vec;` -- see `Ast.hc`'s own `Program.uses` header for the full design. A bare
             // topic name, no path/namespace syntax at all (there's no real module-path resolution
@@ -1962,6 +1963,17 @@ impl Parser {
                     throw ParseError::new("doc comments aren't supported on 'component' declarations");
                 }
                 components.push(self.component_decl());
+            } else if self.check(RESOURCE) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'resource' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'resource' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'resource' declarations");
+                }
+                resources.push(self.resource_decl());
             } else if self.check(SYSTEM) {
                 if has_pending_annotation {
                     throw ParseError::new("annotations aren't supported on 'system' declarations");
@@ -1993,7 +2005,7 @@ impl Parser {
                 fns.push(fd);
             }
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
 
     // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field
@@ -2001,6 +2013,17 @@ impl Parser {
     // already use).
     fn component_decl(&mut self) -> ComponentDecl {
         self.expect(COMPONENT);
+        let name = self.expect(IDENT).text;
+        let fields = self.struct_fields();
+        return ComponentDecl { name: name, fields: fields };
+    }
+
+    // `resource Name { field: Type, ... }` -- see `Ast.hc`'s own `Program.resources` header.
+    // Identical grammar to `component_decl` right above (reuses the same `ComponentDecl` AST
+    // shape) -- the two are only ever told apart by which registry `Checker.hotc` puts the name
+    // into.
+    fn resource_decl(&mut self) -> ComponentDecl {
+        self.expect(RESOURCE);
         let name = self.expect(IDENT).text;
         let fields = self.struct_fields();
         return ComponentDecl { name: name, fields: fields };

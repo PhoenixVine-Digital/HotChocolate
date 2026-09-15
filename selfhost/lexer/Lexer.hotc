@@ -97,6 +97,9 @@ pub enum TokType {
     // See `Ast.hc`'s own `ComponentDecl`/`SystemDecl` header -- `ECS_IDEAS.md`'s own design doc
     // for the full feature these two keywords introduce.
     COMPONENT, SYSTEM,
+    // `resource Name { fields }` -- a world-wide singleton value, distinct from `component` --
+    // see `Ast.hc`'s own `Program.resources` header.
+    RESOURCE,
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
@@ -127,6 +130,7 @@ fn build_keywords() -> Registry<TokType> {
     kw.register("mut", MUT);
     kw.register("arena", ARENA);
     kw.register("component", COMPONENT);
+    kw.register("resource", RESOURCE);
     kw.register("system", SYSTEM);
     kw.register("interface", INTERFACE);
     kw.register("dyn", DYN);

@@ -413,7 +413,7 @@ fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, cl
         dprog.struct_annotation_names, dprog.struct_annotation_data, dprog.fn_annotation_names, dprog.fn_annotation_data,
         dprog.extend_decls, dprog.must_use_fn_names,
         dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data, dprog.sendable_struct_names,
-        dprog.components, dprog.systems, target, explain_schedule, classpath,
+        dprog.components, dprog.systems, target, explain_schedule, classpath, dprog.resources,
     );
     if report_errors(derrors) {
         let md = render_doc_markdown(dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data);
@@ -525,7 +525,7 @@ pub fn run_cli(args: [String]) {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, target, explain_schedule, classpath,
+        prog.components, prog.systems, target, explain_schedule, classpath, prog.resources,
     );
     if report_errors(errors) {
         print("wrote " + out_path);
@@ -592,7 +592,7 @@ pub fn run_selfcompile_cli_prep() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors2) {
         print("wrote SelfhostCLI.class -- run it standalone with a real target path to compile any .hotc file or project directory.");
@@ -744,7 +744,7 @@ pub fn run_bootstrap_demo(path: String) {
 
     var args = vec_of(3);
     args.push(4);
-    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, prog_interfaces, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class", prog_struct_ann_names, prog_struct_ann_data, prog_fn_ann_names, prog_fn_ann_data, prog_extend_decls, prog_must_use_fn_names, prog_struct_doc_names, prog_struct_doc_data, prog_fn_doc_names, prog_fn_doc_data, merge_str_vec(prelude_prog.sendable_struct_names, real_prog.sendable_struct_names), merge_component_decl_vec(prelude_prog.components, real_prog.components), merge_system_decl_vec(prelude_prog.systems, real_prog.systems), 17, false, empty_str_vec4()); // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
+    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, prog_interfaces, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class", prog_struct_ann_names, prog_struct_ann_data, prog_fn_ann_names, prog_fn_ann_data, prog_extend_decls, prog_must_use_fn_names, prog_struct_doc_names, prog_struct_doc_data, prog_fn_doc_names, prog_fn_doc_data, merge_str_vec(prelude_prog.sendable_struct_names, real_prog.sendable_struct_names), merge_component_decl_vec(prelude_prog.components, real_prog.components), merge_system_decl_vec(prelude_prog.systems, real_prog.systems), 17, false, empty_str_vec4(), merge_component_decl_vec(prelude_prog.resources, real_prog.resources)); // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     if report_errors(errors) {
         print("wrote SelfhostDemoProgram.class (combo(3, 4) should print 18 when run)");
     }
@@ -888,6 +888,7 @@ fn merge_program(a: Program, b: Program) -> Program {
         sendable_struct_names: merge_str_vec(a.sendable_struct_names, b.sendable_struct_names),
         components: merge_component_decl_vec(a.components, b.components),
         systems: merge_system_decl_vec(a.systems, b.systems),
+        resources: merge_component_decl_vec(a.resources, b.resources),
     };
 }
 
@@ -1075,7 +1076,7 @@ pub fn run_selfcompile_probe() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors) {
         print("SELF-HOSTING MILESTONE: the self-hosted compiler successfully checked+compiled its own full source (ast+types+lexer+parser+checker+codegen)!");
@@ -1135,7 +1136,7 @@ pub fn run_selfcompile_stage2() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors) {
         print("wrote SelfhostStage2Compiler.class -- run it with a real target .hotc/.hcsrc path as argv[0] to test the true fixed point.");
@@ -1205,7 +1206,7 @@ pub fn run_selfcompile_stage3_prep() {
         prog.struct_annotation_names, prog.struct_annotation_data, prog.fn_annotation_names, prog.fn_annotation_data,
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
-        prog.components, prog.systems, 17, false, empty_str_vec4(), // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
+        prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath never wanted here
     );
     if report_errors(errors) {
         print("wrote SelfhostSelfReplicator.class -- run it standalone (no args) to rebuild SelfhostStage2Compiler.class with zero Kotlin involved.");

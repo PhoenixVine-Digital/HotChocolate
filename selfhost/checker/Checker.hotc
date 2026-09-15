@@ -286,6 +286,13 @@ pub struct TyChecker {
     // purpose -- field access, construction, `Codegen.hotc`'s own struct codegen once that's
     // wired up) -- this registry is the ONE extra fact needed on top of that.
     components: Registry<Bool>,
+    // Same shape as `components` right above, but for `resource Name { ... }` -- a SEPARATE
+    // registry (not folded into `components`) so a resource is never accidentally archetype-
+    // matched by a system's own ordinary component-borrow check, and a component is never
+    // accidentally treated as a world-wide singleton. See `Ast.hc`'s own `Program.resources`
+    // header for why this exists at all (the real gap Marshmallow's ECS ring surfaced: no way to
+    // get live external per-frame state -- a camera, input, delta time -- into a system).
+    resources: Registry<Bool>,
     // Non-fatal diagnostics -- unlike `errors` (which abort codegen once any exist, see
     // `compile_program`'s own `has_real_errors` gate), a warning never blocks compilation. First
     // real use: the scheduling-conflict warning `check_systems` emits when two systems share a
@@ -378,6 +385,7 @@ pub fn checker_new() -> TyChecker {
     var mcscopes_seed = vec_of(mut_capable);
     var mut_capable_scopes = Vec { data: mcscopes_seed.data, len: 0 };
     var components = registry_new("__init__", true);
+    var resources = registry_new("__init__", true);
     var warns = vec_of("__init__");
     warns.set(0, "");
     var system_order = empty_str_vec2();
@@ -385,7 +393,7 @@ pub fn checker_new() -> TyChecker {
     var archetype_signatures = empty_str_vec_vec_ecs();
     var add_component_types = empty_str_vec2();
     var remove_component_types = empty_str_vec2();
-    return TyChecker { fn_sigs: sigs, vars: vars, var_scopes: var_scopes, structs: structs, methods: methods, variant_owner: variant_owner, variant_owner_q: variant_owner_q, generic_templates: generic_templates, generic_enum_templates: generic_enum_templates, mono_needed: mono_needed, externs: externs, extern_methods: extern_methods, extern_fields: extern_fields, struct_extends: struct_extends, must_use_fns: must_use_fns, fn_param_names: fn_param_names, enum_variants: enum_variants, static_methods: static_methods, generic_fn_templates: generic_fn_templates, fn_mono_needed: fn_mono_needed, generic_method_templates: generic_method_templates, method_mono_needed: method_mono_needed, statics: statics, errors: errs, loop_depth: 0, cur_ret_ty: "Unit", variant_field_info: variant_field_info, generic_variant_owner: generic_variant_owner, interfaces: interfaces, struct_interfaces: struct_interfaces, arena_structs: arena_structs, sealed_interfaces: sealed_interfaces, interface_supertraits: interface_supertraits, fn_param_is_ref: fn_param_is_ref, method_param_is_ref: method_param_is_ref, static_method_param_is_ref: static_method_param_is_ref, moved: moved, moved_scopes: moved_scopes, fn_param_is_mut_ref: fn_param_is_mut_ref, method_param_is_mut_ref: method_param_is_mut_ref, static_method_param_is_mut_ref: static_method_param_is_mut_ref, mut_capable: mut_capable, mut_capable_scopes: mut_capable_scopes, components: components, warnings: warns, system_order: system_order, system_groups: system_groups, archetype_signatures: archetype_signatures, add_component_types: add_component_types, remove_component_types: remove_component_types };
+    return TyChecker { fn_sigs: sigs, vars: vars, var_scopes: var_scopes, structs: structs, methods: methods, variant_owner: variant_owner, variant_owner_q: variant_owner_q, generic_templates: generic_templates, generic_enum_templates: generic_enum_templates, mono_needed: mono_needed, externs: externs, extern_methods: extern_methods, extern_fields: extern_fields, struct_extends: struct_extends, must_use_fns: must_use_fns, fn_param_names: fn_param_names, enum_variants: enum_variants, static_methods: static_methods, generic_fn_templates: generic_fn_templates, fn_mono_needed: fn_mono_needed, generic_method_templates: generic_method_templates, method_mono_needed: method_mono_needed, statics: statics, errors: errs, loop_depth: 0, cur_ret_ty: "Unit", variant_field_info: variant_field_info, generic_variant_owner: generic_variant_owner, interfaces: interfaces, struct_interfaces: struct_interfaces, arena_structs: arena_structs, sealed_interfaces: sealed_interfaces, interface_supertraits: interface_supertraits, fn_param_is_ref: fn_param_is_ref, method_param_is_ref: method_param_is_ref, static_method_param_is_ref: static_method_param_is_ref, moved: moved, moved_scopes: moved_scopes, fn_param_is_mut_ref: fn_param_is_mut_ref, method_param_is_mut_ref: method_param_is_mut_ref, static_method_param_is_mut_ref: static_method_param_is_mut_ref, mut_capable: mut_capable, mut_capable_scopes: mut_capable_scopes, components: components, resources: resources, warnings: warns, system_order: system_order, system_groups: system_groups, archetype_signatures: archetype_signatures, add_component_types: add_component_types, remove_component_types: remove_component_types };
 }
 
 fn empty_bool_vec_chk() -> Vec<Bool> {
@@ -629,6 +637,16 @@ fn str_vec_contains_ecs(v: &Vec<String>, s: String) -> Bool {
         if v.get(i) == s { return true; }
         i = i + 1;
     }
+    return false;
+}
+
+// `true` iff `name` was declared via `resource Name { ... }` (registered into `resources`, a
+// `Registry<Bool>` -- see that registry's own header). A plain boolean wrapper around `Registry
+// <T>.get`'s own `Option<T>` result, so `check_systems`'s own `else if` chain can test it
+// directly instead of needing an `if let` inside a condition position.
+fn resource_known_ecs(resources: &Registry<Bool>, name: String) -> Bool {
+    let found = resources.get(name);
+    if let Some { value: _rk } = found { return true; }
     return false;
 }
 
@@ -2032,6 +2050,27 @@ impl TyChecker {
         self.components.register(name, true);
     }
 
+    // Called once per `resource Name { ... }` -- identical shape to `register_component` right
+    // above (same field-soundness rule, same "register into `self.structs` too" reasoning), but
+    // into `self.resources` instead of `self.components` -- the ONE fact that lets `check_systems`
+    // tell a resource-typed `run` param apart from an ordinary component-typed one.
+    fn register_resource(&mut self, name: String, fields: Vec<Param>) {
+        var names2 = empty_str_vec2();
+        var types2 = empty_str_vec2();
+        var i2 = 0;
+        while i2 < fields.length() {
+            let f2 = fields.get(i2);
+            if f2.is_ref {
+                self.error("resource '" + name + "' field '" + f2.name + "' cannot be a reference type ('&" + f2.type_name + "') -- a resource can only hold owned values");
+            }
+            names2.push(f2.name);
+            types2.push(f2.type_name);
+            i2 = i2 + 1;
+        }
+        self.structs.register(name, StructInfo { field_names: names2, field_types: types2 });
+        self.resources.register(name, true);
+    }
+
     // The real ownership-derived scheduling analysis -- see `ECS_IDEAS.md`'s own design doc for
     // the full picture. Called once, after every `component` is already registered (so a `run`
     // param's type can be validated against `self.components`). Three things happen, in order:
@@ -2115,12 +2154,26 @@ impl TyChecker {
                     // already forces a `Changed<T>` reader to serialize against a concurrent `&mut`
                     // writer of the same component (folded into `sys_reads` above), so this is an
                     // ordering nuance, not a thread-safety hazard.
+                } else if resource_known_ecs(&self.resources, p.type_name) {
+                    // A `resource`-typed param -- a single, world-wide value (see `Ast.hc`'s own
+                    // `Program.resources` header), never archetype-matched, but still borrowed by
+                    // `&`/`&mut` like a component, and still folded into the SAME conflict
+                    // analysis right below: two systems both wanting `&mut` on the SAME resource
+                    // (or one `&mut` while another `&`) genuinely can't run in parallel, exactly
+                    // like two systems fighting over the same component would.
+                    if !p.is_ref {
+                        self.error("system '" + sysd.name + "' run param '" + p.name + "' must borrow its resource ('&" + p.type_name + "' or '&mut " + p.type_name + "') -- a system can't take ownership of one");
+                    } else if p.is_mut_ref {
+                        sys_writes.push(p.type_name);
+                    } else {
+                        sys_reads.push(p.type_name);
+                    }
                 } else {
                     let comp_found = self.components.get(p.type_name);
                     var comp_known = false;
                     if let Some { value: _ck } = comp_found { comp_known = true; }
                     if !comp_known {
-                        self.error("system '" + sysd.name + "' run param '" + p.name + "' names '" + p.type_name + "', which isn't a known 'component'");
+                        self.error("system '" + sysd.name + "' run param '" + p.name + "' names '" + p.type_name + "', which isn't a known 'component' or 'resource'");
                     }
                     if !p.is_ref {
                         self.error("system '" + sysd.name + "' run param '" + p.name + "' must borrow its component ('&" + p.type_name + "' or '&mut " + p.type_name + "') -- a system can't take ownership of one");
@@ -3614,6 +3667,34 @@ impl TyChecker {
     // precisely the alternative to narrowing first, not a second way to trigger that same error.
     fn check_method_call_by_type(&mut self, rn: String, method: String, args: Vec<Expr>, arg_tys0: Vec<Ty>) -> Ty {
         var arg_tys = arg_tys0;
+        // `world.set_resource(DeltaTime { seconds: 0.016 })` -- sets the ONE world-wide value of
+        // a `resource` type (see `Ast.hc`'s own `Program.resources` header for the real gap this
+        // closes: getting live external per-frame state, a camera/input/delta-time, into a
+        // system). Exactly one argument, a resource struct literal -- unlike `spawn` right below,
+        // there's no variable-length archetype signature to build, so this doesn't need its own
+        // `Vec$<T>#push` instantiation nudge either; `Codegen.hotc`'s own `World#set_resource`
+        // branch is a single, direct `PUTSTATIC`.
+        if rn == "World" && method == "set_resource" {
+            if args.length() != 1 {
+                self.error("'world.set_resource(...)' takes exactly one argument (a resource struct literal), got " + JString::valueOf(args.length()));
+                return ty_from_name("Unit");
+            }
+            let a0 = args.get(0);
+            match a0 {
+                StructLit { name, field_names, field_values, generic_base } => {
+                    let res_found = self.resources.get(name);
+                    var res_known = false;
+                    if let Some { value: _rk2 } = res_found { res_known = true; }
+                    if !res_known {
+                        self.error("'world.set_resource(...)' argument names '" + name + "', which isn't a known 'resource'");
+                    }
+                }
+                _ => {
+                    self.error("'world.set_resource(...)' argument must be a resource struct literal (e.g. a 'DeltaTime' literal), not this expression shape");
+                }
+            }
+            return ty_from_name("Unit");
+        }
         // `world.spawn(Transform { ... }, Velocity { ... }, ...)` -- see `ECS_IDEAS.md`'s own
         // design doc. NOT a real declared method (there's no way to give `spawn` one fixed
         // signature -- it takes an arbitrary set of DIFFERENT component types per call site), so
