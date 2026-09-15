@@ -1,5 +1,24 @@
 # ECS with ownership-derived scheduling — design doc
 
+**Status, 2026-09-15**: the resource-injection gap this doc's own "Still open" #6 raised is
+landed. `resource Name { fields }` declares a single, world-wide value (own registry,
+`Checker.hotc`'s `resources`, never archetype-matched); `world.set_resource(Name { ... })` writes
+it (a real `PUTSTATIC` to `__resource_<Name>`, a field left at the JVM's own `null` default until
+first set -- a real, disclosed runtime precondition, not enforced at compile time, matching every
+other "trust the caller" stance this file's own runtime state already takes). A system's `run`
+param naming a resource is borrowed by `&`/`&mut` exactly like a component (folded into the SAME
+ownership-conflict analysis `check_systems` already does), but fetched from that static directly
+rather than a per-row archetype field -- `required_components_of_system_ecs` excludes it from
+archetype matching entirely, so a resource never has to exist on every entity to be usable.
+Verified with a real, hand-computed-expected-output program (a `DeltaTime` resource read across
+two `world.run_all()` calls with different values set in between), against the full existing ECS
+example suite (zero output changes), AND in Marshmallow itself: the ECS ring's `Render` system now
+reads a real `Camera` resource (`eye`/`target`/`up`) that `main()` sets from its OWN live,
+mouse-look free-fly camera every frame -- confirmed live, the ring cubes now correctly track
+camera movement instead of staying fixed on screen. The IntelliJ plugin's own parser was taught
+`resource`/`RESOURCE_DECL` too (mirroring `component`), so this doesn't regress IDE support the
+way the missing `static`-in-`impl` handling did earlier.
+
 **Status, 2026-09-11**: first real use in a real project, and a real gap found by it. Marshmallow
 (the game engine this compiler exists to serve) now spawns 5 real entities (`Transform` +
 `Renderable`, the latter holding owned `Mesh`/`Shader`/`Texture` struct values -- since those are
@@ -631,7 +650,7 @@ without a big back-and-forth, but real picks nonetheless:
    NOT survive to be seen this tick -- the simpler of the two options this question raised, and
    the one that shipped), then any `&mut`-taking system's dispatch sets `true` for every row it
    touches as it runs.
-6. **A resource/singleton-injection mechanism** — the real gap Marshmallow's own first ECS use
+6. ~~**A resource/singleton-injection mechanism**~~ — **Resolved and implemented, 2026-09-15**:
    surfaced (see the "Status" note at the top). Concretely needed: a way for `main()`'s own
    per-frame external state (a live camera position, keyboard/mouse input, a `FrameTimer`'s own
    delta time -- `stdlib/graphics.hotc`, added alongside this same session's work) to reach a
@@ -663,3 +682,17 @@ without a big back-and-forth, but real picks nonetheless:
    Real, disclosed scope note: nothing above is small — this is genuinely open design work, not a
    "just add a method" gap, closer in size to the original archetype-storage decision than to any
    single "Still open" item resolved above.
+
+   **Answers, now that it's built**: a NEW, separate `resource` keyword (not `component`) --
+   the "more honest about being a different kind of thing" option won, and it cost nothing extra
+   (`Checker.hotc`'s own `resources` registry, `Codegen.hotc`'s own `resource_field_name_ecs`
+   naming, both small, parallel copies of the `component` machinery). Mutable resources DO
+   participate in the SAME conflict graph ordinary components use (folded into `check_systems`'s
+   own `sys_reads`/`sys_writes`, unchanged) -- no separate, simpler rule needed; two systems
+   fighting over the same resource by `&mut` (or one `&mut` while another reads) genuinely can't
+   run in parallel, exactly like a shared component, and the existing conflict-warning machinery
+   catches it for free. The "read a component back out after `run_all()`" question is NOT solved
+   by this -- that's still a real, separate gap (no query API on `World` exists) -- but in
+   practice it hasn't needed solving: every real use so far (Marshmallow's `Camera`) is `main()`
+   pushing state IN, never reading component state back OUT, so resources answered the actual
+   need without requiring the harder half.

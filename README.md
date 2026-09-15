@@ -68,8 +68,10 @@ working today, not aspirational:
   `&`/`&mut` param annotations — the SAME signal the borrow checker
   already tracks, not a second declaration mechanism. Includes real
   parallel dispatch onto Phoenix Flight's own pool, query filters
-  (`Without<T>`, `Changed<T>`), and a `--explain-schedule` flag to see
-  the derived run order.
+  (`Without<T>`, `Changed<T>`), a `resource` declaration (a single,
+  world-wide value — a live camera, delta time — a system can request
+  alongside its ordinary component params, set via `world.set_resource
+  (...)`), and a `--explain-schedule` flag to see the derived run order.
 - **`arena struct`** — off-heap, contiguous game data (particles, ECS
   components) built on `java.lang.foreign`, for the hot-path allocations
   a GC-backed language usually can't avoid.
