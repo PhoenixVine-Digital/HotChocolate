@@ -72,6 +72,9 @@ object HCTokenTypes {
         // through `HCPsiParser`'s own top-level dispatch with no matching branch, and got
         // flagged as a real parse error in the IDE for code the actual compiler accepts cleanly.
         "use", "component", "system",
+        // `resource Name { ... }` -- a real reserved keyword too (`Lexer.hotc`'s own `kw.register
+        // ("resource", RESOURCE)`), added alongside the compiler's own resource-injection feature.
+        "resource",
     )
 
     val SYMBOLS: Map<String, HCTokenType> = mapOf(

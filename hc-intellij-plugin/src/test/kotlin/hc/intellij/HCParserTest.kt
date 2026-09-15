@@ -77,6 +77,20 @@ class HCParserTest : BasePlatformTestCase() {
         }
     }
 
+    // `resource Name { ... }` + `world.set_resource(...)` -- the ECS resource-injection feature
+    // (see `Ast.hc`'s own `Program.resources` header). Same shape as `component`, just its own
+    // keyword and element type (`RESOURCE_DECL`) -- pins that down directly, same reasoning the
+    // interpolated-string/`Type.class` tests above already use.
+    fun `test resource declarations parse as RESOURCE_DECL`() {
+        val src = "resource DeltaTime { seconds: Int }\nfn f() { var world = World::new(); world.set_resource(DeltaTime { seconds: 1 }); }"
+        val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hc", HCLanguage, src)
+        val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+        assertTrue("unexpected parse error(s) in `$src`: ${errors.map { it.errorDescription }}", errors.isEmpty())
+        val allElements = PsiTreeUtil.findChildrenOfType(psiFile, com.intellij.psi.PsiElement::class.java)
+        val hasResourceDecl = allElements.any { it.node?.elementType == HCElementTypes.RESOURCE_DECL }
+        assertTrue("expected a RESOURCE_DECL node in `$src`", hasResourceDecl)
+    }
+
     // Same sweep as the real-example-programs test above, but over `stdlib/*.hotc` -- NOT covered
     // by that one (it only walks `examples/`). This is exactly the class of file that broke and
     // went uncaught: every `extern class` with a `static NAME: Type;` FIELD (not a method) --

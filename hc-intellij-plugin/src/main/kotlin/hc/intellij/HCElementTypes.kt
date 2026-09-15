@@ -24,6 +24,7 @@ object HCElementTypes {
     val ANNOTATION = HCElementType("ANNOTATION")
     val USE_DECL = HCElementType("USE_DECL")
     val COMPONENT_DECL = HCElementType("COMPONENT_DECL")
+    val RESOURCE_DECL = HCElementType("RESOURCE_DECL")
     val SYSTEM_DECL = HCElementType("SYSTEM_DECL")
 
     val TYPE_PARAM_LIST = HCElementType("TYPE_PARAM_LIST")

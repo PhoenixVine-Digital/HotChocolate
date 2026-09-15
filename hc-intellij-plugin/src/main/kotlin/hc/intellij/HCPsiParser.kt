@@ -127,6 +127,7 @@ object HCPsiParser : PsiParser {
             b.atKw("struct") -> structDecl(b)
             b.atKw("arena") -> arenaStructDecl(b)
             b.atKw("component") -> componentDecl(b)
+            b.atKw("resource") -> resourceDecl(b)
             b.atKw("system") -> systemDecl(b)
             b.atKw("fn") -> fnDecl(b)
             b.atKw("static") -> staticDecl(b)
@@ -159,6 +160,18 @@ object HCPsiParser : PsiParser {
     private fun componentDecl(b: PsiBuilder) = node(b, HCElementTypes.COMPONENT_DECL) {
         expectKw(b, "component")
         expect(b, HCTokenTypes.IDENT, "a component name")
+        fieldList(b)
+    }
+
+    // `resource Name { field: Type, ... }` -- a single, world-wide value a system can request
+    // alongside its ordinary `&`/`&mut` component params (see `Ast.hc`'s own `Program.resources`
+    // header: the real gap found wiring Marshmallow's ECS ring up to a live camera/input/delta-
+    // time). Identical grammar to `componentDecl` right above (`Parser.hotc`'s own `resource_decl`
+    // reuses `struct_fields()` too) -- the two are only ever told apart by which registry
+    // `Checker.hotc` puts the name into.
+    private fun resourceDecl(b: PsiBuilder) = node(b, HCElementTypes.RESOURCE_DECL) {
+        expectKw(b, "resource")
+        expect(b, HCTokenTypes.IDENT, "a resource name")
         fieldList(b)
     }
 
@@ -482,6 +495,22 @@ object HCPsiParser : PsiParser {
     // (b, "fn")` right after `static`) is a real bug that broke every `extern class` with a
     // static field -- which is most of them (`GL11`'s own `GL_COLOR_BUFFER_BIT`, etc.) --
     // producing "expected 'fn'" and cascading errors through the rest of the file.
+    // A real JVM method/field's own name occasionally collides with a real HC keyword -- `open`
+    // is the concrete case (`javax.sound.sampled.Clip.open(...)`, real JDK API, needed by
+    // `stdlib/audio.hotc`): `open` never lexes as `IDENT` at all (it's the real `pub open
+    // module ...` visibility keyword). Mirrors the real compiler's own `extern_method_name`
+    // (`selfhost/parser/Parser.hotc`) exactly -- used at BOTH places this can bite: declaring an
+    // extern method (right after `fn` in an `extern class` body) and CALLING/accessing one
+    // (right after a `.`) -- both positions always expect a plain member name next, never a
+    // real `open module` declaration, so accepting the keyword here is safe.
+    private fun memberName(b: PsiBuilder, what: String) {
+        if (b.tokenType == HCTokenTypes.IDENT || b.atKw("open")) {
+            b.advanceLexer()
+        } else {
+            b.error("expected $what")
+        }
+    }
+
     private fun externMember(b: PsiBuilder) {
         val isField = if (b.atKw("static")) !b.lookAheadIsKw(1, "fn") else !b.atKw("fn")
         if (isField) {
@@ -497,7 +526,7 @@ object HCPsiParser : PsiParser {
         node(b, HCElementTypes.EXTERN_METHOD_DECL) {
             if (b.atKw("static")) b.advanceLexer()
             expectKw(b, "fn")
-            expect(b, HCTokenTypes.IDENT, "a method name")
+            memberName(b, "a method name")
             paramList(b)
             if (b.tokenType == HCTokenTypes.ARROW) { b.advanceLexer(); typeRef(b) }
             expect(b, HCTokenTypes.SEMI, "';'")
@@ -861,7 +890,7 @@ object HCPsiParser : PsiParser {
                 }
                 b.tokenType == HCTokenTypes.DOT -> {
                     b.advanceLexer()
-                    expect(b, HCTokenTypes.IDENT, "a field/method name")
+                    memberName(b, "a field/method name")
                     val isCall = b.tokenType == HCTokenTypes.LPAREN
                     if (isCall) argList(b)
                     val precede = marker.precede()
@@ -885,7 +914,7 @@ object HCPsiParser : PsiParser {
                 b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "?" && b.lookAhead(1) == HCTokenTypes.DOT -> {
                     b.advanceLexer() // ?
                     b.advanceLexer() // .
-                    expect(b, HCTokenTypes.IDENT, "a field/method name")
+                    memberName(b, "a field/method name")
                     val isCall = b.tokenType == HCTokenTypes.LPAREN
                     if (isCall) argList(b)
                     val precede = marker.precede()

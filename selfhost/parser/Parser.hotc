@@ -431,7 +431,12 @@ impl Parser {
                 }
             } else if self.check(DOT) {
                 self.advance();
-                let field = self.expect(IDENT).text;
+                // `recv.open(...)` -- same real keyword collision `extern_method_name`'s own
+                // header documents (`javax.sound.sampled.Clip.open(...)`, a real JDK method a
+                // caller needs to actually CALL, not just declare). Safe to loosen here too:
+                // right after `.`, the next token is ALWAYS a field/method name, never a real
+                // `pub open module ...` declaration (which only ever appears at the top level).
+                let field = self.extern_method_name();
                 if self.check(LPAREN) {
                     self.advance();
                     let args = self.arg_list();
@@ -1568,10 +1573,28 @@ impl Parser {
         return ExternField { name: name, type_name: type_name, is_static: is_static };
     }
 
+    // A real JVM method's own name occasionally collides with a real HC keyword -- `open` is
+    // the concrete case that surfaced this (`javax.sound.sampled.Clip.open(...)`, real JDK API,
+    // needed by `stdlib/audio.hotc`'s own `Sound::load`/`Sound::play`): `open` never lexes as
+    // `IDENT` at all (it's the real `pub open module ...` visibility keyword -- same trap
+    // `Window::open` hit as a STRUCT method name, documented in `window.hotc`'s own header,
+    // except THAT one could just be renamed to `new` since it was HC's own naming choice; a real
+    // extern method's name is NOT a free choice -- it must match the real JVM method exactly, so
+    // renaming isn't an option here). Used at BOTH the places this can bite: declaring the
+    // extern method itself (right after `fn` inside an `extern class` body), and CALLING it
+    // (`postfix_loop`'s own `.method(...)` parsing, right after a `.`) -- both positions always
+    // expect a plain member name next, never a real `open module` visibility declaration, so
+    // loosening them is safe; ordinary identifier parsing everywhere else is untouched.
+    fn extern_method_name(&mut self) -> String {
+        if self.check(IDENT) { return self.advance().text; }
+        if self.check(OPEN) { return self.advance().text; }
+        return self.expect(IDENT).text; // real error, naming what was actually expected
+    }
+
     fn extern_method(&mut self) -> ExternMethod {
         let is_static_kw = self.match_kind(STATIC);
         self.expect(FN);
-        let name = self.expect(IDENT).text;
+        let name = self.extern_method_name();
         self.expect(LPAREN);
         let is_ctor = name == "new";
         var params = empty_param_vec();

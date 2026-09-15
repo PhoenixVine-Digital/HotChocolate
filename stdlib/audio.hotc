@@ -1,0 +1,84 @@
+// Audio -- minimal playback via `javax.sound.sampled` (pure JDK, no LWJGL/native library
+// dependency needed at all -- unlike `window`/`graphics`, this topic works in any consuming
+// project with zero extra Gradle wiring). Opt-in via `use audio;`. No dependency on any other
+// stdlib topic.
+//
+// **Real, disclosed scope**: `javax.sound.sampled` only natively decodes WAV/AIFF/AU -- no
+// MP3/OGG without a third-party decoder this stdlib doesn't bundle. Fire-and-forget playback
+// only (no volume/pan control yet) -- the real, narrower thing a caller usually wants first
+// ("play this sound effect now"), not a full audio engine. Checked exceptions the real JDK API
+// declares (`UnsupportedAudioFileException`, `IOException`, `LineUnavailableException`) aren't
+// specially handled here -- same "not tracked at the type level in this subset" stance every
+// other checked-exception-throwing extern in this codebase already takes (`ImageIO::read` in
+// `graphics.hotc`, real JDK file I/O elsewhere); an unsupported/missing file surfaces as a real,
+// uncaught runtime exception, not a silent failure.
+//
+// ```
+// use audio;
+//
+// fn main() {
+//     let jump_sfx = Sound::load("assets/jump.wav");
+//     jump_sfx.play();
+// }
+// ```
+
+extern class JFileAudio = "java.io.File" {
+    fn new(pathname: String) -> Self;
+}
+
+// Opaque -- `AudioSystem::getAudioInputStream`'s own return value is only ever handed straight
+// to `Clip::open`, never read directly (same "declared shape, trusted, nothing more" scope
+// `JGLCapabilitiesWin` in `window.hotc` already uses for its own opaque LWJGL return value).
+extern class JAudioInputStream = "javax.sound.sampled.AudioInputStream" {}
+
+extern class JAudioSystem = "javax.sound.sampled.AudioSystem" {
+    static fn getAudioInputStream(file: JFileAudio) -> JAudioInputStream;
+    static fn getClip() -> JClipAudio;
+}
+
+// A real JDK INTERFACE (`javax.sound.sampled.Clip`), not a class -- needs the trailing
+// `interface` marker for `Sound::play`'s own calls to emit real `INVOKEINTERFACE`, not
+// `INVOKEVIRTUAL` (see `window.hotc`'s own `JCharSequenceWin` for the same real distinction on a
+// different type). Every method below is a genuine INSTANCE method (`clip.open(...)`, not
+// `JClipAudio::open(...)`) -- the `&self` first param isn't optional decoration, it's what makes
+// `is_static` come out `false` at all (`Parser.hotc`'s own `extern_method`: no receiver at all
+// is implicitly static, even without the `static` keyword) -- same real trap `JFloatBufferGfx`
+// in `graphics.hotc` already hit for the identical reason.
+extern class JClipAudio = "javax.sound.sampled.Clip" interface {
+    fn open(&self, stream: JAudioInputStream) -> Unit;
+    fn start(&self) -> Unit;
+    fn stop(&self) -> Unit;
+    fn close(&self) -> Unit;
+    fn setFramePosition(&self, frames: Int) -> Unit;
+}
+
+// Loads a real audio clip once and plays it back on demand -- `Clip::open` decodes and buffers
+// the WHOLE file up front (fine for short sound effects, the real, disclosed use case this is
+// scoped to; not a streaming API for long music tracks).
+struct Sound {
+    clip: JClipAudio,
+}
+
+impl Sound {
+    static fn load(path: String) -> Sound {
+        let file = JFileAudio::new(path);
+        let stream = JAudioSystem::getAudioInputStream(file);
+        let clip = JAudioSystem::getClip();
+        clip.open(stream);
+        return Sound { clip: clip };
+    }
+
+    // Plays from the start, every time -- `stop()` + rewind first, so calling `play()` again on
+    // a clip that's still mid-playback (or already finished) restarts it audibly instead of
+    // silently no-op-ing, matching the "fire and forget, hear it every time you ask" expectation
+    // a sound EFFECT (as opposed to background music) actually wants.
+    fn play(&self) {
+        self.clip.stop();
+        self.clip.setFramePosition(0);
+        self.clip.start();
+    }
+
+    fn stop(&self) {
+        self.clip.stop();
+    }
+}
