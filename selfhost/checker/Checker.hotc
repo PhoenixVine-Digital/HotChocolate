@@ -684,6 +684,20 @@ fn systems_conflict_ecs(reads_a: &Vec<String>, writes_a: &Vec<String>, reads_b: 
     return false;
 }
 
+// `systems_conflict_ecs` OR'd with the real, general hazard component/resource analysis alone
+// can never see: two `@main_thread` systems (see `Ast.hc`'s own `SystemDecl.has_main_thread`
+// header) are forced to conflict with EACH OTHER unconditionally, even sharing zero components
+// -- real motivating case: two independent rendering systems, no shared `&mut` component at
+// all, still crash if scheduled onto separate real threads, since a GL context only ever works
+// on the thread that created it. A `@main_thread` system conflicting with an ORDINARY one is
+// fine and NOT forced here (only two `@main_thread` systems specifically are guaranteed unsafe
+// together) -- an ordinary system already correctly conflicts or doesn't purely by its own real
+// component access.
+fn systems_conflict_or_main_thread_ecs(reads_a: &Vec<String>, writes_a: &Vec<String>, main_thread_a: Bool, reads_b: &Vec<String>, writes_b: &Vec<String>, main_thread_b: Bool) -> Bool {
+    if main_thread_a && main_thread_b { return true; }
+    return systems_conflict_ecs(reads_a, writes_a, reads_b, writes_b);
+}
+
 // Real, independent `Vec<Bool>` of `n` `false` entries -- `Registry<T>`'s own established "seed
 // via `vec_of`, then reset `len` to 0 and push for real" convention doesn't fit here (this needs
 // a KNOWN LENGTH up front, indexable by `.set()`, not built by pushing) -- built by pushing `n`
@@ -2094,10 +2108,15 @@ impl TyChecker {
         var writes = empty_str_vec_vec_ecs();
         var after = empty_str_vec2();
         var before = empty_str_vec2();
+        // `@main_thread` -- see `Ast.hc`'s own `SystemDecl.has_main_thread` header. Indexed the
+        // SAME way as `names`/`reads`/`writes` (built in this same loop), read by both
+        // `systems_conflict_main_thread_ecs` call sites below.
+        var main_thread = empty_bool_vec_chk();
         var i = 0;
         while i < systems.length() {
             let sysd = systems.get(i);
             names.push(sysd.name);
+            main_thread.push(sysd.has_main_thread);
             var sys_reads = empty_str_vec2();
             var sys_writes = empty_str_vec2();
             var pi = 0;
@@ -2216,11 +2235,15 @@ impl TyChecker {
         while k < names.length() {
             var m = k + 1;
             while m < names.length() {
-                if systems_conflict_ecs(reads.get(k), writes.get(k), reads.get(m), writes.get(m)) {
+                if systems_conflict_or_main_thread_ecs(reads.get(k), writes.get(k), main_thread.get(k), reads.get(m), writes.get(m), main_thread.get(m)) {
                     var shared = first_shared_component_ecs(writes.get(k), reads.get(m));
                     if shared == "" { shared = first_shared_component_ecs(writes.get(k), writes.get(m)); }
                     if shared == "" { shared = first_shared_component_ecs(writes.get(m), reads.get(k)); }
-                    self.warn("systems '" + names.get(k) + "' and '" + names.get(m) + "' both touch component '" + shared + "' (at least one writes it) -- forced to run sequentially, can't be scheduled in parallel");
+                    if shared == "" && main_thread.get(k) && main_thread.get(m) {
+                        self.warn("systems '" + names.get(k) + "' and '" + names.get(m) + "' are both '@main_thread' -- forced to run sequentially, can't be scheduled in parallel");
+                    } else {
+                        self.warn("systems '" + names.get(k) + "' and '" + names.get(m) + "' both touch component '" + shared + "' (at least one writes it) -- forced to run sequentially, can't be scheduled in parallel");
+                    }
                 }
                 m = m + 1;
             }
@@ -2249,13 +2272,14 @@ impl TyChecker {
             var group_idx = empty_int_vec_ecs();
             var group_reads = empty_str_vec_vec_ecs();
             var group_writes = empty_str_vec_vec_ecs();
+            var group_main_thread = empty_bool_vec_chk();
             var gi = 0;
             while gi < n {
                 if !placed.get(gi) && system_ready_ecs(gi, names, after, before, placed) {
                     var conflicts = false;
                     var mi = 0;
                     while mi < group.length() {
-                        if systems_conflict_ecs(reads.get(gi), writes.get(gi), group_reads.get(mi), group_writes.get(mi)) {
+                        if systems_conflict_or_main_thread_ecs(reads.get(gi), writes.get(gi), main_thread.get(gi), group_reads.get(mi), group_writes.get(mi), group_main_thread.get(mi)) {
                             conflicts = true;
                         }
                         mi = mi + 1;
@@ -2265,6 +2289,7 @@ impl TyChecker {
                         group_idx.push(gi);
                         group_reads.push(reads.get(gi));
                         group_writes.push(writes.get(gi));
+                        group_main_thread.push(main_thread.get(gi));
                     }
                 }
                 gi = gi + 1;

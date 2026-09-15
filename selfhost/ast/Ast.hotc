@@ -775,6 +775,21 @@ pub struct SystemDecl {
     // already records it (cheap, and avoids a second syntax change once the checker/codegen catch
     // up) -- unread by anything yet.
     has_profile: Bool,
+    // `@main_thread` -- a real, general scheduling constraint the ownership-conflict analysis
+    // this whole scheduler is built on can never see on its own: this system's own `run` body
+    // touches a thread-affine external resource (real, disclosed motivating case: any OpenGL
+    // call, since a GL context only ever works on the thread that created it) that has NOTHING
+    // to do with `&`/`&mut` component access. Two `@main_thread` systems are forced to conflict
+    // with EACH OTHER unconditionally (`Checker.hotc`'s own `check_systems`), even sharing zero
+    // components -- real motivating case found the hard way in Marshmallow: two independent
+    // rendering systems (no shared `&mut` component at all) got scheduled onto separate real
+    // threads via Phoenix Flight's own parallel dispatch, crashing with a real LWJGL fatal abort
+    // ("No context is current") the instant both made OpenGL calls at once. See ECS_IDEAS.md's
+    // own "Still open" #7 for the fuller design questions this doesn't fully answer (should this
+    // be checker-inferred from calling into `window`/`graphics` automatically, rather than an
+    // author-remembered marker? not solved here -- this is the "author remembers to mark it"
+    // half only).
+    has_main_thread: Bool,
 }
 
 pub struct Program {
