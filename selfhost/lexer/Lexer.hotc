@@ -86,6 +86,7 @@ pub static CP_RBRACE: Int = 125;
 pub static CP_BANG: Int = 33;
 pub static CP_PERCENT: Int = 37;
 pub static CP_AMP: Int = 38;
+pub static CP_CARET: Int = 94;
 
 pub enum TokType {
     INT, LONG, FLOAT, DOUBLE, STRING, IDENT,
@@ -103,6 +104,14 @@ pub enum TokType {
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
+    // `^` (real bitwise XOR) and `<<` (real left shift) -- see `Parser.hotc`'s own `shift`/
+    // `bitwise_xor` header for why `>>`/`>>>` (right shift, unsigned right shift) deliberately do
+    // NOT get their own merged token here: `>` alone still has to close ONE level of a nested
+    // generic type annotation (`Vec<Vec<Int>>`), and merging two/three adjacent `GT`s into a single
+    // token at the LEXER level would make that ambiguous with no way to un-merge it later. `<<` has
+    // no such conflict (`Vec<<Something>>` is never valid syntax), so it merges here exactly like
+    // `&&`/`||` already do.
+    CARET, LTLT,
     DOC_COMMENT,
     EOF,
 }
@@ -282,13 +291,19 @@ impl Lexer {
             return Token { kind: BANG, text: "!", line: start_line };
         }
         if c == CP_LT {
+            if self.match_cp(CP_LT) { return Token { kind: LTLT, text: "<<", line: start_line }; }
             if self.match_cp(CP_EQ) { return Token { kind: LTEQ, text: "<=", line: start_line }; }
             return Token { kind: LT, text: "<", line: start_line };
         }
+        // `>` deliberately never merges with a following `>` here -- see `TokType`'s own `LTLT`
+        // header for why (nested generic type annotations, `Vec<Vec<Int>>`, need each `>` to stay
+        // its own token). `Parser.hotc`'s own `shift` assembles `>>`/`>>>` from consecutive `GT`
+        // tokens by lookahead instead, only in real expression-operand position.
         if c == CP_GT {
             if self.match_cp(CP_EQ) { return Token { kind: GTEQ, text: ">=", line: start_line }; }
             return Token { kind: GT, text: ">", line: start_line };
         }
+        if c == CP_CARET { return Token { kind: CARET, text: "^", line: start_line }; }
         throw LexError::new("Unexpected character (codepoint " + JString::valueOf(c) + ") at line " + JString::valueOf(start_line));
     }
 

@@ -1,0 +1,48 @@
+// Real bitwise `^` (XOR), `<<` (left shift), `>>` (arithmetic right shift, sign-extending), and
+// `>>>` (unsigned/logical right shift, zero-fills) -- see IDEAS.md's own entry for why these
+// landed alongside the existing `&`/`|`. `>>`/`>>>` are deliberately NOT their own lexer token
+// (see Lexer.hotc's own `LTLT` header): a lone `>` still has to close one level of a nested
+// generic type annotation (`Vec<Vec<Int>>`), so Parser.hotc's own `shift()` assembles them from
+// two/three consecutive bare `GT` tokens by lookahead instead, only in real expression position.
+fn main() {
+    // XOR
+    print(5 ^ 3);           // 6  (101 ^ 011 = 110)
+    print(true ^ false);    // true (Bool XOR)
+    print(true ^ true);     // false
+
+    // Left shift
+    print(1 << 4);          // 16
+    print(3 << 2);          // 12
+
+    // Arithmetic right shift (sign-extending)
+    print(16 >> 2);         // 4
+    print(-16 >> 2);        // -4 (sign preserved)
+
+    // Unsigned right shift (zero-filling) -- the real difference shows on a negative number
+    print(-1 >>> 28);       // 15 (0xFFFFFFFF >>> 28 == 0xF)
+    print(-1 >> 28);        // -1 (arithmetic keeps the sign, stays all-1s)
+
+    // Precedence sanity: shift binds tighter than relational/equality/bitwise, matching C/Java
+    print((1 << 2) == 4);   // true, and...
+    print(1 << 2 == 4);     // ...same result unparenthesized: '==' is looser than '<<'
+
+    // Confirms nested generic TYPE ANNOTATIONS still parse correctly -- the trailing '>>' closing
+    // `Vec<Vec<Int>>` here must NOT be swallowed as a shift operator (this is `type_name_ref`'s
+    // own separate grammar path, never `shift()`). A bare declared-type annotation is enough to
+    // exercise this -- a nested-generic struct LITERAL is a separate, pre-existing, unrelated
+    // scope limit (`looks_like_generic_lit` only handles one level), not attempted here.
+    var outer: Vec<Int> = vec_of(1);
+    var nested: Option<Vec<Int>> = Some { value: outer };
+    match nested {
+        Some { value: v } => { print(v.length()); } // 1
+        None => { print(-1); }
+    }
+
+    // Long variants
+    let bigA: Long = 1L << 40;
+    print(bigA);             // 1099511627776
+    let bigB: Long = bigA >> 4;
+    print(bigB);              // 68719476736
+
+    print("done");
+}

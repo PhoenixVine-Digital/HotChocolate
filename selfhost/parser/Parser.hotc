@@ -238,10 +238,22 @@ impl Parser {
     // from that: `bitwise_and()` only checks for `&` AFTER it has already parsed a complete left
     // operand via `equality()`, a position `unary()`'s own prefix check never reaches).
     fn bitwise_or(&mut self) -> Expr {
-        var expr = self.bitwise_and();
+        var expr = self.bitwise_xor();
         while self.check(PIPE) {
             self.advance();
-            expr = Binary { op: "|", left: expr, right: self.bitwise_and() };
+            expr = Binary { op: "|", left: expr, right: self.bitwise_xor() };
+        }
+        return expr;
+    }
+
+    // Real bitwise `^` (XOR) -- slots between `|` and `&`, matching real C/Java precedence
+    // (`| < ^ < &`), same reasoning `bitwise_or`'s own header already gives for `|`/`&`'s
+    // placement relative to `==`/comparison.
+    fn bitwise_xor(&mut self) -> Expr {
+        var expr = self.bitwise_and();
+        while self.check(CARET) {
+            self.advance();
+            expr = Binary { op: "^", left: expr, right: self.bitwise_and() };
         }
         return expr;
     }
@@ -265,12 +277,59 @@ impl Parser {
     }
 
     fn comparison(&mut self) -> Expr {
-        var expr = self.term();
+        var expr = self.shift();
         while self.check(LT) || self.check(LTEQ) || self.check(GT) || self.check(GTEQ) {
             let op = self.advance().text;
-            expr = Binary { op: op, left: expr, right: self.term() };
+            expr = Binary { op: op, left: expr, right: self.shift() };
         }
         return expr;
+    }
+
+    // Non-consuming lookahead: is the token AT THE CURRENT POSITION a `GT`, immediately followed
+    // by another `GT`? Used by `shift`, right below, to assemble `>>`/`>>>` from consecutive `GT`
+    // tokens -- see `Lexer.hc`'s own `LTLT` header for why the lexer deliberately never merges
+    // these itself (a lone `>` still has to close one level of a nested generic type annotation,
+    // `Vec<Vec<Int>>`, and `type_name_ref`'s own separate grammar path consumes those one at a
+    // time; this check only ever runs from real expression-operand position, never there, so the
+    // two can never collide).
+    fn is_double_gt(&self) -> Bool {
+        if !self.check(GT) { return false; }
+        if self.pos + 1 >= self.tokens.length() { return false; }
+        return self.tokens.get(self.pos + 1).kind == GT;
+    }
+
+    // Same idea, one token further -- THREE consecutive `GT`s, for `>>>` (unsigned right shift).
+    fn is_triple_gt(&self) -> Bool {
+        if !self.is_double_gt() { return false; }
+        if self.pos + 2 >= self.tokens.length() { return false; }
+        return self.tokens.get(self.pos + 2).kind == GT;
+    }
+
+    // Real `<<`/`>>`/`>>>` (left shift, arithmetic right shift, unsigned/logical right shift) --
+    // slots between `comparison` and `term`, matching real C/Java precedence (`relational <
+    // shift < additive`). `<<` is already its own real lexer token (`LTLT`, unambiguous -- see
+    // that token's own header); `>>`/`>>>` are assembled here from two/three consecutive bare
+    // `GT` tokens instead, greedy-longest-match first (three before two), since the lexer itself
+    // never merges them (same header, again).
+    fn shift(&mut self) -> Expr {
+        var expr = self.term();
+        while true {
+            if self.check(LTLT) {
+                self.advance();
+                expr = Binary { op: "<<", left: expr, right: self.term() };
+            } else if self.is_triple_gt() {
+                self.advance();
+                self.advance();
+                self.advance();
+                expr = Binary { op: ">>>", left: expr, right: self.term() };
+            } else if self.is_double_gt() {
+                self.advance();
+                self.advance();
+                expr = Binary { op: ">>", left: expr, right: self.term() };
+            } else {
+                return expr;
+            }
+        }
     }
 
     fn term(&mut self) -> Expr {

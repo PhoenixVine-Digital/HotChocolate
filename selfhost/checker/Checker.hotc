@@ -3218,14 +3218,14 @@ impl TyChecker {
                 self.error("'" + op + "' needs Bool operands, got " + ln + " and " + rn);
                 return TyUnknown;
             }
-        } else if op == "&" || op == "|" {
-            // Real bitwise (`Int`/`Long`) AND/OR -- distinct from `&&`/`||` right above (those
+        } else if op == "&" || op == "|" || op == "^" {
+            // Real bitwise (`Int`/`Long`) AND/OR/XOR -- distinct from `&&`/`||` right above (those
             // short-circuit and are Bool-only; these never short-circuit and work on numeric
-            // operands, matching real Java `&`/`|` semantics, including its own less-common but
-            // real `Bool & Bool`/`Bool | Bool` non-short-circuiting logical form -- e.g. hex
-            // color/flag manipulation, `Integer.MIN_VALUE`-safe masking `Math.abs`/division can't
-            // express). See `Codegen.hotc`'s own `gen_binary` for the matching `IAND`/`IOR`/
-            // `LAND`/`LOR` codegen half of this.
+            // operands, matching real Java `&`/`|`/`^` semantics, including its own less-common but
+            // real `Bool & Bool`/`Bool | Bool`/`Bool ^ Bool` non-short-circuiting logical form --
+            // e.g. hex color/flag manipulation, `Integer.MIN_VALUE`-safe masking `Math.abs`/
+            // division can't express. See `Codegen.hotc`'s own `gen_binary` for the matching
+            // `IAND`/`IOR`/`IXOR`/`LAND`/`LOR`/`LXOR` codegen half of this.
             if ln == "Int" && rn == "Int" {
                 return TyInt;
             } else if ln == "Long" && rn == "Long" {
@@ -3236,6 +3236,26 @@ impl TyChecker {
                 return TyUnknown;
             } else {
                 self.error("'" + op + "' needs matching Int, Long, or Bool operands, got " + ln + " and " + rn);
+                return TyUnknown;
+            }
+        } else if op == "<<" || op == ">>" || op == ">>>" {
+            // Real bitwise shift -- Java semantics: the shift AMOUNT (right operand) is always
+            // `Int`, regardless of the left operand's own type, and the RESULT's type matches only
+            // the left operand (`Int` or `Long` -- no `Bool` shift form exists, unlike `&`/`|`/`^`
+            // right above). See `Codegen.hotc`'s own `gen_binary` for the matching `ISHL`/`ISHR`/
+            // `IUSHR`/`LSHL`/`LSHR`/`LUSHR` codegen half of this.
+            if rn != "Int" && rn != "?" {
+                self.error("'" + op + "' needs an Int shift amount, got " + rn);
+                return TyUnknown;
+            }
+            if ln == "Int" {
+                return TyInt;
+            } else if ln == "Long" {
+                return TyLong;
+            } else if ln == "?" {
+                return TyUnknown;
+            } else {
+                self.error("'" + op + "' needs an Int or Long left operand, got " + ln);
                 return TyUnknown;
             }
         } else if op == "<" || op == "<=" || op == ">" || op == ">=" {

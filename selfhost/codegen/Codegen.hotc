@@ -3533,21 +3533,37 @@ impl CodeGen {
             if widened5 == "Float" { self.mv.visitInsn(114); return "Float"; } // FREM
             if widened5 == "Double" { self.mv.visitInsn(115); return "Double"; } // DREM
             self.mv.visitInsn(112); return widened5; // IREM (see the "+" branch's own header on why not a hardcoded "Int")
-        } else if op == "&" || op == "|" {
-            // Real bitwise AND/OR -- unlike `&&`/`||` right below, both operands are ALWAYS
-            // evaluated (no short-circuit), matching real Java `&`/`|` semantics. `Bool` is
+        } else if op == "&" || op == "|" || op == "^" {
+            // Real bitwise AND/OR/XOR -- unlike `&&`/`||` right below, both operands are ALWAYS
+            // evaluated (no short-circuit), matching real Java `&`/`|`/`^` semantics. `Bool` is
             // already represented as a plain JVM `I` at this compiler's own descriptor level
-            // (`descriptor_of_type`'s own `Int`/`Bool` -> `"I"` mapping), so `IAND`/`IOR` work
-            // correctly for `Bool` operands too (0/1 values) with zero extra casing needed --
-            // real Java's own `Boolean & Boolean` compiles to the identical opcode.
+            // (`descriptor_of_type`'s own `Int`/`Bool` -> `"I"` mapping), so `IAND`/`IOR`/`IXOR`
+            // work correctly for `Bool` operands too (0/1 values) with zero extra casing needed --
+            // real Java's own `Boolean & Boolean`/`Boolean ^ Boolean` compiles to the identical
+            // opcode.
             let lt6 = self.gen_expr(left);
             let rt6 = self.gen_expr(right);
             if lt6 == "Long" && rt6 == "Long" {
-                if op == "&" { self.mv.visitInsn(127); } else { self.mv.visitInsn(129); } // LAND / LOR
+                if op == "&" { self.mv.visitInsn(127); } else if op == "|" { self.mv.visitInsn(129); } else { self.mv.visitInsn(131); } // LAND / LOR / LXOR
                 return "Long";
             }
-            if op == "&" { self.mv.visitInsn(126); } else { self.mv.visitInsn(128); } // IAND / IOR
+            if op == "&" { self.mv.visitInsn(126); } else if op == "|" { self.mv.visitInsn(128); } else { self.mv.visitInsn(130); } // IAND / IOR / IXOR
             return lt6;
+        } else if op == "<<" || op == ">>" || op == ">>>" {
+            // Real bitwise shift -- `ISHL`/`ISHR`/`IUSHR` (`120`/`122`/`124`) take an `Int` shift
+            // amount and operate on an `Int` value; `LSHL`/`LSHR`/`LUSHR` (`121`/`123`/`125`) work
+            // on a `Long` value but STILL take a plain `Int` shift amount (real JVM spec, not a
+            // simplification this compiler is making) -- `Checker.hotc`'s own matching `check_
+            // binary` branch already enforces the shift amount is `Int`, never `Long`, so no
+            // widening/casting is needed here for `right` at all.
+            let lts = self.gen_expr(left);
+            let rts = self.gen_expr(right);
+            if lts == "Long" {
+                if op == "<<" { self.mv.visitInsn(121); } else if op == ">>" { self.mv.visitInsn(123); } else { self.mv.visitInsn(125); } // LSHL / LSHR / LUSHR
+                return "Long";
+            }
+            if op == "<<" { self.mv.visitInsn(120); } else if op == ">>" { self.mv.visitInsn(122); } else { self.mv.visitInsn(124); } // ISHL / ISHR / IUSHR
+            return lts;
         } else if op == "&&" {
             // Short-circuit: only evaluate `right` when `left` is true.
             self.gen_expr(left);

@@ -40,6 +40,29 @@ Confirmed and fixed while self-hosting the parser (`selfhost/`): `make_foo() == 
 
 **Deliberately not attempted yet**: full structural equality for enums whose variants carry fields (`Option<T>`, `Result<T, E>`, this project's own `Expr`/`Stmt` AST). `Some { value: 5 } == Some { value: 5 }` still only compares tags today (both `Some`, so `true`, regardless of whether the `value` fields actually match) -- correct-*enough* for the common "which variant" check, silently wrong for anyone expecting real `#[derive(PartialEq)]`-style deep comparison. The real feature: after a tag match, recursively compare each field by its own type's own equality rule (`Int`/`Bool` primitive compare, `String` via `.equals()`, nested `Struct`/`Enum` via this same mechanism, arrays element-wise) -- genuinely bigger than the tag-only fix (needs a per-enum "compare fields" codegen path, not just one shared opcode sequence), but the tag-only version already shipping makes it a strict extension, not a redesign.
 
+### ~~Bitwise XOR (`^`) and shift (`<<`/`>>`/`>>>`)~~ -- shipped 2026-09-16
+
+Existing `&`/`|` covered AND/OR; XOR and both shift directions were the real, disclosed gap left
+after that (flagged when asked directly: "nothing in stdlib needs it today, but any future
+bit-packing -- color channels, a spatial hash, a PRNG -- would hit a wall immediately"). Landed
+cheaply, same reasoning `&`/`|` used: `^` reuses `IXOR`/`LXOR` (130/131), `<<`/`>>`/`>>>` reuse
+`ISHL`/`ISHR`/`IUSHR`/`LSHL`/`LSHR`/`LUSHR` (120/122/124/121/123/125) directly, slotted into real
+C/Java precedence (`| < ^ < & < == < relational < shift < + -`).
+
+The one real design wrinkle: `>>`/`>>>` do NOT get their own merged lexer token, unlike `<<`
+(`LTLT`, unambiguous) -- a lone `>` still has to close ONE level of a nested generic type
+annotation (`Vec<Vec<Int>>`), and merging two/three adjacent `GT`s into a single token at the
+LEXER level would make that permanently ambiguous with no way to un-merge it later. Fixed instead
+by keeping `GT` a single-char token always, and having `Parser.hotc`'s own new `shift()` (slotted
+between `comparison` and `term`) assemble `>>`/`>>>` from two/three CONSECUTIVE `GT` tokens by
+bounded lookahead, only from real expression-operand position -- `type_name_ref`'s own separate
+grammar path (used for every type annotation) never touches `shift()` at all, so the two can never
+collide. Verified directly: `Vec<Vec<Int>>`-shaped nested generic annotations still parse
+correctly, `1 << 2 == 4` respects real precedence, and `-1 >> 28` (arithmetic, sign-extending,
+`-1`) vs `-1 >>> 28` (logical, zero-filling, `15`) both produce the real, distinct JVM semantics.
+See `examples/bitwise_shift_xor.hotc`. Full example regression suite: zero new failures, same 8
+known pre-existing ones.
+
 ### List comprehensions: `[expensive(x) for x in values if x.isValid()]`
 
 Real design doc: `COMPREHENSIONS_IDEAS.md` (spun out 2026-09-16, same pattern `ECS_IDEAS.md`/
