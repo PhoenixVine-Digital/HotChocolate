@@ -83,13 +83,11 @@ shape closely (`selfhost/checker/Checker.hotc`):
   form — concretely, `Vec$<ResultType>` (a real, concrete mono struct name, `ensure_instantiated`d
   immediately since the element type is always fully concrete by the time a comprehension is
   checked, never itself generic-and-unresolved).
-- **Real open question, not yet answered**: `check_for`'s own existing `arr_expr` handling ONLY
-  accepts a raw array type (`[T]`) as the iteration source today — `for x in someVec` doesn't
-  compile at all currently, only `for x in someVec.data` (reaching into the raw backing array
-  field directly) does. Does a comprehension's own `iter_expr` inherit that SAME narrow scope
-  (simplest, reuses `check_for`'s own logic close to verbatim), or does it ALSO directly accept a
-  `Vec<T>` (nicer ergonomics matching how `Vec<T>` is the primary collection type basically
-  everywhere else in stdlib work this session, but real additional scope — see "Open questions").
+- `iter_expr`'s own checked type is either a raw array (`[T]`, `is_array_type_name`) or a `Vec<T>`
+  mono struct (a name like `"Vec$Int"` — recognized via `mono_base(name) == "Vec"`, mirroring how
+  other checker code already recognizes a specific mono base). Either shape resolves the element
+  type `var_name` gets registered with; anything else is the new, comprehension-specific error
+  (see "Resolved decisions" #3) — no other collection shape is accepted this pass.
 
 ### Codegen
 
@@ -106,9 +104,13 @@ sequence of bytecode instructions that leaves one value on the stack" shape):
 2. Store the fresh, empty result `Vec` into a real local slot (same "unregistered temp slot" trick
    `ArrayLit`'s own codegen already uses to sequence `NEW`/`DUP`/`<init>` against per-element
    stores).
-3. Emit a REAL loop over `iter_expr` — reusing `gen_stmt`'s own existing `For` bytecode shape
-   (index-based iteration + array-length bound check + element load) rather than inventing a
-   second array-iteration bytecode pattern from scratch.
+3. Emit a REAL loop over `iter_expr`, one of two shapes depending on the checked source type
+   (see "Resolved decisions" #1): for a raw array, reuse `gen_stmt`'s own existing `For` bytecode
+   shape directly (index-based iteration + `arraylength` bound check + `xALOAD` element load); for
+   a `Vec<T>`, the SAME index-based loop skeleton but bounded by a real `Vec::length()` call and
+   loading each element via a real `Vec::get(i)` call instead of an array-load opcode. Both share
+   everything except that one innermost "get the current element" step -- not two independent
+   loop implementations, one shared skeleton with a swapped-out element-access call.
 4. Inside the loop body: if `cond` is present, emit it and skip to the next iteration when false
    (a real conditional branch, same shape an ordinary `if` inside a `for` body already compiles
    to); otherwise, evaluate `result_expr` and call the result `Vec`'s own real `push` method
@@ -138,28 +140,28 @@ under one new `Expr` variant's own `gen_expr` arm.
   need its own separate design pass once `HashMap`/`HashMap2`/a future `HashSet` are the target,
   not attempted here.
 
-## Open questions
+## Resolved decisions
 
-1. **Comprehension source: raw array only, or also `Vec<T>` directly?** See the Checker section's
-   own header for the real, existing asymmetry this raises (`for x in someVec` doesn't compile
-   today at all). Reusing `check_for`'s exact existing scope (raw arrays only) is the lower-risk,
-   smaller-diff option; accepting `Vec<T>` directly is the more ergonomic one (matches how almost
-   every other real example in this codebase already reaches for `Vec<T>` over a raw array) but
-   needs the comprehension's own codegen to ALSO support index-based `Vec::get`/`length` iteration
-   as a genuinely separate code path from the array-iteration one, roughly doubling the codegen
-   surface for comparatively small ergonomic gain. Leaning toward raw-array-only for v1, given the
-   project's own repeated "ship the narrow case first" pattern — but a real pick, not resolved yet.
-2. **Verb bikeshed**: is `result_expr for var_name in iter_expr if cond` the right clause order
-   (Python's own), or would `for var_name in iter_expr` reading more like this language's own
-   existing `for`-statement syntax (`for var_name in iter_expr { ... }`, just without the braces)
-   matter enough to insist on it? The sketch above already matches the original proposal's own
-   syntax exactly; no real objection raised yet, just flagging it as a real, if minor, choice.
-3. **Error message shape when `iter_expr` isn't an array/`Vec`** — mirror `check_for`'s own
-   existing wording ("'for x in ...' needs a range (a..b) or an array, got ...") closely, or write
-   comprehension-specific phrasing? Small, but worth picking deliberately rather than by
-   copy-paste accident.
-4. **Does an empty-source comprehension need special-casing**, or does the general "loop zero
-   times over an empty array, `Vec::push` never called" case already produce the correct empty
-   result automatically (very likely yes, given step 1 of the codegen sketch always builds a real
-   empty `Vec` up front regardless of how many iterations the loop body actually runs) — worth
-   confirming with a real test once built, not just assumed.
+Answered directly (2026-09-16) — kept as the record of what was decided and why, not just a bare
+answer key.
+
+1. **Comprehension source: BOTH raw array and `Vec<T>` directly.** The real ergonomic case wins
+   over the smaller diff — `for x in someVec` not compiling today (only `for x in someVec.data`
+   does) was flagged as a real, existing asymmetry, not a reason to propagate it into a NEW
+   feature. Codegen needs two real iteration shapes (index-into-array vs. `Vec::get`/`length`),
+   not one — see "Architecture" below for how they share everything except the innermost
+   load-current-element step.
+2. **Clause order: `result_expr for var_name in iter_expr if cond`, Python-style, is the one real
+   grammar** — not a second parseable syntax alongside a `for`-statement-flavored alternative.
+   "Suggested but not enforced" describes a STYLE preference (how the docs/examples present it),
+   not a compiler-level choice between two accepted orderings.
+3. **Error message: comprehension-specific phrasing**, not `check_for`'s own wording reused
+   verbatim — e.g. `"comprehension source 'for x in ...' needs an array or Vec<T>, got " + name`,
+   distinct enough from `check_for`'s own "'for x in ...' needs a range (a..b) or an array, got
+   ..." that a caller reading either error immediately knows which construct is complaining.
+4. **Empty-source handling: build it per the general-case sketch (no special-casing), then
+   empirically verify with a real test** rather than assume it "just works" — the codegen sketch's
+   own step 1 (always build a real empty `Vec` up front, regardless of how many loop iterations
+   actually run) should already produce the right answer for a zero-iteration loop, but this gets
+   confirmed with an actual run, not just reasoned about, matching this whole project's own
+   "verify against a real published jar, not just the design" discipline.
