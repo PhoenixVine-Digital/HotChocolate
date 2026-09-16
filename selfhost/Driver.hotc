@@ -1005,8 +1005,15 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // already follows.
         out = add_stdlib_topic_and_deps("window", out, target);
         out = add_stdlib_topic_and_deps("vec", out, target);
-    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" && topic != "audio" && topic != "input" {
-        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics, audio, input");
+    } else if topic == "collections" {
+        // `collections.hotc`'s own `HashMap<V>`/`IntHashMap<V>` build on real `Vec<Entry<V>>`
+        // buckets and return real `Option<V>` from `get` -- same "declares a real type from
+        // another topic, needs that topic's own program merged in" reasoning every other
+        // cross-topic dependency here already follows. See `COLLECTIONS_IDEAS.md`.
+        out = add_stdlib_topic_and_deps("vec", out, target);
+        out = add_stdlib_topic_and_deps("option", out, target);
+    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" && topic != "audio" && topic != "input" && topic != "collections" {
+        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics, audio, input, collections");
     }
     out.push(topic);
     return out;

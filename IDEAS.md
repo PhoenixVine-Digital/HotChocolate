@@ -1060,7 +1060,14 @@ No native map type exists — `LinkedHashMap` etc. are reached today purely
 through `extern class` (see `hc/Copytool.hotc`'s block-ID mapping for a real
 example). A literal syntax needs a real target type to construct into
 first; revisit once/if a native `Map<K, V>` (like `Vec<T>`/`Registry<T>`)
-gets built, not before.
+gets built, not before. **A real, hand-rolled `HashMap`/`IntHashMap` is now
+being designed** — see `COLLECTIONS_IDEAS.md` (spun out 2026-09-15, same
+pattern `ECS_IDEAS.md` and `PHOENIX_FLIGHT_IDEAS.md` already established):
+`java.util.HashMap` can't just be `extern class`-bound the way `Registry<T>`
+avoided doing already, since HC's own generics are monomorphized per
+instantiation (real, separate class files, confirmed in the published
+jar), not type-erased like `javac` compiles `HashMap<K, V>` — see that doc's
+own header for the full reasoning.
 
 ### A hand-rolled full borrow checker (lifetimes/regions, not just moves)
 

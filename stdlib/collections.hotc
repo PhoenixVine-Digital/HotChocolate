@@ -1,0 +1,363 @@
+// Real hashed collections -- see `COLLECTIONS_IDEAS.md` for the full design reasoning (why this
+// can't just be an `extern class` binding over `java.util.HashMap`, and why it's two separate,
+// concrete-key-type structs rather than one arbitrary-`K` generic map). Opt-in via `use
+// collections;`. Depends on `vec` (bucket storage) and `option` (`get`'s own return type).
+//
+// **A real, previously-undocumented generics constraint found writing this file**: this
+// compiler's generic-instantiation machinery only ever resolves a type parameter by unifying it
+// against a REAL ARGUMENT VALUE somewhere in the call chain (exactly why `vec_of<T>(first: T)`/
+// `registry_new<T>(firstKey, firstValue: T)` take a value up front, never offering a bare no-arg
+// `new()`) -- there is no "infer from the assignment's declared LHS type" path for a call with
+// nothing to unify against. Confirmed two ways: a `static fn new() -> Box<V>` inside `impl Box<V>`
+// silently monomorphized to the literal placeholder name `V` instead of a real type when called as
+// `Box::new()`; the same static method taking a real `V`-typed argument STILL failed ("expects V,
+// got Int") -- generic inference through a `static fn` declared inside `impl Struct<V> { ... }`
+// doesn't work reliably at all, only a plain top-level `fn f<V>(...)` does (unifying `V` from a
+// REAL argument, same mechanism `vec_of`/`registry_new` already rely on). Ordinary `&self`/`&mut
+// self` INSTANCE methods inside `impl Struct<V> { ... }` work fine (proven: `Vec<T>`'s own `push`/
+// `get`/`set` already do this) since `V` there comes from the receiver's own already-resolved
+// concrete type, not fresh inference. Consequence for this file's own design: `HashMap<V>`/
+// `IntHashMap<V>` are built by plain top-level `fn hash_map_new<V>(...)`/`fn int_hash_map_new<V>
+// (...)` functions (mirroring `registry_new`'s own shape exactly, including requiring a real first
+// key/value pair -- there is no bare `HashMap::new()`), and every internal `None`/`Some { ... }`
+// construction is routed through a small `&self` HELPER METHOD returning it in `return` position
+// (the one other place bare `None`/`Some { value }` sugar is confirmed to resolve correctly,
+// alongside a `match` arm and a function's own `return`) rather than written inline as an
+// explicitly-qualified `Option<...>::None {}` expression -- that explicit form only accepts a
+// SINGLE bare identifier as its type argument (`Parser.hotc`'s own expression-level generic-enum-
+// variant parsing, a real, narrower scope cut than `type_name_ref`'s fuller recursive generic-type
+// support used for declarations), so it can never spell a compound type like `Vec<Entry<V>>`
+// directly. Every helper method/function below exists ONLY because of this constraint -- there is
+// no other new capability being added, they're all pure plumbing around bare `None`/`Some`.
+//
+// ```
+// use collections;
+//
+// fn main() {
+//     var cache = hash_map_new("assets/checker.png", tex);
+//     cache.register("assets/other.png", tex2);
+//     match cache.get("assets/checker.png") {
+//         Some { value } => { print("cached"); }
+//         None => { print("miss"); }
+//     }
+//
+//     var by_id = int_hash_map_new(entity_id, PlayerPos { x: 4.0f, y: 0.0f, z: 0.0f });
+// }
+// ```
+
+// A real, hand-rolled polynomial rolling hash (`h = h * 31 + codepoint`, same shape Java's own
+// `String.hashCode()` uses, but genuinely computed in HC rather than calling into it) -- built
+// from `.length()`/`.codePointAt(Int)`, the same real `String` methods `Lexer.hotc`'s own
+// `peek`/`peek2` already use, no JDK hashing dependency at all.
+fn hash_string_hc(s: String) -> Int {
+    var h = 0;
+    var i = 0;
+    let n = s.length();
+    while i < n {
+        h = h * 31 + s.codePointAt(i);
+        i = i + 1;
+    }
+    return h;
+}
+
+// One key/value pair inside a bucket -- `HashMap<V>`'s own flat unit, mirrors `RegistryEntry<T>`
+// (`registry.hotc`) exactly.
+struct Entry<V> {
+    key: String,
+    value: V,
+}
+
+// String-keyed hash map -- real O(1)-average `get`/`register`/`remove`, replacing `Registry<T>`'s
+// own O(n) linear scan for anything that outgrows a handful of entries (an asset cache keyed by
+// path, say). `buckets` is a `Vec<Option<Vec<Entry<V>>>>` (grown by full rehash, never resized in
+// place) -- each slot starts `None`, promoted to `Some` holding a real `Vec<Entry<V>>` on that
+// bucket's first insert. Deliberately `Vec<Option<...>>`, NOT a raw `[Option<Vec<Entry<V>>>]`
+// array field -- this language's own array-type syntax (`Parser.hotc`'s own `type_name_ref`) only
+// accepts a BARE type name inside `[...]`, not a full generic type expression, a real, second
+// narrower parser scope cut found writing this file (see this file's own top header for the
+// first). Routing through `Vec<T>` instead sidesteps it (generic type ARGUMENTS parse fully
+// recursively already -- confirmed by `Option<Vec<Bool>>` already existing in the compiler's own
+// self-hosted output) and reuses its own proven growth logic for free.
+struct HashMap<V> {
+    buckets: Vec<Option<Vec<Entry<V>>>>,
+    bucket_count: Int,
+    size: Int,
+}
+
+// See this file's own top header -- `hint` is used ONLY to let the checker resolve `V` (the exact
+// same real-argument-driven inference `vec_of`/`registry_new` already rely on); its actual value
+// is discarded.
+fn make_empty_bucket_hc<V>(hint: V) -> Option<Vec<Entry<V>>> {
+    return None;
+}
+
+// "Last write wins," same semantics `Registry<T>::register` already documents -- reused
+// deliberately (see `COLLECTIONS_IDEAS.md`'s own "reuse the verb" decision) so a caller migrating
+// FROM `Registry<T>` TO this type for the performance win changes nothing but the type name.
+// Mirrors `registry_new`'s own shape exactly, including requiring a real first key/value (see this
+// file's own top header for why there's no bare `HashMap::new()`).
+fn hash_map_new<V>(first_key: String, first_value: V) -> HashMap<V> {
+    var m = HashMap<V> {
+        buckets: vec_of(make_empty_bucket_hc(first_value)),
+        bucket_count: 1,
+        size: 0,
+    };
+    while m.buckets.length() < 16 {
+        m.buckets.push(m.make_empty_bucket());
+    }
+    m.bucket_count = 16;
+    m.register(first_key, first_value);
+    return m;
+}
+
+impl HashMap<V> {
+    fn make_empty_bucket(&self) -> Option<Vec<Entry<V>>> {
+        return None;
+    }
+
+    fn make_full_bucket(&self, entry: Entry<V>) -> Option<Vec<Entry<V>>> {
+        return Some { value: vec_of(entry) };
+    }
+
+    fn make_found(&self, value: V) -> Option<V> {
+        return Some { value: value };
+    }
+
+    fn make_missing(&self) -> Option<V> {
+        return None;
+    }
+
+    // `&` (real bitwise AND -- `Parser.hotc`'s own `bitwise_and`, `Codegen.hotc`'s own `IAND`
+    // emission, confirmed alongside this file's own design doc) against `bucket_count - 1` --
+    // correct for a NEGATIVE `hash` too, since ANDing against a mask with only low bits set always
+    // yields a non-negative result regardless of the input's sign, unlike `hash % bucket_count`
+    // (which can itself be negative for a negative `hash`, needing a separate `abs(...)` fix-up
+    // this approach never needs).
+    fn bucket_index_for(&self, key: String) -> Int {
+        let h = hash_string_hc(key);
+        return h & (self.bucket_count - 1);
+    }
+
+    fn register(&mut self, key: String, value: V) {
+        let idx = self.bucket_index_for(key);
+        match self.buckets.get(idx) {
+            Some { value: bucket } => {
+                var found_idx = -1;
+                var i = 0;
+                while i < bucket.length() {
+                    if bucket.get(i).key == key {
+                        found_idx = i;
+                    }
+                    i = i + 1;
+                }
+                if found_idx >= 0 {
+                    bucket.set(found_idx, Entry<V> { key: key, value: value });
+                } else {
+                    bucket.push(Entry<V> { key: key, value: value });
+                    self.size = self.size + 1;
+                }
+            }
+            None => {
+                let e = Entry<V> { key: key, value: value };
+                let full = self.make_full_bucket(e);
+                self.buckets.set(idx, full);
+                self.size = self.size + 1;
+            }
+        }
+        self.maybe_resize();
+    }
+
+    fn get(&self, key: String) -> Option<V> {
+        let idx = self.bucket_index_for(key);
+        match self.buckets.get(idx) {
+            Some { value: bucket } => {
+                var i = 0;
+                while i < bucket.length() {
+                    let e = bucket.get(i);
+                    if e.key == key {
+                        return self.make_found(e.value);
+                    }
+                    i = i + 1;
+                }
+                return self.make_missing();
+            }
+            None => {
+                return self.make_missing();
+            }
+        }
+    }
+
+    fn contains_key(&self, key: String) -> Bool {
+        match self.get(key) {
+            Some { value } => { return true; }
+            None => { return false; }
+        }
+    }
+
+    // Swap-with-last + pop inside the bucket's own `Vec` -- order within a bucket was never
+    // meaningful to begin with, same "cheap removal, no shifting" convention `ECS_IDEAS.md`'s own
+    // archetype-row removal already established, rather than adding a new shifting `remove_at`
+    // method to `Vec<T>` just for this one caller.
+    fn remove(&mut self, key: String) {
+        let idx = self.bucket_index_for(key);
+        match self.buckets.get(idx) {
+            Some { value: bucket } => {
+                var found_idx = -1;
+                var i = 0;
+                while i < bucket.length() {
+                    if bucket.get(i).key == key {
+                        found_idx = i;
+                    }
+                    i = i + 1;
+                }
+                if found_idx >= 0 {
+                    let last_idx = bucket.length() - 1;
+                    if found_idx != last_idx {
+                        bucket.set(found_idx, bucket.get(last_idx));
+                    }
+                    bucket.pop();
+                    self.size = self.size - 1;
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn length(&self) -> Int {
+        return self.size;
+    }
+
+    // Doubles `bucket_count` and rehashes every existing entry into a fresh bucket array once the
+    // load factor crosses 0.75 (`size * 4 >= bucket_count * 3`, the integer-only equivalent of
+    // `size / bucket_count >= 0.75` -- avoids needing a `Float` cast just for this comparison).
+    // Real, bounded complexity (walks every entry exactly once) -- not attempted incrementally,
+    // matching this project's own "correctness first" discipline (`ECS_IDEAS.md`'s own archetype-
+    // storage section) rather than a more clever in-place growth scheme.
+    fn maybe_resize(&mut self) {
+        if self.size * 4 < self.bucket_count * 3 {
+            return;
+        }
+        let new_count = self.bucket_count * 2;
+        var new_buckets = vec_of(self.make_empty_bucket());
+        var k = 1;
+        while k < new_count {
+            new_buckets.push(self.make_empty_bucket());
+            k = k + 1;
+        }
+        var i = 0;
+        while i < self.buckets.length() {
+            match self.buckets.get(i) {
+                Some { value: bucket } => {
+                    var j = 0;
+                    while j < bucket.length() {
+                        let e = bucket.get(j);
+                        let new_idx = hash_string_hc(e.key) & (new_count - 1);
+                        match new_buckets.get(new_idx) {
+                            Some { value: nb } => {
+                                nb.push(Entry<V> { key: e.key, value: e.value });
+                            }
+                            None => {
+                                let full = self.make_full_bucket(Entry<V> { key: e.key, value: e.value });
+                                new_buckets.set(new_idx, full);
+                            }
+                        }
+                        j = j + 1;
+                    }
+                }
+                None => {}
+            }
+            i = i + 1;
+        }
+        self.buckets = new_buckets;
+        self.bucket_count = new_count;
+    }
+}
+
+// Int-keyed map -- deliberately NOT a hash table. `COLLECTIONS_IDEAS.md`'s own "Open questions"
+// #4 asked whether `IntHashMap<V>` even needs real buckets for its actual expected use case (dense,
+// small, sequentially-assigned keys -- entity ids, `ECS_IDEAS.md`'s own `__next_entity_id`
+// counter), and the answer is no: a direct-indexed, growable `Vec<Option<V>>` is exactly O(1) with
+// zero hash collisions and less code than a hash table, strictly better for THAT key
+// distribution. Real, disclosed scope limit: a single large, sparse key (a hashed id in the
+// billions, say) would allocate an enormous backing `Vec` -- this type is for dense/sequential int
+// keys specifically, not a general sparse-int hash map (which would need real bucketing, same as
+// `HashMap<V>` above, if that ever becomes a real need).
+struct IntHashMap<V> {
+    slots: Vec<Option<V>>,
+    len: Int,
+}
+
+fn make_empty_slot_hc<V>(hint: V) -> Option<V> {
+    return None;
+}
+
+// Mirrors `hash_map_new`'s own shape (see this file's own top header for why there's no bare
+// `IntHashMap::new()`).
+fn int_hash_map_new<V>(first_key: Int, first_value: V) -> IntHashMap<V> {
+    var m = IntHashMap<V> { slots: vec_of(make_empty_slot_hc(first_value)), len: 0 };
+    m.register(first_key, first_value);
+    return m;
+}
+
+impl IntHashMap<V> {
+    fn make_empty_slot(&self) -> Option<V> {
+        return None;
+    }
+
+    fn make_full_slot(&self, value: V) -> Option<V> {
+        return Some { value: value };
+    }
+
+    // Grows by real `Vec<T>::push` (its own proven doubling-capacity growth, see `vec.hotc`) until
+    // there's a real slot at index `min_len - 1`.
+    fn ensure_capacity(&mut self, min_len: Int) {
+        while self.slots.length() < min_len {
+            let e = self.make_empty_slot();
+            self.slots.push(e);
+        }
+    }
+
+    fn register(&mut self, key: Int, value: V) {
+        self.ensure_capacity(key + 1);
+        match self.slots.get(key) {
+            Some { value: existing } => {}
+            None => {
+                self.len = self.len + 1;
+            }
+        }
+        let filled = self.make_full_slot(value);
+        self.slots.set(key, filled);
+    }
+
+    fn get(&self, key: Int) -> Option<V> {
+        if key < 0 || key >= self.slots.length() {
+            return self.make_empty_slot();
+        }
+        return self.slots.get(key);
+    }
+
+    fn contains_key(&self, key: Int) -> Bool {
+        match self.get(key) {
+            Some { value } => { return true; }
+            None => { return false; }
+        }
+    }
+
+    fn remove(&mut self, key: Int) {
+        if key < 0 || key >= self.slots.length() {
+            return;
+        }
+        match self.slots.get(key) {
+            Some { value } => {
+                self.len = self.len - 1;
+            }
+            None => {}
+        }
+        let e = self.make_empty_slot();
+        self.slots.set(key, e);
+    }
+
+    fn length(&self) -> Int {
+        return self.len;
+    }
+}
