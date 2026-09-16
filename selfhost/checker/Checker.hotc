@@ -568,7 +568,7 @@ fn strip_nullable(name: String) -> String {
 }
 
 fn is_numeric_ty_name_chk(name: String) -> Bool {
-    return name == "Int" || name == "Long" || name == "Float" || name == "Double";
+    return name == "Int" || name == "Long" || name == "Float" || name == "Double" || name == "Char" || name == "Byte";
 }
 
 // Move-checking's own "never needs tracking" set -- same primitives/`String` every other Copy-ish
@@ -578,7 +578,7 @@ fn is_numeric_ty_name_chk(name: String) -> Bool {
 // uninferred type) is ALSO treated as Copy -- trust it rather than block on a checker gap, same
 // "when unsure, don't reject" honesty `is_arg_type_mismatch` already has elsewhere.
 fn is_copy_ty_name_chk(name: String) -> Bool {
-    return name == "Int" || name == "Bool" || name == "Long" || name == "Float" || name == "Double" || name == "String" || name == "?";
+    return name == "Int" || name == "Bool" || name == "Long" || name == "Float" || name == "Double" || name == "Char" || name == "Byte" || name == "String" || name == "?";
 }
 
 // Does `body` unconditionally diverge (its own last statement is `return`/`throw`)? Same simple
@@ -1495,8 +1495,8 @@ impl TyChecker {
             // gate just above gives, applied here too.
             if is_nullable_type_name(n) && strip_nullable(n) == "String" {
                 self.error("interpolated value is a possibly-null String (" + n + ") used without a null check");
-            } else if n != "Int" && n != "Long" && n != "Float" && n != "Double" && n != "Bool" && n != "String" && n != "?" {
-                self.error("cannot interpolate " + n + " into a string -- only Int/Long/Float/Double/Bool/String are supported");
+            } else if n != "Int" && n != "Long" && n != "Float" && n != "Double" && n != "Char" && n != "Byte" && n != "Bool" && n != "String" && n != "?" {
+                self.error("cannot interpolate " + n + " into a string -- only Int/Long/Float/Double/Char/Byte/Bool/String are supported");
             }
             i = i + 1;
         }
@@ -3113,7 +3113,7 @@ impl TyChecker {
             // else. Both fixed together: negation now works for every numeric type this subset has.
             if iname == "?" {
                 return TyUnknown;
-            } else if iname == "Int" || iname == "Long" || iname == "Float" || iname == "Double" {
+            } else if iname == "Int" || iname == "Long" || iname == "Float" || iname == "Double" || iname == "Char" || iname == "Byte" {
                 // `it` was already consumed by `ty_name(it)` above (`Ty` isn't `Copy` -- see
                 // `Types.hotc`'s own `ty_name` header) -- rebuilding from the `String` (which IS
                 // `Copy`) instead of trying to reuse `it` directly. `ty_from_name` would build a
@@ -5097,6 +5097,8 @@ impl TyChecker {
         if type_name == "Float" { return "F"; }
         if type_name == "Double" { return "D"; }
         if type_name == "Bool" { return "Z"; }
+        if type_name == "Char" { return "C"; }
+        if type_name == "Byte" { return "B"; }
         if type_name == "Unit" { return "V"; }
         if type_name == "String" { return "Ljava/lang/String;"; }
         if is_array_type_name(type_name) {

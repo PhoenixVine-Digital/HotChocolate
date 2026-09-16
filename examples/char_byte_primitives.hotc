@@ -1,0 +1,69 @@
+// `Char`/`Byte` -- two new primitive types, ported the same "no literal syntax, only `as Char`/
+// `as Byte` casts and extern calls" way `Long`/`Float`/`Double` were (see `selfhost/types/
+// Types.hotc`'s own header). Real arithmetic (same-type only -- `Char + Int` needs an explicit
+// cast, matching `Int`+`Long` staying unwidened too), comparison, casts (including narrowing
+// truncation via real `i2c`/`i2b` opcodes), print/string-interpolation, and real `char[]`/`byte[]`
+// JVM arrays (via `CALOAD`/`CASTORE`/`BALOAD`/`BASTORE`, not just an `int[]` wearing a Char/Byte
+// label -- `Byte` in particular needs this for real interop with byte-array JDK APIs).
+fn main() {
+    // --- Casts ---
+    let a_char = 65 as Char; // 'A'
+    let a_int = a_char as Int;
+    print(a_int); // 65
+
+    let neg_byte = -20 as Byte;
+    let neg_byte_as_int = neg_byte as Int;
+    print(neg_byte_as_int); // -20
+
+    // Narrowing truncation: 300 doesn't fit in a byte (range -128..127); i2b wraps it.
+    let wrapped = 300 as Byte;
+    print(wrapped as Int); // 44 (300 - 256)
+
+    // Char <-> Byte direct cast
+    let mid_char = 200 as Char; // fits fine in Char (0..65535)
+    let mid_char_as_byte = mid_char as Byte; // truncates through i2b
+    print(mid_char_as_byte as Int); // -56 (200 - 256)
+
+    // --- Arithmetic (same-type only) ---
+    let c1 = 10 as Char;
+    let c2 = 5 as Char;
+    let csum = c1 + c2;
+    print(csum as Int); // 15
+
+    let b1 = 100 as Byte;
+    let b2 = 27 as Byte;
+    let bsum = b1 + b2;
+    print(bsum as Int); // 127
+
+    let cdiff = c1 - c2;
+    print(cdiff as Int); // 5
+
+    // unary minus
+    let bneg = -b1;
+    print(bneg as Int); // -100
+
+    // --- Comparison ---
+    print(c1 > c2); // true
+    print(c1 == c2); // false
+    print(b1 == 100 as Byte); // true
+
+    // --- Print / interpolation ---
+    print(a_char); // 65 (raw print(Char) uses (C)V -- prints the actual character 'A')
+    print(neg_byte); // -20 (println(byte) widens to println(int))
+    print("char value: {a_char}, byte value: {neg_byte}");
+
+    // --- Arrays ---
+    var chars = [65 as Char, 66 as Char, 67 as Char];
+    print(chars[0] as Int);
+    print(chars[1] as Int);
+    print(chars[2] as Int);
+    chars[1] = 90 as Char;
+    print(chars[1] as Int);
+
+    var bytes = [1 as Byte, 2 as Byte, 3 as Byte];
+    print(bytes[0] as Int);
+    bytes[2] = 127 as Byte;
+    print(bytes[2] as Int);
+
+    print("done");
+}

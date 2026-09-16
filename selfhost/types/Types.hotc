@@ -18,13 +18,21 @@ module hc.selfhost.types;
 // comparison/cast/slot support (see `Codegen.hotc`'s own `alloc_slot` header), but no literal
 // syntax -- `Parser.hotc`'s `primary()` never grew a case for the lexer's own pre-existing `FLOAT`/
 // `DOUBLE` token kinds, so a value only arrives via `as Float`/`as Double` casts or an extern call,
-// same as `Long` already did via `as Long`/`JLong::parseLong`. `TyStruct` is this subset's one
-// field-carrying variant, and doubles as the catch-all for both real structs AND enums (see
-// `Checker.hotc`'s own comments on `variant_owner`) -- there's no separate `TyEnum` tag the way the
-// real `Ty.Enum` is distinct from `Ty.Struct`.
+// same as `Long` already did via `as Long`/`JLong::parseLong`. `Char`/`Byte` landed the SAME way
+// later still (see `examples/char_byte_primitives.hotc`) -- no new lexer token kind needed there
+// either, since neither has literal syntax. Both are JVM int-category primitives (same operand-
+// stack representation and arithmetic/comparison opcodes `Int` already uses -- `IADD`/`IF_ICMPEQ`/
+// etc. work unchanged), so the real NEW work for them was narrower than `Long`/`Float`/`Double`
+// needed: real narrowing-cast opcodes (`i2c`=146/`i2b`=145, since `Int` -> `Char`/`Byte` can
+// genuinely lose information, unlike widening to `Int` which is a free relabel) and real per-type
+// JVM array opcodes (`CALOAD`/`CASTORE`, `BALOAD`/`BASTORE` -- `Codegen.hotc`'s own `array_load_
+// opcode_cg`/`_store_`/`newarray_atype_cg` headers), not a whole new arithmetic-opcode family.
+// `TyStruct` is this subset's one field-carrying variant, and doubles as the catch-all for both
+// real structs AND enums (see `Checker.hotc`'s own comments on `variant_owner`) -- there's no
+// separate `TyEnum` tag the way the real `Ty.Enum` is distinct from `Ty.Struct`.
 
 pub enum Ty {
-    TyInt, TyBool, TyStr, TyUnit, TyUnknown, TyLong, TyFloat, TyDouble,
+    TyInt, TyBool, TyStr, TyUnit, TyUnknown, TyLong, TyFloat, TyDouble, TyChar, TyByte,
     TyStruct { name: String },
 }
 
@@ -91,6 +99,8 @@ pub fn ty_from_name(name: String) -> Ty {
     if name == "Long" { return TyLong; }
     if name == "Float" { return TyFloat; }
     if name == "Double" { return TyDouble; }
+    if name == "Char" { return TyChar; }
+    if name == "Byte" { return TyByte; }
     return TyStruct { name: name };
 }
 
@@ -109,6 +119,8 @@ pub fn ty_name(t: Ty) -> String {
         TyLong => { return "Long"; }
         TyFloat => { return "Float"; }
         TyDouble => { return "Double"; }
+        TyChar => { return "Char"; }
+        TyByte => { return "Byte"; }
         TyStruct { name } => { return name; }
     }
 }

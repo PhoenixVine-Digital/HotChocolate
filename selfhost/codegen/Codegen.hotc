@@ -728,6 +728,10 @@ impl CodeGen {
             if ety == "Float" { desc = "(F)Ljava/lang/StringBuilder;"; }
             if ety == "Double" { desc = "(D)Ljava/lang/StringBuilder;"; }
             if ety == "Bool" { desc = "(Z)Ljava/lang/StringBuilder;"; }
+            if ety == "Char" { desc = "(C)Ljava/lang/StringBuilder;"; }
+            // `StringBuilder` has no real `append(byte)` overload -- same auto-widen-to-`int`
+            // reasoning `print`'s own descriptor picker header already explains.
+            if ety == "Byte" { desc = "(I)Ljava/lang/StringBuilder;"; }
             self.mv.visitMethodInsn(182, "java/lang/StringBuilder", "append", desc, false);
             let lit = literals.get(i + 1);
             if lit.length() > 0 {
@@ -1584,6 +1588,8 @@ impl CodeGen {
         if name == "Long" { return "J"; } // see `descriptor_of_type`'s own header
         if name == "Float" { return "F"; }
         if name == "Double" { return "D"; }
+        if name == "Char" { return "C"; }
+        if name == "Byte" { return "B"; }
         if is_array_type_name_cg(name) {
             let inner = array_elem_type_name_cg(name);
             return "[" + self.resolve_descriptor(inner);
@@ -2318,6 +2324,12 @@ impl CodeGen {
                     if arg_ty == "Long" { desc = "(J)V"; }
                     if arg_ty == "Float" { desc = "(F)V"; }
                     if arg_ty == "Double" { desc = "(D)V"; }
+                    if arg_ty == "Char" { desc = "(C)V"; }
+                    // `PrintStream` has no real `println(byte)` overload -- real Java itself
+                    // auto-widens a `byte` argument to `int` at the CALL SITE for exactly this
+                    // reason, so `(I)V` (the value's already sitting on the stack as a plain int)
+                    // is the correct, real-Java-equivalent descriptor, not a workaround.
+                    if arg_ty == "Byte" { desc = "(I)V"; }
                     self.mv.visitMethodInsn(182, "java/io/PrintStream", "println", desc, false); // INVOKEVIRTUAL
                     return "Unit";
                 }
@@ -3158,6 +3170,27 @@ impl CodeGen {
         if inner_ty == "Double" && target_type == "Int" { self.mv.visitInsn(142); return "Int"; } // D2I
         if inner_ty == "Double" && target_type == "Long" { self.mv.visitInsn(143); return "Long"; } // D2L
         if inner_ty == "Double" && target_type == "Float" { self.mv.visitInsn(144); return "Float"; } // D2F
+        // `Char`/`Byte` live on the JVM operand stack as a plain `int` (same representation Int
+        // itself uses) -- narrowing FROM `Int` needs a real truncating opcode (`i2c`/`i2b`, since
+        // the value could be out of the narrower type's range), but widening BACK to `Int` needs
+        // NO opcode at all (the bits are already a valid int, same "no-op, just relabel" the rest
+        // of this fn's own same-type check at its very top already relies on for every other
+        // trivial case).
+        if inner_ty == "Int" && target_type == "Char" { self.mv.visitInsn(146); return "Char"; } // I2C
+        if inner_ty == "Int" && target_type == "Byte" { self.mv.visitInsn(145); return "Byte"; } // I2B
+        if inner_ty == "Char" && target_type == "Int" { return "Int"; }
+        if inner_ty == "Byte" && target_type == "Int" { return "Int"; }
+        // `Char`<->`Byte` directly: route through the SAME truncating/no-op rules above by way of
+        // `Int` -- both are already plain ints on the stack, so `Char`->`Byte` is just `i2b` (the
+        // value's current bit pattern narrowed, identical to `Int`->`Byte`) and `Byte`->`Char` is
+        // a real, disclosed narrower case: `byte` is SIGNED (-128..127) and `char` is UNSIGNED
+        // (0..65535) on the JVM, so a negative `Byte` value cast to `Char` would sign-extend
+        // through `i2b`'s own inverse and land at a real, surprising large positive `Char` code
+        // point -- `i2c` on the raw stack value (skipping any narrowing first) is the correct,
+        // real Java-equivalent behavior for this pair (`(char) byteValue` in real Java does
+        // exactly this: sign-extend to int implicitly, then mask to 16 bits).
+        if inner_ty == "Char" && target_type == "Byte" { self.mv.visitInsn(145); return "Byte"; } // I2B
+        if inner_ty == "Byte" && target_type == "Char" { self.mv.visitInsn(146); return "Char"; } // I2C
         // Primitive-to-reference (boxing) and reference-to-primitive (unboxing) -- the real gap
         // `stdlib/phoenix.hotc`'s own header used to disclose as a scope cut: `PhoenixTask::join()`
         // returns a raw `PhoenixObject` (`java.lang.Object`-erased, exactly like real
@@ -3379,7 +3412,15 @@ impl CodeGen {
             if widened == "Float" { self.mv.visitInsn(98); return "Float"; } // FADD
             if widened == "Double" { self.mv.visitInsn(99); return "Double"; } // DADD
             self.mv.visitInsn(96); // IADD
-            return "Int";
+            // `Int`/`Char`/`Byte` all share this opcode (same JVM int-category representation) --
+            // a real, previously-latent bug found adding `Char`/`Byte`: this used to hardcode
+            // `return "Int"` unconditionally, silently WRONG the moment a same-type non-Int pair
+            // (`Char + Char`) could ever reach this fallback at all (harmless before, since only
+            // `Int` ever did) -- `widened` already holds the correct same-type result from
+            // `gen_widen_numeric_pair`'s own `lt == rt` passthrough, so returning it instead keeps
+            // a `Char + Char` result correctly typed `Char` (not silently relabeled `Int`, which
+            // would pick the wrong print/interpolation descriptor downstream).
+            return widened;
         } else if op == "-" {
             let lt2 = self.gen_expr(left); let rt2 = self.gen_expr(right);
             let overload2 = self.try_gen_operator_overload(op, lt2, rt2);
@@ -3388,7 +3429,7 @@ impl CodeGen {
             if widened2 == "Long" { self.mv.visitInsn(101); return "Long"; } // LSUB
             if widened2 == "Float" { self.mv.visitInsn(102); return "Float"; } // FSUB
             if widened2 == "Double" { self.mv.visitInsn(103); return "Double"; } // DSUB
-            self.mv.visitInsn(100); return "Int"; // ISUB
+            self.mv.visitInsn(100); return widened2; // ISUB (see the "+" branch's own header on why not a hardcoded "Int")
         } else if op == "*" {
             let lt3 = self.gen_expr(left); let rt3 = self.gen_expr(right);
             let overload3 = self.try_gen_operator_overload(op, lt3, rt3);
@@ -3397,7 +3438,7 @@ impl CodeGen {
             if widened3 == "Long" { self.mv.visitInsn(105); return "Long"; } // LMUL
             if widened3 == "Float" { self.mv.visitInsn(106); return "Float"; } // FMUL
             if widened3 == "Double" { self.mv.visitInsn(107); return "Double"; } // DMUL
-            self.mv.visitInsn(104); return "Int"; // IMUL
+            self.mv.visitInsn(104); return widened3; // IMUL (see the "+" branch's own header on why not a hardcoded "Int")
         } else if op == "/" {
             let lt4 = self.gen_expr(left); let rt4 = self.gen_expr(right);
             let overload4 = self.try_gen_operator_overload(op, lt4, rt4);
@@ -3406,7 +3447,7 @@ impl CodeGen {
             if widened4 == "Long" { self.mv.visitInsn(109); return "Long"; } // LDIV
             if widened4 == "Float" { self.mv.visitInsn(110); return "Float"; } // FDIV
             if widened4 == "Double" { self.mv.visitInsn(111); return "Double"; } // DDIV
-            self.mv.visitInsn(108); return "Int"; // IDIV
+            self.mv.visitInsn(108); return widened4; // IDIV (see the "+" branch's own header on why not a hardcoded "Int")
         } else if op == "%" {
             let lt5 = self.gen_expr(left); let rt5 = self.gen_expr(right);
             let overload5 = self.try_gen_operator_overload(op, lt5, rt5);
@@ -3415,7 +3456,7 @@ impl CodeGen {
             if widened5 == "Long" { self.mv.visitInsn(113); return "Long"; } // LREM
             if widened5 == "Float" { self.mv.visitInsn(114); return "Float"; } // FREM
             if widened5 == "Double" { self.mv.visitInsn(115); return "Double"; } // DREM
-            self.mv.visitInsn(112); return "Int"; // IREM
+            self.mv.visitInsn(112); return widened5; // IREM (see the "+" branch's own header on why not a hardcoded "Int")
         } else if op == "&" || op == "|" {
             // Real bitwise AND/OR -- unlike `&&`/`||` right below, both operands are ALWAYS
             // evaluated (no short-circuit), matching real Java `&`/`|` semantics. `Bool` is
@@ -3624,7 +3665,11 @@ impl CodeGen {
                 return "Int";
             }
             self.mv.visitInsn(116); // INEG
-            return "Int";
+            // `Int`/`Char`/`Byte` share this opcode -- same latent-bug fix as `gen_binary`'s own
+            // arithmetic branches (see that fn's own header): return the real inner type instead
+            // of a hardcoded `"Int"`, so unary `-` on a `Char`/`Byte` doesn't get silently
+            // relabeled.
+            return ity;
         }
     }
 
@@ -4166,7 +4211,7 @@ fn ref_cmp_opcode(op: String) -> Int {
 // `Long`/`Float`/`Double`) is a reference type -- `String` and every struct instance alike -- and
 // needs `ALOAD`/`ASTORE` instead of `ILOAD`/`ISTORE`/`LLOAD`/`FLOAD`/`DLOAD`/etc.
 fn is_ref_type(name: String) -> Bool {
-    return name != "Int" && name != "Bool" && name != "Long" && name != "Float" && name != "Double";
+    return name != "Int" && name != "Bool" && name != "Long" && name != "Float" && name != "Double" && name != "Char" && name != "Byte";
 }
 
 // The real JDK wrapper class for a given primitive type name -- `gen_cast`'s own box/unbox pair
@@ -4177,6 +4222,8 @@ fn box_class_for(ty: String) -> String {
     if ty == "Long" { return "java/lang/Long"; }
     if ty == "Float" { return "java/lang/Float"; }
     if ty == "Double" { return "java/lang/Double"; }
+    if ty == "Char" { return "java/lang/Character"; }
+    if ty == "Byte" { return "java/lang/Byte"; }
     return "java/lang/Integer";
 }
 
@@ -4186,6 +4233,8 @@ fn box_desc_for(ty: String) -> String {
     if ty == "Long" { return "(J)Ljava/lang/Long;"; }
     if ty == "Float" { return "(F)Ljava/lang/Float;"; }
     if ty == "Double" { return "(D)Ljava/lang/Double;"; }
+    if ty == "Char" { return "(C)Ljava/lang/Character;"; }
+    if ty == "Byte" { return "(B)Ljava/lang/Byte;"; }
     return "(I)Ljava/lang/Integer;";
 }
 
@@ -4195,6 +4244,8 @@ fn unbox_method_for(ty: String) -> String {
     if ty == "Long" { return "longValue"; }
     if ty == "Float" { return "floatValue"; }
     if ty == "Double" { return "doubleValue"; }
+    if ty == "Char" { return "charValue"; }
+    if ty == "Byte" { return "byteValue"; }
     return "intValue";
 }
 
@@ -4204,6 +4255,8 @@ fn unbox_desc_for(ty: String) -> String {
     if ty == "Long" { return "()J"; }
     if ty == "Float" { return "()F"; }
     if ty == "Double" { return "()D"; }
+    if ty == "Char" { return "()C"; }
+    if ty == "Byte" { return "()B"; }
     return "()I";
 }
 
@@ -4238,6 +4291,14 @@ fn array_load_opcode_cg(ty: String) -> Int {
     if ty == "Long" { return 47; } // LALOAD
     if ty == "Float" { return 48; } // FALOAD
     if ty == "Double" { return 49; } // DALOAD
+    // `Byte` gets a REAL `byte[]` array (via `BALOAD`, shared with `Bool`'s own JVM
+    // representation when it genuinely IS `boolean[]` -- this compiler's own `Bool` never is, see
+    // `newarray_atype_cg`'s own header just below, so this branch is Byte-only in practice), for
+    // real interop with byte-array-based JDK APIs (network/file I/O) -- unlike `Bool`, which
+    // deliberately stays a plain `int[]` (see `array_store_opcode_cg`'s own "Int/Bool" comment
+    // right below), `Byte` has a real, disclosed motivation to be a genuine JVM `byte[]`.
+    if ty == "Byte" { return 51; } // BALOAD
+    if ty == "Char" { return 52; } // CALOAD
     if is_ref_type(ty) { return 50; } // AALOAD
     return 46; // IALOAD (Int/Bool)
 }
@@ -4246,18 +4307,25 @@ fn array_store_opcode_cg(ty: String) -> Int {
     if ty == "Long" { return 80; } // LASTORE
     if ty == "Float" { return 81; } // FASTORE
     if ty == "Double" { return 82; } // DASTORE
+    if ty == "Byte" { return 84; } // BASTORE
+    if ty == "Char" { return 85; } // CASTORE
     if is_ref_type(ty) { return 83; } // AASTORE
     return 79; // IASTORE (Int/Bool)
 }
 
 // `NEWARRAY`'s own `atype` operand for a primitive element type -- `-1` for anything that isn't
 // one (a reference element type, which needs `ANEWARRAY` against a real class name instead, not
-// `NEWARRAY` at all).
+// `NEWARRAY` at all). `Bool` stays `T_INT` deliberately (this compiler's own `Bool` is never a
+// real JVM `boolean` at the field/array-descriptor level either -- see `resolve_descriptor`'s own
+// "Bool intentionally maps to I, not Z" header), so a real `T_BOOLEAN` (4) is never used here --
+// `Byte`/`Char` are the two REAL new primitive array kinds this adds.
 fn newarray_atype_cg(ty: String) -> Int {
     if ty == "Int" || ty == "Bool" { return 10; } // T_INT
     if ty == "Long" { return 11; } // T_LONG
     if ty == "Float" { return 6; } // T_FLOAT
     if ty == "Double" { return 7; } // T_DOUBLE
+    if ty == "Byte" { return 8; } // T_BYTE
+    if ty == "Char" { return 5; } // T_CHAR
     return -1;
 }
 
@@ -6094,7 +6162,7 @@ fn is_sendable_type_cg(ty: String, sendable_structs: &Registry<Bool>) -> Bool {
 }
 
 fn is_numeric_ty_name_cg(name: String) -> Bool {
-    return name == "Int" || name == "Long" || name == "Float" || name == "Double";
+    return name == "Int" || name == "Long" || name == "Float" || name == "Double" || name == "Char" || name == "Byte";
 }
 
 // Mirrors `Checker.hotc`'s own identical `numeric_widen_result` -- see that fn's own header for
@@ -6542,6 +6610,8 @@ fn descriptor_of_type(name0: String, alias_names: &Vec<String>, alias_binaries: 
     if name == "Long" { return "J"; }
     if name == "Float" { return "F"; }
     if name == "Double" { return "D"; }
+    if name == "Char" { return "C"; }
+    if name == "Byte" { return "B"; }
     if is_array_type_name_cg(name) { return "[" + descriptor_of_type(array_elem_type_name_cg(name), &alias_names, &alias_binaries, &module_names, &module_values); }
     if is_dyn_type_name_cg(name) {
         // See `resolve_descriptor`'s own header (the `&mut self` sibling of this free fn) -- an
@@ -7227,6 +7297,8 @@ fn zero_value_expr_ecs(type_name: String, structs: &Vec<StructDecl>) -> Expr {
     if type_name == "Float" { return FloatLit { text: "0.0" }; }
     if type_name == "Double" { return DoubleLit { text: "0.0" }; }
     if type_name == "Long" { return Cast { expr: IntLit { value: 0 }, target_type: "Long" }; }
+    if type_name == "Char" { return Cast { expr: IntLit { value: 0 }, target_type: "Char" }; }
+    if type_name == "Byte" { return Cast { expr: IntLit { value: 0 }, target_type: "Byte" }; }
     var i = 0;
     while i < structs.length() {
         let sd = structs.get(i);
