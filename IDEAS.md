@@ -40,9 +40,36 @@ Confirmed and fixed while self-hosting the parser (`selfhost/`): `make_foo() == 
 
 **Deliberately not attempted yet**: full structural equality for enums whose variants carry fields (`Option<T>`, `Result<T, E>`, this project's own `Expr`/`Stmt` AST). `Some { value: 5 } == Some { value: 5 }` still only compares tags today (both `Some`, so `true`, regardless of whether the `value` fields actually match) -- correct-*enough* for the common "which variant" check, silently wrong for anyone expecting real `#[derive(PartialEq)]`-style deep comparison. The real feature: after a tag match, recursively compare each field by its own type's own equality rule (`Int`/`Bool` primitive compare, `String` via `.equals()`, nested `Struct`/`Enum` via this same mechanism, arrays element-wise) -- genuinely bigger than the tag-only fix (needs a per-enum "compare fields" codegen path, not just one shared opcode sequence), but the tag-only version already shipping makes it a strict extension, not a redesign.
 
-### A `Byte` primitive type (or at minimum, a real `byte[]` bridge)
+### List comprehensions: `[expensive(x) for x in values if x.isValid()]`
 
-Confirmed as a genuine, currently-unworkaroundable gap during a real
+Real design doc: `COMPREHENSIONS_IDEAS.md` (spun out 2026-09-16, same pattern `ECS_IDEAS.md`/
+`COLLECTIONS_IDEAS.md` already established). A genuine `Comprehension` expression node, NOT sugar
+desugaring to `.filter()`/`.map()` (`Vec<T>` doesn't have those methods, and building them would
+allocate a real intermediate `Vec` per stage anyway) -- compiles to one specialized loop, no
+intermediate collection, everything inlined the same way `gen_string_interp` already builds a
+`StringBuilder` chain via direct bytecode within one expression's own codegen. v1 scope
+deliberately narrow (single `for` clause, optional `if`, no multiple clauses/tuples/nesting) per
+explicit direction to keep the grammar boring and predictable. Needed (and got) a real prerequisite
+first: a genuinely empty `Vec<T>` literal (`COLLECTIONS_IDEAS.md`'s own note, `[]` now works in a
+concrete-type struct-literal-field context) -- a comprehension's own result can legitimately be
+empty when the filter rejects everything, and there was previously no way to build one at all. See
+that doc's own "Open questions" for what's still unresolved (chiefly: does the comprehension source
+need to be a raw array, matching `for`'s own existing narrower scope, or does it also accept `Vec
+<T>` directly).
+
+### ~~A `Byte` primitive type (or at minimum, a real `byte[]` bridge)~~ -- `Char`/`Byte` shipped, 2026-09-16
+
+Landed as the full, first option below -- real `Byte`/`Char` types (`Ty.TyChar`/`Ty.TyByte`), real
+descriptors (`C`/`B`), real array element handling (`CALOAD`/`CASTORE`/`BALOAD`/`BASTORE`,
+`T_CHAR`/`T_BYTE` for `NEWARRAY` -- a genuine `byte[]`/`char[]`, not the generic reference-array
+`ANEWARRAY` path), and real arithmetic/comparison/cast support (`i2c`/`i2b` narrowing on `as`,
+same-type-only arithmetic reusing `Int`'s own opcodes directly since both are JVM int-category
+primitives). `Short` deliberately NOT included -- a real, disclosed scope cut (no concrete blocking
+API needed it the way `Byte`'s own `ClassWriter.toByteArray()`/raw-I/O motivation did), revisit if
+one shows up. See `examples/char_byte_primitives.hotc`; two real, previously-latent bugs found and
+fixed along the way (documented there and in the commit that landed this).
+
+**Original gap, kept for the record**: confirmed as a genuine, currently-unworkaroundable gap during a real
 ASM-interop spike (see `PHOENIX_FLIGHT_IDEAS.md`-adjacent self-hosting
 work): `Ty` has `Int_`/`Long_`/`Float_`/`Double_`/`Bool_` and nothing
 else numeric — no `Byte`, no `Short`, no `Char` — so there is currently
@@ -1004,13 +1031,15 @@ access to the same field.
 
 ### Pipeline syntax: `xs |> filter(f) |> map(g)`
 
-Reads nicely, but this language doesn't have first-class functions/
-closures yet (every `impl`/interface method call is resolved to a static
-target at compile time, and `Vec<T>`'s `push`/`get`/`set` are the only
-"generic over an operation" thing that exists). `filter`/`map` as generic
-higher-order functions need that first — `|>` itself is trivial sugar
-(`a |> f(b)` desugars to `f(a, b)`) once there's something worth piping
-into.
+Written when this language had no closures yet — that part's since shipped (2026-09-02, see this
+doc's own entry above), so the ORIGINAL blocker no longer applies; `filter`/`map` as real generic
+higher-order `Vec<T>` methods are buildable now, just not built (`Vec<T>` still only has `push`/
+`get`/`set`/`length`/`pop`/`clear`). Still not pursuing `|>` itself, though, for a different real
+reason found designing list comprehensions (`COMPREHENSIONS_IDEAS.md`): chained `filter`/`map`
+calls allocate a real intermediate `Vec` per stage, where a comprehension compiles to ONE
+specialized loop with no intermediate allocation at all — see that doc's own header for the full
+reasoning. If `filter`/`map` ever get built anyway (a real caller wanting the point-free style),
+`|>` stays trivial sugar on top (`a |> f(b)` desugars to `f(a, b)`), unchanged from before.
 
 ### `defer` / `using` for resource cleanup
 
