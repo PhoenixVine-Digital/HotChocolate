@@ -1,0 +1,136 @@
+// Input -- real keyboard/mouse polling helpers on top of `window.hotc`'s raw GLFW bindings.
+// Opt-in via `use input;` (see ARCHITECTURE.md's own "Standard library modules" section).
+// Depends on `window` (needs `Window`/`GLFW` directly) and `vec` (`Input`'s own rising-edge
+// tracking list).
+//
+// **Why this exists**: every real game written against `window.hotc` alone ends up hand-rolling
+// the SAME boilerplate -- a `first_mouse`/`last_x`/`last_y` trio to turn absolute cursor position
+// into a per-frame delta, and a `was_down`-per-frame local to turn a level-check key poll into a
+// one-shot "just pressed" edge (Marshmallow's own `Main.hotc` had both, independently, before this
+// file existed -- see its own `space_was_down` and the free-fly camera's `first_mouse` block).
+// Neither needs anything ECS-specific (an ECS `Input` *resource*, like Marshmallow's own, is still
+// the right way to get this state INTO a system -- this file only replaces the raw-GLFW-polling
+// half of that, not the resource-injection half).
+//
+// ```
+// use window;
+// use input;
+//
+// fn main() {
+//     // ... GLFW init, Window::new(...) as normal ...
+//     var input = Input::new();
+//     while !window.should_close() {
+//         input.update_mouse(&window);
+//         if input.just_pressed(&window, GLFW::GLFW_KEY_SPACE) {
+//             print("space pressed this frame");
+//         }
+//         if input.mouse_button_down(&window, INPUT_MOUSE_LEFT) {
+//             // ... use input.mouse_dx / input.mouse_dy for a camera-look drag ...
+//         }
+//         // ...
+//     }
+// }
+// ```
+
+extern class GLFWMouse = "org.lwjgl.glfw.GLFW" {
+    static fn glfwGetCursorPos(window: Long, xpos: [Double], ypos: [Double]) -> Unit;
+    static fn glfwGetMouseButton(window: Long, button: Int) -> Int;
+}
+
+// One tracked key's own last-seen state -- `code` is a raw GLFW key constant (`GLFW::GLFW_KEY_*`),
+// `was_down` is whatever `just_pressed` observed it as on the PREVIOUS call for that same code.
+// `Input::keys` is seeded (see `Input::new`, below) with a `code: -1` sentinel rather than starting
+// genuinely empty -- `Vec<T>::push`'s own backing array always needs a real first element to exist
+// at all (see `vec.hotc`'s own `vec_of`), and no real GLFW key constant is ever negative, so the
+// sentinel can never accidentally match a real `just_pressed` lookup.
+struct KeyEdge {
+    code: Int,
+    was_down: Bool,
+}
+
+// Real, disclosed scope cut, v1: no scroll-wheel support yet (GLFW delivers that via a callback,
+// not a poll -- `glfwGetCursorPos`/`glfwGetMouseButton`'s own simple "ask right now" shape doesn't
+// extend to it directly). A future pass wiring up `glfwSetScrollCallback` is its own, separately-
+// scoped follow-up once something actually needs it.
+struct Input {
+    keys: Vec<KeyEdge>,
+    mouse_x: Float,
+    mouse_y: Float,
+    mouse_dx: Float,
+    mouse_dy: Float,
+    first_mouse: Bool,
+}
+
+// GLFW's own raw mouse-button indices (`org.lwjgl.glfw.GLFW.GLFW_MOUSE_BUTTON_*`), given real
+// names here rather than making every caller remember "0 is left" the way Marshmallow's own
+// `Main.hotc` used to (`let mouse_left = 0; let mouse_right = 1; let mouse_middle = 2;`). Plain
+// top-level `pub static` constants -- same shape `Lexer.hotc`'s own `CP_*` codepoint constants
+// already use -- rather than struct-attached constants (unproven syntax inside an `impl` block).
+pub static INPUT_MOUSE_LEFT: Int = 0;
+pub static INPUT_MOUSE_RIGHT: Int = 1;
+pub static INPUT_MOUSE_MIDDLE: Int = 2;
+
+impl Input {
+    static fn new() -> Input {
+        return Input {
+            keys: vec_of(KeyEdge { code: -1, was_down: false }),
+            mouse_x: 0.0f,
+            mouse_y: 0.0f,
+            mouse_dx: 0.0f,
+            mouse_dy: 0.0f,
+            first_mouse: true,
+        };
+    }
+
+    // Rising-edge check: true only on the frame `key` transitions from up to down, false while
+    // held or while up. Call at most once per key per frame -- `window.is_key_down` is a per-frame
+    // LEVEL check, so a second call for the same key this frame would consume the edge the first
+    // call already saw and report `false`.
+    fn just_pressed(&mut self, window: &Window, key: Int) -> Bool {
+        let down = window.is_key_down(key);
+        var idx = -1;
+        var i = 0;
+        while i < self.keys.length() {
+            if self.keys.get(i).code == key {
+                idx = i;
+            }
+            i = i + 1;
+        }
+        var was_down = false;
+        if idx >= 0 {
+            was_down = self.keys.get(idx).was_down;
+            self.keys.set(idx, KeyEdge { code: key, was_down: down });
+        } else {
+            self.keys.push(KeyEdge { code: key, was_down: down });
+        }
+        return down && !was_down;
+    }
+
+    // Refreshes `mouse_x`/`mouse_y`/`mouse_dx`/`mouse_dy` from the current cursor position. Call
+    // exactly once per frame, before reading any of those four fields -- same "poll once, read
+    // many times" shape `FrameTimer::tick` (`graphics.hotc`) already uses.
+    fn update_mouse(&mut self, window: &Window) {
+        var xpos_arr = [0.0];
+        var ypos_arr = [0.0];
+        GLFWMouse::glfwGetCursorPos(window.handle, xpos_arr, ypos_arr);
+        let cx = xpos_arr[0] as Float;
+        let cy = ypos_arr[0] as Float;
+        // First-ever call has no real previous position to diff against -- without this, the
+        // very first frame's delta would be a bogus jump from `(0, 0)` to wherever the cursor
+        // actually starts, same "first_mouse" trap Marshmallow's own free-fly camera worked
+        // around by hand before this file existed.
+        if self.first_mouse {
+            self.mouse_x = cx;
+            self.mouse_y = cy;
+            self.first_mouse = false;
+        }
+        self.mouse_dx = cx - self.mouse_x;
+        self.mouse_dy = self.mouse_y - cy;
+        self.mouse_x = cx;
+        self.mouse_y = cy;
+    }
+
+    fn mouse_button_down(&self, window: &Window, button: Int) -> Bool {
+        return GLFWMouse::glfwGetMouseButton(window.handle, button) == 1;
+    }
+}

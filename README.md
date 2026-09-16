@@ -100,6 +100,13 @@ working today, not aspirational:
   `window`/`graphics`. WAV/AIFF/AU only (no MP3/OGG without a third-party
   decoder), fire-and-forget playback. No dependency on any other stdlib
   topic.
+- **`input`** (`use input;`) — `Input::new()`/`just_pressed`/
+  `update_mouse`/`mouse_button_down` on top of `window`: rising-edge key
+  detection and cursor-delta tracking, replacing the `first_mouse`/
+  `was_down`-per-frame boilerplate every real game against raw `window`
+  otherwise hand-rolls itself. No ECS involvement — pairs with a
+  project's own ECS `resource` (see `ECS_IDEAS.md`) the same way
+  Marshmallow's own `Input` resource already does.
 - **Full JDK/Java interop** (`extern class`/`extern interface`,
   compile-time `--classpath`-verified signatures — a wrong param/return
   type is a compile error, not a runtime `NoSuchMethodError`), sealed
