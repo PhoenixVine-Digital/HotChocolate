@@ -997,6 +997,11 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // 2026-09-11, alongside `FrameTimer`) need `vec.hotc`'s real `Vec<T>`/`vec_of` --
         // same reasoning as the `math` dependency right above, just for `vec` instead.
         out = add_stdlib_topic_and_deps("vec", out, target);
+        // `TextureCache` itself now holds a real `Option<HashMap<Texture>>` (switched 2026-09-16
+        // from the old linear-scan-over-two-parallel-`Vec`s design to a real hashed lookup, once
+        // `HashMap<V>` existed) -- same "declares a real type from another topic" reasoning as
+        // every other cross-topic dependency here.
+        out = add_stdlib_topic_and_deps("collections", out, target);
     } else if topic == "input" {
         // `input.hotc`'s own `Input::just_pressed`/`update_mouse` take a real `&Window` directly
         // (raw GLFW polling, no ECS involvement -- see that file's own header) and its `keys`

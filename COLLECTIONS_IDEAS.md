@@ -1,5 +1,29 @@
 # Real hashed collections — design doc
 
+**Status, 2026-09-16 (Marshmallow integration)**: `HashMap<V>` got its first real consumer outside
+this repo's own `examples/` -- Marshmallow's `TextureCache` (`stdlib/graphics.hotc`) switched from
+its original two-parallel-`Vec`-with-linear-scan design to a real `Option<HashMap<Texture>>`,
+lazily built on the first `get_or_load` call (since `HashMap<V>`'s own constructor needs a real
+first key/value up front, and the cache has neither at construction time). This surfaced a genuine,
+previously-latent gap, found the hard way, not by inspection: a bare fieldless-generic-variant VALUE
+(`cache: None`, or `c.cache = Some { value: ... };`) nested inside ANOTHER struct's own field
+position had no way to resolve its own concrete type. `check_expr`'s `StructLit`/`Ident` dispatch
+only ever threads `self.cur_ret_ty` as the inference hint (correct for a `return None;`, meaningless
+for a field nested inside a DIFFERENT struct literal or a `recv.field = ...` assignment) -- so
+`TextureCache { cache: None }` and `self.cache = Some { value: hash_map_new(...) };` both failed
+with "unknown struct or enum variant" even though the field's own DECLARED type
+(`Option$HashMap$Texture`) said exactly what was needed. Fixed in three places, each threading the
+real declared field type as the hint instead: `Checker.hotc`'s `check_struct_lit` (per-field loop)
+and `check_field_assign_on_type`, and `Codegen.hotc`'s own struct-construction field loop and
+`finish_field_assign` (via a temporary `self.ret_ty` override, saved/restored around just that one
+field's codegen, mirroring how `Codegen.hotc` already leans on `self.ret_ty` as its own equivalent
+hint elsewhere). Verified against a minimal, isolated reproduction of the exact shape (a
+`ResourceCache`-shaped struct wrapping `Option<HashMap<Resource>>`, covering literal construction,
+field re-assignment, and a `match` read) before trusting it in the real GL-backed `TextureCache`.
+Full existing example regression suite: zero new failures, same 8 known pre-existing ones (plus 4
+grep false-positives from this sweep's own stdin-dependent/intentionally-caught-exception examples,
+confirmed not real regressions). Self-hosting verified to a true fixed point.
+
 **Status, 2026-09-16 (later still)**: a real `[]` empty array literal landed -- narrow, but a real
 prerequisite found discussing list comprehensions (`[f(x) for x in xs if pred(x)]`, a natural
 extension of this whole "real collections" push): a comprehension's own result can legitimately be

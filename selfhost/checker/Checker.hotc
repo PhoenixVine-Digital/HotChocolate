@@ -1754,19 +1754,56 @@ impl TyChecker {
     }
 
     fn check_field_assign_on_type(&mut self, on: String, field: String, value: &Expr) -> Ty {
-        let vt = self.check_expr(value);
-        let vn = ty_name(vt);
-        if on == "?" { return ty_from_name(vn); }
+        if on == "?" {
+            let vt0 = self.check_expr(value);
+            return ty_from_name(ty_name(vt0));
+        }
         self.ensure_instantiated(on);
         let found = self.structs.get(on);
         if let Some { value: info } = found {
             let ft = find_field_type(info, field);
+            // Same real gap `check_struct_lit`'s own per-field loop just got fixed for (see that
+            // fn's own header, added wiring `TextureCache` over to `Option<HashMap<Texture>>`):
+            // `recv.field = None;`/`recv.field = Some { value: ... };` needs the field's own
+            // DECLARED type as `check_struct_lit`'s `expected_mono` hint -- the naive `self.
+            // check_expr(value)` this used to call unconditionally has no way to resolve a bare
+            // generic variant on its own (`self.cur_ret_ty` is the wrong context here, same as
+            // every other nested-nested-generic-literal spot this bug family shows up in).
+            var vt = TyUnknown;
+            var handled_variant_assign = false;
+            if ft != "?" {
+                match value {
+                    StructLit { name: nname, field_names: nfnames, field_values: nfvals, generic_base: ngbase } => {
+                        vt = self.check_struct_lit(nname, nfnames, nfvals, ngbase, some_string3(ft));
+                        handled_variant_assign = true;
+                    }
+                    Ident { name: iname } => {
+                        let variant_found3 = self.variant_owner.get(iname);
+                        let generic_variant_found3 = self.generic_variant_owner.get(iname);
+                        var is_known_variant3 = false;
+                        if let Some { value: ow3 } = variant_found3 { is_known_variant3 = true; }
+                        if let Some { value: gow3 } = generic_variant_found3 { is_known_variant3 = true; }
+                        if is_known_variant3 {
+                            vt = self.check_struct_lit(iname, empty_str_vec2(), empty_expr_vec3(), none_string3(), some_string3(ft));
+                            handled_variant_assign = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !handled_variant_assign {
+                vt = self.check_expr(value);
+            }
+            let vn = ty_name(vt);
             if ft == "?" {
                 self.error("struct '" + on + "' has no field '" + field + "'");
             } else if vn != "?" && ft != vn {
                 self.error("cannot assign " + vn + " to field '" + field + "' of type " + ft);
             }
+            return ty_from_name(vn);
         } else {
+            let vt = self.check_expr(value);
+            let vn = ty_name(vt);
             let ext_found = self.externs.get(on);
             var ext_known = false;
             if let Some { value: b } = ext_found { ext_known = true; }
@@ -1797,8 +1834,8 @@ impl TyChecker {
             } else {
                 self.error("type '" + on + "' has no field '" + field + "'");
             }
+            return ty_from_name(vn);
         }
-        return ty_from_name(vn);
     }
 
     // `name` may be a real struct's own name, or an enum variant's name -- resolved to whichever
@@ -2044,7 +2081,47 @@ impl TyChecker {
                         _ => {}
                     }
                 }
-                if !handled_empty_array {
+                // Second special case, same reasoning as the empty-array one right above: a field
+                // VALUE that's itself a bare generic struct/enum literal (`cache: None`, `inner:
+                // Some { value: 5 }`) needs the DECLARED field type as its own `expected_mono`
+                // hint -- `check_expr`'s own `StructLit` arm only ever threads `self.cur_ret_ty`
+                // (see that arm's own header: "harmless when not needed," true for a `return`
+                // position, but a field nested inside ANOTHER struct literal has nothing to do
+                // with the enclosing FUNCTION's return type). Real gap found wiring `TextureCache`
+                // over to a real `Option<HashMap<Texture>>` field: `TextureCache { cache: None }`
+                // failed with "unknown struct or enum variant 'None'" even though `cache`'s own
+                // declared type (`"Option$HashMap$Texture"`) says exactly what `None` should
+                // resolve to -- calling `check_struct_lit` directly here, with `expected` as the
+                // real hint, mirrors the fix as closely as possible to how `Return`/`Let` already
+                // supply it.
+                var handled_nested_lit = false;
+                if !handled_empty_array && expected != "?" {
+                    let fv_shape2 = field_values.get(i);
+                    match fv_shape2 {
+                        StructLit { name: nname, field_names: nfnames, field_values: nfvals, generic_base: ngbase } => {
+                            fty = self.check_struct_lit(nname, nfnames, nfvals, ngbase, some_string3(expected));
+                            handled_nested_lit = true;
+                        }
+                        // A BARE fieldless-enum-variant reference (`cache: None`, no `{}` at all --
+                        // `check_ident`'s own header explains why this parses as a plain `Ident`,
+                        // not a `StructLit`) needs the exact same `expected`-hint treatment; without
+                        // this arm too, `TextureCache { cache: None }` still failed even after the
+                        // `StructLit` arm above landed, since `None` itself never reaches it.
+                        Ident { name: iname } => {
+                            let variant_found2 = self.variant_owner.get(iname);
+                            let generic_variant_found2 = self.generic_variant_owner.get(iname);
+                            var is_known_variant2 = false;
+                            if let Some { value: ow2 } = variant_found2 { is_known_variant2 = true; }
+                            if let Some { value: gow2 } = generic_variant_found2 { is_known_variant2 = true; }
+                            if is_known_variant2 {
+                                fty = self.check_struct_lit(iname, empty_str_vec2(), empty_expr_vec3(), none_string3(), some_string3(expected));
+                                handled_nested_lit = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !handled_empty_array && !handled_nested_lit {
                     let fv = field_values.get(i);
                     fty = self.check_expr(&fv);
                 }

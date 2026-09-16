@@ -944,7 +944,15 @@ impl CodeGen {
             throw CodegenError::new("codegen: unknown field '" + field + "' on extern class '" + ot + "'");
         }
         let fty = self.field_type_of(ot, field);
+        // Same `self.ret_ty`-as-hint reasoning as the plain-struct-literal field loop's own fix
+        // right above in this file (see that one's own header) -- `recv.field = None;`/`recv.field
+        // = Some { value: ... }` needs `fty` (this field's own already-resolved declared type),
+        // not whatever the ENCLOSING function happens to return, for `gen_expr`'s own bare-
+        // generic-variant fallback to resolve correctly. Saved/restored around just this one call.
+        let saved_ret_ty_for_assign = self.ret_ty;
+        self.ret_ty = fty;
         self.gen_expr(value); // stack: [objref, value]
+        self.ret_ty = saved_ret_ty_for_assign;
         // A `Long`/`Double`-typed field is a real, previously-undetected gap here: `value` is
         // category-2 (64-bit), so a bare `DUP_X1` (90) -- which only ever correctly preserves a
         // category-1 value across the 1-deep `objref` underneath it -- produces a real,
@@ -2780,7 +2788,21 @@ impl CodeGen {
                                 self.mv.visitTypeInsn(189, self.resolve_elem_class_name(empty_elem_ty)); // ANEWARRAY
                             }
                         } else {
+                            // Same reasoning as `gen_expr`'s own `StructLit` arm threading
+                            // `self.ret_ty` unconditionally as its bare-generic-variant fallback
+                            // hint (see that arm's own header) -- "harmless when not needed," but
+                            // for a field VALUE nested inside ANOTHER struct literal (`cache:
+                            // None` inside `TextureCache { cache: None, ... }`), the enclosing
+                            // FUNCTION's own return type is the wrong context entirely; this
+                            // field's own already-resolved declared type (`ftype`) is the real
+                            // one. Mirrors `Checker.hotc`'s own identical `check_struct_lit` fix
+                            // (same real gap, found wiring `TextureCache` over to a real
+                            // `Option<HashMap<Texture>>` field) -- saved/restored around just this
+                            // one field's own codegen so it can't leak into anything after it.
+                            let saved_ret_ty_for_field = self.ret_ty;
+                            self.ret_ty = ftype;
                             self.gen_expr(field_values.get(found_idx));
+                            self.ret_ty = saved_ret_ty_for_field;
                         }
                         i = i + 1;
                     }

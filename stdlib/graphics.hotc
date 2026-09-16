@@ -453,38 +453,43 @@ impl Mesh {
 // returning the already-loaded `Texture` (the same GL handle, shared) on every repeat request
 // instead of re-decoding the image file and re-uploading a new GL texture every time a caller
 // asks for the same path (e.g. the same tile/sprite texture requested once per entity that uses
-// it, instead of once ever). Real, disclosed scope cut: linear search over every cached path per
-// lookup -- fine for the handful-to-dozens of distinct textures a real game asset list actually
-// has, not optimized for hundreds+.
+// it, instead of once ever). Backed by a real `HashMap<Texture>` (switched 2026-09-16 from the
+// original two-parallel-`Vec`-with-linear-scan design, once `HashMap<V>` existed in `collections.
+// hotc`) -- real O(1)-average lookup instead of an O(n) scan per `get_or_load` call, which matters
+// once a scene's asset list grows past a handful of distinct paths. `HashMap<V>`'s own constructor
+// needs a real first key/value up front (see `collections.hotc`'s own header for why there's no
+// bare `HashMap::new()`), which this cache doesn't have at construction time -- so the map itself
+// starts as `None` and is built on the FIRST real `get_or_load` call, once an actual path/`Texture`
+// exists to seed it with.
 struct TextureCache {
-    paths: Vec<String>,
-    textures: Vec<Texture>,
+    cache: Option<HashMap<Texture>>,
 }
 
 impl TextureCache {
     static fn new() -> TextureCache {
-        // `Vec<T>` has no zero-argument constructor (its own backing array needs a real seed
-        // value to size itself from -- see `vec.hotc`'s own `vec_of`) -- bootstrap with a throwaway
-        // element, then `clear()` it back to empty before this cache is ever used for real.
-        var paths = vec_of("");
-        paths.clear();
-        var textures = vec_of(Texture { id: 0 });
-        textures.clear();
-        return TextureCache { paths: paths, textures: textures };
+        return TextureCache { cache: None };
     }
 
     fn get_or_load(&mut self, path: String) -> Texture {
-        var i = 0;
-        while i < self.paths.length() {
-            if self.paths.get(i) == path {
-                return self.textures.get(i);
+        match self.cache {
+            Some { value: m } => {
+                match m.get(path) {
+                    Some { value: tex } => {
+                        return tex;
+                    }
+                    None => {
+                        let tex = Texture::load(path);
+                        m.register(path, tex);
+                        return tex;
+                    }
+                }
             }
-            i = i + 1;
+            None => {
+                let tex = Texture::load(path);
+                self.cache = Some { value: hash_map_new(path, tex) };
+                return tex;
+            }
         }
-        let tex = Texture::load(path);
-        self.paths.push(path);
-        self.textures.push(tex);
-        return tex;
     }
 }
 
