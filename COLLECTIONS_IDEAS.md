@@ -1,5 +1,24 @@
 # Real hashed collections — design doc
 
+**Status, 2026-09-16 (later still)**: a real `[]` empty array literal landed -- narrow, but a real
+prerequisite found discussing list comprehensions (`[f(x) for x in xs if pred(x)]`, a natural
+extension of this whole "real collections" push): a comprehension's own result can legitimately be
+EMPTY (the filter rejects everything), and this language had NO way to construct a genuinely empty
+`Vec<T>` at all before this -- every array literal/repeat needed a real element to seed the backing
+array/infer its type. Scoped narrowly on purpose: `[]` only resolves when the surrounding context
+already names a CONCRETE array type directly (currently: a struct literal field whose declared type
+is an array, e.g. `Vec<Int> { data: [], len: 0 }`) -- both `Checker.hotc`'s own `check_struct_lit`
+and `Codegen.hotc`'s own struct-construction field loop special-case it there, reading the element
+type from the field's own already-known declared type instead of (impossible, for zero elements)
+inferring it from the literal itself. A fully GENERIC `fn f<T>() -> Vec<T>` still can't call some
+`vec_empty<T>()` and get a real empty one -- that's the SAME "no return-type-only inference for a
+zero-argument generic call" wall this doc's own earlier note already hit building `HashMap`/
+`HashMap2` (`static fn new()` inside `impl Struct<V>` silently failing to infer `V`) -- unresolved,
+and a separate, bigger ask than this pass attempted. Verified with a real program (`Vec<Int>`/
+`Vec<String>`, each starting length 0, then pushed into normally -- `Vec<T>::push`'s own pre-
+existing "grow from a zero-length backing array" handling, unrelated to this fix, already worked)
+-- see `examples/empty_vec_literal.hotc`.
+
 **Status, 2026-09-16 (even later)**: the reference-identity limitation the entry right below
 disclosed is CLOSED. A real `Eq` interface (`fn equals(&self, other: &Self) -> Bool;`) landed
 alongside `Hashable`, and `Self` in an interface's own declaration needed **zero compiler

@@ -1960,8 +1960,30 @@ impl TyChecker {
             var i = 0;
             while i < field_values.length() {
                 let fname = field_names.get(i);
-                let fv = field_values.get(i);
-                let fty = self.check_expr(&fv);
+                // Computed BEFORE the field value is checked (moved up from right below its own
+                // former position) so a genuine empty array literal (`data: []`, see `Ast.hc`'s
+                // own `array_lit` header) can be special-cased against it directly -- `check_expr`
+                // alone has nothing to infer an empty array's element type FROM (no elements),
+                // but the struct's own declared field type already says exactly what's needed.
+                let expected = find_field_type(field_info, fname);
+                var fty = TyUnknown;
+                var handled_empty_array = false;
+                if expected != "?" && is_array_type_name(expected) {
+                    let fv_shape = field_values.get(i);
+                    match fv_shape {
+                        ArrayLit { elements } => {
+                            if elements.length() == 0 {
+                                fty = TyStruct { name: expected };
+                                handled_empty_array = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !handled_empty_array {
+                    let fv = field_values.get(i);
+                    fty = self.check_expr(&fv);
+                }
                 let fn_ = ty_name(fty);
                 // Scope cut, disclosed: struct-literal field VALUES are deliberately NOT
                 // move-checked (unlike `let`/`return`/call arguments) -- sharing one already-built
@@ -1969,7 +1991,6 @@ impl TyChecker {
                 // perfectly safe under this language's actual reference semantics (nothing here
                 // is EVER really "consumed" at runtime), and real construction code leans on that
                 // constantly. See README's own "Compile-time safety roadmap" section.
-                let expected = find_field_type(field_info, fname);
                 if expected == "?" {
                     self.error("'" + name + "' has no field '" + fname + "'");
                 } else if fn_ != "?" && expected != fn_ {

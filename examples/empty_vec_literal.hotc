@@ -1,0 +1,38 @@
+// A real, empty `[]` array literal -- new, narrow support specifically for building a genuinely
+// empty `Vec<T>` at a call site that already knows the CONCRETE `T` (`Vec<Int> { data: [], len: 0
+// }`, below). Previously impossible: every array literal/repeat needed at least one real value to
+// seed the backing array/infer the element type, so a caller wanting a zero-element `Vec<T>` had
+// no way to build one directly (the established workaround, `TextureCache::new()`'s own "seed with
+// a throwaway element, then `.clear()`", still works and is still needed for a truly GENERIC `fn
+// f<T>() -> Vec<T>` with no concrete `T` in sight -- this fix is scoped to the concrete-type case
+// only, see `Parser.hotc`'s own `array_lit` header for why). `Vec<T>::push`'s own existing "newCap
+// == 0 -> start at 4" growth-from-zero handling (already there, unrelated to this fix) means a
+// `Vec` built this way grows normally the first time something is pushed.
+use vec;
+
+fn main() {
+    var v: Vec<Int> = Vec<Int> { data: [], len: 0 };
+    print(v.length());
+
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    print(v.length());
+    print(v.get(0));
+    print(v.get(1));
+    print(v.get(2));
+
+    var s: Vec<String> = Vec<String> { data: [], len: 0 };
+    print(s.length());
+    s.push("a");
+    s.push("b");
+    print(s.length());
+    print(s.get(0));
+    print(s.get(1));
+
+    // A genuinely-never-pushed-to empty vec stays correctly empty.
+    var never_used: Vec<Int> = Vec<Int> { data: [], len: 0 };
+    print(never_used.length());
+
+    print("done");
+}

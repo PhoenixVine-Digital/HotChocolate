@@ -2736,7 +2736,36 @@ impl CodeGen {
                         if found_idx < 0 {
                             throw CodegenError::new("struct literal for '" + resolved_name + "' is missing field '" + fname + "'");
                         }
-                        self.gen_expr(field_values.get(found_idx));
+                        // A genuine empty array literal (`data: []`) as this field's own value --
+                        // mirrors `Checker.hotc`'s own identical `check_struct_lit` special case
+                        // (see that fn's own header): `gen_expr`'s ordinary `ArrayLit` codegen
+                        // unconditionally reads `elements.get(0)` to learn the element type, which
+                        // would crash outright on a real empty one -- this field's own ALREADY-
+                        // KNOWN declared type (`ftype`, resolved above) has the element type
+                        // instead, so the array gets built directly (`SIPUSH 0` + `NEWARRAY`/
+                        // `ANEWARRAY`, no element stores at all) rather than calling `gen_expr` at
+                        // all for this one field.
+                        var is_empty_array_field = false;
+                        if is_array_type_name_cg(ftype) {
+                            match field_values.get(found_idx) {
+                                ArrayLit { elements } => {
+                                    if elements.length() == 0 { is_empty_array_field = true; }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if is_empty_array_field {
+                            let empty_elem_ty = array_elem_type_name_cg(ftype);
+                            self.mv.visitIntInsn(17, 0); // SIPUSH 0
+                            let empty_atype = newarray_atype_cg(empty_elem_ty);
+                            if empty_atype >= 0 {
+                                self.mv.visitIntInsn(188, empty_atype); // NEWARRAY
+                            } else {
+                                self.mv.visitTypeInsn(189, self.resolve_elem_class_name(empty_elem_ty)); // ANEWARRAY
+                            }
+                        } else {
+                            self.gen_expr(field_values.get(found_idx));
+                        }
                         i = i + 1;
                     }
                     ctor_desc = ctor_desc + ")V";

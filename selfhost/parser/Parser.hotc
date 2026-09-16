@@ -706,9 +706,22 @@ impl Parser {
         return StringInterp { literals: literals, exprs: exprs };
     }
 
-    // `[e1, e2, ...]` -- non-empty only, see `Ast.hc`'s own header.
+    // `[e1, e2, ...]` -- usually non-empty (see `Ast.hc`'s own header), but a genuine `[]` (real
+    // empty array literal, ZERO elements) is now accepted too -- `Checker.hotc`'s own
+    // `check_struct_lit` and `Codegen.hotc`'s own struct-literal field-construction loop are the
+    // only two places that actually know how to make sense of one (both require the DECLARED
+    // field type to already be an array type, since there's no element to infer from) -- anywhere
+    // else `[]` is used, `check_array_lit`'s own existing "empty array literal not supported"
+    // error still fires, unchanged. This exists specifically so a genuinely empty `Vec<T>` can be
+    // built via `Vec<T> { data: [], len: 0 }` for a CONCRETE `T` known at the call site -- see
+    // `COLLECTIONS_IDEAS.md`'s own note on why a fully generic `Vec<T>::empty()` (no explicit `T`
+    // in sight at all) is a separate, much bigger ask this doesn't attempt.
     fn array_lit(&mut self) -> Expr {
         self.expect(LBRACKET);
+        if self.check(RBRACKET) {
+            self.advance();
+            return ArrayLit { elements: empty_expr_vec() };
+        }
         let first = self.expression();
         // `[value; count]` -- distinguished from `[e1, e2, ...]` by whether a `;` or a `,`/`]`
         // follows the first expression (see `Ast.hc`'s own `ArrayRepeat` header). An early
