@@ -75,6 +75,21 @@ fn abs_long(x: Long) -> Long { if x < (0 as Long) { return -x; } return x; }
 fn min_long(a: Long, b: Long) -> Long { if a < b { return a; } return b; }
 fn max_long(a: Long, b: Long) -> Long { if a > b { return a; } return b; }
 
+// `Float` wrappers for `Math::sqrt`/`::sin`/`::cos`/`::tan`/`::acos` -- unlike `abs`/`min`/`max`
+// right above, there's no way to compute a square root or a trig function directly in HC (no
+// native intrinsic exists), so these still round-trip through `Double` internally -- but they do
+// it ONCE, here, instead of every `Vec2`/`Vec3`/`Vec4`/`Mat4`/`Quaternion` method below spelling
+// out `Math::sqrt(x as Double) as Float` for itself. Real, external gap report: a reviewer flagged
+// this exact repetition reading `Vec3::length`, suggesting a "future" HotC-native `sqrt`/`sin`/
+// `cos` intrinsic -- unnecessary here, since this file already established the fix (ordinary HC
+// wrapper functions) for `abs`/`min`/`max`'s identical extern-overload limitation; this just
+// extends the SAME convention to the functions that actually needed the `Double` round-trip.
+fn sqrt_float(x: Float) -> Float { return Math::sqrt(x as Double) as Float; }
+fn sin_float(x: Float) -> Float { return Math::sin(x as Double) as Float; }
+fn cos_float(x: Float) -> Float { return Math::cos(x as Double) as Float; }
+fn tan_float(x: Float) -> Float { return Math::tan(x as Double) as Float; }
+fn acos_float(x: Float) -> Float { return Math::acos(x as Double) as Float; }
+
 struct Vec2 {
     x: Float,
     y: Float,
@@ -86,7 +101,7 @@ impl Vec2 {
     fn scale(&self, s: Float) -> Vec2 { return Vec2 { x: self.x * s, y: self.y * s }; }
     fn dot(&self, o: &Vec2) -> Float { return self.x * o.x + self.y * o.y; }
     fn length_sq(&self) -> Float { return self.x * self.x + self.y * self.y; }
-    fn length(&self) -> Float { return Math::sqrt(self.length_sq() as Double) as Float; }
+    fn length(&self) -> Float { return sqrt_float(self.length_sq()); }
     // A zero-length vector normalizes to itself -- there's no "correct" direction to pick for a
     // true zero vector, and returning it unchanged (rather than dividing by zero into NaN) is
     // the same disclosed, deliberate choice `Vec3`/`Vec4`'s own `normalize` make below.
@@ -119,7 +134,7 @@ impl Vec3 {
         };
     }
     fn length_sq(&self) -> Float { return self.x * self.x + self.y * self.y + self.z * self.z; }
-    fn length(&self) -> Float { return Math::sqrt(self.length_sq() as Double) as Float; }
+    fn length(&self) -> Float { return sqrt_float(self.length_sq()); }
     fn normalize(&self) -> Vec3 {
         let len = self.length();
         if len == 0.0f { return Vec3 { x: self.x, y: self.y, z: self.z }; }
@@ -143,7 +158,7 @@ impl Vec4 {
     fn scale(&self, s: Float) -> Vec4 { return Vec4 { x: self.x * s, y: self.y * s, z: self.z * s, w: self.w * s }; }
     fn dot(&self, o: &Vec4) -> Float { return self.x * o.x + self.y * o.y + self.z * o.z + self.w * o.w; }
     fn length_sq(&self) -> Float { return self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w; }
-    fn length(&self) -> Float { return Math::sqrt(self.length_sq() as Double) as Float; }
+    fn length(&self) -> Float { return sqrt_float(self.length_sq()); }
     fn normalize(&self) -> Vec4 {
         let len = self.length();
         if len == 0.0f { return Vec4 { x: self.x, y: self.y, z: self.z, w: self.w }; }
@@ -195,8 +210,8 @@ impl Mat4 {
     }
 
     static fn rotation_x(angle_rad: Float) -> Mat4 {
-        let c = Math::cos(angle_rad as Double) as Float;
-        let s = Math::sin(angle_rad as Double) as Float;
+        let c = cos_float(angle_rad);
+        let s = sin_float(angle_rad);
         var m = Mat4::identity();
         m.m11 = c; m.m12 = -s;
         m.m21 = s; m.m22 = c;
@@ -204,8 +219,8 @@ impl Mat4 {
     }
 
     static fn rotation_y(angle_rad: Float) -> Mat4 {
-        let c = Math::cos(angle_rad as Double) as Float;
-        let s = Math::sin(angle_rad as Double) as Float;
+        let c = cos_float(angle_rad);
+        let s = sin_float(angle_rad);
         var m = Mat4::identity();
         m.m00 = c; m.m02 = s;
         m.m20 = -s; m.m22 = c;
@@ -213,8 +228,8 @@ impl Mat4 {
     }
 
     static fn rotation_z(angle_rad: Float) -> Mat4 {
-        let c = Math::cos(angle_rad as Double) as Float;
-        let s = Math::sin(angle_rad as Double) as Float;
+        let c = cos_float(angle_rad);
+        let s = sin_float(angle_rad);
         var m = Mat4::identity();
         m.m00 = c; m.m01 = -s;
         m.m10 = s; m.m11 = c;
@@ -224,7 +239,7 @@ impl Mat4 {
     // Right-handed, OpenGL-style depth range ([-1, 1] NDC z) -- the standard convention most
     // JVM-accessible graphics bindings (LWJGL's own OpenGL bindings included) expect.
     static fn perspective(fov_y_rad: Float, aspect: Float, near: Float, far: Float) -> Mat4 {
-        let f = 1.0f / (Math::tan((fov_y_rad as Double) / 2.0f) as Float);
+        let f = 1.0f / tan_float(fov_y_rad / 2.0f);
         var m = Mat4 {
             m00: f / aspect, m01: 0.0f, m02: 0.0f, m03: 0.0f,
             m10: 0.0f, m11: f, m12: 0.0f, m13: 0.0f,
@@ -306,8 +321,8 @@ impl Quaternion {
     static fn from_axis_angle(axis: &Vec3, angle_rad: Float) -> Quaternion {
         let a = axis.normalize();
         let half = angle_rad / 2.0f;
-        let s = Math::sin(half as Double) as Float;
-        let c = Math::cos(half as Double) as Float;
+        let s = sin_float(half);
+        let c = cos_float(half);
         return Quaternion { x: a.x * s, y: a.y * s, z: a.z * s, w: c };
     }
 
@@ -324,7 +339,7 @@ impl Quaternion {
 
     fn length(&self) -> Float {
         let len_sq = self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w;
-        return Math::sqrt(len_sq as Double) as Float;
+        return sqrt_float(len_sq);
     }
 
     // A zero quaternion (never a valid rotation to begin with) normalizes to the identity
@@ -376,11 +391,11 @@ impl Quaternion {
             let lw = self.w + (ow - self.w) * t;
             return Quaternion { x: lx, y: ly, z: lz, w: lw }.normalize();
         }
-        let theta_0 = Math::acos(d as Double) as Float;
+        let theta_0 = acos_float(d);
         let theta = theta_0 * t;
-        let sin_theta_0 = Math::sin(theta_0 as Double) as Float;
-        let sin_theta = Math::sin(theta as Double) as Float;
-        let s0 = Math::cos(theta as Double) as Float - d * sin_theta / sin_theta_0;
+        let sin_theta_0 = sin_float(theta_0);
+        let sin_theta = sin_float(theta);
+        let s0 = cos_float(theta) - d * sin_theta / sin_theta_0;
         let s1 = sin_theta / sin_theta_0;
         return Quaternion {
             x: s0 * self.x + s1 * ox,
