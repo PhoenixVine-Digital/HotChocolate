@@ -1,11 +1,10 @@
-// `HashMap2<K: Hashable, V>` -- a real, arbitrary-struct-keyed hash map (see `COLLECTIONS_IDEAS.md`
-// for the full design and the two-type-param generics work it took to make this possible at all).
-// `ItemStack` opts in with one method (`impl Hashable for ItemStack`); everything else (bucketing,
-// resize, overwrite-on-repeat-key) works exactly like `HashMap<V>`'s own String-keyed version.
-// Also demonstrates the real, disclosed limitation this doc's own header calls out: key equality
-// is plain reference identity for a struct key (no `Self` type in this language's interfaces to
-// express a real `Eq` bound), so a DIFFERENT `ItemStack` instance with the same fields is a real
-// miss, not a match -- `sword_lookalike` below.
+// `HashMap2<K: Hashable + Eq, V>` -- a real, arbitrary-struct-keyed hash map (see
+// `COLLECTIONS_IDEAS.md` for the full design and the two-type-param generics work it took to make
+// this possible at all). `ItemStack` opts in with two small methods (`impl Hashable`/`impl Eq`);
+// everything else (bucketing, resize, overwrite-on-repeat-key) works exactly like `HashMap<V>`'s
+// own String-keyed version. `Eq::equals`'s own `&Self` param needed no new compiler work at all --
+// see `COLLECTIONS_IDEAS.md`'s own note -- and gives REAL value equality: `sword_lookalike` below,
+// a DIFFERENT `ItemStack` instance with the same fields as `sword`, correctly matches.
 use collections;
 
 struct ItemStack {
@@ -16,6 +15,12 @@ struct ItemStack {
 impl Hashable for ItemStack {
     fn hash_key(&self) -> Int {
         return self.item_id * 31 + self.count;
+    }
+}
+
+impl Eq for ItemStack {
+    fn equals(&self, other: &ItemStack) -> Bool {
+        return self.item_id == other.item_id && self.count == other.count;
     }
 }
 
@@ -41,12 +46,12 @@ fn main() {
         None => { print("MISS"); }
     }
 
-    // A DIFFERENT ItemStack instance with the same fields as `sword` -- real, disclosed reference-
-    // identity limitation, should MISS (not treated as the same key).
+    // A DIFFERENT ItemStack instance with the same fields as `sword` -- real VALUE equality via
+    // `Eq::equals`, should MATCH (treated as the same key, not a miss).
     let sword_lookalike = ItemStack { item_id: 100, count: 1 };
     match m.get(sword_lookalike) {
-        Some { value } => { print("FOUND (unexpected): {value}"); }
-        None => { print("MISS (expected)"); }
+        Some { value } => { print("FOUND (expected): {value}"); }
+        None => { print("MISS (unexpected)"); }
     }
 
     print(m.length());
@@ -58,6 +63,15 @@ fn main() {
 
     // Re-register the SAME sword reference with a new value -- overwrite, not a new entry.
     m.register(sword, "steel sword");
+    match m.get(sword) {
+        Some { value } => { print(value); }
+        None => { print("MISS"); }
+    }
+    print(m.length());
+
+    // Re-register via the LOOKALIKE (a different instance, equal fields) -- real value equality
+    // means this is STILL an overwrite of the same logical key, not a third distinct entry.
+    m.register(sword_lookalike, "reforged sword");
     match m.get(sword) {
         Some { value } => { print(value); }
         None => { print("MISS"); }

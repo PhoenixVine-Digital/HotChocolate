@@ -1,5 +1,28 @@
 # Real hashed collections — design doc
 
+**Status, 2026-09-16 (even later)**: the reference-identity limitation the entry right below
+disclosed is CLOSED. A real `Eq` interface (`fn equals(&self, other: &Self) -> Bool;`) landed
+alongside `Hashable`, and `Self` in an interface's own declaration needed **zero compiler
+changes** -- tried directly (a standalone `interface Eq { fn equals(&self, other: &Self) -> Bool;
+}` + `impl Eq for ItemStack { fn equals(&self, other: &ItemStack) -> Bool { ... } }`, both as a
+param type and, separately, as a return type) and it just worked, first try. The reason: `Self` in
+an interface DECLARATION is never independently resolved to anything at all -- this language's
+interface/impl checking is loose/structural (an impl's own method is checked as an ordinary struct
+method against its OWN literally-spelled concrete signature, never cross-checked against the
+interface's own declared param types), so `Self` only ever needs to PARSE as a type name (it
+already does -- `Self` is just an ordinary `IDENT`, no reserved-keyword collision) and never needs
+runtime resolution, because every real IMPL spells out its own concrete type directly and never
+writes `Self` itself. `HashMap2<K: Hashable + Eq, V>`'s own `register`/`get`/`remove` now call
+`stored_key.equals(&key)` instead of `==` -- verified with the SAME `ItemStack` example extended
+with a `sword_lookalike` (a different instance, same fields): it now correctly `FOUND`s the
+existing entry instead of missing, and re-registering through the lookalike correctly overwrites
+the same logical entry (`length()` staying 2, not growing to 3) rather than creating a duplicate.
+One real bug caught and fixed along the way: the FIRST pass only updated `register`/`remove`'s own
+key-comparison sites, missing `get`'s own (a real, easy-to-miss third near-identical call site) --
+the test's own `sword_lookalike` lookup still MISSed until that one was found and fixed too, a good
+reminder that near-duplicated code (three copies of the same bucket-scan shape) needs the SAME
+audit at EVERY copy, not just the ones that happen to get exercised first.
+
 **Status, 2026-09-16 (later)**: `HashMap2<K: Hashable, V>` landed -- real, arbitrary-STRUCT-keyed
 hashing (`HashMap2<ItemStack, Int>`, say), closing the gap this doc's own header originally
 scoped OUT ("blocked on primitives being unable to implement interfaces... not needed by any

@@ -362,30 +362,33 @@ impl IntHashMap<V> {
     }
 }
 
-// Arbitrary-STRUCT-keyed hash map -- `HashMap2<K: Hashable, V>`, e.g. `HashMap2<ItemStack, Int>`.
-// A caller's own struct (`ItemStack`, an entity handle, anything) opts in by implementing
-// `Hashable` (one method, `hash_key`); this works via genuine two-type-param generics
-// (`struct HashMap2<K, V> { ... }`/`fn hash_map2_new<K: Hashable, V>(...)`), added specifically
-// for this -- see `COLLECTIONS_IDEAS.md`'s own "Status" note and this file's own top header for
-// the real generics-constraint work that took.
+// Arbitrary-STRUCT-keyed hash map -- `HashMap2<K: Hashable + Eq, V>`, e.g. `HashMap2<ItemStack,
+// Int>`. A caller's own struct (`ItemStack`, an entity handle, anything) opts in by implementing
+// TWO small interfaces (`Hashable`'s `hash_key`, `Eq`'s `equals`); this works via genuine
+// two-type-param generics (`struct HashMap2<K, V> { ... }`/`fn hash_map2_new<K: Hashable + Eq,
+// V>(...)`, multi-bound `+`-joined the same way `Parser.hotc`'s own `fn_decl` already parses
+// `<T: A + B>`), added specifically for this -- see `COLLECTIONS_IDEAS.md`'s own "Status" note
+// and this file's own top header for the real generics-constraint work that took.
 //
-// **A real, disclosed limitation, not a bug**: key EQUALITY (for overwrite-on-`register`,
-// `get`, and `remove`) uses this language's own ordinary `==` -- which is real VALUE equality for
-// `Int`/`Bool`/`String` keys, but plain JVM REFERENCE identity for an ordinary struct key (see
-// `Codegen.hotc`'s own header on its `==`/`!=` codegen: "Struct reference-identity comparison --
-// no per-field structural equality"). There's no `Self` type in this language's interfaces (see
-// this file's own... actually `COLLECTIONS_IDEAS.md`'s note), so `Hashable` can't ALSO require a
-// `key_equals(&self, other: &Self)` method the way a real `Hash + Eq` pair would in a language
-// that has one. Concretely: `HashMap2<ItemStack, Int>` correctly buckets by `hash_key()`, and
-// `get`/`remove` work perfectly for the EXACT SAME key reference a value was `register`ed with
-// (the common, expected pattern -- keep the key you inserted with, look it up with that same
-// reference) -- but two SEPARATE `ItemStack` instances describing the same item/count are NOT
-// treated as the same key unless `ItemStack` itself opts into value-equality by overloading `==`
-// (this language's real operator-overload mechanism, `Codegen.hotc`'s own `try_gen_operator_
-// overload` -- outside this file's own scope to demonstrate, but available to any caller who
-// needs it).
+// **Real key VALUE equality, not just reference identity** -- `Eq`'s own `equals(&self, other:
+// &Self) -> Bool` uses this language's `Self` type, which turned out to need ZERO compiler
+// changes at all once actually tried (see `COLLECTIONS_IDEAS.md`'s own note): `Self` in an
+// INTERFACE's own declaration is just an ordinary type name string, never independently resolved
+// -- the real work happens in `impl Eq for ItemStack { fn equals(&self, other: &ItemStack) -> Bool
+// { ... } }`, which spells out its OWN concrete type directly (never literally writing `Self`),
+// and this language's real, loose/structural interface checking (no abstract per-interface body
+// check against an unresolved `Self`) never needed to resolve what `Self` "really is" at the
+// declaration site at all. `HashMap2`'s own `register`/`get`/`remove` call `stored_key.equals
+// (&key)` instead of `==` (JVM reference identity for a plain struct, see `Codegen.hotc`'s own
+// header on its `==`/`!=` codegen) -- so two SEPARATE `ItemStack` instances describing the same
+// item/count ARE now correctly treated as the same key, as long as `ItemStack` implements `Eq`
+// honestly (comparing real fields, not identity itself).
 interface Hashable {
     fn hash_key(&self) -> Int;
+}
+
+interface Eq {
+    fn equals(&self, other: &Self) -> Bool;
 }
 
 struct Entry2<K, V> {
@@ -407,9 +410,9 @@ fn make_empty_bucket2_hc<K, V>(hint_k: K, hint_v: V) -> Option<Vec<Entry2<K, V>>
 }
 
 // Mirrors `hash_map_new`'s own shape (see this file's own top header for why there's no bare
-// `HashMap2::new()`) -- `K: Hashable` gives a real, early, named error ("doesn't implement
-// Hashable") if the caller's own struct never wrote `impl Hashable for ItemStack { ... }`.
-fn hash_map2_new<K: Hashable, V>(first_key: K, first_value: V) -> HashMap2<K, V> {
+// `HashMap2::new()`) -- `K: Hashable + Eq` gives a real, early, named error if the caller's own
+// struct never wrote `impl Hashable for ItemStack { ... }`/`impl Eq for ItemStack { ... }`.
+fn hash_map2_new<K: Hashable + Eq, V>(first_key: K, first_value: V) -> HashMap2<K, V> {
     var m = HashMap2<K, V> {
         buckets: vec_of(make_empty_bucket2_hc(first_key, first_value)),
         bucket_count: 1,
@@ -452,7 +455,7 @@ impl HashMap2<K, V> {
                 var found_idx = -1;
                 var i = 0;
                 while i < bucket.length() {
-                    if bucket.get(i).key == key {
+                    if bucket.get(i).key.equals(&key) {
                         found_idx = i;
                     }
                     i = i + 1;
@@ -481,7 +484,7 @@ impl HashMap2<K, V> {
                 var i = 0;
                 while i < bucket.length() {
                     let e = bucket.get(i);
-                    if e.key == key {
+                    if e.key.equals(&key) {
                         return self.make_found(e.value);
                     }
                     i = i + 1;
@@ -508,7 +511,7 @@ impl HashMap2<K, V> {
                 var found_idx = -1;
                 var i = 0;
                 while i < bucket.length() {
-                    if bucket.get(i).key == key {
+                    if bucket.get(i).key.equals(&key) {
                         found_idx = i;
                     }
                     i = i + 1;
