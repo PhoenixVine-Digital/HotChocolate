@@ -1,5 +1,22 @@
 # ECS with ownership-derived scheduling — design doc
 
+**Status, 2026-09-15 (later still)**: the GL-thread-safety hazard right below is **fixed**, not
+just worked around. `@main_thread` -- a bare directive, same shape `@profile` already has --
+marks a system as touching a thread-affine external resource; `check_systems` now forces any TWO
+`@main_thread` systems to conflict with EACH OTHER unconditionally, regardless of what their own
+`&`/`&mut` component access would otherwise permit (a new `systems_conflict_or_main_thread_ecs`,
+OR'd with the existing `systems_conflict_ecs`, feeds both the warning loop and the real Phase B
+grouping logic). Marshmallow's own `Render`/`PlayerRender` are now marked `@main_thread` directly
+-- replacing the fully sequential `@after` chain across all four systems that the note below
+originally used as a stopgap -- and the compiler correctly reports "systems 'X' and 'Y' are both
+'@main_thread' -- forced to run sequentially" for them. Verified with a synthetic two-system test
+(disjoint components, would otherwise parallelize): 2 sequential groups WITH `@main_thread` on
+both, 1 parallel group WITHOUT it (`--explain-schedule` confirms both directions), plus the full
+existing example/ECS regression suite with zero output changes (including a real stress test's
+own genuine parallel dispatch, unaffected). This only solves the "author remembers to mark it"
+half -- whether the checker could ever INFER this automatically (by seeing a system's own body
+call into `window`/`graphics`) is still open, and not attempted here.
+
 **Status, 2026-09-15 (later)**: a real, previously-latent hazard found adding a SECOND rendering
 system to Marshmallow's ECS use (a `PlayerMove`/`PlayerRender` pair, driven by a new `Input`
 resource's own arrow-key fields, alongside the existing `Rotate`/`Render` ring). `Render` and
