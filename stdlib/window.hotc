@@ -79,6 +79,7 @@ extern class GLFW = "org.lwjgl.glfw.GLFW" {
     static GLFW_KEY_DOWN: Int;
     static GLFW_KEY_LEFT: Int;
     static GLFW_KEY_RIGHT: Int;
+    static GLFW_KEY_R: Int;
 
     static fn glfwInit() -> Bool;
     static fn glfwTerminate() -> Unit;
