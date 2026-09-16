@@ -1,0 +1,121 @@
+use collections;
+use registry;
+
+// Real head-to-head: `Registry<T>`'s O(n) linear scan vs `HashMap<V>`'s real O(1)-average hashed
+// buckets, at the SAME entry count, timed with real `nanoTime()` -- same profiling discipline
+// `ECS_IDEAS.md`'s own archetype-storage stress tests already used to settle "is this actually
+// slow, or premature optimization" with real numbers instead of assumptions. See
+// `COLLECTIONS_IDEAS.md`'s own "Status" note for the recorded verdict.
+
+extern class SystemClockColl = "java.lang.System" {
+    static fn nanoTime() -> Long;
+}
+
+fn ms_since(start: Long) -> Long {
+    return (SystemClockColl::nanoTime() - start) / (1000000 as Long);
+}
+
+fn main() {
+    // --- Stage A: apples-to-apples at N=2000 (small enough that Registry's own O(n^2) full
+    // lookup sweep -- 4,000,000 string comparisons -- still finishes in well under a second, so
+    // this measures the REAL algorithmic difference, not just "one finished, one didn't"). ---
+    let n = 2000;
+
+    let t0 = SystemClockColl::nanoTime();
+    var reg = registry_new("key0", 0);
+    var i = 1;
+    while i < n {
+        let k = "key{i}";
+        reg.register(k, i);
+        i = i + 1;
+    }
+    let reg_insert_ms = ms_since(t0);
+
+    let t1 = SystemClockColl::nanoTime();
+    var reg_sum = 0 as Long;
+    i = 0;
+    while i < n {
+        let k2 = "key{i}";
+        match reg.get(k2) {
+            Some { value } => { reg_sum = reg_sum + (value as Long); }
+            None => {}
+        }
+        i = i + 1;
+    }
+    let reg_get_ms = ms_since(t1);
+
+    let t2 = SystemClockColl::nanoTime();
+    var hm = hash_map_new("key0", 0);
+    i = 1;
+    while i < n {
+        let k3 = "key{i}";
+        hm.register(k3, i);
+        i = i + 1;
+    }
+    let hm_insert_ms = ms_since(t2);
+
+    let t3 = SystemClockColl::nanoTime();
+    var hm_sum = 0 as Long;
+    i = 0;
+    while i < n {
+        let k4 = "key{i}";
+        match hm.get(k4) {
+            Some { value } => { hm_sum = hm_sum + (value as Long); }
+            None => {}
+        }
+        i = i + 1;
+    }
+    let hm_get_ms = ms_since(t3);
+
+    print("=== Stage A: N=2000, Registry<Int> (O(n) linear scan) vs HashMap<Int> (real hashed) ===");
+    print("Registry  insert ms:");
+    print(reg_insert_ms);
+    print("Registry  get    ms (n lookups, each O(n)):");
+    print(reg_get_ms);
+    print("HashMap   insert ms:");
+    print(hm_insert_ms);
+    print("HashMap   get    ms (n lookups, each O(1) average):");
+    print(hm_get_ms);
+    print("correctness check (both sums should match, expected sum of 0..1999):");
+    print(reg_sum);
+    print(hm_sum);
+
+    // --- Stage B: HashMap<Int> alone at a much larger N, to confirm it actually scales -- NOT
+    // run against Registry at this size on purpose (Registry's own O(n^2) full sweep at this N
+    // would be minutes, not seconds -- that's the whole point being demonstrated, not a bug). ---
+    let n2 = 100000;
+    let t4 = SystemClockColl::nanoTime();
+    var hm2 = hash_map_new("k0", 0);
+    i = 1;
+    while i < n2 {
+        let k5 = "k{i}";
+        hm2.register(k5, i);
+        i = i + 1;
+    }
+    let hm2_insert_ms = ms_since(t4);
+
+    let t5 = SystemClockColl::nanoTime();
+    var hm2_sum = 0 as Long;
+    i = 0;
+    while i < n2 {
+        let k6 = "k{i}";
+        match hm2.get(k6) {
+            Some { value } => { hm2_sum = hm2_sum + (value as Long); }
+            None => {}
+        }
+        i = i + 1;
+    }
+    let hm2_get_ms = ms_since(t5);
+
+    print("=== Stage B: N=100000, HashMap<Int> only ===");
+    print("insert ms:");
+    print(hm2_insert_ms);
+    print("get    ms (n lookups):");
+    print(hm2_get_ms);
+    print("final bucket_count (should have grown well past 16 via real resizes):");
+    print(hm2.bucket_count);
+    print("length (should be n2):");
+    print(hm2.length());
+
+    print("done");
+}
