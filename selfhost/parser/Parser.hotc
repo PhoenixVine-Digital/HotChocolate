@@ -112,6 +112,26 @@ impl Parser {
         return t7.kind == LBRACE;
     }
 
+    // Same idea as `looks_like_generic_lit` above, for the TWO-type-argument PLAIN struct literal
+    // shape (`HashMap<ItemStack, Int> { ... }`, see `Ast.hc`'s own `StructDecl.type_param2`
+    // header) -- `LT IDENT COMMA IDENT GT LBRACE`, 5 tokens from the current `LT`. Mutually
+    // exclusive with `looks_like_generic_lit`/`looks_like_generic_variant`/`looks_like_generic_
+    // variant2` purely by shape (token 2 is `COMMA` here, and there's no `COLONCOLON` anywhere in
+    // this one), so no ordering dependency between any of them.
+    fn looks_like_generic_lit2(&self) -> Bool {
+        if self.pos + 5 >= self.tokens.length() { return false; }
+        let t1 = self.tokens.get(self.pos + 1);
+        if t1.kind != IDENT { return false; }
+        let t2 = self.tokens.get(self.pos + 2);
+        if t2.kind != COMMA { return false; }
+        let t3 = self.tokens.get(self.pos + 3);
+        if t3.kind != IDENT { return false; }
+        let t4 = self.tokens.get(self.pos + 4);
+        if t4.kind != GT { return false; }
+        let t5 = self.tokens.get(self.pos + 5);
+        return t5.kind == LBRACE;
+    }
+
     fn peek_kind(&self) -> TokType {
         let t = self.peek();
         return t.kind;
@@ -609,6 +629,18 @@ impl Parser {
                 let type_arg = self.expect(IDENT).text;
                 self.expect(GT);
                 return self.struct_lit(t.text + "$" + type_arg, none_string());
+            }
+            // `HashMap<ItemStack, Int> { ... }` -- the TWO-type-argument plain struct literal
+            // shape, see `Ast.hc`'s own `StructDecl.type_param2` header and this file's own
+            // `looks_like_generic_lit2`. Checked before the one-arg case's own fallthrough would
+            // ever matter since the two are mutually exclusive by shape (see that fn's header).
+            if self.check(LT) && !self.no_struct_lit && self.looks_like_generic_lit2() {
+                self.advance(); // LT
+                let type_arg1 = self.expect(IDENT).text;
+                self.expect(COMMA);
+                let type_arg2 = self.expect(IDENT).text;
+                self.expect(GT);
+                return self.struct_lit(t.text + "$" + type_arg1 + "$" + type_arg2, none_string());
             }
             // `Base<Arg>::Variant { ... }` -- explicitly-qualified generic-enum-variant
             // construction (see `Ast.hc`'s own `EnumDecl` header for why this can't just be bare
@@ -1161,6 +1193,8 @@ impl Parser {
         let name = self.expect(IDENT).text;
         var type_param = none_string();
         var type_bounds = empty_str_vec();
+        var type_param2 = none_string();
+        var type_bounds2 = empty_str_vec();
         if self.match_kind(LT) {
             let tp = self.expect(IDENT).text;
             type_param = some_string(tp);
@@ -1172,6 +1206,18 @@ impl Parser {
                     type_bounds.push(self.expect(IDENT).text);
                 }
             }
+            // `<K: Hashable, V>` -- a second, independently-bounded type param, see `Ast.hc`'s own
+            // `FnDecl.type_param2` header.
+            if self.match_kind(COMMA) {
+                let tp2 = self.expect(IDENT).text;
+                type_param2 = some_string(tp2);
+                if self.match_kind(COLON) {
+                    type_bounds2.push(self.expect(IDENT).text);
+                    while self.match_kind(PLUS) {
+                        type_bounds2.push(self.expect(IDENT).text);
+                    }
+                }
+            }
             self.expect(GT);
         }
         let params = self.param_list();
@@ -1180,7 +1226,7 @@ impl Parser {
             ret_type = some_string(self.type_name_ref());
         }
         let body = self.block();
-        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: type_param, type_bounds: type_bounds, self_is_mut: false };
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: type_param, type_bounds: type_bounds, self_is_mut: false, type_param2: type_param2, type_bounds2: type_bounds2 };
     }
 
     // === One `struct` declaration form: `struct Name { field: Type, field: Type, ... }` ===
@@ -1215,10 +1261,16 @@ impl Parser {
         self.expect(STRUCT);
         let name = self.expect(IDENT).text;
         var type_param = none_string();
+        var type_param2 = none_string();
         if self.match_kind(LT) {
             let tp = self.expect(IDENT).text;
-            self.expect(GT);
             type_param = some_string(tp);
+            // `struct HashMap<K, V> { ... }` -- see `Ast.hc`'s own `StructDecl.type_param2` header,
+            // mirroring `enum_decl`'s own identical `<T, E>` parsing above.
+            if self.match_kind(COMMA) {
+                type_param2 = some_string(self.expect(IDENT).text);
+            }
+            self.expect(GT);
         }
         var super_class = none_string();
         if self.match_kind(EXTENDS) {
@@ -1226,7 +1278,7 @@ impl Parser {
         }
         let fields = self.struct_fields();
         let mod0 = self.current_module_opt();
-        return StructDecl { name: name, type_param: type_param, fields: fields, is_arena: false, module_name: mod0, super_class: super_class };
+        return StructDecl { name: name, type_param: type_param, fields: fields, is_arena: false, module_name: mod0, super_class: super_class, type_param2: type_param2 };
     }
 
     // `arena struct Name { field: Type, ... }` -- see `Ast.hc`'s own `StructDecl.is_arena` header.
@@ -1239,7 +1291,7 @@ impl Parser {
         let name = self.expect(IDENT).text;
         let fields = self.struct_fields();
         let mod1 = self.current_module_opt();
-        return StructDecl { name: name, type_param: none_string(), fields: fields, is_arena: true, module_name: mod1, super_class: none_string() };
+        return StructDecl { name: name, type_param: none_string(), fields: fields, is_arena: true, module_name: mod1, super_class: none_string(), type_param2: none_string() };
     }
 
     // === `impl Name { fn method(self[, ...]) [-> Ret] { block } ... }` ===
@@ -1283,7 +1335,7 @@ impl Parser {
             ret_type = some_string(self.type_name_ref());
         }
         let body = self.block();
-        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: self_is_mut };
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: self_is_mut, type_param2: none_string(), type_bounds2: empty_str_vec() };
     }
 
     // `static fn name(...) -> Ret { body }` -- no `self`, plain params like a top-level `fn`.
@@ -1297,7 +1349,7 @@ impl Parser {
             ret_type = some_string(self.type_name_ref());
         }
         let body = self.block();
-        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false };
+        return FnDecl { name: name, params: params, ret_type: ret_type, body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
     }
 
     // `impl Box<T> { ... }` -- the `<T>` (matching the struct's own declared type parameter) is
@@ -1305,6 +1357,24 @@ impl Parser {
     // `type_param` (already known via `structs: Vec<StructDecl>`) is what governs what `T` means
     // inside these methods, so there's nothing new to remember here beyond consuming the syntax
     // (see `Checker.hotc`'s own `generic_method_templates` header).
+    // Parses and discards an optional `<T>` OR `<K, V>` right here -- shared by all three spots
+    // `impl_decl` needs it (leading `impl<T>`, trailing `Box<T>`, trailing `for StructName<T>`).
+    // Never stored on `ImplDecl` itself, same reasoning the ONE-param form already documented at
+    // `impl_decl`'s own header: the struct's own registered `type_param`/`type_param2` (`struct
+    // HashMap<K, V> { ... }`, see `Ast.hc`'s own `StructDecl.type_param2` header) is what governs
+    // what `K`/`V` mean inside these methods, so there's nothing new to remember beyond consuming
+    // the syntax -- `impl Pair<K, V> { ... }` needs this to parse at all now that two-param
+    // generic structs exist.
+    fn skip_optional_type_params(&mut self) {
+        if self.match_kind(LT) {
+            self.expect(IDENT);
+            if self.match_kind(COMMA) {
+                self.expect(IDENT);
+            }
+            self.expect(GT);
+        }
+    }
+
     fn impl_decl(&mut self) -> ImplDecl {
         self.expect(IMPL);
         // `impl<T> Box<T> { ... }` / `impl<T> Labeled for Box<T> { ... }` -- an optional LEADING
@@ -1317,15 +1387,9 @@ impl Parser {
         // `ensure_method_instantiated` in `Checker.hotc`, unaffected either way) -- so accepting and
         // discarding this leading form the same way is a pure parser change, no checker/codegen gap
         // at all once past this point.
-        if self.match_kind(LT) {
-            self.expect(IDENT);
-            self.expect(GT);
-        }
+        self.skip_optional_type_params();
         let name1 = self.expect(IDENT).text;
-        if self.match_kind(LT) {
-            self.expect(IDENT);
-            self.expect(GT);
-        }
+        self.skip_optional_type_params();
         // `impl InterfaceName for StructName { ... }` -- the FIRST identifier is the interface, the
         // one after `for` is the struct actually implementing it (mirrors the real compiler's own
         // `implDecl` exactly: `name1` is provisionally the struct name, reinterpreted as the
@@ -1336,10 +1400,7 @@ impl Parser {
         if self.match_kind(FOR) {
             interface_name = some_string(name1);
             struct_name = self.expect(IDENT).text;
-            if self.match_kind(LT) {
-                self.expect(IDENT);
-                self.expect(GT);
-            }
+            self.skip_optional_type_params();
         }
         // `by fieldName` -- composition delegation sugar, only meaningful right after `for
         // StructName` (an interface impl); see `Ast.hc`'s own `ImplDecl.delegate_field` header. No
@@ -2204,12 +2265,12 @@ fn empty_annvalue_vec() -> Vec<AnnValue> {
 }
 
 fn empty_fn_decl_vec() -> Vec<FnDecl> {
-    var v = vec_of(FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false });
+    var v = vec_of(FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
 fn empty_struct_decl_vec() -> Vec<StructDecl> {
-    var v = vec_of(StructDecl { name: "_", type_param: none_string(), fields: empty_param_vec(), is_arena: false, module_name: none_string(), super_class: none_string() });
+    var v = vec_of(StructDecl { name: "_", type_param: none_string(), fields: empty_param_vec(), is_arena: false, module_name: none_string(), super_class: none_string(), type_param2: none_string() });
     return Vec { data: v.data, len: 0 };
 }
 

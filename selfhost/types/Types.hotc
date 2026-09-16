@@ -47,6 +47,8 @@ pub struct GenericTemplate {
     type_param: String,
     field_names: Vec<String>,
     field_types: Vec<String>,
+    // `struct HashMap<K, V> { ... }` -- see `Ast.hc`'s own `StructDecl.type_param2` header.
+    type_param2: Option<String>,
 }
 
 // A generic enum declaration (`enum Option<T> { ... }`), mirroring `GenericTemplate` -- kept as

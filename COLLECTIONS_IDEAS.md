@@ -1,5 +1,47 @@
 # Real hashed collections — design doc
 
+**Status, 2026-09-16 (later)**: `HashMap2<K: Hashable, V>` landed -- real, arbitrary-STRUCT-keyed
+hashing (`HashMap2<ItemStack, Int>`, say), closing the gap this doc's own header originally
+scoped OUT ("blocked on primitives being unable to implement interfaces... not needed by any
+concrete use case this project actually has yet" -- it became a real, stated need: "I need to be
+able to hashmap say a random minecraft item stack"). Didn't need the deferred `Hashable`-bound
+route this doc originally imagined (primitives implementing interfaces) at all -- the real blocker
+turned out to be that THIS COMPILER'S STRUCTS AND FUNCTIONS ONLY EVER SUPPORTED ONE GENERIC TYPE
+PARAMETER, full stop (`Result<T, E>` was the only TWO-param generic anywhere, and only as an
+`enum`). Landed by porting that exact, already-proven enum mechanism to `struct`/`fn` (`Ast.hc`'s
+own `StructDecl.type_param2`/`FnDecl.type_param2`, mirrored end-to-end through
+`Parser.hotc`/`Checker.hotc`/`Codegen.hotc`) -- real, substantial compiler work, verified with a
+hand-computed program (`Pair<K: Hashable, V>`, a bounded two-param struct+fn, calling an interface
+method on the bounded `K`) BEFORE touching `collections.hotc` at all, then again with a real
+`HashMap2<ItemStack, Int>` end to end (insert/overwrite/miss/remove/resize all matching hand-
+computed expected output exactly).
+
+**Two real bugs found along the way, both worth keeping as patterns** (same "these were invisible
+until something actually exercised them" lesson `ECS_IDEAS.md`'s own catalogue already has several
+of):
+1. **`substitute_field_type`/`substitute_field_type_cg` only ever substituted a mono name's LAST
+   `"$"`-delimited segment**, not each one independently -- invisible for every single-param
+   generic this compiler had ever had (`"Vec$T"` has exactly one segment, so "last" and "only"
+   were the same thing), but real the moment a flat two-param mono name existed at all
+   (`"Pair$K$V"`): substituting `K` first, the old recursive shape treated the REMAINING `"K$V"`
+   as itself a nested mono argument ("K applied to V"), so `K` was silently never substituted, and
+   a second sequential pass substituting `V` produced `"Pair$K$String"` -- `K` never replaced.
+   Fixed by splitting the whole mono name flat on every `"$"` and checking each segment
+   independently, rather than recursing into "the rest" as if it were always exactly one more
+   nested type application.
+2. **Codegen's own generic-CALL-SITE inference (`gen_expr`'s `Call` arm) only ever built a
+   single-segment mono target name** (`callee + "$" + inferred_type`), completely independent of
+   (and un-synced with) the checker's own now-dual-aware `check_generic_call` -- a real, separate
+   reimplementation this file already carries for every other piece of generic-call metadata
+   (`generic_fn_infer_idx`/`_unwrap`, "redone independently here since this file doesn't share the
+   checker's own registries"). Missing its own `_idx2`/`_unwrap2` pair, a two-param call built the
+   WRONG target name (`"pair_new$ItemStack"`, missing `$String`), found `fn_descs` empty for it,
+   and fed ASM an empty method descriptor -- a real `StringIndexOutOfBoundsException` deep inside
+   `MethodWriter.visitMethodInsn`, not a clean compiler error. Fixed by porting the exact same
+   `_idx2`/`_unwrap2` metadata (computed once in `build_program_info`, mirroring `generic_fn_infer_
+   idx`/`_unwrap`'s own population loop) through to the call site, appending a second `"$..."`
+   segment when present.
+
 **Status, 2026-09-16**: profiled, with real numbers. `examples/collections_stress_test.hotc` runs
 a real head-to-head, timed with `System.nanoTime()` (same profiling discipline `ECS_IDEAS.md`'s own
 archetype-storage stress tests already used -- real measurement over assumption): at N=2000

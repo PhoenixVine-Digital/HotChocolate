@@ -1,0 +1,68 @@
+// `HashMap2<K: Hashable, V>` -- a real, arbitrary-struct-keyed hash map (see `COLLECTIONS_IDEAS.md`
+// for the full design and the two-type-param generics work it took to make this possible at all).
+// `ItemStack` opts in with one method (`impl Hashable for ItemStack`); everything else (bucketing,
+// resize, overwrite-on-repeat-key) works exactly like `HashMap<V>`'s own String-keyed version.
+// Also demonstrates the real, disclosed limitation this doc's own header calls out: key equality
+// is plain reference identity for a struct key (no `Self` type in this language's interfaces to
+// express a real `Eq` bound), so a DIFFERENT `ItemStack` instance with the same fields is a real
+// miss, not a match -- `sword_lookalike` below.
+use collections;
+
+struct ItemStack {
+    item_id: Int,
+    count: Int,
+}
+
+impl Hashable for ItemStack {
+    fn hash_key(&self) -> Int {
+        return self.item_id * 31 + self.count;
+    }
+}
+
+fn main() {
+    let sword = ItemStack { item_id: 100, count: 1 };
+    let apples = ItemStack { item_id: 5, count: 64 };
+    let gold = ItemStack { item_id: 42, count: 999 };
+
+    var m = hash_map2_new(sword, "iron sword");
+    m.register(apples, "food");
+    m.register(gold, "currency");
+
+    match m.get(sword) {
+        Some { value } => { print(value); }
+        None => { print("MISS"); }
+    }
+    match m.get(apples) {
+        Some { value } => { print(value); }
+        None => { print("MISS"); }
+    }
+    match m.get(gold) {
+        Some { value } => { print(value); }
+        None => { print("MISS"); }
+    }
+
+    // A DIFFERENT ItemStack instance with the same fields as `sword` -- real, disclosed reference-
+    // identity limitation, should MISS (not treated as the same key).
+    let sword_lookalike = ItemStack { item_id: 100, count: 1 };
+    match m.get(sword_lookalike) {
+        Some { value } => { print("FOUND (unexpected): {value}"); }
+        None => { print("MISS (expected)"); }
+    }
+
+    print(m.length());
+    print(m.contains_key(gold));
+
+    m.remove(apples);
+    print(m.contains_key(apples));
+    print(m.length());
+
+    // Re-register the SAME sword reference with a new value -- overwrite, not a new entry.
+    m.register(sword, "steel sword");
+    match m.get(sword) {
+        Some { value } => { print(value); }
+        None => { print("MISS"); }
+    }
+    print(m.length());
+
+    print("done");
+}

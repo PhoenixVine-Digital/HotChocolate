@@ -336,6 +336,16 @@ pub struct FnDecl {
     // parsed and discarded `&`/`mut` unconditionally). The one thing Phase 3 borrow checking needs
     // to know whether `self.field = ...` is allowed inside a given method body.
     self_is_mut: Bool,
+    // `fn hash_map2_new<K: Hashable, V>(...) { ... }` -- a SECOND independently-bounded type
+    // param, mirroring `StructDecl.type_param2`/`EnumDecl.type_param2` (see the former's own
+    // header for why this exists at all: a hash map keyed by an arbitrary struct needs its
+    // CONSTRUCTOR to infer both `K` and `V` from real arguments in the SAME call, which needs two
+    // independent generic params on one function, not just on the struct it returns). `None` when
+    // the source only wrote one type param (or none); `type_bounds2` is `V`'s own bound list,
+    // empty when `V` is unbounded (the common case -- only the KEY side needs a `Hashable`-style
+    // bound, the value side never does).
+    type_param2: Option<String>,
+    type_bounds2: Vec<String>,
 }
 
 // `Param` doubles as a struct field decl (`name: type_name`) -- same shape, no separate type
@@ -383,6 +393,13 @@ pub struct StructDecl {
     // this), no `super.method(...)`, single inheritance only (an extends-struct can't itself be
     // extended further -- `gen_struct` emits it `final`).
     super_class: Option<String>,
+    // `struct HashMap<K, V> { ... }` -- a SECOND type parameter, mirroring `EnumDecl.type_param2`
+    // (`Result<T, E>`) exactly, ported here specifically so a hash map keyed by an arbitrary
+    // caller-supplied STRUCT type (not just `HashMap<V>`'s existing fixed `String` key) is
+    // expressible at all -- see `COLLECTIONS_IDEAS.md`'s own note on this. `None` for the
+    // overwhelmingly common one-(or-zero)-param case; `Some` only when the source actually wrote
+    // `<K, V>`.
+    type_param2: Option<String>,
 }
 
 // `impl Name { fn method(self[, params]) [-> Ret] { body } ... }` -- `self` (bare, `&self`, or

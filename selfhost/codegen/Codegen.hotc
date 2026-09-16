@@ -250,6 +250,11 @@ pub struct ProgramInfo {
     static_type_names: Vec<String>,
     generic_fn_names: Vec<String>,
     generic_fn_infer_idx: Vec<Int>,
+    // Parallel to `generic_fn_names`/`generic_fn_infer_idx` -- the SECOND type param's own
+    // inference index (`-1` when the fn has only one type param), see the `CodeGen` struct's own
+    // `generic_fn_infer_idx2` header.
+    generic_fn_infer_idx2: Vec<Int>,
+    generic_fn_infer_unwrap2: Vec<Int>,
     // Parallel to `generic_fn_infer_idx` (1 = unwrap, 0 = use directly): does the chosen param's
     // OWN declared type wrap the bare type param inside a generic struct/enum (`b: Box<T>`, parsed
     // to the mono-shaped string `"Box$T"` by `type_name_ref` -- see `Ast.hc`'s own header on why
@@ -432,6 +437,13 @@ pub struct CodeGen {
     struct_extends: Registry<String>,
     generic_fn_infer_idx: Registry<Int>,
     generic_fn_infer_unwrap: Registry<Int>,
+    // `fn hash_map2_new<K: Hashable, V>(...)` -- the SECOND type param's own inference metadata,
+    // mirroring `generic_fn_infer_idx`/`_unwrap` exactly (see `Ast.hc`'s own `FnDecl.type_param2`
+    // header). A generic fn with only one type param gets `-1`/`0` here (see `build_program_info`'s
+    // own population loop) -- `gen_expr`'s own `Call` codegen only appends a second `"$..."`
+    // segment to the mono target name when this is present.
+    generic_fn_infer_idx2: Registry<Int>,
+    generic_fn_infer_unwrap2: Registry<Int>,
     generic_struct_infer_field: Registry<String>,
     generic_enum_infer_owner: Registry<String>,
     generic_enum_infer_field: Registry<String>,
@@ -1776,6 +1788,8 @@ impl CodeGen {
             struct_extends: self.struct_extends,
             generic_fn_infer_idx: self.generic_fn_infer_idx,
             generic_fn_infer_unwrap: self.generic_fn_infer_unwrap,
+            generic_fn_infer_idx2: self.generic_fn_infer_idx2,
+            generic_fn_infer_unwrap2: self.generic_fn_infer_unwrap2,
             generic_struct_infer_field: self.generic_struct_infer_field,
             generic_enum_infer_owner: self.generic_enum_infer_owner,
             generic_enum_infer_field: self.generic_enum_infer_field,
@@ -2358,6 +2372,12 @@ impl CodeGen {
                 var infer_idx = -1;
                 var infer_unwrap = 0;
                 var is_generic_call = false;
+                // `fn hash_map2_new<K: Hashable, V>(...)` -- the SECOND type param's own
+                // inference index, mirroring `infer_idx`/`infer_unwrap` exactly (see `Ast.hc`'s
+                // own `FnDecl.type_param2` header, and `generic_fn_infer_idx2`'s own header for
+                // why this file needs its own independent copy of this metadata).
+                var infer_idx2 = -1;
+                var infer_unwrap2 = 0;
                 if !known {
                     let idx_found = self.generic_fn_infer_idx.get(callee);
                     if let Some { value: idx } = idx_found {
@@ -2365,6 +2385,12 @@ impl CodeGen {
                         is_generic_call = true;
                         let unwrap_found = self.generic_fn_infer_unwrap.get(callee);
                         if let Some { value: uw } = unwrap_found { infer_unwrap = uw; }
+                        let idx2_found = self.generic_fn_infer_idx2.get(callee);
+                        if let Some { value: idx2 } = idx2_found {
+                            infer_idx2 = idx2;
+                            let unwrap2_found = self.generic_fn_infer_unwrap2.get(callee);
+                            if let Some { value: uw2 } = unwrap2_found { infer_unwrap2 = uw2; }
+                        }
                     }
                 }
                 if !known && !is_generic_call {
@@ -2372,6 +2398,7 @@ impl CodeGen {
                 }
                 let argc = args.length();
                 var inferred_type = "";
+                var inferred_type2 = "";
                 // `known` (a real, non-generic top-level fn) is the only case a `Lambda` arg can
                 // target here -- a generic call's own inference (right above) has no lambda support
                 // wired up (a real, disclosed scope cut matching `Checker.hotc`'s own
@@ -2422,6 +2449,15 @@ impl CodeGen {
                                 inferred_type = at;
                             }
                         }
+                        if is_generic_call && infer_idx2 >= 0 && i == infer_idx2 {
+                            if infer_unwrap2 == 1 && is_mono_name_cg(at) {
+                                inferred_type2 = mono_arg_cg(at);
+                            } else if infer_unwrap2 == 2 && is_array_type_name_cg(at) {
+                                inferred_type2 = array_elem_type_name_cg(at);
+                            } else {
+                                inferred_type2 = at;
+                            }
+                        }
                         i = i + 1;
                     }
                 }
@@ -2431,6 +2467,12 @@ impl CodeGen {
                         throw CodegenError::new("codegen: could not infer generic type argument for call to '" + callee + "'");
                     }
                     target = callee + "$" + inferred_type;
+                    if infer_idx2 >= 0 {
+                        if inferred_type2 == "" {
+                            throw CodegenError::new("codegen: could not infer second generic type argument for call to '" + callee + "'");
+                        }
+                        target = target + "$" + inferred_type2;
+                    }
                 }
                 let desc_found = self.fn_descs.get(target);
                 var desc = "";
@@ -4356,10 +4398,14 @@ fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info:
     }
     var ginfer = registry_new("__init__", -1);
     var ginferunwrap = registry_new("__init__", 0);
+    var ginfer2 = registry_new("__init__", -1);
+    var ginferunwrap2 = registry_new("__init__", 0);
     var gfi = 0;
     while gfi < info.generic_fn_names.length() {
         ginfer.register(info.generic_fn_names.get(gfi), info.generic_fn_infer_idx.get(gfi));
         ginferunwrap.register(info.generic_fn_names.get(gfi), info.generic_fn_infer_unwrap.get(gfi));
+        ginfer2.register(info.generic_fn_names.get(gfi), info.generic_fn_infer_idx2.get(gfi));
+        ginferunwrap2.register(info.generic_fn_names.get(gfi), info.generic_fn_infer_unwrap2.get(gfi));
         gfi = gfi + 1;
     }
     var gstructinfer = registry_new("__init__", "");
@@ -4404,7 +4450,7 @@ fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info:
     }
     var slot_scopes_seed2 = vec_of(registry_new("__init__", -1));
     var var_type_scopes_seed2 = vec_of(registry_new("__init__", "Int"));
-    return CodeGen { mv: mv, target: info.target, slots: registry_new("__init__", -1), slot_scopes: Vec { data: slot_scopes_seed2.data, len: 0 }, next_slot: 0, owner: owner, fn_descs: descs, fn_ret_tys: rettys, fn_param_types: fnparamtypes, fn_param_names: fnparamnames, var_types: registry_new("__init__", "Int"), var_type_scopes: Vec { data: var_type_scopes_seed2.data, len: 0 }, ret_ty: ret_type_name, struct_fields: sfields, struct_ftypes: sftypes, struct_methods: smethods, struct_method_rettys: smethod_rettys, struct_method_param_types: smethod_param_types, sendable_structs: sendable_structs, variant_owner: vowner, variant_tags: vtags, extern_binary: ebinary, extern_is_interface: eisiface, extern_method_descs: emdescs, extern_method_rettys: emrettys, extern_method_static: emstatic, extern_method_ctor: emctor, extern_method_param_types: emparamtypes, extern_field_descs: efdescs, extern_field_type_names: eftypenames, extern_field_static: efstatic, struct_extends: sextends, generic_fn_infer_idx: ginfer, generic_fn_infer_unwrap: ginferunwrap, generic_struct_infer_field: gstructinfer, generic_enum_infer_owner: genuminferowner, generic_enum_infer_field: genuminferfield, static_types: static_types, enum_names: enum_names_reg, cur_loop_start: Label::new(), cur_loop_end: Label::new(), variant_field_names: vfnames, variant_field_types: vftypes, last_emitted_line: -1, module_of: module_of, interfaces_raw: info.interfaces_raw, fn_identity: fn_identity, lambda_counter: 0 };
+    return CodeGen { mv: mv, target: info.target, slots: registry_new("__init__", -1), slot_scopes: Vec { data: slot_scopes_seed2.data, len: 0 }, next_slot: 0, owner: owner, fn_descs: descs, fn_ret_tys: rettys, fn_param_types: fnparamtypes, fn_param_names: fnparamnames, var_types: registry_new("__init__", "Int"), var_type_scopes: Vec { data: var_type_scopes_seed2.data, len: 0 }, ret_ty: ret_type_name, struct_fields: sfields, struct_ftypes: sftypes, struct_methods: smethods, struct_method_rettys: smethod_rettys, struct_method_param_types: smethod_param_types, sendable_structs: sendable_structs, variant_owner: vowner, variant_tags: vtags, extern_binary: ebinary, extern_is_interface: eisiface, extern_method_descs: emdescs, extern_method_rettys: emrettys, extern_method_static: emstatic, extern_method_ctor: emctor, extern_method_param_types: emparamtypes, extern_field_descs: efdescs, extern_field_type_names: eftypenames, extern_field_static: efstatic, struct_extends: sextends, generic_fn_infer_idx: ginfer, generic_fn_infer_unwrap: ginferunwrap, generic_fn_infer_idx2: ginfer2, generic_fn_infer_unwrap2: ginferunwrap2, generic_struct_infer_field: gstructinfer, generic_enum_infer_owner: genuminferowner, generic_enum_infer_field: genuminferfield, static_types: static_types, enum_names: enum_names_reg, cur_loop_start: Label::new(), cur_loop_end: Label::new(), variant_field_names: vfnames, variant_field_types: vftypes, last_emitted_line: -1, module_of: module_of, interfaces_raw: info.interfaces_raw, fn_identity: fn_identity, lambda_counter: 0 };
 }
 
 // A monomorphized instantiation (`"Box$Int"`) resolves to its TEMPLATE's own `module_name`
@@ -4686,10 +4732,13 @@ fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>,
     var generic_fn_names = empty_str_vec4();
     var generic_fn_infer_idx = empty_int_vec();
     var generic_fn_infer_unwrap = empty_int_vec();
+    var generic_fn_infer_idx2 = empty_int_vec();
+    var generic_fn_infer_unwrap2 = empty_int_vec();
     var fi = 0;
     while fi < fns.length() {
         let g = fns.get(fi);
         let g2 = fns.get(fi); // fresh copy -- `.params` is only safe to read once
+        let g2b = fns.get(fi); // another fresh copy -- the SECOND type param's own scan needs its own read
         let g3 = fns.get(fi); // another fresh copy -- `fn_param_types_list` needs its own read
         let g4 = fns.get(fi); // another fresh copy -- `fn_param_names_list` needs its own read
         var g_is_generic = false;
@@ -4721,6 +4770,33 @@ fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>,
             }
             generic_fn_infer_idx.push(infer_idx);
             generic_fn_infer_unwrap.push(infer_unwrap);
+            // `fn hash_map2_new<K: Hashable, V>(...)` -- the SAME scan, independently, for the
+            // SECOND type param (see `Ast.hc`'s own `FnDecl.type_param2` header). `-1`/`0` when
+            // there is no second type param at all.
+            var g_has_tp2 = false;
+            var g_tp2 = "";
+            if let Some { value: tp2g } = g.type_param2 { g_has_tp2 = true; g_tp2 = tp2g; }
+            var infer_idx2 = -1;
+            var infer_unwrap2 = 0;
+            if g_has_tp2 {
+                var pgi2 = 0;
+                while pgi2 < g2b.params.length() {
+                    let ptn2 = g2b.params.get(pgi2).type_name;
+                    if ptn2 == g_tp2 && infer_idx2 < 0 {
+                        infer_idx2 = pgi2;
+                        infer_unwrap2 = 0;
+                    } else if is_mono_name_cg(ptn2) && mono_arg_cg(ptn2) == g_tp2 && infer_idx2 < 0 {
+                        infer_idx2 = pgi2;
+                        infer_unwrap2 = 1;
+                    } else if is_array_type_name_cg(ptn2) && array_elem_type_name_cg(ptn2) == g_tp2 && infer_idx2 < 0 {
+                        infer_idx2 = pgi2;
+                        infer_unwrap2 = 2;
+                    }
+                    pgi2 = pgi2 + 1;
+                }
+            }
+            generic_fn_infer_idx2.push(infer_idx2);
+            generic_fn_infer_unwrap2.push(infer_unwrap2);
         } else {
             // `"Unit"`, not `"Int"` -- a real, pre-existing mismatch found self-hosting the new
             // classpath-reflection module's own `verify_extern_signature` (the first `Unit`-
@@ -5202,7 +5278,7 @@ fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>,
         sendable_names_owned.push(sendable_struct_names.get(sni));
         sni = sni + 1;
     }
-    return ProgramInfo { target: target, sendable_struct_names: sendable_names_owned, fn_names: fn_names, fn_descs_list: fn_descs_list, fn_rettys_list: fn_rettys_list, fn_param_types_list: fn_param_types_list, fn_param_names_list: fn_param_names_list, static_names: static_names, static_type_names: static_type_names, generic_fn_names: generic_fn_names, generic_fn_infer_idx: generic_fn_infer_idx, generic_fn_infer_unwrap: generic_fn_infer_unwrap, generic_struct_infer_names: generic_struct_infer_names, generic_struct_infer_fields: generic_struct_infer_fields, generic_enum_infer_variant_names: generic_enum_infer_variant_names, generic_enum_infer_owner_names: generic_enum_infer_owner_names, generic_enum_infer_field_names: generic_enum_infer_field_names, enum_names: enum_names, struct_names: struct_names, struct_field_names_list: struct_field_names_list, struct_field_types_list: struct_field_types_list, method_keys: method_keys, method_descs_list: method_descs_list, method_rettys_list: method_rettys_list, method_param_types_list: method_param_types_list, variant_owner_names: variant_owner_names, variant_owner_enums: variant_owner_enums, variant_tag_keys: variant_tag_keys, variant_tag_list: variant_tag_list, extern_alias_names: extern_alias_names, extern_binary_names: extern_binary_names, extern_alias_is_interface: extern_alias_is_interface, extern_method_keys: extern_method_keys, extern_method_descs_list: extern_method_descs_list, extern_method_rettys_list: extern_method_rettys_list, extern_method_static_list: extern_method_static_list, extern_method_ctor_list: extern_method_ctor_list, extern_method_param_types_list: extern_method_param_types_list, extern_field_keys: extern_field_keys, extern_field_descs_list: extern_field_descs_list, extern_field_type_names_list: extern_field_type_names_list, extern_field_static_list: extern_field_static_list, struct_extends_names: struct_extends_names, struct_extends_targets: struct_extends_targets, variant_field_keys: variant_field_keys, variant_field_names_list: variant_field_names_list, variant_field_types_list: variant_field_types_list, module_names: module_names, module_values: module_values, interfaces_raw: interfaces_raw };
+    return ProgramInfo { target: target, sendable_struct_names: sendable_names_owned, fn_names: fn_names, fn_descs_list: fn_descs_list, fn_rettys_list: fn_rettys_list, fn_param_types_list: fn_param_types_list, fn_param_names_list: fn_param_names_list, static_names: static_names, static_type_names: static_type_names, generic_fn_names: generic_fn_names, generic_fn_infer_idx: generic_fn_infer_idx, generic_fn_infer_unwrap: generic_fn_infer_unwrap, generic_fn_infer_idx2: generic_fn_infer_idx2, generic_fn_infer_unwrap2: generic_fn_infer_unwrap2, generic_struct_infer_names: generic_struct_infer_names, generic_struct_infer_fields: generic_struct_infer_fields, generic_enum_infer_variant_names: generic_enum_infer_variant_names, generic_enum_infer_owner_names: generic_enum_infer_owner_names, generic_enum_infer_field_names: generic_enum_infer_field_names, enum_names: enum_names, struct_names: struct_names, struct_field_names_list: struct_field_names_list, struct_field_types_list: struct_field_types_list, method_keys: method_keys, method_descs_list: method_descs_list, method_rettys_list: method_rettys_list, method_param_types_list: method_param_types_list, variant_owner_names: variant_owner_names, variant_owner_enums: variant_owner_enums, variant_tag_keys: variant_tag_keys, variant_tag_list: variant_tag_list, extern_alias_names: extern_alias_names, extern_binary_names: extern_binary_names, extern_alias_is_interface: extern_alias_is_interface, extern_method_keys: extern_method_keys, extern_method_descs_list: extern_method_descs_list, extern_method_rettys_list: extern_method_rettys_list, extern_method_static_list: extern_method_static_list, extern_method_ctor_list: extern_method_ctor_list, extern_method_param_types_list: extern_method_param_types_list, extern_field_keys: extern_field_keys, extern_field_descs_list: extern_field_descs_list, extern_field_type_names_list: extern_field_type_names_list, extern_field_static_list: extern_field_static_list, struct_extends_names: struct_extends_names, struct_extends_targets: struct_extends_targets, variant_field_keys: variant_field_keys, variant_field_names_list: variant_field_names_list, variant_field_types_list: variant_field_types_list, module_names: module_names, module_values: module_values, interfaces_raw: interfaces_raw };
 }
 
 fn empty_interface_vec_cg() -> Vec<InterfaceDecl> {
@@ -6071,26 +6147,47 @@ fn arena_struct_name_cg(name: String) -> String {
 // flat cross-module function namespace, same pattern every other duplicated helper in this file
 // already uses) -- exact match OR array-of-the-type-parameter (`"[T]"` -> `"[Int]"`, needed for
 // `Vec<T> { data: [T], len: Int }`'s own `data` field).
+// See `Checker.hotc`'s own `substitute_field_type` header for the real bug this fixes (the
+// original recursive-single-nested-arg shape only ever substituted a mono name's LAST `"$"`-
+// delimited segment, silently leaving earlier ones untouched -- invisible for a single-param
+// template, real for a flat two-param one like `"Pair$K$V"`). Same fix here: split flat on every
+// `"$"` and check each segment independently, instead of recursing into "the rest" as if it were
+// always exactly one more nested type application.
 fn substitute_field_type_cg(ftype: String, type_param: String, arg: String) -> String {
-    if ftype == type_param {
-        return arg;
+    if is_array_type_name_cg(ftype) {
+        let elem = array_elem_type_name_cg(ftype);
+        return "[" + substitute_field_type_cg(elem, type_param, arg) + "]";
     }
-    if is_array_type_name_cg(ftype) && array_elem_type_name_cg(ftype) == type_param {
-        return "[" + arg + "]";
+    if !is_mono_name_cg(ftype) {
+        if ftype == type_param { return arg; }
+        return ftype;
     }
-    // A *different* generic instantiation naming the type parameter somewhere inside its own type
-    // argument (`"Vec$T"` -> `"Vec$Int"`, needed for `Registry<T> { entries: Vec<T> }`; recurses
-    // for arbitrarily deep chains -- `"Vec$RegistryEntry$T"` -> `"Vec$RegistryEntry$Int"` -- see
-    // `Checker.hotc`'s own `substitute_field_type` header for the real bug this generalization
-    // fixed) -- see that same header for the cascading half of this (making sure the nested
-    // instantiation actually gets emitted as a real class too, not just named in a field
-    // descriptor); that cascading already happened during the check pass (`mono_names` here is
-    // `checker.mono_needed`, read back after checking finished), so this file only needs to
-    // reproduce the same substitution, not the cascade itself.
-    if is_mono_name_cg(ftype) {
-        return mono_base_cg(ftype) + "$" + substitute_field_type_cg(mono_arg_cg(ftype), type_param, arg);
+    var result = "";
+    var remaining = ftype;
+    var first = true;
+    var keep_going = true;
+    while keep_going {
+        let idx = remaining.indexOf("$");
+        var seg = remaining;
+        var has_more = false;
+        if idx >= 0 {
+            seg = remaining.substring(0, idx);
+            remaining = remaining.substring(idx + 1, remaining.length());
+            has_more = true;
+        }
+        var out_seg = seg;
+        if !first && seg == type_param {
+            out_seg = arg;
+        }
+        if first {
+            result = out_seg;
+        } else {
+            result = result + "$" + out_seg;
+        }
+        first = false;
+        if !has_more { keep_going = false; }
     }
-    return ftype;
+    return result;
 }
 
 fn empty_expr_vec_cg() -> Vec<Expr> {
@@ -6268,7 +6365,7 @@ fn find_template_method_cg(impls: &Vec<ImplDecl>, base: String, method: String) 
         }
         i = i + 1;
     }
-    return FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    return FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // A generic struct declaration's own `type_param` string (`"T"` for `struct Box<T> { ... }`), `""`
@@ -6289,6 +6386,22 @@ fn struct_type_param_cg(structs: &Vec<StructDecl>, base: String) -> String {
     return "";
 }
 
+// The `type_param2`-shaped sibling of `struct_type_param_cg` above -- `""` when `base` isn't
+// found or has only one type param, see `Ast.hc`'s own `StructDecl.type_param2` header.
+fn struct_type_param2_cg(structs: &Vec<StructDecl>, base: String) -> String {
+    var i = 0;
+    while i < structs.length() {
+        let sd = structs.get(i);
+        if sd.name == base {
+            var tp2 = "";
+            if let Some { value: t2 } = sd.type_param2 { tp2 = t2; }
+            return tp2;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
 // The method-shaped counterpart to `monomorphized_fn_params_cg`/`_retty_cg`/body substitution --
 // `owner` is the MONO struct name (`"Box$Int"`), `method` the bare method name (`"get"`); finds
 // the template via `find_template_method_cg` (base = `mono_base_cg(owner)`) and substitutes its
@@ -6299,12 +6412,26 @@ fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDec
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
     let found_tp = struct_type_param_cg(&structs, base);
+    // `impl Pair<K, V> { fn describe(&self) { self.key.hash_key(); } }` -- a SECOND type param on
+    // the RECEIVER's own struct, mirroring `monomorphized_fields`'s own two-param handling (see
+    // `Ast.hc`'s own `StructDecl.type_param2` header).
+    let tp2meth = struct_type_param2_cg(&structs, base);
+    let has_tp2meth = tp2meth != "";
+    var real_argmeth = arg;
+    var arg2meth = "";
+    if has_tp2meth {
+        real_argmeth = mono_arg1_of2_cg(owner);
+        arg2meth = mono_arg2_of2_cg(owner);
+    }
     let tmpl = find_template_method_cg(&impls, base, method);
     var out = empty_param_vec2();
     var i = 0;
     while i < tmpl.params.length() {
         let p = tmpl.params.get(i);
-        let pty = substitute_field_type_cg(p.type_name, found_tp, arg);
+        var pty = substitute_field_type_cg(p.type_name, found_tp, real_argmeth);
+        if has_tp2meth {
+            pty = substitute_field_type_cg(pty, tp2meth, arg2meth);
+        }
         out.push(Param { name: p.name, type_name: pty, is_ref: p.is_ref, is_mut_ref: p.is_mut_ref });
         i = i + 1;
     }
@@ -6315,17 +6442,41 @@ fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
     let found_tp = struct_type_param_cg(&structs, base);
+    let tp2meth2 = struct_type_param2_cg(&structs, base);
+    let has_tp2meth2 = tp2meth2 != "";
+    var real_argmeth2 = arg;
+    var arg2meth2 = "";
+    if has_tp2meth2 {
+        real_argmeth2 = mono_arg1_of2_cg(owner);
+        arg2meth2 = mono_arg2_of2_cg(owner);
+    }
     let tmpl = find_template_method_cg(&impls, base, method);
     let ret_str = opt_string_or(tmpl.ret_type, "Unit");
-    return substitute_field_type_cg(ret_str, found_tp, arg);
+    var subbed_ret = substitute_field_type_cg(ret_str, found_tp, real_argmeth2);
+    if has_tp2meth2 {
+        subbed_ret = substitute_field_type_cg(subbed_ret, tp2meth2, arg2meth2);
+    }
+    return subbed_ret;
 }
 
 fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Stmt> {
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
     let found_tp = struct_type_param_cg(&structs, base);
+    let tp2meth3 = struct_type_param2_cg(&structs, base);
+    let has_tp2meth3 = tp2meth3 != "";
+    var real_argmeth3 = arg;
+    var arg2meth3 = "";
+    if has_tp2meth3 {
+        real_argmeth3 = mono_arg1_of2_cg(owner);
+        arg2meth3 = mono_arg2_of2_cg(owner);
+    }
     let tmpl = find_template_method_cg(&impls, base, method);
-    return subst_stmt_list_cg(tmpl.body, found_tp, arg);
+    var subbed_body = subst_stmt_list_cg(tmpl.body, found_tp, real_argmeth3);
+    if has_tp2meth3 {
+        subbed_body = subst_stmt_list_cg(subbed_body, tp2meth3, arg2meth3);
+    }
+    return subbed_body;
 }
 
 // The full substituted `FnDecl` for one mono method instantiation, ready to hand to `gen_method`
@@ -6337,7 +6488,7 @@ fn monomorphized_method_decl_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>
     let body = monomorphized_method_body_cg(&impls, &structs, owner, method);
     let base2 = mono_base_cg(owner);
     let tmpl2 = find_template_method_cg(&impls, base2, method);
-    return FnDecl { name: method, params: params, ret_type: some_string2(ret), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: tmpl2.self_is_mut };
+    return FnDecl { name: method, params: params, ret_type: some_string2(ret), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: tmpl2.self_is_mut, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // Every substituted method `checker.method_mono_needed` recorded for THIS particular mono struct
@@ -6549,11 +6700,27 @@ fn monomorphized_fields(structs: &Vec<StructDecl>, mono_name: String) -> Vec<Par
             if let Some { value: tp } = sd.type_param {
                 found_tp = tp;
             }
+            // `struct HashMap<K, V> { ... }` -- see `Ast.hc`'s own `StructDecl.type_param2`
+            // header, and `monomorphized_enum_variants`'s own identical two-param handling right
+            // above for why a two-param mono name needs its own arg-splitting instead of reusing
+            // `mono_arg_cg`.
+            var has_tp2f = false;
+            var tp2f = "";
+            if let Some { value: tp2fv } = sd.type_param2 { has_tp2f = true; tp2f = tp2fv; }
+            var arg2f = "";
+            var real_argf = arg;
+            if has_tp2f {
+                real_argf = mono_arg1_of2_cg(mono_name);
+                arg2f = mono_arg2_of2_cg(mono_name);
+            }
             var out = empty_param_vec2();
             var j = 0;
             while j < sd.fields.length() {
                 let f = sd.fields.get(j);
-                let ftype3 = substitute_field_type_cg(f.type_name, found_tp, arg);
+                var ftype3 = substitute_field_type_cg(f.type_name, found_tp, real_argf);
+                if has_tp2f {
+                    ftype3 = substitute_field_type_cg(ftype3, tp2f, arg2f);
+                }
                 out.push(Param { name: f.name, type_name: ftype3, is_ref: false, is_mut_ref: false });
                 j = j + 1;
             }
@@ -6579,11 +6746,26 @@ fn monomorphized_fn_params_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Param
         var is_generic = false;
         if let Some { value: tp } = f.type_param { found_tp = tp; is_generic = true; }
         if f.name == base && is_generic {
+            // `fn hash_map2_new<K: Hashable, V>(...)` -- a SECOND type param, mirroring
+            // `monomorphized_fields`/`monomorphized_enum_variants`'s own identical two-param
+            // handling (see `Ast.hc`'s own `FnDecl.type_param2` header).
+            var has_tp2p = false;
+            var tp2p = "";
+            if let Some { value: tp2pv } = f.type_param2 { has_tp2p = true; tp2p = tp2pv; }
+            var arg2p = "";
+            var real_argp = arg;
+            if has_tp2p {
+                real_argp = mono_arg1_of2_cg(mono_name);
+                arg2p = mono_arg2_of2_cg(mono_name);
+            }
             var out = empty_param_vec2();
             var j = 0;
             while j < f.params.length() {
                 let p = f.params.get(j);
-                let pty = substitute_field_type_cg(p.type_name, found_tp, arg);
+                var pty = substitute_field_type_cg(p.type_name, found_tp, real_argp);
+                if has_tp2p {
+                    pty = substitute_field_type_cg(pty, tp2p, arg2p);
+                }
                 out.push(Param { name: p.name, type_name: pty, is_ref: p.is_ref, is_mut_ref: p.is_mut_ref });
                 j = j + 1;
             }
@@ -6606,8 +6788,21 @@ fn monomorphized_fn_retty_cg(fns: &Vec<FnDecl>, mono_name: String) -> String {
         var is_generic = false;
         if let Some { value: tp } = f.type_param { found_tp = tp; is_generic = true; }
         if f.name == base && is_generic {
+            var has_tp2r = false;
+            var tp2r = "";
+            if let Some { value: tp2rv } = f.type_param2 { has_tp2r = true; tp2r = tp2rv; }
+            var real_argr = arg;
+            var arg2r = "";
+            if has_tp2r {
+                real_argr = mono_arg1_of2_cg(mono_name);
+                arg2r = mono_arg2_of2_cg(mono_name);
+            }
             let ret_str = opt_string_or(f.ret_type, "Unit");
-            return substitute_field_type_cg(ret_str, found_tp, arg);
+            var subbed = substitute_field_type_cg(ret_str, found_tp, real_argr);
+            if has_tp2r {
+                subbed = substitute_field_type_cg(subbed, tp2r, arg2r);
+            }
+            return subbed;
         }
         i = i + 1;
     }
@@ -6628,7 +6823,20 @@ fn fn_body_of_generic_template_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<S
         var is_generic = false;
         if let Some { value: tp } = f.type_param { found_tp = tp; is_generic = true; }
         if f.name == base && is_generic {
-            return subst_stmt_list_cg(f.body, found_tp, arg);
+            var has_tp2b = false;
+            var tp2b = "";
+            if let Some { value: tp2bv } = f.type_param2 { has_tp2b = true; tp2b = tp2bv; }
+            var real_argb = arg;
+            var arg2b = "";
+            if has_tp2b {
+                real_argb = mono_arg1_of2_cg(mono_name);
+                arg2b = mono_arg2_of2_cg(mono_name);
+            }
+            var subbed_body = subst_stmt_list_cg(f.body, found_tp, real_argb);
+            if has_tp2b {
+                subbed_body = subst_stmt_list_cg(subbed_body, tp2b, arg2b);
+            }
+            return subbed_body;
         }
         i = i + 1;
     }
@@ -6758,7 +6966,7 @@ pub fn emit_and_write(fn_name: String, param_names: Vec<String>, body: Vec<Stmt>
     var self_only_descs = vec_of(int_descriptor(param_count));
     var self_only_rettys = vec_of("Int");
     var int_types = all_int_types(param_count);
-    let info = ProgramInfo { target: 17, fn_names: self_only_names, fn_descs_list: self_only_descs, fn_rettys_list: self_only_rettys, fn_param_types_list: vec_of(empty_str_vec4()), fn_param_names_list: vec_of(empty_str_vec4()), static_names: empty_str_vec4(), static_type_names: empty_str_vec4(), generic_fn_names: empty_str_vec4(), generic_fn_infer_idx: empty_int_vec(), generic_fn_infer_unwrap: empty_int_vec(), generic_struct_infer_names: empty_str_vec4(), generic_struct_infer_fields: empty_str_vec4(), generic_enum_infer_variant_names: empty_str_vec4(), generic_enum_infer_owner_names: empty_str_vec4(), generic_enum_infer_field_names: empty_str_vec4(), enum_names: empty_str_vec4(), struct_names: empty_str_vec4(), struct_field_names_list: empty_str_vec_vec(), struct_field_types_list: empty_str_vec_vec(), method_keys: empty_str_vec4(), method_descs_list: empty_str_vec4(), method_rettys_list: empty_str_vec4(), method_param_types_list: empty_str_vec_vec(), variant_owner_names: empty_str_vec4(), variant_owner_enums: empty_str_vec4(), variant_tag_keys: empty_str_vec4(), variant_tag_list: empty_int_vec(), extern_alias_names: empty_str_vec4(), extern_binary_names: empty_str_vec4(), extern_alias_is_interface: empty_int_vec(), extern_method_keys: empty_str_vec4(), extern_method_descs_list: empty_str_vec4(), extern_method_rettys_list: empty_str_vec4(), extern_method_static_list: empty_int_vec(), extern_method_ctor_list: empty_int_vec(), extern_method_param_types_list: empty_str_vec_vec(), extern_field_keys: empty_str_vec4(), extern_field_descs_list: empty_str_vec4(), extern_field_type_names_list: empty_str_vec4(), extern_field_static_list: empty_int_vec(), struct_extends_names: empty_str_vec4(), struct_extends_targets: empty_str_vec4(), variant_field_keys: empty_str_vec4(), variant_field_names_list: empty_str_vec_vec(), variant_field_types_list: empty_str_vec_vec(), module_names: empty_str_vec4(), module_values: empty_str_vec4(), interfaces_raw: empty_interface_vec_cg(), sendable_struct_names: empty_str_vec4() };
+    let info = ProgramInfo { target: 17, fn_names: self_only_names, fn_descs_list: self_only_descs, fn_rettys_list: self_only_rettys, fn_param_types_list: vec_of(empty_str_vec4()), fn_param_names_list: vec_of(empty_str_vec4()), static_names: empty_str_vec4(), static_type_names: empty_str_vec4(), generic_fn_names: empty_str_vec4(), generic_fn_infer_idx: empty_int_vec(), generic_fn_infer_unwrap: empty_int_vec(), generic_fn_infer_idx2: empty_int_vec(), generic_fn_infer_unwrap2: empty_int_vec(), generic_struct_infer_names: empty_str_vec4(), generic_struct_infer_fields: empty_str_vec4(), generic_enum_infer_variant_names: empty_str_vec4(), generic_enum_infer_owner_names: empty_str_vec4(), generic_enum_infer_field_names: empty_str_vec4(), enum_names: empty_str_vec4(), struct_names: empty_str_vec4(), struct_field_names_list: empty_str_vec_vec(), struct_field_types_list: empty_str_vec_vec(), method_keys: empty_str_vec4(), method_descs_list: empty_str_vec4(), method_rettys_list: empty_str_vec4(), method_param_types_list: empty_str_vec_vec(), variant_owner_names: empty_str_vec4(), variant_owner_enums: empty_str_vec4(), variant_tag_keys: empty_str_vec4(), variant_tag_list: empty_int_vec(), extern_alias_names: empty_str_vec4(), extern_binary_names: empty_str_vec4(), extern_alias_is_interface: empty_int_vec(), extern_method_keys: empty_str_vec4(), extern_method_descs_list: empty_str_vec4(), extern_method_rettys_list: empty_str_vec4(), extern_method_static_list: empty_int_vec(), extern_method_ctor_list: empty_int_vec(), extern_method_param_types_list: empty_str_vec_vec(), extern_field_keys: empty_str_vec4(), extern_field_descs_list: empty_str_vec4(), extern_field_type_names_list: empty_str_vec4(), extern_field_static_list: empty_int_vec(), struct_extends_names: empty_str_vec4(), struct_extends_targets: empty_str_vec4(), variant_field_keys: empty_str_vec4(), variant_field_names_list: empty_str_vec_vec(), variant_field_types_list: empty_str_vec_vec(), module_names: empty_str_vec4(), module_values: empty_str_vec4(), interfaces_raw: empty_interface_vec_cg(), sendable_struct_names: empty_str_vec4() };
     gen_fn(&mut cw, binary_name, fn_name, param_names, int_types, "Int", body, info, none_annotation2());
 
     let main_mv = CodegenShim::visitMethodNoSig(&mut cw, 9, "main", "([Ljava/lang/String;)V", ["x"; 0]);
@@ -6856,7 +7064,7 @@ fn materialize_delegated_methods(impls: Vec<ImplDecl>, interfaces: &Vec<Interfac
                     } else {
                         fwd_body.push(Return { value: some_expr_cg(fwd_call), line: 0 });
                     }
-                    methods.push(FnDecl { name: fm2_name, params: fm2_params, ret_type: some_string2(fm2_ret_type), body: fwd_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false });
+                    methods.push(FnDecl { name: fm2_name, params: fm2_params, ret_type: some_string2(fm2_ret_type), body: fwd_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() });
                 }
                 fi2 = fi2 + 1;
             }
@@ -6902,7 +7110,7 @@ fn materialize_default_methods(impls: Vec<ImplDecl>, interfaces: &Vec<InterfaceD
                         mi = mi + 1;
                     }
                     if !already {
-                        methods.push(FnDecl { name: fm_name, params: fm_params, ret_type: some_string2(fm_ret_type), body: default_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false });
+                        methods.push(FnDecl { name: fm_name, params: fm_params, ret_type: some_string2(fm_ret_type), body: default_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() });
                     }
                 }
                 fi = fi + 1;
@@ -6995,7 +7203,7 @@ fn materialize_extend_fns(extend_decls: Vec<ExtendDecl>, structs: &Vec<StructDec
             // Desugared into a PLAIN top-level fn (its own `self` is just an ordinary first param
             // now, not a real receiver) -- `self_is_mut: false` is right regardless of `m`'s own
             // receiver kind, which the synthesized param above already carries forward.
-            out.push(FnDecl { name: m.name, params: new_params, ret_type: m.ret_type, body: m.body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false });
+            out.push(FnDecl { name: m.name, params: new_params, ret_type: m.ret_type, body: m.body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() });
             mi = mi + 1;
         }
         i = i + 1;
@@ -7126,7 +7334,7 @@ fn synthesize_archetype_struct_ecs(sig: Vec<String>) -> StructDecl {
         i = i + 1;
     }
     fields.push(Param { name: "__id", type_name: "Int", is_ref: false, is_mut_ref: false });
-    return StructDecl { name: archetype_struct_name_ecs(&sig), type_param: none_string2(), fields: fields, is_arena: false, module_name: none_string2(), super_class: none_string2() };
+    return StructDecl { name: archetype_struct_name_ecs(&sig), type_param: none_string2(), fields: fields, is_arena: false, module_name: none_string2(), super_class: none_string2(), type_param2: none_string2() };
 }
 
 fn synthesize_archetype_static_ecs(sig: Vec<String>, structs: &Vec<StructDecl>, id: Int) -> StaticDecl {
@@ -7354,7 +7562,7 @@ fn changed_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
 // a filter), so keeping one in the ACTUAL synthesized fn's param list would ask codegen to
 // declare a JVM param of a type ("Without$Transform") that doesn't exist as a real class at all.
 fn synthesize_system_fn_ecs(sysd: SystemDecl) -> FnDecl {
-    return FnDecl { name: system_fn_name_ecs(sysd.name), params: real_run_params_ecs(&sysd.run_params), ret_type: none_string2(), body: sysd.run_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    return FnDecl { name: system_fn_name_ecs(sysd.name), params: real_run_params_ecs(&sysd.run_params), ret_type: none_string2(), body: sysd.run_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // The real top-level static field name a `resource Name { ... }`'s own world-wide value lives
@@ -7542,7 +7750,7 @@ fn system_dispatch_fn_name_ecs(sys_name: String) -> String {
 // documented `"{...}" as PhoenixObject` idiom) without needing a second wrapper fn just to
 // manufacture one.
 fn synthesize_system_dispatch_fn_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> FnDecl {
-    return FnDecl { name: system_dispatch_fn_name_ecs(sysd.name), params: empty_param_vec2(), ret_type: some_string2("String"), body: build_system_dispatch_body_ecs(sysd, archetype_signatures, profiled, group_size, resource_names), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    return FnDecl { name: system_dispatch_fn_name_ecs(sysd.name), params: empty_param_vec2(), ret_type: some_string2("String"), body: build_system_dispatch_body_ecs(sysd, archetype_signatures, profiled, group_size, resource_names), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // `__world_run_all`'s own real body, Phase B (real parallel dispatch) -- see `ECS_IDEAS.md`'s
@@ -7937,7 +8145,7 @@ fn synthesize_transition_fn_ecs(comp_type: String, is_add: Bool, closed_sigs: &V
         }
         si = si + 1;
     }
-    return FnDecl { name: apply_fn_name_ecs(comp_type, is_add), params: params, ret_type: none_string2(), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    return FnDecl { name: apply_fn_name_ecs(comp_type, is_add), params: params, ret_type: none_string2(), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // `world.add(entity, Value { ... })`'s own real forward target -- just enqueues (see this
@@ -7959,7 +8167,7 @@ fn synthesize_queue_add_fn_ecs(comp_type: String) -> FnDecl {
     var body = empty_stmt_vec2();
     body.push(ExprStmt { expr: MethodCall { recv: Ident { name: pending_add_entities_name_ecs(comp_type) }, method: "push", args: vec_of(Ident { name: "__entity" }) }, line: 0 });
     body.push(ExprStmt { expr: MethodCall { recv: Ident { name: pending_add_values_name_ecs(comp_type) }, method: "push", args: vec_of(Ident { name: "__value" }) }, line: 0 });
-    return FnDecl { name: queue_fn_name_ecs(comp_type, true), params: params, ret_type: none_string2(), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    return FnDecl { name: queue_fn_name_ecs(comp_type, true), params: params, ret_type: none_string2(), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // `world.remove(entity, Value)`'s own real forward target -- the `synthesize_queue_add_fn_ecs`
@@ -7974,7 +8182,7 @@ fn synthesize_queue_remove_fn_ecs(comp_type: String) -> FnDecl {
     var params = queue_remove_params_ecs();
     var body = empty_stmt_vec2();
     body.push(ExprStmt { expr: MethodCall { recv: Ident { name: pending_remove_entities_name_ecs(comp_type) }, method: "push", args: vec_of(Ident { name: "__entity" }) }, line: 0 });
-    return FnDecl { name: queue_fn_name_ecs(comp_type, false), params: params, ret_type: none_string2(), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    return FnDecl { name: queue_fn_name_ecs(comp_type, false), params: params, ret_type: none_string2(), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // Prepended to `__world_run_all`'s own body (see `compile_program`'s own ECS section) -- one
@@ -8069,7 +8277,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
     var si0 = 0;
     while si0 < sn {
         let sd = structs.get(si0);
-        checker.register_struct(sd.name, sd.type_param, sd.fields, sd.is_arena, sd.super_class);
+        checker.register_struct(sd.name, sd.type_param, sd.fields, sd.is_arena, sd.super_class, sd.type_param2);
         si0 = si0 + 1;
     }
     // ECS with ownership-derived scheduling -- see `ECS_IDEAS.md`'s own design doc. Components
@@ -8093,7 +8301,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         // exercised end-to-end. Fixed the same way archetype storage itself is -- synthesizing a
         // real, plain `StructDecl` (no methods, no type param) and letting it flow through the
         // ORDINARY struct-registration/codegen pipeline like any other.
-        structs.push(StructDecl { name: cd2.name, type_param: none_string2(), fields: cd2.fields, is_arena: false, module_name: none_string2(), super_class: none_string2() });
+        structs.push(StructDecl { name: cd2.name, type_param: none_string2(), fields: cd2.fields, is_arena: false, module_name: none_string2(), super_class: none_string2(), type_param2: none_string2() });
         ci0 = ci0 + 1;
     }
     // Same "register, then synthesize a real `StructDecl` so its fields flow through the
@@ -8106,7 +8314,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         let rd = resources.get(ri0);
         let rd2 = resources.get(ri0); // fresh copy -- `.fields` is only safe to read once
         checker.register_resource(rd.name, rd.fields);
-        structs.push(StructDecl { name: rd2.name, type_param: none_string2(), fields: rd2.fields, is_arena: false, module_name: none_string2(), super_class: none_string2() });
+        structs.push(StructDecl { name: rd2.name, type_param: none_string2(), fields: rd2.fields, is_arena: false, module_name: none_string2(), super_class: none_string2(), type_param2: none_string2() });
         // `__resource_<Name>` needs to be a real, known static from HERE on -- both to the
         // checker (`register_static_decl`, so the synthesized system-dispatch call sites'
         // `Ident` reference to it type-checks -- see `synthesize_system_call_stmts_ecs`'s own
@@ -8397,7 +8605,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
     while eai < closed_sigs.length() {
         let sig = closed_sigs.get(eai);
         let asd = synthesize_archetype_struct_ecs(sig);
-        checker.register_struct(asd.name, asd.type_param, asd.fields, asd.is_arena, asd.super_class);
+        checker.register_struct(asd.name, asd.type_param, asd.fields, asd.is_arena, asd.super_class, asd.type_param2);
         structs.push(asd);
         let sig2 = closed_sigs.get(eai); // fresh copy -- `sig` already consumed above
         let astatic = synthesize_archetype_static_ecs(sig2, &structs, eai);
@@ -8607,8 +8815,8 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
     let group_body2 = build_run_all_body_ecs(&checker.system_groups);
     var gbi2 = 0;
     while gbi2 < group_body2.length() { run_all_body2.push(group_body2.get(gbi2)); gbi2 = gbi2 + 1; }
-    let run_all_decl = FnDecl { name: "__world_run_all", params: empty_param_vec2(), ret_type: none_string2(), body: run_all_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
-    let run_all_decl2 = FnDecl { name: "__world_run_all", params: empty_param_vec2(), ret_type: none_string2(), body: run_all_body2, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    let run_all_decl = FnDecl { name: "__world_run_all", params: empty_param_vec2(), ret_type: none_string2(), body: run_all_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
+    let run_all_decl2 = FnDecl { name: "__world_run_all", params: empty_param_vec2(), ret_type: none_string2(), body: run_all_body2, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
     checker.check_fn(run_all_decl2);
     fns.push(run_all_decl);
     // `__world_shutdown` -- always synthesized (see its own header on why an empty body is a
@@ -8619,8 +8827,8 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
     checker.fn_param_names.register(shutdown_name, param_names_of(empty_param_vec2()));
     checker.fn_param_is_ref.register(shutdown_name, param_is_ref_of(empty_param_vec2()));
     checker.fn_param_is_mut_ref.register(shutdown_name, param_is_mut_ref_of(empty_param_vec2()));
-    let shutdown_decl = FnDecl { name: shutdown_name, params: empty_param_vec2(), ret_type: none_string2(), body: build_world_shutdown_body_ecs(pool_size), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
-    let shutdown_decl2 = FnDecl { name: shutdown_name, params: empty_param_vec2(), ret_type: none_string2(), body: build_world_shutdown_body_ecs(pool_size), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false };
+    let shutdown_decl = FnDecl { name: shutdown_name, params: empty_param_vec2(), ret_type: none_string2(), body: build_world_shutdown_body_ecs(pool_size), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
+    let shutdown_decl2 = FnDecl { name: shutdown_name, params: empty_param_vec2(), ret_type: none_string2(), body: build_world_shutdown_body_ecs(pool_size), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
     checker.check_fn(shutdown_decl2);
     fns.push(shutdown_decl);
     // The ordinary `n` (captured way above, before this whole section's own `fns` growth -- the
@@ -8903,7 +9111,7 @@ fn static_methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<
 }
 
 fn empty_fn_decl_vec2() -> Vec<FnDecl> {
-    var v = vec_of(FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false });
+    var v = vec_of(FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() });
     return Vec { data: v.data, len: 0 };
 }
 

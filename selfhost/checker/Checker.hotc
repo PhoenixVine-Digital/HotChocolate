@@ -342,7 +342,7 @@ pub fn checker_new() -> TyChecker {
     var methods = registry_new("__init__", FnSig { param_types: empty_ty_vec(), ret_type: TyUnknown });
     var variant_owner = registry_new("__init__", "__init__");
     var variant_owner_q = registry_new("__init__", true);
-    var generic_templates = registry_new("__init__", GenericTemplate { type_param: "__init__", field_names: empty_str_vec2(), field_types: empty_str_vec2() });
+    var generic_templates = registry_new("__init__", GenericTemplate { type_param: "__init__", field_names: empty_str_vec2(), field_types: empty_str_vec2(), type_param2: none_string3() });
     var generic_enum_templates = registry_new("__init__", GenericEnumTemplate { type_param: "__init__", variants: empty_variant_vec3(), type_param2: none_string3() });
     var externs = registry_new("__init__", "__init__");
     var extern_methods = registry_new("__init__", ExternMethodInfo { param_types: empty_str_vec2(), ret_type: "Unit", is_static: false, is_ctor: false });
@@ -352,8 +352,8 @@ pub fn checker_new() -> TyChecker {
     var fn_param_names = registry_new("__init__", empty_str_vec2());
     var enum_variants = registry_new("__init__", empty_str_vec2());
     var static_methods = registry_new("__init__", FnSig { param_types: empty_ty_vec(), ret_type: TyUnknown });
-    var generic_fn_templates = registry_new("__init__", FnDecl { name: "__init__", params: empty_param_vec3(), ret_type: none_string3(), body: empty_stmt_vec3(), type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: false });
-    var generic_method_templates = registry_new("__init__", FnDecl { name: "__init__", params: empty_param_vec3(), ret_type: none_string3(), body: empty_stmt_vec3(), type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: false });
+    var generic_fn_templates = registry_new("__init__", FnDecl { name: "__init__", params: empty_param_vec3(), ret_type: none_string3(), body: empty_stmt_vec3(), type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: false, type_param2: none_string3(), type_bounds2: empty_str_vec2() });
+    var generic_method_templates = registry_new("__init__", FnDecl { name: "__init__", params: empty_param_vec3(), ret_type: none_string3(), body: empty_stmt_vec3(), type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: false, type_param2: none_string3(), type_bounds2: empty_str_vec2() });
     var mono = vec_of("__init__");
     var mono_needed = Vec { data: mono.data, len: 0 };
     var fmono = vec_of("__init__");
@@ -836,17 +836,64 @@ fn operator_method_name(op: String) -> String {
 // correctly handling arbitrarily deep chains: `substitute_field_type("Vec$RegistryEntry$T", "T",
 // "Int")` now recurses into `"RegistryEntry$T"` -> `"RegistryEntry$Int"`, then wraps back into
 // `"Vec$RegistryEntry$Int"`.
+// A real bug found adding two-param generics (`struct Pair<K, V> { ... }` / `fn f<K, V>(...)`,
+// see `Ast.hc`'s own `StructDecl.type_param2`/`FnDecl.type_param2` headers): the ORIGINAL version
+// of this fn only ever substituted the LAST `"$"`-delimited segment of a mono name, silently
+// leaving every earlier one untouched. Invisible for a genuinely single-param template (`"Vec$T"`
+// has exactly one segment after the base, so "last" and "only" were the same thing) -- but a flat
+// two-param mono name like `"Pair$K$V"` (built when a two-param generic FN's own body constructs
+// `Pair<K, V> { ... }`, using its own still-abstract type param NAMES as the literal type
+// arguments) has TWO. Substituting `K` first, the old recursive shape (`mono_base(ftype) + "$" +
+// substitute_field_type(mono_arg(ftype), ...)`) treated the REMAINING `"K$V"` as itself a nested
+// mono arg (`mono_base("K$V")` = `"K"`, `mono_arg("K$V")` = `"V"`) -- i.e. "K applied to V", which
+// is wrong; it's really two independent siblings, not one type parameterized by the other. Only
+// the LAST segment (`"V"`) was ever actually compared against `type_param`, so substituting `K`
+// silently did nothing, and a SECOND sequential call substituting `V` -> `String` produced the
+// real, observed bug: `"Pair$K$V"` -> `"Pair$K$String"`, `K` never replaced at all.
+//
+// Fixed by splitting the WHOLE mono name flat on every `"$"` and checking EACH segment
+// independently against `type_param`, instead of recursing into "the rest" as if it were always
+// exactly one more nested type application. Correct for the original single-param case too (one
+// segment to check, same outcome as before) AND now for a flat multi-param name -- callers doing
+// two SEQUENTIAL substitutions (`ensure_fn_instantiated`/`ensure_instantiated`'s own two-param
+// branches: substitute `K` -> its concrete type first, leaving `V` untouched since it doesn't
+// match; substitute `V` next, leaving the now-already-substituted `K` slot untouched since IT
+// doesn't match `V` either) now produce the right final string either order.
 fn substitute_field_type(ftype: String, type_param: String, arg: String) -> String {
-    if ftype == type_param {
-        return arg;
+    if is_array_type_name(ftype) {
+        let elem = array_elem_type_name(ftype);
+        return "[" + substitute_field_type(elem, type_param, arg) + "]";
     }
-    if is_array_type_name(ftype) && array_elem_type_name(ftype) == type_param {
-        return "[" + arg + "]";
+    if !is_mono_name(ftype) {
+        if ftype == type_param { return arg; }
+        return ftype;
     }
-    if is_mono_name(ftype) {
-        return mono_base(ftype) + "$" + substitute_field_type(mono_arg(ftype), type_param, arg);
+    var result = "";
+    var remaining = ftype;
+    var first = true;
+    var keep_going = true;
+    while keep_going {
+        let idx = remaining.indexOf("$");
+        var seg = remaining;
+        var has_more = false;
+        if idx >= 0 {
+            seg = remaining.substring(0, idx);
+            remaining = remaining.substring(idx + 1, remaining.length());
+            has_more = true;
+        }
+        var out_seg = seg;
+        if !first && seg == type_param {
+            out_seg = arg;
+        }
+        if first {
+            result = out_seg;
+        } else {
+            result = result + "$" + out_seg;
+        }
+        first = false;
+        if !has_more { keep_going = false; }
     }
-    return ftype;
+    return result;
 }
 
 // A substituted field type's own CASCADE target -- what `ensure_instantiated` should actually try
@@ -1994,7 +2041,7 @@ impl TyChecker {
     // type is -- see `ty_from_name`. A *generic* struct (`type_param` is `Some`) goes into
     // `generic_templates` instead -- it isn't directly usable until `ensure_instantiated`
     // monomorphizes some concrete `Base$Arg` name for it.
-    fn register_struct(&mut self, name: String, type_param: Option<String>, fields: Vec<Param>, is_arena: Bool, super_class: Option<String>) {
+    fn register_struct(&mut self, name: String, type_param: Option<String>, fields: Vec<Param>, is_arena: Bool, super_class: Option<String>, type_param2: Option<String>) {
         var names = empty_str_vec2();
         var types = empty_str_vec2();
         var i = 0;
@@ -2014,7 +2061,7 @@ impl TyChecker {
             i = i + 1;
         }
         if let Some { value: tp } = type_param {
-            self.generic_templates.register(name, GenericTemplate { type_param: tp, field_names: names, field_types: types });
+            self.generic_templates.register(name, GenericTemplate { type_param: tp, field_names: names, field_types: types, type_param2: type_param2 });
         } else {
             self.structs.register(name, StructInfo { field_names: names, field_types: types });
         }
@@ -2470,10 +2517,28 @@ impl TyChecker {
         let arg = mono_arg(name);
         let tmpl_found = self.generic_templates.get(base);
         if let Some { value: tmpl } = tmpl_found {
+            // `struct HashMap<K, V> { ... }` -- a SECOND type param, mirroring the enum branch
+            // right below exactly (see that branch's own header for the full reasoning):
+            // `mono_arg(name)` alone is right for a one-param template, wrong for a two-param one
+            // ("HashMap$ItemStack$Int" needs "ItemStack" and "Int" separately) -- `mono_arg1_of2`/
+            // `mono_arg2_of2` do that split, ONLY reached when `tmpl.type_param2` is actually
+            // `Some`.
+            var has_tp2s = false;
+            var tp2s = "";
+            if let Some { value: tp2sv } = tmpl.type_param2 { has_tp2s = true; tp2s = tp2sv; }
+            var arg2s = "";
+            var real_args = arg;
+            if has_tp2s {
+                real_args = mono_arg1_of2(name);
+                arg2s = mono_arg2_of2(name);
+            }
             var fields = empty_param_vec3();
             var i = 0;
             while i < tmpl.field_names.length() {
-                let ftype = substitute_field_type(tmpl.field_types.get(i), tmpl.type_param, arg);
+                var ftype = substitute_field_type(tmpl.field_types.get(i), tmpl.type_param, real_args);
+                if has_tp2s {
+                    ftype = substitute_field_type(ftype, tp2s, arg2s);
+                }
                 let ctarget = cascade_target(ftype);
                 if is_mono_name(ctarget) {
                     self.ensure_instantiated(ctarget);
@@ -2481,7 +2546,7 @@ impl TyChecker {
                 fields.push(Param { name: tmpl.field_names.get(i), type_name: ftype, is_ref: false, is_mut_ref: false });
                 i = i + 1;
             }
-            self.register_struct(name, none_string3(), fields, false, none_string3());
+            self.register_struct(name, none_string3(), fields, false, none_string3(), none_string3());
             self.mono_needed.push(name);
             return;
         }
@@ -2705,7 +2770,25 @@ impl TyChecker {
         if let Some { value: tmpl } = tmpl_found {
             var found_tp = "";
             if let Some { value: tp } = tmpl.type_param { found_tp = tp; }
-            self.check_type_param_bounds(found_tp, arg, tmpl.type_bounds);
+            // `fn hash_map2_new<K: Hashable, V>(...)` -- a SECOND, independently-bounded type
+            // param, mirroring `ensure_instantiated`'s own struct branch (see `Ast.hc`'s own
+            // `FnDecl.type_param2` header for why this exists at all). `mono_arg(name)` alone is
+            // right for a one-param template, wrong for a two-param one -- `mono_arg1_of2`/
+            // `mono_arg2_of2` split "hash_map2_new$ItemStack$Int" into "ItemStack"/"Int"
+            // separately, ONLY reached when `tmpl.type_param2` is actually `Some`.
+            var has_tp2fn = false;
+            var tp2fn = "";
+            if let Some { value: tp2fnv } = tmpl.type_param2 { has_tp2fn = true; tp2fn = tp2fnv; }
+            var arg2fn = "";
+            var real_argfn = arg;
+            if has_tp2fn {
+                real_argfn = mono_arg1_of2(name);
+                arg2fn = mono_arg2_of2(name);
+            }
+            self.check_type_param_bounds(found_tp, real_argfn, tmpl.type_bounds);
+            if has_tp2fn {
+                self.check_type_param_bounds(tp2fn, arg2fn, tmpl.type_bounds2);
+            }
             // Builds `new_param_tys` alongside `new_params` in the same pass -- rather than
             // deriving it afterward via `param_types_of(new_params)`, which would MOVE
             // `new_params` (it takes `Vec<Param>` by value) before `mono_decl` below needs it
@@ -2715,17 +2798,26 @@ impl TyChecker {
             var pi = 0;
             while pi < tmpl.params.length() {
                 let p = tmpl.params.get(pi);
-                let pty = substitute_field_type(p.type_name, found_tp, arg);
+                var pty = substitute_field_type(p.type_name, found_tp, real_argfn);
+                if has_tp2fn {
+                    pty = substitute_field_type(pty, tp2fn, arg2fn);
+                }
                 new_params.push(Param { name: p.name, type_name: pty, is_ref: p.is_ref, is_mut_ref: p.is_mut_ref });
                 new_param_tys.push(ty_from_name(pty));
                 pi = pi + 1;
             }
             let ret_ty_str = opt_string_or2(tmpl.ret_type, "Int");
-            let new_ret = substitute_field_type(ret_ty_str, found_tp, arg);
+            var new_ret = substitute_field_type(ret_ty_str, found_tp, real_argfn);
+            if has_tp2fn {
+                new_ret = substitute_field_type(new_ret, tp2fn, arg2fn);
+            }
             self.fn_sigs.register(name, FnSig { param_types: new_param_tys, ret_type: ty_from_name(new_ret) });
             self.fn_mono_needed.push(name);
-            let substituted_body = subst_stmt_list(tmpl.body, found_tp, arg);
-            var mono_decl = FnDecl { name: name, params: new_params, ret_type: some_string3(new_ret), body: substituted_body, type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: false };
+            var substituted_body = subst_stmt_list(tmpl.body, found_tp, real_argfn);
+            if has_tp2fn {
+                substituted_body = subst_stmt_list(substituted_body, tp2fn, arg2fn);
+            }
+            var mono_decl = FnDecl { name: name, params: new_params, ret_type: some_string3(new_ret), body: substituted_body, type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: false, type_param2: none_string3(), type_bounds2: empty_str_vec2() };
             // Real bug found building this: `ensure_fn_instantiated` can fire from the MIDDLE of
             // checking a totally different function's body (a call site inside it just triggered
             // the first-ever use of this instantiation) -- but `check_fn` unconditionally resets
@@ -3375,18 +3467,22 @@ impl TyChecker {
     // argument, only this one bare-match rule (see `Ast.hc`'s own `FnDecl` header). Builds the
     // mono name (`"identity$Int"`), `ensure_fn_instantiated`s it, and returns its real (now-
     // concrete) return type.
-    fn check_generic_call(&mut self, callee: String, gtmpl: FnDecl, arg_tys: Vec<Ty>) -> Ty {
-        var found_tp = "";
-        if let Some { value: tp } = gtmpl.type_param { found_tp = tp; }
+    // Runs the SAME per-param inference scan `check_generic_call` used to do inline for its one
+    // and only type param, now factored out so it can be run a SECOND, independent time for `fn
+    // hash_map2_new<K: Hashable, V>(...)`-style two-param generics (see `Ast.hc`'s own `FnDecl.
+    // type_param2` header) -- `target_tp` is whichever of the two the caller wants inferred THIS
+    // call, entirely independent of the other. Returns `"?"` (the same sentinel `ty_name`'s own
+    // catch-all already uses) on failure to infer.
+    fn infer_one_type_param(&self, params: &Vec<Param>, arg_tys: &Vec<Ty>, target_tp: String) -> String {
         var inferred = "";
         var found_infer = false;
         var i = 0;
-        while i < gtmpl.params.length() {
-            let p = gtmpl.params.get(i);
-            if p.type_name == found_tp && i < arg_tys.length() {
+        while i < params.length() {
+            let p = params.get(i);
+            if p.type_name == target_tp && i < arg_tys.length() {
                 inferred = ty_name(arg_tys.get(i));
                 found_infer = true;
-            } else if is_mono_name(p.type_name) && mono_arg(p.type_name) == found_tp && i < arg_tys.length() {
+            } else if is_mono_name(p.type_name) && mono_arg(p.type_name) == target_tp && i < arg_tys.length() {
                 // `b: Box<T>` -- the param's OWN declared type isn't the bare type param (that's
                 // the case right above), it's a generic struct/enum PARAMETERIZED BY it
                 // (`type_name_ref` parses `Box<T>` to the mono-shaped string "Box$T", same as any
@@ -3410,7 +3506,7 @@ impl TyChecker {
                     inferred = mono_arg(argn);
                     found_infer = true;
                 }
-            } else if is_array_type_name(p.type_name) && array_elem_type_name(p.type_name) == found_tp && i < arg_tys.length() {
+            } else if is_array_type_name(p.type_name) && array_elem_type_name(p.type_name) == target_tp && i < arg_tys.length() {
                 // `arr: &[T]` -- the param's own declared type is an ARRAY of the bare type param
                 // (`type_name_ref` parses `[T]` to the plain string `"[T]"`, same "just a type-name
                 // string" convention `"dyn Name"`/`Base$Arg` already use -- see that fn's own
@@ -3431,11 +3527,37 @@ impl TyChecker {
             }
             i = i + 1;
         }
-        if !found_infer || inferred == "?" {
+        if !found_infer {
+            return "?";
+        }
+        return inferred;
+    }
+
+    // Infers a generic top-level fn's type argument(s) from whichever argument's corresponding
+    // declared param type is EXACTLY the bare type parameter (see `infer_one_type_param`'s own
+    // header for the full scope/rules) -- builds the mono name (`"identity$Int"`, or
+    // `"hash_map2_new$ItemStack$Int"` for a two-param generic), `ensure_fn_instantiated`s it, and
+    // returns its real (now-concrete) return type.
+    fn check_generic_call(&mut self, callee: String, gtmpl: FnDecl, arg_tys: Vec<Ty>) -> Ty {
+        var found_tp = "";
+        if let Some { value: tp } = gtmpl.type_param { found_tp = tp; }
+        var has_tp2call = false;
+        var found_tp2call = "";
+        if let Some { value: tp2 } = gtmpl.type_param2 { has_tp2call = true; found_tp2call = tp2; }
+        let inferred1 = self.infer_one_type_param(&gtmpl.params, &arg_tys, found_tp);
+        if inferred1 == "?" {
             self.error("could not infer generic type argument for call to '" + callee + "'");
             return TyUnknown;
         }
-        let mono_name = callee + "$" + inferred;
+        var mono_name = callee + "$" + inferred1;
+        if has_tp2call {
+            let inferred2 = self.infer_one_type_param(&gtmpl.params, &arg_tys, found_tp2call);
+            if inferred2 == "?" {
+                self.error("could not infer second generic type argument for call to '" + callee + "'");
+                return TyUnknown;
+            }
+            mono_name = mono_name + "$" + inferred2;
+        }
         self.ensure_fn_instantiated(mono_name);
         let sig_found = self.fn_sigs.get(mono_name);
         if let Some { value: sig } = sig_found {
@@ -3467,24 +3589,51 @@ impl TyChecker {
         let gm_found = self.generic_method_templates.get(base + "#" + method);
         if let Some { value: gm } = gm_found {
             var found_tp = "";
+            var has_tp2m = false;
+            var tp2m = "";
             let tmpl_found = self.generic_templates.get(base);
-            if let Some { value: tmpl } = tmpl_found { found_tp = tmpl.type_param; }
+            if let Some { value: tmpl } = tmpl_found {
+                found_tp = tmpl.type_param;
+                if let Some { value: tp2mv } = tmpl.type_param2 { has_tp2m = true; tp2m = tp2mv; }
+            }
+            // `impl Pair<K, V> { fn describe(&self) { self.key.hash_key(); } }` -- a SECOND type
+            // param on the RECEIVER's own struct, mirroring `ensure_fn_instantiated`'s own two-
+            // param branch (see `Ast.hc`'s own `StructDecl.type_param2` header). `mono_arg(owner)`
+            // alone is right for a one-param receiver, wrong for a two-param one
+            // ("Pair$ItemStack$String" needs "ItemStack" and "String" separately) -- `mono_arg1_
+            // of2`/`mono_arg2_of2` do that split, ONLY reached when the receiver's own template
+            // actually has a `type_param2`.
+            var real_argm = arg;
+            var arg2m = "";
+            if has_tp2m {
+                real_argm = mono_arg1_of2(owner);
+                arg2m = mono_arg2_of2(owner);
+            }
             var new_params = empty_param_vec3();
             var new_param_tys = empty_ty_vec();
             var pi = 0;
             while pi < gm.params.length() {
                 let p = gm.params.get(pi);
-                let pty = substitute_field_type(p.type_name, found_tp, arg);
+                var pty = substitute_field_type(p.type_name, found_tp, real_argm);
+                if has_tp2m {
+                    pty = substitute_field_type(pty, tp2m, arg2m);
+                }
                 new_params.push(Param { name: p.name, type_name: pty, is_ref: p.is_ref, is_mut_ref: p.is_mut_ref });
                 new_param_tys.push(ty_from_name(pty));
                 pi = pi + 1;
             }
             let ret_ty_str = opt_string_or2(gm.ret_type, "Int");
-            let new_ret = substitute_field_type(ret_ty_str, found_tp, arg);
+            var new_ret = substitute_field_type(ret_ty_str, found_tp, real_argm);
+            if has_tp2m {
+                new_ret = substitute_field_type(new_ret, tp2m, arg2m);
+            }
             self.methods.register(key, FnSig { param_types: new_param_tys, ret_type: ty_from_name(new_ret) });
             self.method_mono_needed.push(key);
-            let substituted_body = subst_stmt_list(gm.body, found_tp, arg);
-            var mono_decl = FnDecl { name: method, params: new_params, ret_type: some_string3(new_ret), body: substituted_body, type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: gm.self_is_mut };
+            var substituted_body = subst_stmt_list(gm.body, found_tp, real_argm);
+            if has_tp2m {
+                substituted_body = subst_stmt_list(substituted_body, tp2m, arg2m);
+            }
+            var mono_decl = FnDecl { name: method, params: new_params, ret_type: some_string3(new_ret), body: substituted_body, type_param: none_string3(), type_bounds: empty_str_vec2(), self_is_mut: gm.self_is_mut, type_param2: none_string3(), type_bounds2: empty_str_vec2() };
             let saved_vars = self.vars;
             let saved_scopes = self.var_scopes;
             let saved_moved = self.moved;
