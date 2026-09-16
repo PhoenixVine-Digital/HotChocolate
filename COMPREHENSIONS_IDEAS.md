@@ -1,5 +1,26 @@
 # List comprehensions — design doc
 
+**Status, 2026-09-16**: landed, exactly as this doc's own architecture section sketched, and it
+compiled cleanly + ran correctly on the FIRST real attempt (a genuine rarity for a feature this
+size this session) -- the design-doc-first discipline paid for itself directly here. A real,
+previously-unnoticed architectural wall surfaced mid-implementation and got resolved before any
+code was written, not discovered the hard way after: this compiler has no side-effect-free way to
+learn an arbitrary expression's type (`gen_expr` always emits bytecode AND returns the type
+together, no "just tell me" twin exists for a general expression), so the doc's own original plan
+("build the empty result `Vec` before the loop starts") had nothing to infer `result_expr`'s type
+FROM until a real element actually matched -- fatal for the zero-match case specifically, which is
+exactly the case this whole feature needed to get right. Resolved by requiring an EXPLICIT declared
+result type (`let squares: Vec<Int> = [x * x for x in numbers];` — the annotation is REQUIRED, not
+optional, a real, disclosed v1 scope narrowing from "anywhere an `Expr` is legal" to "only as a
+`let`/`var` initializer with a declared array type"), trusted directly the same way `Stmt::Let.
+declared_type` already is for a `dyn` annotation elsewhere. Verified end to end with a real program
+covering every real case at once: no filter, with filter, a function-call result expression AND a
+function-call filter (the proposal's own two motivating examples), a genuine ZERO-MATCH result
+(the case that needed the whole redesign, now a correct empty `Vec<Int>`, not a crash), and a
+`Vec<T>` (not just a raw array) as the comprehension source -- every value matched hand-computed
+expectations exactly. See `examples/comprehensions.hotc`. Full existing example regression suite:
+zero new failures, same 8 known pre-existing ones. Self-hosting verified to a true fixed point.
+
 Spun out of a direct proposal (a real, concrete syntax sketch: `[expensive(x) for x in values if
 x.isValid()]`) the same way `ECS_IDEAS.md`/`COLLECTIONS_IDEAS.md` were spun out once each became a
 real, actively-worked feature — this doc is where the design gets worked through before any
@@ -159,9 +180,10 @@ answer key.
    verbatim — e.g. `"comprehension source 'for x in ...' needs an array or Vec<T>, got " + name`,
    distinct enough from `check_for`'s own "'for x in ...' needs a range (a..b) or an array, got
    ..." that a caller reading either error immediately knows which construct is complaining.
-4. **Empty-source handling: build it per the general-case sketch (no special-casing), then
-   empirically verify with a real test** rather than assume it "just works" — the codegen sketch's
-   own step 1 (always build a real empty `Vec` up front, regardless of how many loop iterations
-   actually run) should already produce the right answer for a zero-iteration loop, but this gets
-   confirmed with an actual run, not just reasoned about, matching this whole project's own
-   "verify against a real published jar, not just the design" discipline.
+4. **Empty-source handling: turned out to need a real design change, not just verification** — see
+   this doc's own top "Status" note for the full story. Building the empty `Vec` per the original
+   sketch's own step 1 ran into a genuine wall (no way to know `result_expr`'s type before ANY
+   element has been evaluated), resolved by requiring an explicit declared result type rather than
+   inferring one. Once that landed, the zero-match case verified correctly on the first real test
+   run — exactly the confirmation this item originally asked for, just via a different path than
+   assumed when it was written.

@@ -1,0 +1,61 @@
+// List comprehensions -- `[result_expr for var_name in iter_expr if cond]`, see
+// `COMPREHENSIONS_IDEAS.md` for the full design. Compiles to one real loop, no intermediate
+// collection. Real, disclosed v1 scope: only valid as a `let`/`var` initializer with an EXPLICIT
+// declared `Vec<T>` type (`let squares: Vec<Int> = [...]` -- required, not optional, since this
+// compiler has no way to learn `result_expr`'s own type without a declared one to trust). Both
+// raw arrays and `Vec<T>` work as the source (`doubled` below iterates a real `Vec<Int>`, not a
+// raw array) -- and a zero-match comprehension (`none` below) correctly produces a real, empty
+// `Vec<Int>`, the exact case that needed `COLLECTIONS_IDEAS.md`'s own real empty-`[]`-literal
+// fix to be buildable at all.
+use vec;
+
+fn is_valid(x: Int) -> Bool {
+    return x > 2;
+}
+
+fn expensive(x: Int) -> Int {
+    return x * 100;
+}
+
+fn main() {
+    let numbers = [1, 2, 3, 4, 5];
+
+    // No filter.
+    let squares: Vec<Int> = [x * x for x in numbers];
+    print(squares.length());
+    print(squares.get(0));
+    print(squares.get(1));
+    print(squares.get(2));
+    print(squares.get(3));
+    print(squares.get(4));
+
+    // With filter.
+    let evens: Vec<Int> = [x for x in numbers if x % 2 == 0];
+    print(evens.length());
+    print(evens.get(0));
+    print(evens.get(1));
+
+    // Function-call result expr + function-call filter -- the two real motivating examples.
+    let results: Vec<Int> = [expensive(x) for x in numbers if is_valid(x)];
+    print(results.length());
+    print(results.get(0));
+    print(results.get(1));
+    print(results.get(2));
+
+    // Zero matches -- the real, previously-unbuildable empty case.
+    let none: Vec<Int> = [x for x in numbers if x > 1000];
+    print(none.length());
+
+    // Vec<T> as the comprehension source (not just a raw array).
+    var src: Vec<Int> = Vec<Int> { data: [], len: 0 };
+    src.push(10);
+    src.push(20);
+    src.push(30);
+    let doubled: Vec<Int> = [v * 2 for v in src];
+    print(doubled.length());
+    print(doubled.get(0));
+    print(doubled.get(1));
+    print(doubled.get(2));
+
+    print("done");
+}

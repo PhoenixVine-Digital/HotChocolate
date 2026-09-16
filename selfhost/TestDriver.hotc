@@ -54,6 +54,14 @@ fn dump_expr(e: Expr) -> String {
         SafeCall { recv, method, args } => { return dump_expr(recv) + "?." + method + "(" + dump_args(args) + ")"; }
         SafeFieldAccess { recv, field } => { return dump_expr(recv) + "?." + field; }
         Elvis { left, right } => { return dump_expr(left) + " ?: " + dump_expr(right); }
+        Comprehension { result_expr, var_name, iter_expr, cond } => {
+            var cond_str = "";
+            match cond {
+                Some { value: c } => { cond_str = " if " + dump_expr(c); }
+                None => {}
+            }
+            return "[" + dump_expr(result_expr) + " for " + var_name + " in " + dump_expr(iter_expr) + cond_str + "]";
+        }
     }
 }
 

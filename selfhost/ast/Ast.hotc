@@ -54,8 +54,13 @@ pub enum Expr {
     // concrete instantiation is meant once a generic enum is used at more than one type argument
     // in the same program).
     StructLit { name: String, field_names: Vec<String>, field_values: Vec<Expr>, generic_base: Option<String> },
-    // `[e1, e2, ...]` -- non-empty only (element type is inferred from the first element; an
-    // empty array literal would have nothing to infer from and isn't supported this phase).
+    // `[e1, e2, ...]` -- usually non-empty (element type is inferred from the first element), but
+    // a genuine `[]` (zero elements) is now real syntax too -- only resolves where the surrounding
+    // context already names a concrete array type directly (a struct-literal field whose declared
+    // type is an array; see `Checker.hotc`'s own `check_struct_lit` and `Codegen.hotc`'s own
+    // struct-construction field loop), since there's nothing to infer an element type FROM
+    // otherwise. See `Parser.hotc`'s own `array_lit` header for the real motivation
+    // (`COLLECTIONS_IDEAS.md`'s own note on a genuinely empty `Vec<T>`).
     ArrayLit { elements: Vec<Expr> },
     // `[value; count]` -- a fixed-size array with every slot initialized to (a freshly re-
     // evaluated copy of) the same `value` expression, `count` an `Int` expression. A distinct AST
@@ -66,6 +71,22 @@ pub enum Expr {
     // The prelude's own `Vec<T>`'s `push`/`vec_of` (`[value; newCap]`, `[first; 4]`) are exactly
     // why this exists -- real self-hosting needs it, not a hypothetical feature.
     ArrayRepeat { value: Expr, count: Expr },
+    // `[result_expr for var_name in iter_expr if cond]` -- see `COMPREHENSIONS_IDEAS.md` for the
+    // full design. A genuinely NEW expression shape, not sugar lowered to other `Expr`/`Stmt`
+    // nodes at parse time -- this language has no block-expression/IIFE mechanism to embed a real
+    // loop inside an arbitrary expression position, so `Codegen.hotc`'s own `gen_comprehension`
+    // builds the result `Vec` and its loop directly, entirely within this one expression's own
+    // codegen (the same "emit a real bytecode sequence that leaves one value on the stack" shape
+    // `gen_string_interp` already uses for a `StringBuilder` chain). `cond` is `None` for the
+    // no-filter form (`[x * x for x in numbers]`). Real, disclosed v1 scope cut: only valid as a
+    // `let`/`var` initializer with an explicit declared array type (`let r: Vec<Int> = [...];`) --
+    // `Checker.hotc`'s own `check_stmt` is the only caller of `check_comprehension` that ever
+    // succeeds; reached any other way (a bare expression statement, a call argument, ...), it's a
+    // real, named error, not silently accepted. This exists because the compiler has no way to
+    // learn `result_expr`'s own type without actually generating its bytecode (no side-effect-free
+    // "just tell me the type" pass for an arbitrary expression) -- the declared type is trusted
+    // directly instead, the same way `Stmt::Let.declared_type` already is for a `dyn` annotation.
+    Comprehension { result_expr: Expr, var_name: String, iter_expr: Expr, cond: Option<Expr> },
     // `arena Name[count]` -- allocates a real, contiguous, off-heap buffer of `count` `Name`
     // arena-structs (see `StructDecl`'s own `is_arena` header). Checked type is the plain string
     // `"arena Name"` (same "just a type-name string" convention `"dyn Name"` already uses for

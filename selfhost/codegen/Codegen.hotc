@@ -1736,6 +1736,22 @@ impl CodeGen {
             SafeCall { recv, method, args } => { self.collect_lambda_captures(recv, exclude, out); self.collect_lambda_captures_list(args, exclude, out); }
             SafeFieldAccess { recv, field } => { self.collect_lambda_captures(recv, exclude, out); }
             Elvis { left, right } => { self.collect_lambda_captures(left, exclude, out); self.collect_lambda_captures(right, exclude, out); }
+            // `var_name` is a locally-bound loop variable, same shape `Lambda`'s own `params`
+            // handling right above already gives -- excluded from `result_expr`/`cond`'s own
+            // traversal (never a real capture candidate), but NOT from `iter_expr`'s (evaluated
+            // in the OUTER scope, before `var_name` is bound at all).
+            Comprehension { result_expr, var_name, iter_expr, cond } => {
+                self.collect_lambda_captures(iter_expr, exclude, out);
+                var nested_exclude2 = empty_str_vec4();
+                var nei2 = 0;
+                while nei2 < exclude.length() { nested_exclude2.push(exclude.get(nei2)); nei2 = nei2 + 1; }
+                nested_exclude2.push(var_name);
+                self.collect_lambda_captures(result_expr, &nested_exclude2, out);
+                match cond {
+                    Some { value: c } => { self.collect_lambda_captures(c, &nested_exclude2, out); }
+                    None => {}
+                }
+            }
         }
     }
 
@@ -3170,6 +3186,15 @@ impl CodeGen {
             SafeCall { recv, method, args } => { return self.gen_safe_call(recv, method, args); }
             SafeFieldAccess { recv, field } => { return self.gen_safe_field_access(recv, field); }
             Elvis { left, right } => { return self.gen_elvis(left, right); }
+            // Never actually reached: `gen_stmt`'s own `Let` handling intercepts a `Comprehension`
+            // init BEFORE it ever reaches this generic dispatch, calling `gen_comprehension`
+            // directly with the declared type it needs. Anywhere else, `Checker.hotc`'s own
+            // generic `Comprehension` dispatch already emitted a real error, and a real error
+            // means this codegen pass never runs at all (`compile_program` checks `has_real_errors`
+            // first) -- this arm exists only so the match stays exhaustive.
+            Comprehension { result_expr, var_name, iter_expr, cond } => {
+                throw CodegenError::new("codegen: comprehension reached outside its own special-cased 'let x: Vec<T> = [...]' path -- Checker.hotc should have already rejected this");
+            }
         }
     }
 
@@ -3702,22 +3727,170 @@ impl CodeGen {
         }
     }
 
+    // `[result_expr for var_name in iter_expr if cond]` -- see `Ast.hc`'s own `Comprehension`
+    // header and `COMPREHENSIONS_IDEAS.md` for the full design. `declared_type` is a real,
+    // already-`ensure_instantiated`d mono struct name (`"Vec$Int"`), trusted directly -- see
+    // `gen_stmt`'s own `Let` handling, the only real caller. Builds the whole thing as ONE
+    // sequence of bytecode within this one expression's own codegen (no synthesized `FnDecl`, no
+    // second compile pass) -- same "emit real instructions that leave one value on the stack"
+    // shape `gen_string_interp` already uses for a `StringBuilder` chain.
+    fn gen_comprehension(&mut self, result_expr: Expr, var_name: String, iter_expr: Expr, cond: Option<Expr>, declared_type: String) -> String {
+        let elem_result_ty = mono_arg_cg(declared_type);
+        // 1. The EMPTY result `Vec$<ResultType>` -- built as a REAL, synthesized `Vec$<T> { data:
+        // [], len: 0 }` struct literal and handed to the ALREADY-PROVEN struct-literal codegen
+        // (including its own empty-`[]`-field special case, `Codegen.hotc`'s own struct-
+        // construction field loop) rather than hand-rolling the same `NEW`/`DUP`/`<init>` sequence
+        // a second time here -- same "materialize real AST, reuse existing codegen" pattern this
+        // whole compiler already uses for ECS synthesis.
+        var empty_fnames = vec_of("data");
+        empty_fnames.push("len");
+        var empty_fvals = vec_of(ArrayLit { elements: empty_expr_vec_cg() });
+        empty_fvals.push(IntLit { value: 0 });
+        let empty_lit = StructLit { name: declared_type, field_names: empty_fnames, field_values: empty_fvals, generic_base: none_string2() };
+        let result_ty = self.gen_expr(empty_lit);
+        let result_slot = self.next_slot;
+        self.next_slot = self.next_slot + 1;
+        self.mv.visitVarInsn(58, result_slot); // ASTORE
+
+        // 2. Real loop over `iter_expr` -- one of two shapes depending on its own checked source
+        // type (both raw arrays and `Vec<T>` are accepted, see `COMPREHENSIONS_IDEAS.md`'s own
+        // "Resolved decisions" #1), sharing everything except the innermost "get the current
+        // element" step. Mirrors `gen_stmt`'s own `For` bytecode shape closely (see that arm's own
+        // header) rather than inventing a second array-iteration pattern.
+        self.push_var_scope();
+        let src_ty = self.gen_expr(iter_expr);
+        let src_slot = self.next_slot;
+        self.next_slot = self.next_slot + 1;
+        self.mv.visitVarInsn(58, src_slot); // ASTORE
+        let idx_slot = self.next_slot;
+        self.next_slot = self.next_slot + 1;
+        self.mv.visitInsn(3); // ICONST_0
+        self.mv.visitVarInsn(54, idx_slot); // ISTORE
+
+        var is_vec_source = false;
+        var elem_ty = "";
+        if is_array_type_name_cg(src_ty) {
+            elem_ty = array_elem_type_name_cg(src_ty);
+        } else {
+            is_vec_source = true;
+            elem_ty = mono_arg_cg(src_ty);
+        }
+
+        let len_slot = self.next_slot;
+        self.next_slot = self.next_slot + 1;
+        self.mv.visitVarInsn(25, src_slot); // ALOAD
+        if is_vec_source {
+            self.mv.visitMethodInsn(182, self.qualify(src_ty), "length", "()I", false); // INVOKEVIRTUAL
+        } else {
+            self.mv.visitInsn(190); // ARRAYLENGTH
+        }
+        self.mv.visitVarInsn(54, len_slot); // ISTORE
+
+        let var_slot = self.alloc_slot(var_name, elem_ty);
+        self.var_types.register(var_name, elem_ty);
+
+        var loop_start = Label::new();
+        var loop_end = Label::new();
+        self.mv.visitLabel(&loop_start);
+        self.mv.visitVarInsn(21, idx_slot); // ILOAD
+        self.mv.visitVarInsn(21, len_slot); // ILOAD
+        self.mv.visitJumpInsn(162, &loop_end); // IF_ICMPGE
+
+        if is_vec_source {
+            self.mv.visitVarInsn(25, src_slot); // ALOAD
+            self.mv.visitVarInsn(21, idx_slot); // ILOAD
+            let get_desc = "(I)" + self.resolve_descriptor(elem_ty);
+            self.mv.visitMethodInsn(182, self.qualify(src_ty), "get", get_desc, false); // INVOKEVIRTUAL
+            self.mv.visitVarInsn(store_opcode(elem_ty), var_slot);
+        } else {
+            self.mv.visitVarInsn(25, src_slot); // ALOAD
+            self.mv.visitVarInsn(21, idx_slot); // ILOAD
+            self.mv.visitInsn(array_load_opcode_cg(elem_ty));
+            self.mv.visitVarInsn(store_opcode(elem_ty), var_slot);
+        }
+
+        // 3. Optional filter -- skip straight to the increment step (no push) when false.
+        var skip_label = Label::new();
+        match cond {
+            Some { value: c } => {
+                self.gen_expr(c);
+                self.mv.visitJumpInsn(153, &skip_label); // IFEQ (cond == 0/false) -> skip
+            }
+            None => {}
+        }
+
+        // 4. Matching element: `result_vec.push(result_expr)` -- INVOKEVIRTUAL needs [objectref,
+        // value] on the stack in that order, so the receiver loads FIRST.
+        self.mv.visitVarInsn(25, result_slot); // ALOAD result vec
+        self.gen_expr(result_expr);
+        let push_desc = "(" + self.resolve_descriptor(elem_result_ty) + ")V";
+        self.mv.visitMethodInsn(182, self.qualify(declared_type), "push", push_desc, false); // INVOKEVIRTUAL
+
+        self.mv.visitLabel(&skip_label);
+        self.mv.visitVarInsn(21, idx_slot); // ILOAD
+        self.mv.visitIntInsn(17, 1); // SIPUSH 1
+        self.mv.visitInsn(96); // IADD
+        self.mv.visitVarInsn(54, idx_slot); // ISTORE
+        self.mv.visitJumpInsn(167, &loop_start); // GOTO
+        self.mv.visitLabel(&loop_end);
+        self.pop_var_scope();
+
+        // 5. The comprehension's own overall value: the now-fully-populated result Vec.
+        self.mv.visitVarInsn(25, result_slot); // ALOAD
+        return result_ty;
+    }
+
     fn gen_stmt(&mut self, s: Stmt) {
         match s {
             Let { name, mutable, init, declared_type, line } => {
                 self.mark_line(line);
-                var ty = self.gen_expr(init);
-                // See `Ast.hc`'s own `Stmt::Let.declared_type` header: a `dyn` annotation here is
-                // unconditionally trusted (no re-verifying it against a `struct_interfaces`
-                // registry this file doesn't have) -- `Checker.hotc`'s own `check_stmt` already
-                // either applied the exact same override or emitted a real error for it, and a
-                // real error means this codegen pass never runs at all (`compile_program` checks
-                // first, aborts before any codegen on `has_real_errors`). A JVM store instruction
-                // doesn't care about the exact static type either way -- `ty`/`dt` are both
-                // ordinary object-reference types, same `ASTORE`/1-slot storage regardless.
-                if let Some { value: dt } = declared_type {
-                    if is_dyn_type_name_cg(dt) {
-                        ty = dt;
+                // Consumed exactly ONCE, right here, into plain `Copy`-safe locals (`dt_str`/
+                // `has_dt`) -- both this arm's own NEW comprehension special-case below and the
+                // EXISTING `dyn`-override check right after it need `declared_type`, and matching/
+                // destructuring an `Option<String>` twice would trip the same "use of moved value"
+                // trap this file's own header repeatedly documents elsewhere.
+                var dt_str = "";
+                var has_dt = false;
+                if let Some { value: dt0 } = declared_type { dt_str = dt0; has_dt = true; }
+                // A comprehension (`let result: Vec<Int> = [x * x for x in numbers];`) needs its
+                // own dedicated codegen (`gen_comprehension`, right below) -- NOT the generic
+                // `gen_expr` dispatch every other `init` shape goes through, since a comprehension
+                // genuinely can't be compiled without ALREADY knowing its own declared result type
+                // (see `COMPREHENSIONS_IDEAS.md`'s own header on why: this compiler has no way to
+                // learn an arbitrary expression's type without actually generating its bytecode,
+                // so the empty result `Vec` this needs to build BEFORE the loop even starts has
+                // nothing to infer its own element type FROM unless the caller declared one).
+                // `Checker.hotc`'s own `check_stmt` already requires exactly this same annotation
+                // for a `Comprehension` init (a real error otherwise, blocking codegen from ever
+                // running at all) -- trusted here unconditionally, same "checker already verified
+                // it" discipline every other codegen pass in this file already has.
+                // `self.gen_expr(init)` (the fallback, non-comprehension path) is called FROM
+                // INSIDE the wildcard arm itself, not after this whole match -- calling it
+                // afterward would need `init` again post-match, and the move-checker's own
+                // conservative branch handling treats a value as "possibly moved" after ANY match
+                // arm moves it, regardless of which arm actually ran (the same trap this file's
+                // own header documents elsewhere, e.g. `register_enum`).
+                var ty = "?";
+                match init {
+                    Comprehension { result_expr, var_name, iter_expr, cond } => {
+                        if !has_dt {
+                            throw CodegenError::new("comprehension needs a declared result type (Checker.hotc should have already caught this)");
+                        }
+                        ty = self.gen_comprehension(result_expr, var_name, iter_expr, cond, dt_str);
+                    }
+                    _ => {
+                        ty = self.gen_expr(init);
+                        // See `Ast.hc`'s own `Stmt::Let.declared_type` header: a `dyn` annotation
+                        // here is unconditionally trusted (no re-verifying it against a `struct_
+                        // interfaces` registry this file doesn't have) -- `Checker.hotc`'s own
+                        // `check_stmt` already either applied the exact same override or emitted a
+                        // real error for it, and a real error means this codegen pass never runs
+                        // at all. A JVM store instruction doesn't care about the exact static type
+                        // either way -- `ty`/`dt_str` are both ordinary object-reference types,
+                        // same `ASTORE`/1-slot storage regardless.
+                        if has_dt && is_dyn_type_name_cg(dt_str) {
+                            ty = dt_str;
+                        }
                     }
                 }
                 let slot = self.alloc_slot(name, ty);
@@ -6348,6 +6521,11 @@ fn subst_expr_cg(e: &Expr, type_param: String, arg: String) -> Expr {
         SafeCall { recv, method, args } => { return SafeCall { recv: subst_expr_cg(recv, type_param, arg), method: method, args: subst_expr_list_cg(args, type_param, arg) }; }
         SafeFieldAccess { recv, field } => { return SafeFieldAccess { recv: subst_expr_cg(recv, type_param, arg), field: field }; }
         Elvis { left, right } => { return Elvis { left: subst_expr_cg(left, type_param, arg), right: subst_expr_cg(right, type_param, arg) }; }
+        Comprehension { result_expr, var_name, iter_expr, cond } => {
+            var new_cond2 = none_expr_cg();
+            if let Some { value: c } = cond { new_cond2 = some_expr_cg(subst_expr_cg(c, type_param, arg)); }
+            return Comprehension { result_expr: subst_expr_cg(result_expr, type_param, arg), var_name: var_name, iter_expr: subst_expr_cg(iter_expr, type_param, arg), cond: new_cond2 };
+        }
     }
 }
 

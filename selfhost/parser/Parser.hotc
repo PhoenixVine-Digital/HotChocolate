@@ -723,18 +723,30 @@ impl Parser {
             return ArrayLit { elements: empty_expr_vec() };
         }
         let first = self.expression();
-        // `[value; count]` -- distinguished from `[e1, e2, ...]` by whether a `;` or a `,`/`]`
-        // follows the first expression (see `Ast.hc`'s own `ArrayRepeat` header). An early
-        // `return` inside the `if` here (rather than this exhaustive `if`/`else`) would trip the
-        // move-checker's conservative branch handling -- it doesn't reason about reachability past
-        // a `return`, so code after the `if` using `first` again would see it as still-possibly-
-        // moved even though the two paths are genuinely exclusive (the same trap hit and fixed in
+        // `[value; count]` vs `[e1, e2, ...]` vs `[result_expr for var_name in iter_expr if cond]`
+        // -- distinguished by whether a `;`, a `for`, or a `,`/`]` follows the first expression
+        // (see `Ast.hc`'s own `ArrayRepeat`/`Comprehension` headers). An early `return` inside any
+        // branch here (rather than this exhaustive `if`/`else if`/`else`) would trip the move-
+        // checker's conservative branch handling -- it doesn't reason about reachability past a
+        // `return`, so code after using `first` again would see it as still-possibly-moved even
+        // though the three paths are genuinely exclusive (the same trap hit and fixed in
         // `Checker.hotc`'s own `register_enum`).
         if self.check(SEMI) {
             self.advance();
             let count = self.expression();
             self.expect(RBRACKET);
             return ArrayRepeat { value: first, count: count };
+        } else if self.check(FOR) {
+            self.advance();
+            let var_name = self.expect(IDENT).text;
+            self.expect(IN);
+            let iter_expr = self.expression();
+            var cond = none_expr();
+            if self.match_kind(IF) {
+                cond = some_expr(self.expression());
+            }
+            self.expect(RBRACKET);
+            return Comprehension { result_expr: first, var_name: var_name, iter_expr: iter_expr, cond: cond };
         } else {
             var elements = vec_of(first);
             while self.match_kind(COMMA) {

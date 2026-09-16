@@ -978,6 +978,11 @@ fn subst_expr(e: &Expr, type_param: String, arg: String) -> Expr {
         SafeCall { recv, method, args } => { return SafeCall { recv: subst_expr(recv, type_param, arg), method: method, args: subst_expr_list(args, type_param, arg) }; }
         SafeFieldAccess { recv, field } => { return SafeFieldAccess { recv: subst_expr(recv, type_param, arg), field: field }; }
         Elvis { left, right } => { return Elvis { left: subst_expr(left, type_param, arg), right: subst_expr(right, type_param, arg) }; }
+        Comprehension { result_expr, var_name, iter_expr, cond } => {
+            var new_cond = none_expr3();
+            if let Some { value: c } = cond { new_cond = some_expr3(subst_expr(c, type_param, arg)); }
+            return Comprehension { result_expr: subst_expr(result_expr, type_param, arg), var_name: var_name, iter_expr: subst_expr(iter_expr, type_param, arg), cond: new_cond };
+        }
     }
 }
 
@@ -1142,6 +1147,15 @@ impl TyChecker {
             SafeCall { recv, method, args } => { return self.check_safe_call(recv, method, args); }
             SafeFieldAccess { recv, field } => { return self.check_safe_field_access(recv, field); }
             Elvis { left, right } => { return self.check_elvis(left, right); }
+            // Reached only OUTSIDE the special-cased `let x: Vec<T> = [...]` position (`check_stmt`'s
+            // own `Let` handling intercepts a `Comprehension` init BEFORE it ever reaches this
+            // generic dispatch, calling `check_comprehension` directly with a real expected type) --
+            // see `Ast.hc`'s own `Comprehension` header for why a comprehension genuinely can't be
+            // checked/compiled without one.
+            Comprehension { result_expr, var_name, iter_expr, cond } => {
+                self.error("list comprehensions need a declared result type this pass -- use 'let x: Vec<T> = [...]' instead of a bare expression");
+                return TyUnknown;
+            }
         }
     }
 
@@ -1396,6 +1410,56 @@ impl TyChecker {
             self.error("array repeat count must be Int, got " + cn);
         }
         return TyStruct { name: "[" + vn + "]" };
+    }
+
+    // `let result: Vec<Int> = [x * x for x in numbers if x > 0];` -- see `Ast.hc`'s own
+    // `Comprehension` header for why `expected_type` (the surrounding `let`'s own declared type,
+    // ALWAYS required -- `check_stmt`'s own `Let` handling is the only caller, and refuses to call
+    // this at all without one) exists at all: there's no way to check/compile `result_expr` without
+    // already knowing what it's expected to produce. Mirrors `check_for`'s own shape for the
+    // iteration half (`push_scope`/`pop_scope` around `var_name`'s own per-iteration binding).
+    fn check_comprehension(&mut self, result_expr: Expr, var_name: String, iter_expr: Expr, cond: Option<Expr>, expected_type: String) -> Ty {
+        self.push_scope();
+        let it = self.check_expr(&iter_expr);
+        let in_ = ty_name(it);
+        var elem_ty_name = "?";
+        if in_ != "?" {
+            if is_array_type_name(in_) {
+                elem_ty_name = array_elem_type_name(in_);
+            } else if is_mono_name(in_) && mono_base(in_) == "Vec" {
+                elem_ty_name = mono_arg(in_);
+            } else {
+                self.error("comprehension source 'for " + var_name + " in ...' needs an array or Vec<T>, got " + in_);
+            }
+        }
+        self.vars.register(var_name, ty_from_name(elem_ty_name));
+        match cond {
+            Some { value: c } => {
+                let ct = self.check_expr(&c);
+                let cn = ty_name(ct);
+                if cn != "Bool" && cn != "?" {
+                    self.error("comprehension filter ('if ...') must be Bool, got " + cn);
+                }
+            }
+            None => {}
+        }
+        let rt = self.check_expr(&result_expr);
+        let rn = ty_name(rt);
+        self.pop_scope();
+        var valid_expected = false;
+        if is_mono_name(expected_type) {
+            if mono_base(expected_type) == "Vec" { valid_expected = true; }
+        }
+        if !valid_expected {
+            self.error("comprehension result type must be declared as Vec<T>, got " + expected_type);
+            return TyUnknown;
+        }
+        let expected_elem = mono_arg(expected_type);
+        if rn != "?" && expected_elem != "?" && rn != expected_elem {
+            self.error("comprehension result expects " + expected_elem + ", got " + rn);
+        }
+        self.ensure_instantiated(expected_type);
+        return TyStruct { name: expected_type };
     }
 
     fn check_index(&mut self, arr: &Expr, index: &Expr) -> Ty {
@@ -4252,45 +4316,74 @@ impl TyChecker {
             // WIDER declared one -- everything else (no annotation, or one that doesn't apply)
             // keeps the plain inferred type, unchanged from before this feature.
             Let { name, mutable, init, declared_type, line } => {
-                let t = self.check_expr(&init);
-                // `t` is consumed exactly once, right here (`ty_name` takes it by value) -- the
-                // rest of this arm rebuilds whichever `Ty` it ultimately registers FRESH from the
-                // resulting `gn` string (`ty_name`/`ty_from_name` already round-trip losslessly for
-                // every type this checker has), rather than ever reading `t` itself again, so there
-                // is no later "use of moved value" regardless of which conditional branch below
-                // actually runs.
-                let gn = ty_name(t);
-                // Move-check: `let x = y;` moves `y` (a bare, non-Copy local) into `x` -- see this
-                // file's own move-checking header (`TyChecker.moved`).
-                self.move_check_consumed(&init, gn);
-                var final_ty = ty_from_name(gn);
-                if let Some { value: dt } = declared_type {
-                    if is_dyn_type_name_chk(dt) {
-                        if gn != "?" && self.is_arg_type_mismatch(dt, gn) {
-                            self.error("cannot assign " + gn + " to '" + name + "' of declared type " + dt);
-                        } else {
-                            // Always overridden once a `dyn` annotation is present and passes (or
-                            // is simply untyped, "?", trusted the same honest way every other
-                            // unknown-typed value already is elsewhere in this file) -- never left
-                            // silently un-applied, so `Codegen.hotc`'s own `Let` codegen (which has
-                            // no `struct_interfaces` registry of its own to re-verify this against)
-                            // can unconditionally trust "declared_type present and dyn" without
-                            // ever risking a checker/codegen type disagreement -- see that fn's own
-                            // header.
-                            final_ty = ty_from_name(dt);
+                // Consumed exactly ONCE, right here, into plain `Copy`-safe locals -- both the NEW
+                // comprehension special-case below and the EXISTING `dyn`-override check need
+                // `declared_type`, and destructuring an `Option<String>` twice trips the same
+                // "use of moved value" trap this file's own header repeatedly documents elsewhere.
+                var dt_str = "";
+                var has_dt = false;
+                if let Some { value: dt00 } = declared_type { dt_str = dt00; has_dt = true; }
+                // A comprehension init is checked entirely differently (`check_comprehension`, NOT
+                // the generic `check_expr` dispatch every other `init` shape goes through) --
+                // see `Ast.hc`'s own `Comprehension` header for why it genuinely needs
+                // `declared_type` to exist at all. `self.check_expr(&init)` (the fallback path) is
+                // called FROM INSIDE the wildcard arm itself, not after this whole match -- the
+                // move-checker's own conservative branch handling treats `init` as "possibly
+                // moved" after ANY match arm moves it, regardless of which arm actually ran.
+                var gn = "?";
+                match init {
+                    Comprehension { result_expr, var_name, iter_expr, cond } => {
+                        if !has_dt {
+                            self.error("comprehension needs a declared result type, e.g. 'let " + name + ": Vec<T> = [...]'");
                         }
+                        let ct = self.check_comprehension(result_expr, var_name, iter_expr, cond, dt_str);
+                        gn = ty_name(ct);
+                        self.vars.register(name, ty_from_name(gn));
+                        self.unmark_moved(name);
+                        self.mark_mut_capable(name, mutable);
+                    }
+                    _ => {
+                        let t = self.check_expr(&init);
+                        // `t` is consumed exactly once, right here (`ty_name` takes it by value) --
+                        // the rest of this arm rebuilds whichever `Ty` it ultimately registers
+                        // FRESH from the resulting `gn` string (`ty_name`/`ty_from_name` already
+                        // round-trip losslessly for every type this checker has), rather than ever
+                        // reading `t` itself again, so there is no later "use of moved value"
+                        // regardless of which conditional branch below actually runs.
+                        gn = ty_name(t);
+                        // Move-check: `let x = y;` moves `y` (a bare, non-Copy local) into `x` --
+                        // see this file's own move-checking header (`TyChecker.moved`).
+                        self.move_check_consumed(&init, gn);
+                        var final_ty = ty_from_name(gn);
+                        if has_dt && is_dyn_type_name_chk(dt_str) {
+                            if gn != "?" && self.is_arg_type_mismatch(dt_str, gn) {
+                                self.error("cannot assign " + gn + " to '" + name + "' of declared type " + dt_str);
+                            } else {
+                                // Always overridden once a `dyn` annotation is present and passes
+                                // (or is simply untyped, "?", trusted the same honest way every
+                                // other unknown-typed value already is elsewhere in this file) --
+                                // never left silently un-applied, so `Codegen.hotc`'s own `Let`
+                                // codegen (which has no `struct_interfaces` registry of its own to
+                                // re-verify this against) can unconditionally trust "declared_type
+                                // present and dyn" without ever risking a checker/codegen type
+                                // disagreement -- see that fn's own header.
+                                final_ty = ty_from_name(dt_str);
+                            }
+                        }
+                        self.vars.register(name, final_ty);
+                        self.unmark_moved(name);
+                        self.mark_mut_capable(name, mutable);
                     }
                 }
-                self.vars.register(name, final_ty);
                 // `name` is a fresh binding (even when it shadows an existing local of the same
                 // name in the SAME scope frame -- `register` overwrites in place, see `Registry`'s
                 // own "last write wins" header) -- any stale moved-flag left over from whatever it
                 // shadows must not leak onto it, same reasoning `check_assign`'s own header gives.
-                self.unmark_moved(name);
                 // Phase 3 borrow checking: only a `var` local's own fields can be assigned into,
                 // or the local itself re-borrowed `&mut` -- see `TyChecker.mut_capable`'s own
-                // header.
-                self.mark_mut_capable(name, mutable);
+                // header. Both already applied inside each match arm above (`unmark_moved`/
+                // `mark_mut_capable`), once per arm rather than once here, since each arm's own
+                // `name` registration happens at a different point in the match.
             }
             ExprStmt { expr, line } => {
                 // `@must_use` -- a bare `Call` to a must-use fn with nothing consuming its return
