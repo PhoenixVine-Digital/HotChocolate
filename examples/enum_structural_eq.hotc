@@ -1,0 +1,67 @@
+// Real structural equality for enums with fields -- `Some { value: 5 } == Some { value: 5 }` used
+// to return `true` regardless of whether `value` actually matched (only the shared `tag` was ever
+// compared). Now compares the ACTUAL variant's own fields once tags match, recursively by each
+// field's own type's equality rule (Int/Bool compare directly, String via .equals(), a NESTED
+// enum recurses right back into this same fix). See IDEAS.md's own entry for the full story.
+
+enum Shape {
+    Circle { radius: Int },
+    Rect { w: Int, h: Int },
+    Point,
+}
+
+enum Wrapped {
+    Has { inner: Shape },
+    Empty,
+}
+
+fn main() {
+    // Same variant, same field values -- must be equal now (was already correct before, tag-only
+    // comparison also gets this right; confirms no regression on the "actually equal" case).
+    let a: Option<Int> = Some { value: 5 };
+    let b: Option<Int> = Some { value: 5 };
+    print(a == b); // true
+
+    // Same variant, DIFFERENT field values -- the real bug: this used to print `true`.
+    let c: Option<Int> = Some { value: 5 };
+    let d: Option<Int> = Some { value: 9 };
+    print(c == d); // false (was true before this fix)
+    print(c != d); // true
+
+    // Different variants of the same enum -- tag mismatch, must stay false.
+    let e: Option<Int> = None;
+    print(c == e); // false
+
+    // Multi-field variant -- every field must match.
+    let r1 = Rect { w: 3, h: 4 };
+    let r2 = Rect { w: 3, h: 4 };
+    let r3 = Rect { w: 3, h: 5 };
+    print(r1 == r2); // true
+    print(r1 == r3); // false (h differs)
+
+    // Cross-variant comparison within the same enum.
+    let circ = Circle { radius: 3 };
+    let rect = Rect { w: 3, h: 3 };
+    print(circ == rect); // false (different variants, even with "matching" numbers)
+
+    // Zero-field variant vs itself -- still correct (matches the old tag-only behavior, since
+    // there are no fields to compare).
+    let p1 = Point;
+    let p2 = Point;
+    print(p1 == p2); // true
+
+    // Nested enum field -- structural equality must recurse, not just compare the OUTER tag.
+    let w1 = Has { inner: Circle { radius: 7 } };
+    let w2 = Has { inner: Circle { radius: 7 } };
+    let w3 = Has { inner: Circle { radius: 8 } };
+    print(w1 == w2); // true
+    print(w1 == w3); // false (nested radius differs)
+
+    // String-typed field -- must go through real String equality (.equals()), not reference
+    // identity.
+    let s1: Option<String> = Some { value: "hello" };
+    let s2: Option<String> = Some { value: "hel" + "lo" };
+    print(s1 == s2); // true (different String objects, same content)
+
+    print("done");
+}

@@ -459,6 +459,16 @@ pub struct CodeGen {
     // Keyed "EnumName#VariantName" -- see `ProgramInfo`'s own matching field header.
     variant_field_names: Registry<Vec<String>>,
     variant_field_types: Registry<Vec<String>>,
+    // Concrete enum type name (plain or mono, e.g. `"Option$Int"`) -> the ORDERED list of its own
+    // variant names (index == tag, since `build_program_info`'s own two enum-processing loops
+    // push every variant of ONE enum consecutively, in declaration order, as its own tag). Built
+    // by `group_variant_names_by_enum_cg` from `ProgramInfo.variant_tag_keys` directly -- no new
+    // `ProgramInfo` field needed, since that flat "EnumName#VariantName" list already has
+    // everything required. `gen_binary`'s own real structural-equality codegen (`==`/`!=` on two
+    // enum values with fields) is the one reader: once two values' tags are confirmed equal, it
+    // still needs to know EVERY possible variant this concrete enum type could be, to build the
+    // real runtime tag-dispatch chain that picks which variant's own fields to compare.
+    enum_variant_names: Registry<Vec<String>>,
     // The most recent source line `mark_line` actually emitted a `LineNumberTable` entry for --
     // `-1` (never equals a real 1-based line number) at the start of a method, so the FIRST
     // `mark_line` call always emits, same real convention the real compiler's own `lastEmittedLine`
@@ -1829,6 +1839,7 @@ impl CodeGen {
             cur_loop_end: Label::new(),
             variant_field_names: self.variant_field_names,
             variant_field_types: self.variant_field_types,
+            enum_variant_names: self.enum_variant_names,
             last_emitted_line: -1,
             module_of: self.module_of,
             interfaces_raw: self.interfaces_raw,
@@ -3689,19 +3700,98 @@ impl CodeGen {
             // real tag values. The REAL compiler's own `CodeGen.kt` already fixes this (tag
             // comparison, not reference identity -- see `Parser.hotc`'s own header, a much earlier
             // finding), but this self-hosted PORT never got the equivalent fix until now.
+            //
+            // **Extended 2026-09-16 -- real structural equality, not just tag equality.** The
+            // tag-only version above shipped first and was correct/complete for any ALL-UNIT-
+            // VARIANT enum (`TokType`, no field data to differ on -- tag equality IS full
+            // equality), but silently wrong for a field-carrying enum: `Some { value: 5 } ==
+            // Some { value: 5 }` returned `true` regardless of whether `value` actually matched,
+            // since only the shared tags were ever compared (`IDEAS.md`'s own long-flagged, real
+            // gap). Once tags match, this now dispatches on the RUNTIME tag value to find out
+            // which variant it actually is, then compares THAT variant's own fields one at a
+            // time -- reusing `gen_binary`'s own "==" codegen recursively per field (via a
+            // synthetic `$enumeq_l`/`$enumeq_r` local pair, the same "wrap an already-computed
+            // value in a synthetic `Ident` so existing codegen can be reused" trick `Match`'s own
+            // literal-arm dispatch already uses for `$match_subject`) rather than hand-writing a
+            // separate comparison opcode per field type -- this gets every type's own real
+            // equality rule for free: `Int`/`Bool`/`Long`/`Float`/`Double` compare directly,
+            // `String` goes through `.equals()`, and a NESTED enum field recurses into this exact
+            // same fix. A struct- or array-typed field still falls back to reference-identity
+            // (the separate, still-disclosed gap the branch right below this one covers) -- not a
+            // regression, just consistent with that gap's own existing, accepted scope.
             if (op == "==" || op == "!=") && (is_ref_type(lt) || is_ref_type(rt)) && self.is_enum_type(lt) {
-                self.mv.visitFieldInsn(180, self.qualify(rt), "tag", "I"); // GETFIELD rightRef.tag -- stack: [leftRef, rightTag]
-                self.mv.visitInsn(95); // SWAP -- stack: [rightTag, leftRef]
-                self.mv.visitFieldInsn(180, self.qualify(lt), "tag", "I"); // GETFIELD leftRef.tag -- stack: [rightTag, leftTag]
-                var true_label3 = Label::new();
-                var end_label3 = Label::new();
-                let icmp = comparison_opcode(op); // IF_ICMPEQ / IF_ICMPNE
-                self.mv.visitJumpInsn(icmp, &true_label3);
-                self.mv.visitInsn(3); // ICONST_0 (false)
-                self.mv.visitJumpInsn(167, &end_label3); // GOTO
-                self.mv.visitLabel(&true_label3);
+                // Both refs have to survive PAST the tag check now (unlike the old version, which
+                // only ever read `tag` once from each side straight off the stack) -- real field
+                // comparisons need to re-read from each ref multiple times, so stash them in real
+                // local slots first.
+                let right_slot9 = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                self.mv.visitVarInsn(58, right_slot9); // ASTORE rightRef -- stack: [leftRef]
+                let left_slot9 = self.next_slot;
+                self.next_slot = self.next_slot + 1;
+                self.mv.visitVarInsn(58, left_slot9); // ASTORE leftRef -- stack: []
+
+                var false_label9 = Label::new();
+                var done_label9 = Label::new();
+
+                self.mv.visitVarInsn(25, left_slot9); // ALOAD leftRef
+                self.mv.visitFieldInsn(180, self.qualify(lt), "tag", "I"); // GETFIELD leftTag
+                self.mv.visitVarInsn(25, right_slot9); // ALOAD rightRef
+                self.mv.visitFieldInsn(180, self.qualify(rt), "tag", "I"); // GETFIELD rightTag
+                self.mv.visitJumpInsn(160, &false_label9); // IF_ICMPNE -- tags differ -> false
+
+                var variants9 = empty_str_vec4();
+                let variants9_found = self.enum_variant_names.get(lt);
+                if let Some { value: vn9 } = variants9_found { variants9 = vn9; }
+
+                var vi9 = 0;
+                while vi9 < variants9.length() {
+                    let vname9 = variants9.get(vi9);
+                    var next_label9 = Label::new();
+                    self.mv.visitVarInsn(25, left_slot9); // ALOAD leftRef
+                    self.mv.visitFieldInsn(180, self.qualify(lt), "tag", "I"); // GETFIELD leftTag
+                    self.mv.visitIntInsn(17, vi9); // SIPUSH -- this variant's own declared index == its tag
+                    self.mv.visitJumpInsn(160, &next_label9); // IF_ICMPNE -- not this variant -> try next
+
+                    let vfkey9 = lt + "#" + vname9;
+                    var vfn9 = empty_str_vec4();
+                    var vft9 = empty_str_vec4();
+                    let vfn9_found = self.variant_field_names.get(vfkey9);
+                    let vft9_found = self.variant_field_types.get(vfkey9);
+                    if let Some { value: x9 } = vfn9_found { vfn9 = x9; }
+                    if let Some { value: y9 } = vft9_found { vft9 = y9; }
+
+                    var fj9 = 0;
+                    while fj9 < vfn9.length() {
+                        let fname9 = vfn9.get(fj9);
+                        let fty9 = vft9.get(fj9);
+                        // Field names on an enum's own shared class are mangled per-variant
+                        // (`"VariantName$fieldName"`, e.g. "Some$value") -- see `Match`'s own
+                        // codegen right above for why (a field name like "value" is legitimately
+                        // reused across different variants at different types).
+                        let mangled9 = vname9 + "$" + fname9;
+                        self.gen_enum_field_eq_or_jump(lt, mangled9, fty9, left_slot9, right_slot9, &false_label9);
+                        fj9 = fj9 + 1;
+                    }
+                    // Every field of this variant matched (or it has none at all) -- equal.
+                    self.mv.visitInsn(4); // ICONST_1 (true)
+                    self.mv.visitJumpInsn(167, &done_label9); // GOTO
+                    self.mv.visitLabel(&next_label9);
+                    vi9 = vi9 + 1;
+                }
+                // Fell through every declared variant without a match -- unreachable in practice
+                // (the tag check above already proved both sides share one of exactly 0..n-1 real
+                // tags), but lands on `true` rather than leaving the stack shape undefined if it
+                // somehow is.
                 self.mv.visitInsn(4); // ICONST_1 (true)
-                self.mv.visitLabel(&end_label3);
+                self.mv.visitJumpInsn(167, &done_label9); // GOTO
+                self.mv.visitLabel(&false_label9);
+                self.mv.visitInsn(3); // ICONST_0 (false)
+                self.mv.visitLabel(&done_label9);
+                if op == "!=" {
+                    self.mv.visitIntInsn(17, 1);
+                    self.mv.visitInsn(130); // IXOR (negate)
+                }
                 return "Bool";
             }
             if (op == "==" || op == "!=") && (is_ref_type(lt) || is_ref_type(rt)) {
@@ -3729,6 +3819,39 @@ impl CodeGen {
             self.mv.visitLabel(&end_label);
             return "Bool";
         }
+    }
+
+    // `gen_binary`'s own enum structural-equality branch, above, calls this once per field of
+    // whichever variant the runtime tag dispatch already narrowed down to. Loads `mangled` (the
+    // real, per-variant-mangled JVM field name) off BOTH `left_slot`/`right_slot`, stashes each
+    // value into a fresh real local, then wraps those two locals as synthetic `Ident`s and
+    // recurses into `gen_binary("==", ...)` itself -- the exact "wrap an already-computed value
+    // in a synthetic `Ident` so existing codegen can be reused" trick `Match`'s own literal-arm
+    // dispatch already uses for `$match_subject` (see that call site's own header), just applied
+    // to a per-field comparison instead of a whole `match` subject. This is what makes every
+    // field type's own real equality rule (`Int`/`Bool` compare, `String.equals()`, a NESTED enum
+    // recursing right back into `gen_binary`'s own enum branch) come for free, rather than this
+    // fn needing its own hand-written comparison opcode per possible field type. Jumps straight
+    // to `fail_label` when this ONE field doesn't match; falls through (empty stack) otherwise.
+    fn gen_enum_field_eq_or_jump(&mut self, ety: String, mangled: String, fty: String, left_slot: Int, right_slot: Int, fail_label: &Label) {
+        self.mv.visitVarInsn(25, left_slot); // ALOAD leftRef
+        self.mv.visitFieldInsn(180, self.qualify(ety), mangled, self.resolve_descriptor(fty)); // GETFIELD
+        let lv_slot = self.next_slot;
+        if fty == "Long" || fty == "Double" { self.next_slot = self.next_slot + 2; } else { self.next_slot = self.next_slot + 1; }
+        self.mv.visitVarInsn(store_opcode(fty), lv_slot);
+
+        self.mv.visitVarInsn(25, right_slot); // ALOAD rightRef
+        self.mv.visitFieldInsn(180, self.qualify(ety), mangled, self.resolve_descriptor(fty)); // GETFIELD
+        let rv_slot = self.next_slot;
+        if fty == "Long" || fty == "Double" { self.next_slot = self.next_slot + 2; } else { self.next_slot = self.next_slot + 1; }
+        self.mv.visitVarInsn(store_opcode(fty), rv_slot);
+
+        self.slots.register("$enumeq_l", lv_slot);
+        self.slots.register("$enumeq_r", rv_slot);
+        self.var_types.register("$enumeq_l", fty);
+        self.var_types.register("$enumeq_r", fty);
+        self.gen_binary("==", Ident { name: "$enumeq_l" }, Ident { name: "$enumeq_r" });
+        self.mv.visitJumpInsn(153, fail_label); // IFEQ -- not equal -> fail
     }
 
     fn gen_unary(&mut self, op: String, inner: &Expr) -> String {
@@ -3917,7 +4040,27 @@ impl CodeGen {
                         ty = self.gen_comprehension(result_expr, var_name, iter_expr, cond, dt_str);
                     }
                     _ => {
-                        ty = self.gen_expr(init);
+                        // Same `self.ret_ty`-as-hint reasoning as the struct-literal field loop's
+                        // and `finish_field_assign`'s own identical fixes (see those two's own
+                        // headers) -- a bare fieldless-enum-variant init (`let e: Option<Int> =
+                        // None;`) needs `dt_str` (this `let`'s own declared type), not whatever the
+                        // ENCLOSING function happens to return, for `gen_expr`'s own bare-variant
+                        // fallback to resolve correctly. Harmless to set unconditionally for ANY
+                        // init shape when `has_dt` (not just a bare `Ident`) -- `gen_expr`'s own
+                        // `Ident`/`StructLit` arms only ever CONSULT `self.ret_ty` as a fallback
+                        // when nothing else resolves it (a local/static lookup, an explicit
+                        // `generic_base`), so this is simply ignored whenever it isn't needed,
+                        // same "harmless when not needed" property `self.cur_ret_ty` already has
+                        // on the `Checker.hotc` side. Saved/restored around just this one call so
+                        // it can't leak into anything after it.
+                        if has_dt {
+                            let saved_ret_ty_for_let = self.ret_ty;
+                            self.ret_ty = dt_str;
+                            ty = self.gen_expr(init);
+                            self.ret_ty = saved_ret_ty_for_let;
+                        } else {
+                            ty = self.gen_expr(init);
+                        }
                         // See `Ast.hc`'s own `Stmt::Let.declared_type` header: a `dyn` annotation
                         // here is unconditionally trusted (no re-verifying it against a `struct_
                         // interfaces` registry this file doesn't have) -- `Checker.hotc`'s own
@@ -4750,6 +4893,7 @@ fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info:
         vftypes.register(info.variant_field_keys.get(vfi), info.variant_field_types_list.get(vfi));
         vfi = vfi + 1;
     }
+    let enum_variant_names_reg = group_variant_names_by_enum_cg(&info.variant_tag_keys);
     var module_of = registry_new("__init__", "");
     var moi = 0;
     while moi < info.module_names.length() {
@@ -4758,7 +4902,59 @@ fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info:
     }
     var slot_scopes_seed2 = vec_of(registry_new("__init__", -1));
     var var_type_scopes_seed2 = vec_of(registry_new("__init__", "Int"));
-    return CodeGen { mv: mv, target: info.target, slots: registry_new("__init__", -1), slot_scopes: Vec { data: slot_scopes_seed2.data, len: 0 }, next_slot: 0, owner: owner, fn_descs: descs, fn_ret_tys: rettys, fn_param_types: fnparamtypes, fn_param_names: fnparamnames, var_types: registry_new("__init__", "Int"), var_type_scopes: Vec { data: var_type_scopes_seed2.data, len: 0 }, ret_ty: ret_type_name, struct_fields: sfields, struct_ftypes: sftypes, struct_methods: smethods, struct_method_rettys: smethod_rettys, struct_method_param_types: smethod_param_types, sendable_structs: sendable_structs, variant_owner: vowner, variant_tags: vtags, extern_binary: ebinary, extern_is_interface: eisiface, extern_method_descs: emdescs, extern_method_rettys: emrettys, extern_method_static: emstatic, extern_method_ctor: emctor, extern_method_param_types: emparamtypes, extern_field_descs: efdescs, extern_field_type_names: eftypenames, extern_field_static: efstatic, struct_extends: sextends, generic_fn_infer_idx: ginfer, generic_fn_infer_unwrap: ginferunwrap, generic_fn_infer_idx2: ginfer2, generic_fn_infer_unwrap2: ginferunwrap2, generic_struct_infer_field: gstructinfer, generic_enum_infer_owner: genuminferowner, generic_enum_infer_field: genuminferfield, static_types: static_types, enum_names: enum_names_reg, cur_loop_start: Label::new(), cur_loop_end: Label::new(), variant_field_names: vfnames, variant_field_types: vftypes, last_emitted_line: -1, module_of: module_of, interfaces_raw: info.interfaces_raw, fn_identity: fn_identity, lambda_counter: 0 };
+    return CodeGen { mv: mv, target: info.target, slots: registry_new("__init__", -1), slot_scopes: Vec { data: slot_scopes_seed2.data, len: 0 }, next_slot: 0, owner: owner, fn_descs: descs, fn_ret_tys: rettys, fn_param_types: fnparamtypes, fn_param_names: fnparamnames, var_types: registry_new("__init__", "Int"), var_type_scopes: Vec { data: var_type_scopes_seed2.data, len: 0 }, ret_ty: ret_type_name, struct_fields: sfields, struct_ftypes: sftypes, struct_methods: smethods, struct_method_rettys: smethod_rettys, struct_method_param_types: smethod_param_types, sendable_structs: sendable_structs, variant_owner: vowner, variant_tags: vtags, extern_binary: ebinary, extern_is_interface: eisiface, extern_method_descs: emdescs, extern_method_rettys: emrettys, extern_method_static: emstatic, extern_method_ctor: emctor, extern_method_param_types: emparamtypes, extern_field_descs: efdescs, extern_field_type_names: eftypenames, extern_field_static: efstatic, struct_extends: sextends, generic_fn_infer_idx: ginfer, generic_fn_infer_unwrap: ginferunwrap, generic_fn_infer_idx2: ginfer2, generic_fn_infer_unwrap2: ginferunwrap2, generic_struct_infer_field: gstructinfer, generic_enum_infer_owner: genuminferowner, generic_enum_infer_field: genuminferfield, static_types: static_types, enum_names: enum_names_reg, cur_loop_start: Label::new(), cur_loop_end: Label::new(), variant_field_names: vfnames, variant_field_types: vftypes, enum_variant_names: enum_variant_names_reg, last_emitted_line: -1, module_of: module_of, interfaces_raw: info.interfaces_raw, fn_identity: fn_identity, lambda_counter: 0 };
+}
+
+// Groups `variant_tag_keys` (flat "EnumName#VariantName" strings, in per-enum, tag-ascending
+// declaration order -- see `build_program_info`'s own two enum-processing loops, which push every
+// variant of ONE enum consecutively, in declaration order, before moving to the next enum) into a
+// real `EnumName -> Vec<VariantName>` registry. Lets `gen_binary`'s structural-equality codegen
+// enumerate every variant of a concrete enum type without its own dedicated `ProgramInfo` field --
+// everything it needs is already flattened into `variant_tag_keys` by the existing scan, this just
+// re-groups it by the part before the "#".
+fn group_variant_names_by_enum_cg(keys: &Vec<String>) -> Registry<Vec<String>> {
+    // Deliberately two flat passes over `keys` (O(n^2) in the total variant count across the
+    // whole program, always tiny) instead of accumulating into a `Vec<Vec<String>>` and mutating
+    // an inner entry via `.set(...)` -- that specific shape (a doubly-nested generic instantiation
+    // NEEDING its own `.set` monomorphized) turned out to be a real, previously-unexercised gap:
+    // nothing else in this compiler's own source had ever called `.set()` on a `Vec<Vec<String>>`
+    // before, and the self-hosting bootstrap round-trip produced a real `NoSuchMethodError` at
+    // RUNTIME (compilation itself reported success) the first time this function tried it. Two
+    // flat `Vec<String>` passes sidestep the whole nested-generic-mutation question entirely.
+    var enum_key_list = empty_str_vec4(); // distinct enum names, first-encounter order
+    var i = 0;
+    while i < keys.length() {
+        let k = keys.get(i);
+        let hash_idx = k.indexOf("#");
+        let ename = k.substring(0, hash_idx);
+        var already_seen = false;
+        var j = 0;
+        while j < enum_key_list.length() {
+            if enum_key_list.get(j) == ename { already_seen = true; }
+            j = j + 1;
+        }
+        if !already_seen { enum_key_list.push(ename); }
+        i = i + 1;
+    }
+    var reg = registry_new("__init__", empty_str_vec4());
+    var k2 = 0;
+    while k2 < enum_key_list.length() {
+        let ename2 = enum_key_list.get(k2);
+        var variants_for_this = empty_str_vec4();
+        var m = 0;
+        while m < keys.length() {
+            let k3 = keys.get(m);
+            let hash_idx3 = k3.indexOf("#");
+            let ename3 = k3.substring(0, hash_idx3);
+            if ename3 == ename2 {
+                variants_for_this.push(k3.substring(hash_idx3 + 1, k3.length()));
+            }
+            m = m + 1;
+        }
+        reg.register(ename2, variants_for_this);
+        k2 = k2 + 1;
+    }
+    return reg;
 }
 
 // A monomorphized instantiation (`"Box$Int"`) resolves to its TEMPLATE's own `module_name`

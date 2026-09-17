@@ -4439,6 +4439,96 @@ impl TyChecker {
                         self.unmark_moved(name);
                         self.mark_mut_capable(name, mutable);
                     }
+                    // A BARE fieldless-enum-variant reference used as a `let`/`var` initializer
+                    // (`let e: Option<Int> = None;`, no `{}` at all -- `check_ident`'s own header
+                    // explains why this parses as a plain `Ident`, not a `StructLit`) needs the
+                    // declared type as ITS OWN `expected_mono` hint, same real gap `check_struct_
+                    // lit`'s per-field loop and `check_field_assign_on_type` already got fixed for
+                    // (see those two's own headers) -- `check_expr`'s generic `StructLit`/`Ident`
+                    // dispatch only ever threads `self.cur_ret_ty` (the ENCLOSING FUNCTION's own
+                    // return type, e.g. `Unit` for `main`), never a `let`'s own declared type. Real
+                    // gap found writing a real test for the enum-structural-equality fix: `let e:
+                    // Option<Int> = None;` failed with "unknown struct or enum variant 'None'"
+                    // even though `e`'s own declared type said exactly what was needed. Falls back
+                    // to the ordinary `_` wildcard arm's own body (duplicated here rather than
+                    // shared, since `init` isn't a known bare variant with a declared type EVERY
+                    // time an `Ident` shows up here -- most of the time it's just an ordinary
+                    // variable reference, `let x = someVar;`) whenever this ISN'T that one narrow
+                    // shape.
+                    Ident { name: iname } => {
+                        var used_variant_hint = false;
+                        if has_dt {
+                            let local_found3 = self.lookup_var(iname);
+                            var is_ordinary3 = false;
+                            if let Some { value: lv3 } = local_found3 { is_ordinary3 = true; }
+                            let static_found3 = self.statics.get(iname);
+                            if let Some { value: sv3 } = static_found3 { is_ordinary3 = true; }
+                            if !is_ordinary3 {
+                                let variant_found3 = self.variant_owner.get(iname);
+                                let generic_variant_found3 = self.generic_variant_owner.get(iname);
+                                var is_known_variant3 = false;
+                                if let Some { value: ow3 } = variant_found3 { is_known_variant3 = true; }
+                                if let Some { value: gow3 } = generic_variant_found3 { is_known_variant3 = true; }
+                                if is_known_variant3 {
+                                    let ct3 = self.check_struct_lit(iname, empty_str_vec2(), empty_expr_vec3(), none_string3(), some_string3(dt_str));
+                                    gn = ty_name(ct3);
+                                    self.vars.register(name, ty_from_name(gn));
+                                    self.unmark_moved(name);
+                                    self.mark_mut_capable(name, mutable);
+                                    used_variant_hint = true;
+                                }
+                            }
+                        }
+                        if !used_variant_hint {
+                            let t3b = self.check_expr(&init);
+                            gn = ty_name(t3b);
+                            self.move_check_consumed(&init, gn);
+                            var final_ty3b = ty_from_name(gn);
+                            if has_dt && is_dyn_type_name_chk(dt_str) {
+                                if gn != "?" && self.is_arg_type_mismatch(dt_str, gn) {
+                                    self.error("cannot assign " + gn + " to '" + name + "' of declared type " + dt_str);
+                                } else {
+                                    final_ty3b = ty_from_name(dt_str);
+                                }
+                            }
+                            self.vars.register(name, final_ty3b);
+                            self.unmark_moved(name);
+                            self.mark_mut_capable(name, mutable);
+                        }
+                    }
+                    // A generic struct/enum-variant literal used as a `let`/`var` initializer
+                    // (`let s: Option<String> = Some { value: expensive() };`) hits the SAME real
+                    // gap as the bare-`Ident` case right above, just for the `{ ... }` form:
+                    // `check_expr`'s `StructLit` dispatch only ever threads `self.cur_ret_ty`, and
+                    // `check_struct_lit`'s own shape-only field-literal fallback (see its own
+                    // header) only recognizes a NARROW set of field-value shapes (a literal, or an
+                    // already-typed local) -- anything else, like a binary expression or a
+                    // function call, still falls through to "unknown struct or enum variant".
+                    // Real gap found writing a real test for the enum-structural-equality fix:
+                    // `Some { value: "hel" + "lo" }` (a `Binary` field value) failed even with a
+                    // perfectly good declared type sitting right there on the `let`. Threading
+                    // `dt_str` through directly removes the need to guess from the field's own
+                    // shape at all.
+                    StructLit { name: sname, field_names: sfnames, field_values: sfvals, generic_base: sgbase } => {
+                        var t_sl = TyUnknown;
+                        if has_dt {
+                            t_sl = self.check_struct_lit(sname, sfnames, sfvals, sgbase, some_string3(dt_str));
+                        } else {
+                            t_sl = self.check_struct_lit(sname, sfnames, sfvals, sgbase, none_string3());
+                        }
+                        gn = ty_name(t_sl);
+                        var final_ty_sl = ty_from_name(gn);
+                        if has_dt && is_dyn_type_name_chk(dt_str) {
+                            if gn != "?" && self.is_arg_type_mismatch(dt_str, gn) {
+                                self.error("cannot assign " + gn + " to '" + name + "' of declared type " + dt_str);
+                            } else {
+                                final_ty_sl = ty_from_name(dt_str);
+                            }
+                        }
+                        self.vars.register(name, final_ty_sl);
+                        self.unmark_moved(name);
+                        self.mark_mut_capable(name, mutable);
+                    }
                     _ => {
                         let t = self.check_expr(&init);
                         // `t` is consumed exactly once, right here (`ty_name` takes it by value) --
