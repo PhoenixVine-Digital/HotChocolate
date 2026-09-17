@@ -388,7 +388,7 @@ fn render_doc_markdown(struct_names: Vec<String>, struct_docs: Vec<DocComment>, 
 // `off` -- how many leading argv slots `run_cli`'s own `--target` handling already consumed (0
 // if it wasn't present) -- every OTHERWISE-fixed-position `args[N]` access here shifts by it,
 // since `[String]` has no slicing operation to hand this fn a shorter view instead.
-fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, quiet_schedule: Bool, classpath: Vec<String>) {
+fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, quiet_schedule: Bool, classpath: Vec<String>, dev_mode: Bool) {
     let doc_path = args[off + 1];
     var doc_out = "api.md";
     if args.length > off + 2 { doc_out = args[off + 2]; }
@@ -400,6 +400,7 @@ fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, qu
         dprog = parse_source_file(doc_path);
     }
     dprog = merge_program(resolve_stdlib_modules(dprog.uses, target), dprog);
+    dprog = strip_dev_code(dprog, dev_mode);
     let dname0 = base_name_no_ext(doc_path);
     var dname = dname0;
     if name_collides_with_decl(dname0, &dprog.structs, &dprog.enums) {
@@ -466,6 +467,17 @@ pub fn run_cli(args: [String]) {
         quiet_schedule = true;
         off = off + 1;
     }
+    // `--release` -- see `IDEAS.md`'s own "@dev -- conditionally-compiled debug-only code" entry.
+    // A fifth independently-optional leading flag (stacks the same way). Absent (the default):
+    // dev build, `@dev`-marked fns/`if dev { ... }` blocks compile in normally. Present: release
+    // build, `strip_dev_code` (below) drops every `@dev` fn from `Program.fns` entirely and every
+    // `if dev { ... }` block from every remaining fn/method/system body, BEFORE the checker/
+    // codegen ever see the result.
+    var dev_mode = true;
+    if args[off] == "--release" {
+        dev_mode = false;
+        off = off + 1;
+    }
     // `--classpath <paths>` -- a third, independently optional leading flag, PATHS joined with
     // the real platform separator (`java.io.File.pathSeparator` -- `;`/`:`), matching exactly
     // what Gradle's own `FileCollection.getAsPath()` produces (`hc-gradle-plugin`'s own real
@@ -486,7 +498,7 @@ pub fn run_cli(args: [String]) {
         off = off + 2;
     }
     if args[off] == "doc" {
-        run_doc_cli(args, off, target, explain_schedule, quiet_schedule, classpath);
+        run_doc_cli(args, off, target, explain_schedule, quiet_schedule, classpath, dev_mode);
         return;
     }
     // `SelfhostCLI run <path>` (compile AND execute, mirroring `hc run` -- the shape
@@ -515,6 +527,7 @@ pub fn run_cli(args: [String]) {
         prog = parse_source_file(path);
     }
     prog = merge_program(resolve_stdlib_modules(prog.uses, target), prog);
+    prog = strip_dev_code(prog, dev_mode);
 
     // See `name_collides_with_decl`'s own header, right above `parse_directory`: the entry class
     // name is mangled -- ONLY when it would otherwise collide -- never a struct's own name (which
@@ -893,6 +906,7 @@ fn merge_program(a: Program, b: Program) -> Program {
         fn_annotation_data: merge_annotation_vec(a.fn_annotation_data, b.fn_annotation_data),
         extend_decls: merge_extend_decl_vec(a.extend_decls, b.extend_decls),
         must_use_fn_names: merge_str_vec(a.must_use_fn_names, b.must_use_fn_names),
+        dev_fn_names: merge_str_vec(a.dev_fn_names, b.dev_fn_names),
         struct_doc_names: merge_str_vec(a.struct_doc_names, b.struct_doc_names),
         struct_doc_data: merge_doc_comment_vec(a.struct_doc_data, b.struct_doc_data),
         fn_doc_names: merge_str_vec(a.fn_doc_names, b.fn_doc_names),
@@ -903,6 +917,117 @@ fn merge_program(a: Program, b: Program) -> Program {
         systems: merge_system_decl_vec(a.systems, b.systems),
         resources: merge_component_decl_vec(a.resources, b.resources),
     };
+}
+
+// `@dev`/`if dev { ... }` -- real, previously-deferred conditional compilation, see `IDEAS.md`'s
+// own entry. Applied to a fully-merged `Program` right before it reaches `compile_program`, so
+// neither the checker nor codegen ever needs to know this feature exists at all -- a release
+// build's `if dev { debug_only_call(); }` genuinely never gets checked/generated (not just made
+// unreachable at runtime), because `debug_only_call` was ALREADY dropped from `Program.fns`
+// by the time this pass hands the result off.
+//
+// Recognizes the EXACT shape `If { cond: Ident { name: "dev" }, ... }` (see `Parser.hotc`'s own
+// `primary` header for why `dev` parses as a plain `Ident` rather than a dedicated node) -- in a
+// dev build, splices `then_body`'s own statements directly into the surrounding list (no runtime
+// branch at all, just unconditional inclusion); in a release build, drops the whole block,
+// `else_body` included (this feature's own real, disclosed v1 scope: `if dev { ... }` alone, no
+// `else` clause is a supported shape to begin with).
+fn strip_dev_blocks_list(ss: Vec<Stmt>, dev_mode: Bool) -> Vec<Stmt> {
+    var out = empty_stmt_vec2();
+    var i = 0;
+    while i < ss.length() {
+        let s = ss.get(i);
+        match s {
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                var is_dev_cond = false;
+                match cond {
+                    Ident { name } => { if name == "dev" { is_dev_cond = true; } }
+                    _ => {}
+                }
+                if is_dev_cond {
+                    if dev_mode {
+                        let rewritten_then = strip_dev_blocks_list(then_body, dev_mode);
+                        var k = 0;
+                        while k < rewritten_then.length() {
+                            out.push(rewritten_then.get(k));
+                            k = k + 1;
+                        }
+                    }
+                    // release mode: drop the whole block -- neither `then_body` nor `else_body`
+                    // is pushed at all.
+                } else {
+                    var new_else = none_stmt_list_cg();
+                    if let Some { value: eb } = else_body {
+                        new_else = some_stmt_list_cg(strip_dev_blocks_list(eb, dev_mode));
+                    }
+                    out.push(If { cond: cond, then_body: strip_dev_blocks_list(then_body, dev_mode), else_body: new_else, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq });
+                }
+            }
+            While { cond, body, line } => {
+                out.push(While { cond: cond, body: strip_dev_blocks_list(body, dev_mode), line: line });
+            }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: strip_dev_blocks_list(body, dev_mode), line: line });
+            }
+            Try { try_block, catches, line } => {
+                out.push(Try { try_block: strip_dev_blocks_list(try_block, dev_mode), catches: catches, line: line });
+            }
+            Match { subject, arms, line } => {
+                var new_arms = empty_matcharm_vec_cg();
+                var ai = 0;
+                while ai < arms.length() {
+                    let a = arms.get(ai);
+                    new_arms.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: strip_dev_blocks_list(a.body, dev_mode), is_literal: a.is_literal, literal: a.literal });
+                    ai = ai + 1;
+                }
+                out.push(Match { subject: subject, arms: new_arms, line: line });
+            }
+            _ => { out.push(s); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn strip_dev_fn_decl_vec(fns: Vec<FnDecl>, dev_names: &Vec<String>, dev_mode: Bool) -> Vec<FnDecl> {
+    var out = empty_fn_decl_vec2();
+    var i = 0;
+    while i < fns.length() {
+        let f = fns.get(i);
+        if !dev_mode && str_vec_contains(dev_names, f.name) {
+            i = i + 1;
+            continue;
+        }
+        out.push(FnDecl { name: f.name, params: f.params, ret_type: f.ret_type, body: strip_dev_blocks_list(f.body, dev_mode), type_param: f.type_param, type_bounds: f.type_bounds, self_is_mut: f.self_is_mut, type_param2: f.type_param2, type_bounds2: f.type_bounds2 });
+        i = i + 1;
+    }
+    return out;
+}
+
+// Applied to the WHOLE merged `Program` right before `compile_program` -- top-level `fns`
+// (filtered by `Program.dev_fn_names`, then every SURVIVING one's own body rewritten), every
+// `impl`'s own `methods`/`static_methods` (rewritten only -- `@dev` on a METHOD isn't in this v1's
+// own scope, a real, disclosed narrower cut than the top-level-fn case), and every `system`'s own
+// `run_body`.
+fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
+    var new_fns = strip_dev_fn_decl_vec(prog.fns, &prog.dev_fn_names, dev_mode);
+    var new_impls = empty_impl_decl_vec();
+    var ii = 0;
+    while ii < prog.impls.length() {
+        let im = prog.impls.get(ii);
+        let new_methods = strip_dev_fn_decl_vec(im.methods, &empty_str_vec2(), true);
+        let new_static_methods = strip_dev_fn_decl_vec(im.static_methods, &empty_str_vec2(), true);
+        new_impls.push(ImplDecl { struct_name: im.struct_name, methods: new_methods, static_methods: new_static_methods, interface_name: im.interface_name, delegate_field: im.delegate_field });
+        ii = ii + 1;
+    }
+    var new_systems = empty_system_decl_vec();
+    var si = 0;
+    while si < prog.systems.length() {
+        let sysd = prog.systems.get(si);
+        new_systems.push(SystemDecl { name: sysd.name, run_params: sysd.run_params, run_body: strip_dev_blocks_list(sysd.run_body, dev_mode), after: sysd.after, before: sysd.before, has_profile: sysd.has_profile, has_main_thread: sysd.has_main_thread, run_if: sysd.run_if });
+        si = si + 1;
+    }
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources };
 }
 
 fn stdlib_topic_path(topic: String) -> String {

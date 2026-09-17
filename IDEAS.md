@@ -324,7 +324,7 @@ real, bigger ideas (see the `@gpu`/typestate entries below for the
 general shape of "types that track resource state") but conflating them
 with this one keeps a genuinely cheap, high-value check from shipping.
 
-### `@dev` — conditionally-compiled debug-only code
+### ~~`@dev` — conditionally-compiled debug-only code~~ — shipped 2026-09-17
 
 ```
 @dev
@@ -332,19 +332,38 @@ fn debug_draw_hitboxes() { ... }
 
 fn main() {
     if dev {
-        debug.draw_text(...);  // compiled out entirely in a release build
+        debug_draw_hitboxes();  // compiled out entirely in a release build
     }
 }
 ```
 
 Small, proven (Rust's `#[cfg(debug_assertions)]`), and genuinely useful:
-debug-only rendering/logging/assertions that should have zero presence
-(not just "disabled at runtime" — actually absent from the classfile) in
-a shipped build. Parser + checker + codegen all need to know about a
-build-mode flag (a new `hc build --release`-style CLI switch, defaulting
-to "dev" the way `hc run` already implicitly is), and codegen simply
-skips emitting `@dev`-marked fns/`if dev { }` blocks entirely when that
-flag is off. General-purpose, not game-specific.
+debug-only rendering/logging/assertions that have zero presence (not just
+"disabled at runtime" — actually absent from the classfile) in a release
+build. Turned out bigger than it first looked: making a stripped `@dev` fn's
+call site safe to leave in source needed real PARSER-level conditional
+compilation, not just a checker/codegen filter -- `if false { debug_only(
+); }` would still need `debug_only` to exist for ordinary dead-code-free
+checking/codegen to succeed, defeating the whole point. Landed as a `Driver.
+hotc`-only preprocessing pass (`strip_dev_code`/`strip_dev_blocks_list`) that
+rewrites the fully-merged `Program` BEFORE `compile_program` ever sees it --
+neither the checker nor codegen needed to learn this feature exists at all.
+`dev` itself is a real, pre-existing reserved keyword (`Lexer.hotc`'s own
+`DEV` token, previously unused anywhere) that `Parser.hotc`'s `primary()`
+now resolves to a plain `Ident { name: "dev" }`; the rewrite pass recognizes
+the EXACT shape `If { cond: Ident { name: "dev" }, ... }` and either splices
+`then_body` in unconditionally (dev build) or drops the whole block (release
+build, `--release` CLI flag) -- recursing into every `If`/`While`/`For`/
+`Try`/`Match` body so a nested `if dev { ... }` inside a loop still works.
+`@dev fn`s are filtered out of `Program.fns` the same pass, before anything
+downstream ever registers or emits them -- an ungated call to one in a
+release build is a real "unknown function" compile error, exactly the
+signal a forgotten guard should produce. Scope cut, disclosed: `@dev` on an
+`impl` METHOD isn't covered this pass, only top-level `fn`s. Verified against
+`examples/dev_conditional_compilation.hotc` both ways (`run`/`--release run`)
+and a direct check that an ungated call genuinely fails to compile in
+release mode. Full example regression suite: zero new failures. Self-hosting
+verified to a true fixed point.
 
 ### Typestate types: resource lifecycle tracked in the type system
 

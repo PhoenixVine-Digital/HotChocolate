@@ -1,0 +1,23 @@
+// Real `@dev` conditional compilation -- a `@dev fn` and an `if dev { ... }` block are stripped
+// from the compiled output ENTIRELY in a release build (`--release`), not just made runtime-
+// unreachable. Run this file BOTH ways to see the difference:
+//   ./gradlew run --args="run examples/dev_conditional_compilation.hotc"              (dev build)
+//   ./gradlew run --args="--release run examples/dev_conditional_compilation.hotc"    (release)
+// Dev build prints: "start", "debug: hitboxes", "5", "done".
+// Release build prints: "start", "5", "done" -- the debug line is GONE, and `debug_draw_hitboxes`
+// doesn't exist in the compiled class at all (confirmed separately: calling it OUTSIDE an `if dev`
+// guard fails to compile in a release build with a real "unknown function" error).
+
+@dev
+fn debug_draw_hitboxes() {
+    print("debug: hitboxes");
+}
+
+fn main() {
+    print("start");
+    if dev {
+        debug_draw_hitboxes();
+    }
+    print(2 + 3);
+    print("done");
+}

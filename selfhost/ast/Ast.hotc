@@ -878,6 +878,11 @@ pub struct Program {
     // `Expr.Call` to a `@must_use` fn, with no `let`/`return`/anything else consuming its result,
     // is a real compile error naming the fn.
     must_use_fn_names: Vec<String>,
+    // `@dev fn debug_only() { ... }` -- see `IDEAS.md`'s own "conditionally-compiled debug-only
+    // code" entry. Same bare-directive side-channel shape `must_use_fn_names` above already uses.
+    // `Driver.hotc`'s own `strip_dev_code` is the only reader: in a release build, every fn named
+    // here is dropped from `Program.fns` entirely before the checker/codegen ever see it.
+    dev_fn_names: Vec<String>,
     // `/// ...` immediately before a top-level `struct` or `fn` -- see README's own "Structured
     // doc comments" section. Same flat-side-channel reasoning as `struct_annotation_names`/
     // `must_use_fn_names` above -- `Checker.hotc`'s own `check_doc_sees` (a pass at the very end

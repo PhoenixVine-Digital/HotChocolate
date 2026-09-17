@@ -642,6 +642,18 @@ impl Parser {
         if self.check(PIPE) || self.check(PIPEPIPE) {
             return self.lambda_lit();
         }
+        // `dev` -- see `Ast.hc`'s own `IDEAS.md` note on `@dev`/conditional compilation. A reserved
+        // keyword (`Lexer.hotc`'s own `DEV` token), used ONLY as the exact condition of an `if dev
+        // { ... }` block -- `Driver.hotc`'s own `strip_dev_blocks` recognizes that EXACT shape
+        // (an `If` whose `cond` is `Ident { name: "dev" }`) and either splices the block's body in
+        // unconditionally (dev build) or drops it entirely (release build) as a real AST rewrite
+        // pass BEFORE the checker ever runs -- never a real runtime branch. Reusing the plain
+        // `Ident` node (rather than a dedicated new one) is what makes that recognition a simple
+        // shape match instead of needing its own new `Expr` variant.
+        if self.check(DEV) {
+            self.advance();
+            return Ident { name: "dev" };
+        }
         // `3.5f` / `3.5` -- see `Ast.hc`'s own `Expr.FloatLit`/`Expr.DoubleLit` header for why the
         // literal's own source text is kept as-is rather than parsed into a native value here.
         if self.check(FLOAT) {
@@ -1930,6 +1942,7 @@ impl Parser {
         var fn_annotation_names = empty_str_vec();
         var fn_annotation_data = empty_annotation_vec();
         var must_use_fn_names = empty_str_vec();
+        var dev_fn_names = empty_str_vec();
         var struct_doc_names = empty_str_vec();
         var struct_doc_data = empty_doc_comment_vec();
         var fn_doc_names = empty_str_vec();
@@ -1991,6 +2004,11 @@ impl Parser {
             // STRING or an IDENT follows the `@` -- same distinction `Ast.hc`'s own `Annotation`
             // header already draws for `@serializable` (a different, still-unported directive).
             var pending_must_use = false;
+            // `@dev` -- see `IDEAS.md`'s own "conditionally-compiled debug-only code" entry.
+            // Bare, like `@must_use`; only meaningful on a top-level `fn` (gated in ONE place,
+            // right below, rather than `@must_use`'s own scattered per-branch rejects -- same
+            // practical effect, less repetition).
+            var pending_dev = false;
             // `@sendable` -- see `Ast.hc`'s own `Program.sendable_struct_names` header. Same bare-
             // directive distinction as `@must_use` right below, and same "only on struct" gate as
             // Phoenix Flight's own `PhoenixPool::spawn` needs to actually check anything -- see
@@ -2019,6 +2037,14 @@ impl Parser {
                 if self.tokens.get(self.pos + 1).kind == STRING {
                     pending_annotation = some_annotation(self.annotation());
                     has_pending_annotation = true;
+                } else if self.tokens.get(self.pos + 1).kind == DEV {
+                    // `@dev` -- `dev` is a reserved KEYWORD (`Lexer.hotc`'s own `DEV` token, also
+                    // usable as a real expression inside `if dev { ... }`, see `primary`'s own
+                    // header), not an `IDENT` -- `directive()`'s own `self.expect(IDENT)` would
+                    // throw on it, so this one directive is recognized directly here instead.
+                    self.advance(); // AT
+                    self.advance(); // DEV
+                    pending_dev = true;
                 } else {
                     let directive = self.directive();
                     if directive == "must_use" {
@@ -2063,6 +2089,15 @@ impl Parser {
             // since there's only ONE valid target to check for instead of many invalid ones.
             if pending_sendable && !self.check(STRUCT) {
                 throw ParseError::new("'@sendable' is only supported on 'struct' declarations");
+            }
+            // `@dev` is only meaningful on a top-level `fn` -- same single-gate shape `@sendable`
+            // right above uses (one valid target, checked here, rather than `@must_use`'s own
+            // scattered per-branch rejects below). Positive check (IS it one of the other
+            // declaration-kind keywords the loop right below this one dispatches on?) rather than
+            // a long negation -- easier to keep in sync with that chain's own real member list.
+            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM);
+            if pending_dev && next_is_other_decl_kind {
+                throw ParseError::new("'@dev' is only supported on top-level 'fn' declarations");
             }
             // `@after`/`@before`/`@profile` are only meaningful on `system` -- same single up-
             // front gate `@sendable` uses right above, rather than repeating the reject in every
@@ -2226,6 +2261,9 @@ impl Parser {
                 if pending_must_use {
                     must_use_fn_names.push(fd.name);
                 }
+                if pending_dev {
+                    dev_fn_names.push(fd.name);
+                }
                 if has_pending_doc {
                     if let Some { value: docv2 } = pending_doc {
                         fn_doc_names.push(fd.name);
@@ -2235,7 +2273,7 @@ impl Parser {
                 fns.push(fd);
             }
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
 
     // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field
