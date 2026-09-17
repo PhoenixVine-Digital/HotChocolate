@@ -803,16 +803,28 @@ pub struct SystemDecl {
     name: String,
     run_params: Vec<Param>,
     run_body: Vec<Stmt>,
-    // `@after(OtherSystem)` -- an explicit ordering hint: this system runs after `OtherSystem`.
-    // Single-target only this pass (see `ECS_IDEAS.md`'s own "Resolved decisions" #1 -- confirmed,
-    // not a temporary cut). `None` when no `@after` was written.
-    after: Option<String>,
-    // `@before(OtherSystem)` -- the mirror of `after`: this system runs before `OtherSystem`.
-    before: Option<String>,
+    // `@after(OtherSystem)` / `@after(A, B, ...)` -- an explicit ordering hint: this system runs
+    // after every named system. Multi-target (2026-09-17, "Still open" #1 in `ECS_IDEAS.md`) --
+    // originally single-target only, extended once a real caller needed to depend on more than
+    // one other system at once. Empty `Vec` when no `@after` was written.
+    after: Vec<String>,
+    // `@before(OtherSystem)` / `@before(A, B, ...)` -- the mirror of `after`: this system runs
+    // before every named system.
+    before: Vec<String>,
     // `@profile` -- deferred to v2 per `ECS_IDEAS.md`'s own "Still open" #1 answer, but the parser
     // already records it (cheap, and avoids a second syntax change once the checker/codegen catch
     // up) -- unread by anything yet.
     has_profile: Bool,
+    // `@run_if(condition_fn)` -- `condition_fn` is a real, plain top-level `fn condition_fn() ->
+    // Bool` (any zero-arg, `Bool`-returning fn; ordinary code inside it can read a `static` or
+    // call into anything else it needs). Checked by the SAME conflict/ordering analysis but
+    // orthogonal to it (see `ECS_IDEAS.md`'s own "Still open" #1 -- this was deferred alongside
+    // `@profile`, then picked up once `@after`/`@before` went multi-target, since both are the
+    // same "attribute mechanism already exists, just needs a new name recognized" shape):
+    // `Codegen.hotc`'s own driver wraps this system's WHOLE dispatch (every matching row, this
+    // tick) in `if (condition_fn()) { ... }`, skipping the system entirely for the tick when it
+    // returns `false`. `""` when no `@run_if` was written.
+    run_if: String,
     // `@main_thread` -- a real, general scheduling constraint the ownership-conflict analysis
     // this whole scheduler is built on can never see on its own: this system's own `run` body
     // touches a thread-affine external resource (real, disclosed motivating case: any OpenGL

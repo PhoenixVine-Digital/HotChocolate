@@ -722,24 +722,35 @@ fn empty_int_vec_ecs() -> Vec<Int> {
 // Is the system at `idx` ready to be placed next -- its own `@after` target (if any) already
 // placed, and no unplaced system's `@before` names it? See `TyChecker.check_systems`'s own header
 // for the full topological-sort this drives.
-fn system_ready_ecs(idx: Int, names: &Vec<String>, after: &Vec<String>, before: &Vec<String>, placed: &Vec<Bool>) -> Bool {
+fn system_ready_ecs(idx: Int, names: &Vec<String>, after: &Vec<Vec<String>>, before: &Vec<Vec<String>>, placed: &Vec<Bool>) -> Bool {
     let my_name = names.get(idx);
+    // Multi-target `@after` -- EVERY named system must already be placed, not just one.
     let my_after = after.get(idx);
-    if my_after != "" {
+    var aj = 0;
+    while aj < my_after.length() {
+        let want = my_after.get(aj);
         var after_placed = false;
         var ai = 0;
         while ai < names.length() {
-            if names.get(ai) == my_after {
+            if names.get(ai) == want {
                 after_placed = placed.get(ai);
             }
             ai = ai + 1;
         }
         if !after_placed { return false; }
+        aj = aj + 1;
     }
+    // Multi-target `@before` -- any NOT-YET-PLACED other system whose own `before` list names
+    // `my_name` blocks this one from going first.
     var bi = 0;
     while bi < names.length() {
         if !placed.get(bi) && bi != idx {
-            if before.get(bi) == my_name { return false; }
+            let other_before = before.get(bi);
+            var bj = 0;
+            while bj < other_before.length() {
+                if other_before.get(bj) == my_name { return false; }
+                bj = bj + 1;
+            }
         }
         bi = bi + 1;
     }
@@ -2311,12 +2322,32 @@ impl TyChecker {
     // execution order (`self.system_order`), topologically sorted by `@after`/`@before`
     // constraints with declaration order as the tie-break for anything they don't decide (see
     // "Resolved decisions" #4) -- a genuine cycle is a real error, not silently ignored.
-    fn check_systems(&mut self, systems: &Vec<SystemDecl>) {
+    // `fns` is passed in directly (not read from `self.fn_sigs`) purely because of WHEN this runs:
+    // `compile_program` calls `check_systems` right after components/resources register, but
+    // BEFORE any ordinary top-level `fn` gets its own signature registered into `self.fn_sigs` --
+    // so a `self.fn_sigs.get(rif)` lookup here would always fail even for a real, correctly-typed
+    // `@run_if` target. Real gap found writing this feature's own test: `@run_if(regen_enabled)`
+    // failed with "no fn named 'regen_enabled' exists" even though it was declared right there in
+    // the same file. Scanning `fns` directly sidesteps the ordering question entirely.
+    fn check_systems(&mut self, systems: &Vec<SystemDecl>, fns: &Vec<FnDecl>) {
         var names = empty_str_vec2();
         var reads = empty_str_vec_vec_ecs();
         var writes = empty_str_vec_vec_ecs();
-        var after = empty_str_vec2();
-        var before = empty_str_vec2();
+        // `Vec<Vec<String>>`, not `Vec<String>` -- `@after(A, B, ...)` multi-target (2026-09-17,
+        // `ECS_IDEAS.md`'s own "Still open" #1), each system's own after/before list in full.
+        // UNFILTERED (raw `sysd.after`/`sysd.before`, straight off the AST) -- the real, filtered
+        // `after`/`before` (unknown-name entries dropped) get built fresh, by `.push()` alone, in
+        // the second pass below, once `names` is complete enough to validate against. Deliberately
+        // never mutated via `.set()` on a nested `Vec<Vec<String>>` entry -- a real, previously-
+        // hit gap (see `group_variant_names_by_enum_cg`'s own header in `Codegen.hotc`): that
+        // specific shape needs its own `.set` monomorphized, and nothing else in this compiler had
+        // ever called it before, which produced a genuine `NoSuchMethodError` at RUNTIME the first
+        // time something tried, even though compilation itself reported success.
+        var raw_after = empty_str_vec_vec_ecs();
+        var raw_before = empty_str_vec_vec_ecs();
+        // `@run_if(condition_fn)` -- parallel to `names` (see `Ast.hc`'s own `SystemDecl.run_if`
+        // header). `""` for a system with no `@run_if`.
+        var run_ifs = empty_str_vec2();
         // `@main_thread` -- see `Ast.hc`'s own `SystemDecl.has_main_thread` header. Indexed the
         // SAME way as `names`/`reads`/`writes` (built in this same loop), read by both
         // `systems_conflict_main_thread_ecs` call sites below.
@@ -2415,28 +2446,68 @@ impl TyChecker {
             }
             reads.push(sys_reads);
             writes.push(sys_writes);
-            var after_name = "";
-            if let Some { value: an } = sysd.after { after_name = an; }
-            after.push(after_name);
-            var before_name = "";
-            if let Some { value: bn } = sysd.before { before_name = bn; }
-            before.push(before_name);
+            raw_after.push(sysd.after);
+            raw_before.push(sysd.before);
+            run_ifs.push(sysd.run_if);
             i = i + 1;
         }
+        var after = empty_str_vec_vec_ecs();
+        var before = empty_str_vec_vec_ecs();
         var j = 0;
         while j < names.length() {
-            let an2 = after.get(j);
-            if an2 != "" && !str_vec_contains_ecs(names, an2) {
-                self.error("system '" + names.get(j) + "' has '@after(" + an2 + ")', but no system named '" + an2 + "' exists");
-                // Downgrade to "no constraint" for the topo-sort below -- an unknown target would
-                // otherwise never become "placed", surfacing as a spurious cycle error on top of
-                // the real one just reported above.
-                after.set(j, "");
+            // Every name in EACH list gets checked -- multi-target means there's no single "" to
+            // downgrade to on an unknown target anymore, so an unresolved name is instead dropped
+            // straight out of that system's own list (mirrors the old single-target "downgrade to
+            // no constraint" reasoning, just per-entry now): a target that never becomes "placed"
+            // would otherwise surface as a spurious cycle error stacked on top of the real one
+            // just reported.
+            var valid_after = empty_str_vec2();
+            var ai2 = 0;
+            let this_after = raw_after.get(j);
+            while ai2 < this_after.length() {
+                let an2 = this_after.get(ai2);
+                if str_vec_contains_ecs(names, an2) {
+                    valid_after.push(an2);
+                } else {
+                    self.error("system '" + names.get(j) + "' has '@after(" + an2 + ")', but no system named '" + an2 + "' exists");
+                }
+                ai2 = ai2 + 1;
             }
-            let bn2 = before.get(j);
-            if bn2 != "" && !str_vec_contains_ecs(names, bn2) {
-                self.error("system '" + names.get(j) + "' has '@before(" + bn2 + ")', but no system named '" + bn2 + "' exists");
-                before.set(j, "");
+            after.push(valid_after);
+            var valid_before = empty_str_vec2();
+            var bi3 = 0;
+            let this_before = raw_before.get(j);
+            while bi3 < this_before.length() {
+                let bn2 = this_before.get(bi3);
+                if str_vec_contains_ecs(names, bn2) {
+                    valid_before.push(bn2);
+                } else {
+                    self.error("system '" + names.get(j) + "' has '@before(" + bn2 + ")', but no system named '" + bn2 + "' exists");
+                }
+                bi3 = bi3 + 1;
+            }
+            before.push(valid_before);
+            let rif = run_ifs.get(j);
+            if rif != "" {
+                var rif_found = false;
+                var fi3 = 0;
+                while fi3 < fns.length() {
+                    let fd3 = fns.get(fi3);
+                    if fd3.name == rif {
+                        rif_found = true;
+                        if fd3.params.length() != 0 {
+                            self.error("system '" + names.get(j) + "' has '@run_if(" + rif + ")', but '" + rif + "' takes " + JString::valueOf(fd3.params.length()) + " parameter(s) -- it must take none");
+                        }
+                        let rif_ret = opt_string_or2(fd3.ret_type, "Unit");
+                        if rif_ret != "Bool" {
+                            self.error("system '" + names.get(j) + "' has '@run_if(" + rif + ")', but '" + rif + "' returns " + rif_ret + ", not Bool");
+                        }
+                    }
+                    fi3 = fi3 + 1;
+                }
+                if !rif_found {
+                    self.error("system '" + names.get(j) + "' has '@run_if(" + rif + ")', but no fn named '" + rif + "' exists");
+                }
             }
             j = j + 1;
         }

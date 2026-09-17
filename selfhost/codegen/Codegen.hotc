@@ -8217,10 +8217,16 @@ fn synthesize_profile_clock_extern_ecs() -> ExternClassDecl {
 }
 
 fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> Vec<Stmt> {
-    var body = empty_stmt_vec2();
+    // Everything this dispatch fn does for a REAL tick (the profiling clock, every archetype
+    // loop, the profiling print) builds up in `inner_body` first -- `@run_if(condition_fn)` (see
+    // `Ast.hc`'s own `SystemDecl.run_if` header) then decides whether `inner_body` runs AT ALL
+    // this tick, wrapping it in one real `if (condition_fn()) { ...inner_body... }` rather than
+    // guarding each piece separately. The final `return "";` stays OUTSIDE the guard either way --
+    // this fn always has to return something, whether or not the system actually ran this tick.
+    var inner_body = empty_stmt_vec2();
     if profiled {
         let t0_call = StaticCall { type_name: "__ProfileClock", method: "nanoTime", args: empty_expr_vec_cg() };
-        body.push(Let { name: "__prof_t0", mutable: false, init: t0_call, declared_type: none_string2(), line: 0 });
+        inner_body.push(Let { name: "__prof_t0", mutable: false, init: t0_call, declared_type: none_string2(), line: 0 });
     }
     let needed = required_components_of_system_ecs(&sysd.run_params, resource_names);
     let excluded = excluded_components_of_system_ecs(&sysd.run_params);
@@ -8232,7 +8238,7 @@ fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<
         // holding even one excluded component is skipped for this system entirely, regardless of
         // whether it also satisfies `needed`.
         if sig_has_all_ecs(&sig, &needed) && !sig_has_any_ecs(&sig, &excluded) {
-            body.push(synthesize_archetype_loop_stmt_ecs(sysd, &sig, loop_idx, resource_names));
+            inner_body.push(synthesize_archetype_loop_stmt_ecs(sysd, &sig, loop_idx, resource_names));
             loop_idx = loop_idx + 1;
         }
         ai = ai + 1;
@@ -8246,7 +8252,18 @@ fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<
         var literals = vec_of("profile: " + sysd.name + " (" + mode + ") took ");
         literals.push("ms");
         let msg = StringInterp { literals: literals, exprs: vec_of(ms_expr) };
-        body.push(ExprStmt { expr: Call { callee: "print", args: vec_of(msg) }, line: 0 });
+        inner_body.push(ExprStmt { expr: Call { callee: "print", args: vec_of(msg) }, line: 0 });
+    }
+    var body = empty_stmt_vec2();
+    if sysd.run_if != "" {
+        let cond = Call { callee: sysd.run_if, args: empty_expr_vec_cg() };
+        body.push(If { cond: cond, then_body: inner_body, else_body: none_stmt_list_cg(), line: 0, narrow_name: "", narrow_is_eq: false });
+    } else {
+        var ii = 0;
+        while ii < inner_body.length() {
+            body.push(inner_body.get(ii));
+            ii = ii + 1;
+        }
     }
     body.push(Return { value: some_expr_cg(StringLit { value: "" }), line: 0 });
     return body;
@@ -8742,7 +8759,7 @@ fn build_flush_transitions_stmts_ecs(add_types: &Vec<String>, remove_types: &Vec
     return body;
 }
 
-pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool, classpath: Vec<String>, resources: Vec<ComponentDecl>) -> Vec<String> {
+pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool, classpath: Vec<String>, resources: Vec<ComponentDecl>, quiet_schedule: Bool) -> Vec<String> {
     // `arena struct` -- see README's own "Off-heap data" section: built on `java.lang.foreign`,
     // stable only since JDK 22 (still preview at 21). Gated at `25` -- the only discrete
     // `--target` level this compiler actually has (17/21/25, no "22") that's genuinely >= 22 --
@@ -8847,11 +8864,15 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         statics.push(resource_static);
         ri0 = ri0 + 1;
     }
-    checker.check_systems(&systems);
+    checker.check_systems(&systems, &fns);
     var wi0 = 0;
     while wi0 < checker.warnings.length() {
         let w = checker.warnings.get(wi0);
-        if w != "" {
+        // `--quiet-schedule` -- see `Driver.hotc`'s own header for the full design. Suppresses
+        // just this ALWAYS-ON per-conflict scheduling warning (the real, previously-missing opt-
+        // out `ECS_IDEAS.md`'s own "Still open" #3 flagged) -- `--explain-schedule`'s own report,
+        // right below, is unaffected either way.
+        if w != "" && !quiet_schedule {
             print("warning: " + w);
         }
         wi0 = wi0 + 1;

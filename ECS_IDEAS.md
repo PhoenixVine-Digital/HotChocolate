@@ -589,13 +589,26 @@ questions the answers themselves raise is below, in "Still open."
 Narrower follow-ups the answers above raise — small enough to resolve here
 without a big back-and-forth, but real picks nonetheless:
 
-1. **Attribute syntax specifics**: does `@after(Movement)`/`@before(Render)`
-   reference another `system` by its bare name (as sketched above), and can
-   a `system` name more than one (`@after(Movement, Input)`)? Is `@run_if`
-   in scope for v1 at all, or does it stay deferred alongside `@profile`
-   (both are ORTHOGONAL to the scheduling/archetype work, so shipping the
-   attribute MECHANISM now doesn't require shipping every attribute NAME
-   immediately)?
+1. ~~**Attribute syntax specifics**~~ — **Resolved and shipped, 2026-09-17**: yes to both. `@after`/
+   `@before` now take a comma-separated list (`@after(Movement, Input)`, `Ast.hc`'s own `SystemDecl.
+   after`/`.before` changed from `Option<String>` to `Vec<String>`), and `@run_if(condition_fn)`
+   shipped too -- `condition_fn` is any plain, real top-level `fn condition_fn() -> Bool`;
+   `Codegen.hotc`'s own `build_system_dispatch_body_ecs` wraps the WHOLE per-tick dispatch (every
+   matching archetype row) in `if (condition_fn()) { ... }`, skipping the system entirely for the
+   tick when it returns `false`. `Checker.hotc`'s own `check_systems` validates every name in
+   both lists still resolves to a real system (an unknown name is dropped from that ONE entry,
+   same "downgrade to no constraint" reasoning the old single-target version already had, just
+   per-entry now instead of once) and that `@run_if`'s target is a real, zero-arg, `Bool`-returning
+   fn -- found the hard way that `check_systems` runs BEFORE ordinary top-level fns get their
+   signatures registered into the checker's own `fn_sigs`, so validating against `self.fn_sigs`
+   always failed even for a correctly-typed target; fixed by scanning the real `fns: &Vec<FnDecl>`
+   list directly instead. `system_ready_ecs`'s own topo-sort readiness check generalized the same
+   way (ALL of a system's `@after` targets must be placed, not just one). Verified against
+   `examples/ecs_multi_after_run_if.hotc`: `Render` correctly waits on BOTH `Movement` and `Regen`,
+   and a `@run_if`-gated system whose condition is always `false` (`Poison`) never runs at all
+   across two full `world.run_all()` calls, while a sibling gated `true` (`Regen`) runs every
+   time -- exact hand-computed values both ticks. Full example regression suite: zero new
+   failures. Self-hosting verified to a true fixed point.
 2. run is in v2, and no after cannot name multiple
 2. ~~**`--explain-schedule`'s actual output shape**~~ — **Resolved and implemented, 2026-09-10**:
    one parallel-group per line, in RUN order, each listing its own member system names and
@@ -612,11 +625,15 @@ without a big back-and-forth, but real picks nonetheless:
    ECS sections): `--explain-schedule` correctly printed `group 0: Movement, Damage  (parallel)`
    then `group 1: LowHealthAlert`, matching the conflict warning (Damage/LowHealthAlert only) and
    the hand-computed expected trace exactly, with or without `--target` also present.
-3. every build, we want safety but also opt out for iteration -- **still open**: the ALWAYS-ON
-   per-conflict warning has no opt-out yet. A real, separate flag from `--explain-schedule` (that
-   one ADDS a report; this one would SUPPRESS an existing one) -- deliberately not bundled into
-   the same change, since "print more" and "print less" are different enough asks to resolve
-   independently, and nothing forced answering both at once.
+3. ~~every build, we want safety but also opt out for iteration~~ — **Resolved and shipped,
+   2026-09-17**: `--quiet-schedule`, a fourth independently-optional leading CLI flag (stacks with
+   `--target`/`--explain-schedule`/`--classpath` the same way, shifting `off` further in
+   `Driver.hotc`'s own `run_cli`). Suppresses ONLY the always-on per-conflict warning loop in
+   `Codegen.hotc`'s own `compile_program` -- `--explain-schedule`'s own full-schedule report is
+   completely unaffected either way, confirming "print more" and "print less" really were
+   independent asks. Threaded as a new `quiet_schedule: Bool` param on `compile_program` itself
+   (and `run_doc_cli`), all 5 internal self-hosting-bootstrap probe call sites passing `false`
+   (never suppress there).
 3. **Archetype-move mechanics** — when a component is added/removed post-
    spawn (decision #3), does that take effect immediately (mid-tick), or
    queue until the next `world.run_all()` (avoiding an archetype changing

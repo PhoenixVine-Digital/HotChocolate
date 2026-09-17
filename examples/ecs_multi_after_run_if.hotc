@@ -1,0 +1,57 @@
+// Real multi-target `@after`/`@before` (`@after(A, B)`, not just one name) and `@run_if(condition)`
+// -- both real, previously-deferred `ECS_IDEAS.md` "Still open" items. `Render` here depends on
+// BOTH `Movement` and `Regen` having already run this tick; `Regen` is gated by `@run_if
+// (regen_enabled)` (always true here) and `Poison` by `@run_if(poison_enabled)` (always false) --
+// a plain top-level `fn -> Bool` the compiler calls once per dispatch, skipping the WHOLE system
+// body for the tick when it returns `false`.
+use ecs;
+
+component Transform { x: Int }
+component Health { hp: Int }
+
+fn regen_enabled() -> Bool {
+    return true;
+}
+
+fn poison_enabled() -> Bool {
+    return false;
+}
+
+system Movement {
+    fn run(t: &mut Transform) {
+        t.x = t.x + 1;
+    }
+}
+
+@run_if(regen_enabled)
+system Regen {
+    fn run(h: &mut Health) {
+        h.hp = h.hp + 5;
+    }
+}
+
+// Never actually runs (`poison_enabled` always returns false) -- if `@run_if` didn't work at all,
+// this would subtract 50 every tick and the final hp would be wrong.
+@run_if(poison_enabled)
+system Poison {
+    fn run(h: &mut Health) {
+        h.hp = h.hp - 50;
+    }
+}
+
+@after(Movement, Regen)
+system Render {
+    fn run(t: &Transform, h: &Health) {
+        print("{t.x} {h.hp}");
+    }
+}
+
+fn main() {
+    var world = World::new();
+    world.spawn(Transform { x: 0 }, Health { hp: 100 });
+
+    world.run_all(); // expect "1 105" -- Regen ran (+5), Poison never did
+    world.run_all(); // expect "2 110"
+
+    print("done");
+}

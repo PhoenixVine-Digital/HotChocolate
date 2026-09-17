@@ -1962,12 +1962,18 @@ impl Parser {
             // here (not the single `if` this used to be) so multiple directives can stack on one
             // declaration (`@after(...) @profile system Foo { ... }`) -- strictly more permissive
             // than before, every previously-valid single-`@` case still parses identically.
-            var pending_after = none_string();
-            var pending_before = none_string();
+            // `Vec<String>`, not `Option<String>` -- `@after(A, B, ...)` multi-target (2026-09-17,
+            // see `Ast.hc`'s own `SystemDecl.after` header for why); empty means no `@after`/
+            // `@before` was written at all.
+            var pending_after = empty_str_vec2();
+            var pending_before = empty_str_vec2();
             var pending_profile = false;
             // `@main_thread` -- see `Ast.hc`'s own `SystemDecl.has_main_thread` header. Same
             // bare-directive shape `@profile` already has.
             var pending_main_thread = false;
+            // `@run_if(condition_fn)` -- see `Ast.hc`'s own `SystemDecl.run_if` header. `""` when
+            // no `@run_if` was written.
+            var pending_run_if = "";
             while self.check(AT) {
                 if self.tokens.get(self.pos + 1).kind == STRING {
                     pending_annotation = some_annotation(self.annotation());
@@ -1980,16 +1986,26 @@ impl Parser {
                         pending_sendable = true;
                     } else if directive == "after" {
                         self.expect(LPAREN);
-                        pending_after = some_string(self.expect(IDENT).text);
+                        pending_after.push(self.expect(IDENT).text);
+                        while self.match_kind(COMMA) {
+                            pending_after.push(self.expect(IDENT).text);
+                        }
                         self.expect(RPAREN);
                     } else if directive == "before" {
                         self.expect(LPAREN);
-                        pending_before = some_string(self.expect(IDENT).text);
+                        pending_before.push(self.expect(IDENT).text);
+                        while self.match_kind(COMMA) {
+                            pending_before.push(self.expect(IDENT).text);
+                        }
                         self.expect(RPAREN);
                     } else if directive == "profile" {
                         pending_profile = true;
                     } else if directive == "main_thread" {
                         pending_main_thread = true;
+                    } else if directive == "run_if" {
+                        self.expect(LPAREN);
+                        pending_run_if = self.expect(IDENT).text;
+                        self.expect(RPAREN);
                     } else {
                         throw ParseError::new("unknown compiler directive '@" + directive + "'");
                     }
@@ -2010,11 +2026,11 @@ impl Parser {
             // `@after`/`@before`/`@profile` are only meaningful on `system` -- same single up-
             // front gate `@sendable` uses right above, rather than repeating the reject in every
             // other arm.
-            var has_pending_ordering_or_profile = pending_profile || pending_main_thread;
-            if let Some { value: pa0 } = pending_after { has_pending_ordering_or_profile = true; }
-            if let Some { value: pb0 } = pending_before { has_pending_ordering_or_profile = true; }
+            var has_pending_ordering_or_profile = pending_profile || pending_main_thread || pending_run_if != "";
+            if pending_after.length() > 0 { has_pending_ordering_or_profile = true; }
+            if pending_before.length() > 0 { has_pending_ordering_or_profile = true; }
             if has_pending_ordering_or_profile && !self.check(SYSTEM) {
-                throw ParseError::new("'@after'/'@before'/'@profile'/'@main_thread' are only supported on 'system' declarations");
+                throw ParseError::new("'@after'/'@before'/'@profile'/'@main_thread'/'@run_if' are only supported on 'system' declarations");
             }
             if self.check(STRUCT) {
                 if pending_must_use {
@@ -2157,7 +2173,7 @@ impl Parser {
                 if has_pending_doc {
                     throw ParseError::new("doc comments aren't supported on 'system' declarations");
                 }
-                systems.push(self.system_decl(pending_after, pending_before, pending_profile, pending_main_thread));
+                systems.push(self.system_decl(pending_after, pending_before, pending_profile, pending_main_thread, pending_run_if));
             } else {
                 let fd = self.fn_decl();
                 if has_pending_annotation {
@@ -2203,10 +2219,10 @@ impl Parser {
     }
 
     // `system Name { fn run(a: &mut A, b: &B) { ... } }` -- see `Ast.hc`'s own `SystemDecl` header.
-    // `after`/`before`/`has_profile`/`has_main_thread` come from whichever `@after`/`@before`/
-    // `@profile`/`@main_thread` directives preceded this declaration in the top-level loop
-    // (already parsed by the time this runs).
-    fn system_decl(&mut self, after: Option<String>, before: Option<String>, has_profile: Bool, has_main_thread: Bool) -> SystemDecl {
+    // `after`/`before`/`has_profile`/`has_main_thread`/`run_if` come from whichever `@after`/
+    // `@before`/`@profile`/`@main_thread`/`@run_if` directives preceded this declaration in the
+    // top-level loop (already parsed by the time this runs).
+    fn system_decl(&mut self, after: Vec<String>, before: Vec<String>, has_profile: Bool, has_main_thread: Bool, run_if: String) -> SystemDecl {
         self.expect(SYSTEM);
         let name = self.expect(IDENT).text;
         self.expect(LBRACE);
@@ -2220,7 +2236,7 @@ impl Parser {
         // `-> Ret` at all.
         let run_body = self.block();
         self.expect(RBRACE);
-        return SystemDecl { name: name, run_params: run_params, run_body: run_body, after: after, before: before, has_profile: has_profile, has_main_thread: has_main_thread };
+        return SystemDecl { name: name, run_params: run_params, run_body: run_body, after: after, before: before, has_profile: has_profile, has_main_thread: has_main_thread, run_if: run_if };
     }
 
     // `@must_use` -- a bare `@IDENT` compiler directive, no quoted binary name and no `(...)`
@@ -2364,7 +2380,7 @@ fn empty_component_decl_vec() -> Vec<ComponentDecl> {
 }
 
 fn empty_system_decl_vec() -> Vec<SystemDecl> {
-    var v = vec_of(SystemDecl { name: "_", run_params: empty_param_vec(), run_body: empty_stmt_vec(), after: none_string(), before: none_string(), has_profile: false, has_main_thread: false });
+    var v = vec_of(SystemDecl { name: "_", run_params: empty_param_vec(), run_body: empty_stmt_vec(), after: empty_str_vec2(), before: empty_str_vec2(), has_profile: false, has_main_thread: false, run_if: "" });
     return Vec { data: v.data, len: 0 };
 }
 
