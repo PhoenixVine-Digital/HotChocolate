@@ -1,0 +1,60 @@
+// Real HashMap/IntHashMap/HashMap2 iteration helpers (keys()/values()/entries()) and HashSet/
+// IntHashSet -- both real, previously-deferred COLLECTIONS_IDEAS.md items.
+use collections;
+
+struct ItemStack { item_id: Int, count: Int }
+impl Hashable for ItemStack { fn hash_key(&self) -> Int { return self.item_id; } }
+impl Eq for ItemStack { fn equals(&self, other: &ItemStack) -> Bool { return self.item_id == other.item_id; } }
+
+fn main() {
+    // HashMap<V> iteration
+    var m = hash_map_new("a", 1);
+    m.register("b", 2);
+    m.register("c", 3);
+    print(m.keys().length());   // 3
+    print(m.values().length()); // 3
+    var sum = 0;
+    var vals = m.values();
+    var i = 0;
+    while i < vals.length() { sum = sum + vals.get(i); i = i + 1; }
+    print(sum); // 6
+    print(m.entries().length()); // 3
+
+    // IntHashMap<V> iteration
+    var im = int_hash_map_new(0, "zero");
+    im.register(2, "two");
+    im.register(5, "five");
+    print(im.keys().length());    // 3
+    var ikeys = im.keys();
+    var ksum = 0;
+    var j = 0;
+    while j < ikeys.length() { ksum = ksum + ikeys.get(j); j = j + 1; }
+    print(ksum); // 0+2+5 = 7
+    print(im.entries().length()); // 3
+
+    // HashMap2<K,V> iteration
+    var m2 = hash_map2_new(ItemStack { item_id: 1, count: 1 }, "sword");
+    m2.register(ItemStack { item_id: 2, count: 1 }, "shield");
+    print(m2.keys().length());   // 2
+    print(m2.values().length()); // 2
+
+    // HashSet
+    var s = hash_set_new("x");
+    s.add("y");
+    s.add("x"); // duplicate, no-op
+    print(s.length());        // 2
+    print(s.contains("x"));   // true
+    print(s.contains("z"));   // false
+    s.remove("y");
+    print(s.length());        // 1
+
+    // IntHashSet
+    var is_ = int_hash_set_new(10);
+    is_.add(20);
+    is_.add(10); // duplicate
+    print(is_.length());       // 2
+    print(is_.contains(20));   // true
+    print(is_.contains(99));   // false
+
+    print("done");
+}

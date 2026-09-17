@@ -227,6 +227,69 @@ impl HashMap<V> {
         return self.size;
     }
 
+    // Iteration helpers -- real, deferred since `get`/`register`/`remove`/`contains_key` covered
+    // every concrete need this doc's own use cases had, until closing out `COLLECTIONS_IDEAS.md`'s
+    // own backlog made them worth shipping anyway. Each walks every bucket once (`O(bucket_count +
+    // size)`), building a real `Vec<T>` from the empty-`[]`-array-literal feature (`Vec<T> { data:
+    // [], len: 0 }`) rather than the older "seed with a throwaway element, then `.clear()`" trick --
+    // there's no real `V`/`Entry<V>` value in hand up front the way `vec_of(...)` would need one.
+    fn keys(&self) -> Vec<String> {
+        var result = Vec<String> { data: [], len: 0 };
+        var i = 0;
+        while i < self.buckets.length() {
+            match self.buckets.get(i) {
+                Some { value: bucket } => {
+                    var j = 0;
+                    while j < bucket.length() {
+                        result.push(bucket.get(j).key);
+                        j = j + 1;
+                    }
+                }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    fn values(&self) -> Vec<V> {
+        var result = Vec<V> { data: [], len: 0 };
+        var i = 0;
+        while i < self.buckets.length() {
+            match self.buckets.get(i) {
+                Some { value: bucket } => {
+                    var j = 0;
+                    while j < bucket.length() {
+                        result.push(bucket.get(j).value);
+                        j = j + 1;
+                    }
+                }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    fn entries(&self) -> Vec<Entry<V>> {
+        var result = Vec<Entry<V>> { data: [], len: 0 };
+        var i = 0;
+        while i < self.buckets.length() {
+            match self.buckets.get(i) {
+                Some { value: bucket } => {
+                    var j = 0;
+                    while j < bucket.length() {
+                        result.push(bucket.get(j));
+                        j = j + 1;
+                    }
+                }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
     // Doubles `bucket_count` and rehashes every existing entry into a fresh bucket array once the
     // load factor crosses 0.75 (`size * 4 >= bucket_count * 3`, the integer-only equivalent of
     // `size / bucket_count >= 0.75` -- avoids needing a `Float` cast just for this comparison).
@@ -359,6 +422,47 @@ impl IntHashMap<V> {
 
     fn length(&self) -> Int {
         return self.len;
+    }
+
+    // Same iteration helpers as `HashMap<V>`'s own (see that impl's own header) -- direct-indexed
+    // storage makes these even simpler here: a slot's own INDEX is its key.
+    fn keys(&self) -> Vec<Int> {
+        var result = Vec<Int> { data: [], len: 0 };
+        var i = 0;
+        while i < self.slots.length() {
+            match self.slots.get(i) {
+                Some { value: v } => { result.push(i); }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    fn values(&self) -> Vec<V> {
+        var result = Vec<V> { data: [], len: 0 };
+        var i = 0;
+        while i < self.slots.length() {
+            match self.slots.get(i) {
+                Some { value: v } => { result.push(v); }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    fn entries(&self) -> Vec<Entry2<Int, V>> {
+        var result = Vec<Entry2<Int, V>> { data: [], len: 0 };
+        var i = 0;
+        while i < self.slots.length() {
+            match self.slots.get(i) {
+                Some { value: v } => { result.push(Entry2<Int, V> { key: i, value: v }); }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
     }
 }
 
@@ -533,6 +637,66 @@ impl HashMap2<K, V> {
         return self.size;
     }
 
+    // Same iteration helpers as `HashMap<V>`'s own (see that impl's own header) -- neither `K` nor
+    // `V` needs any bound here (`Hashable`/`Eq` are only ever consulted by `bucket_index_for`/
+    // `register`/`get`/`remove`, never by a plain walk-and-collect).
+    fn keys(&self) -> Vec<K> {
+        var result = Vec<K> { data: [], len: 0 };
+        var i = 0;
+        while i < self.buckets.length() {
+            match self.buckets.get(i) {
+                Some { value: bucket } => {
+                    var j = 0;
+                    while j < bucket.length() {
+                        result.push(bucket.get(j).key);
+                        j = j + 1;
+                    }
+                }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    fn values(&self) -> Vec<V> {
+        var result = Vec<V> { data: [], len: 0 };
+        var i = 0;
+        while i < self.buckets.length() {
+            match self.buckets.get(i) {
+                Some { value: bucket } => {
+                    var j = 0;
+                    while j < bucket.length() {
+                        result.push(bucket.get(j).value);
+                        j = j + 1;
+                    }
+                }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    fn entries(&self) -> Vec<Entry2<K, V>> {
+        var result = Vec<Entry2<K, V>> { data: [], len: 0 };
+        var i = 0;
+        while i < self.buckets.length() {
+            match self.buckets.get(i) {
+                Some { value: bucket } => {
+                    var j = 0;
+                    while j < bucket.length() {
+                        result.push(bucket.get(j));
+                        j = j + 1;
+                    }
+                }
+                None => {}
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
     fn maybe_resize(&mut self) {
         if self.size * 4 < self.bucket_count * 3 {
             return;
@@ -570,5 +734,71 @@ impl HashMap2<K, V> {
         }
         self.buckets = new_buckets;
         self.bucket_count = new_count;
+    }
+}
+
+// `HashSet`/`IntHashSet` -- thin wrappers reusing `HashMap<Bool>`/`IntHashMap<Bool>`'s own exact
+// bucket machinery with a throwaway stored value, exactly as `COLLECTIONS_IDEAS.md`'s own
+// "Explicitly deferred" note sketched (shipped once the actual backlog closed rather than a
+// concrete near-term need arriving -- see this doc's own "Status" trail). No new hashing/bucket
+// code at all: every real behavior (resize, collision handling, negative-hash masking) is
+// `HashMap<Bool>`/`IntHashMap<Bool>`'s own, already proven.
+struct HashSet {
+    map: HashMap<Bool>,
+}
+
+fn hash_set_new(first_key: String) -> HashSet {
+    return HashSet { map: hash_map_new(first_key, true) };
+}
+
+impl HashSet {
+    fn add(&mut self, key: String) {
+        self.map.register(key, true);
+    }
+
+    fn contains(&self, key: String) -> Bool {
+        return self.map.contains_key(key);
+    }
+
+    fn remove(&mut self, key: String) {
+        self.map.remove(key);
+    }
+
+    fn length(&self) -> Int {
+        return self.map.length();
+    }
+
+    fn keys(&self) -> Vec<String> {
+        return self.map.keys();
+    }
+}
+
+struct IntHashSet {
+    map: IntHashMap<Bool>,
+}
+
+fn int_hash_set_new(first_key: Int) -> IntHashSet {
+    return IntHashSet { map: int_hash_map_new(first_key, true) };
+}
+
+impl IntHashSet {
+    fn add(&mut self, key: Int) {
+        self.map.register(key, true);
+    }
+
+    fn contains(&self, key: Int) -> Bool {
+        return self.map.contains_key(key);
+    }
+
+    fn remove(&mut self, key: Int) {
+        self.map.remove(key);
+    }
+
+    fn length(&self) -> Int {
+        return self.map.length();
+    }
+
+    fn keys(&self) -> Vec<Int> {
+        return self.map.keys();
     }
 }

@@ -132,6 +132,39 @@ impl Parser {
         return t5.kind == LBRACE;
     }
 
+    // `Vec<Entry<V>> { ... }` / `Vec<Entry2<Int, V>> { ... }` -- a NESTED generic struct literal,
+    // where the type ARGUMENT is itself generic, not a bare `IDENT` -- `looks_like_generic_lit`/
+    // `_lit2` above only ever handle a bare, non-nested one/two-argument shape. Real gap found
+    // writing `stdlib/collections.hotc`'s own `entries()` methods (`Vec<Entry<V>>`), which parsed
+    // fine as a TYPE ANNOTATION (`-> Vec<Entry<V>>` -- `type_name_ref` already recurses through
+    // arbitrary nesting) but failed as a STRUCT LITERAL head, since nothing here ever tried a
+    // real, general parse for that position. A cheap, non-consuming 2-token pre-check (is the
+    // type argument itself `IDENT LT`?) rules out every non-nested case for free WITHOUT ever
+    // calling the heavier real parse below -- those already-handled shapes stay exactly as cheap
+    // as before. When the pre-check passes, this does a REAL (consuming) speculative parse via
+    // `type_name_ref` -- safe because `type_name_ref` already recurses correctly through
+    // arbitrary depth/argument-count nesting, so there's no need for a second, parallel
+    // "look-ahead only" type-expression parser -- then unconditionally restores `self.pos`
+    // (a true lookahead), so the caller re-parses for real, once, only after this confirms the
+    // whole shape genuinely ends in `> {`.
+    fn looks_like_nested_generic_lit(&mut self) -> Bool {
+        if self.pos + 2 >= self.tokens.length() { return false; }
+        let t1 = self.tokens.get(self.pos + 1);
+        if t1.kind != IDENT { return false; }
+        let t2 = self.tokens.get(self.pos + 2);
+        if t2.kind != LT { return false; }
+        let saved = self.pos;
+        self.advance(); // outer LT
+        let type_arg = self.type_name_ref();
+        var matched = false;
+        if self.check(GT) {
+            self.advance();
+            matched = self.check(LBRACE);
+        }
+        self.pos = saved;
+        return matched;
+    }
+
     fn peek_kind(&self) -> TokType {
         let t = self.peek();
         return t.kind;
@@ -700,6 +733,14 @@ impl Parser {
                 let type_arg2 = self.expect(IDENT).text;
                 self.expect(GT);
                 return self.struct_lit(t.text + "$" + type_arg1 + "$" + type_arg2, none_string());
+            }
+            // `Vec<Entry<V>> { ... }` -- the NESTED generic literal shape, see
+            // `looks_like_nested_generic_lit`'s own header.
+            if self.check(LT) && !self.no_struct_lit && self.looks_like_nested_generic_lit() {
+                self.advance(); // LT
+                let type_arg = self.type_name_ref();
+                self.expect(GT);
+                return self.struct_lit(t.text + "$" + type_arg, none_string());
             }
             // `Base<Arg>::Variant { ... }` -- explicitly-qualified generic-enum-variant
             // construction (see `Ast.hc`'s own `EnumDecl` header for why this can't just be bare

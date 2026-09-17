@@ -1,5 +1,24 @@
 # Real hashed collections — design doc
 
+**Status, 2026-09-17 (backlog close-out)**: two of this doc's own "Explicitly deferred" items
+shipped -- iteration helpers (`keys()`/`values()`/`entries()`, added to `HashMap<V>`/
+`IntHashMap<V>`/`HashMap2<K, V>` alike) and `HashSet`/`IntHashSet` (thin wrappers reusing
+`HashMap<Bool>`/`IntHashMap<Bool>`'s own exact bucket machinery with a throwaway stored value,
+exactly as originally sketched -- zero new hashing/bucket code). `entries()`'s own return type
+(`Vec<Entry<V>>`/`Vec<Entry2<Int, V>>`/`Vec<Entry2<K, V>>`) surfaced a real, previously-unexercised
+parser gap: a NESTED generic struct literal (`Vec<Entry<V>> { data: [], len: 0 }`, where the type
+ARGUMENT is itself generic) failed to parse at all -- `Parser.hotc`'s own `looks_like_generic_lit`/
+`_lit2` bounded lookaheads only ever handled a bare, non-nested argument, even though the
+IDENTICAL nesting already parsed fine as a plain TYPE ANNOTATION (`type_name_ref` already recurses
+through arbitrary depth). Fixed with a new `looks_like_nested_generic_lit`: a cheap 2-token
+pre-check (does the type argument itself look like `IDENT LT`?) rules out every already-handled
+shape for free, and only THEN does a real, restore-position-afterward speculative parse via
+`type_name_ref` itself -- reusing its existing recursion rather than writing a second, parallel
+type-expression parser. Verified against `examples/collections_iteration_hashset.hotc`: every
+iteration helper across all three map types, plus `HashSet`/`IntHashSet` add/contains/remove/
+length, all match hand-computed values. Full example regression suite: zero new failures.
+Self-hosting verified to a true fixed point.
+
 **Status, 2026-09-16 (Marshmallow integration)**: `HashMap<V>` got its first real consumer outside
 this repo's own `examples/` -- Marshmallow's `TextureCache` (`stdlib/graphics.hotc`) switched from
 its original two-parallel-`Vec`-with-linear-scan design to a real `Option<HashMap<Texture>>`,
