@@ -7,11 +7,20 @@ wrapping `java.util.concurrent`, at `stdlib/phoenix.hotc`, opt-in via
 design and `examples/phoenix_flight.hc` for a worked example. Also
 shipped, and NOT originally scoped in this doc: a real compile-time
 capture-safety check (`@sendable`) on `pool.spawn(...)`'s own lambda —
-see ARCHITECTURE.md's own "Compile-time concurrency safety" section. Not yet
-shipped, and still exactly the bigger, separate design this doc's own
-"Belongs to `IDEAS.md`'s ECS entry" section describes: `spawn_after`/
-dependency-graph chaining, and the full ownership-derived parallel
-scheduler (needs a real move/borrow checker first).
+see ARCHITECTURE.md's own "Compile-time concurrency safety" section.
+
+**Status, 2026-09-17 (correction)**: this note previously said `spawn_after`/
+dependency-graph chaining was "not yet shipped" — stale. It's real, shipped,
+and already tested: `PhoenixPool::spawn_after`/`::spawn_after_all` (block the
+CALLING thread on the dependency/dependencies, then submit — a deliberate
+trade-off against pool-worker starvation, see that fn's own header in
+`stdlib/phoenix.hotc`) and `PhoenixPool::spawn_chain`/`PhoenixChain::then`
+(a real, non-blocking `CompletableFuture`-backed continuation chain instead)
+cover both real shapes this doc's own sketch wanted. See `examples/
+phoenix_flight_chaining.hc`/`phoenix_flight_chain_async.hc`. The ONE thing
+still genuinely not shipped, unchanged: the full ownership-derived parallel
+scheduler (needs a real move/borrow checker first) — see `IDEAS.md`'s own
+ECS entry.
 
 **Note**: this file cites `ClipboardPacketHandler.hc` and similar files
 from `kubejs-aisle-tool`, a separate consumer project not present in
