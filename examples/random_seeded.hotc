@@ -1,0 +1,40 @@
+// Real, explicit, seeded RNG -- same seed must always produce the same sequence (the real point:
+// a caller can PROVE this by running it twice).
+use random;
+
+fn main() {
+    var rng1 = random_new(42 as Long);
+    var rng2 = random_new(42 as Long);
+
+    var i = 0;
+    while i < 5 {
+        let a = rng1.int(1, 100);
+        let b = rng2.int(1, 100);
+        print(a == b); // true every time -- same seed, same sequence
+        i = i + 1;
+    }
+
+    // Real range bounds -- both ends reachable, never outside [5, 10].
+    var rng3 = random_new(7 as Long);
+    var j = 0;
+    var all_in_range = true;
+    while j < 200 {
+        let v = rng3.int(5, 10);
+        if v < 5 || v > 10 { all_in_range = false; }
+        j = j + 1;
+    }
+    print(all_in_range); // true
+
+    // A DIFFERENT seed produces a different sequence (not a hard guarantee for every possible
+    // seed pair, but true for these two picked values -- confirms it's not silently ignoring the
+    // seed).
+    var rng4 = random_new(1 as Long);
+    var rng5 = random_new(2 as Long);
+    print(rng4.int(1, 1000000) == rng5.int(1, 1000000)); // false
+
+    var rng6 = random_new(99 as Long);
+    let f = rng6.float();
+    print(f >= 0.0f && f < 1.0f); // true
+
+    print("done");
+}

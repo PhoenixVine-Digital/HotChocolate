@@ -272,12 +272,13 @@ existing `a..(b+1)` or just flips the loop-exit comparison
 real code: `for z in min_z..max_z + 1` reads worse than `..=max_z` would.
 
 
-### Explicit, seeded RNG as a real type
+### ~~Explicit, seeded RNG as a real type~~ — shipped 2026-09-17
 
 ```
-let rng = Random(seed);
-let pick = rng.choose(enemies);
-let dmg = rng.int(5..=10);
+use random;
+var rng = random_new(42 as Long);
+let dmg = rng.int(5, 10);   // inclusive both ends
+let crit = rng.boolean();
 ```
 
 Cheap, no engine/runtime needed, and not really a standalone idea so
@@ -290,13 +291,25 @@ see it coming. An `rng: Random` value threaded explicitly through
 `@deterministic` code (same shape as `&mut` state already threaded
 through fn params everywhere else in this language) makes "this
 function's randomness is part of its declared inputs" a checkable fact
-instead of an assumption. Doesn't need new compiler machinery — this is
-almost entirely `extern class Random = "java.util.Random" { ... }` plus
-a handful of convenience methods (`choose`/`int(range)`/`float()`)
-already expressible with what's shipped (ranges, generics for `choose`
-over an array). Mostly a prelude/stdlib addition, not a language
-feature — worth doing whenever the `@deterministic` design work above
-actually happens, as its concrete foundation.
+instead of an assumption. Landed as `stdlib/random.hotc` -- almost
+entirely `extern class JRandomHc = "java.util.Random" { ... }`, wrapped
+in a plain `Random` struct plus `int`/`float`/`double`/`boolean`
+convenience methods, no new compiler machinery at all. One real, disclosed
+scope cut confirmed: `choose(items)` over an arbitrary `Vec<T>` isn't
+included this pass -- it would need a real generic METHOD on a
+non-generic struct (a fresh `T` introduced by the method itself, not the
+receiver's own already-resolved type param), a shape this compiler's
+generic-instantiation machinery has never been proven to support (every
+existing generic method gets its type param from the receiver, never
+fresh per call) -- worth its own real try once an actual caller needs it,
+not attempted speculatively here. Verified against `examples/
+random_seeded.hotc`: two `Random`s seeded identically produce IDENTICAL
+sequences (proven by comparing draws directly, not just eyeballing
+output), `int(lo, hi)` never leaves its declared inclusive range across
+200 draws, two different seeds produce different sequences, and `float()`
+stays in `[0, 1)`. Full example regression suite: zero new failures.
+Self-hosting verified to a true fixed point (no compiler changes at all
+beyond registering `"random"` as a known stdlib topic in `Driver.hotc`).
 
 ### Compile-time asset existence checks
 

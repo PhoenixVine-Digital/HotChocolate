@@ -1256,8 +1256,8 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // cross-topic dependency here already follows. See `COLLECTIONS_IDEAS.md`.
         out = add_stdlib_topic_and_deps("vec", out, target);
         out = add_stdlib_topic_and_deps("option", out, target);
-    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" && topic != "audio" && topic != "input" && topic != "collections" {
-        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics, audio, input, collections");
+    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" && topic != "audio" && topic != "input" && topic != "collections" && topic != "random" {
+        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics, audio, input, collections, random");
     }
     out.push(topic);
     return out;

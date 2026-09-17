@@ -1,0 +1,66 @@
+// Explicit, seeded RNG -- see `IDEAS.md`'s own "Explicit, seeded RNG as a real type" entry. Not a
+// standalone feature so much as the concrete foundation `@deterministic` (a separate, still-
+// deferred, real-design-cost item) would eventually need: today's only RNG access is a hidden,
+// implicit global (`Math::random()`, `java.util.Random`'s own static-feeling defaults) -- two runs
+// calling it in a different order get silently different results, with no way for a caller to see
+// that coming. An explicit `rng: Random` value, threaded through a fn's own params like any other
+// `&mut` state, makes "this function's randomness is part of its declared inputs" a checkable fact.
+// Opt-in via `use random;`. No new compiler machinery at all -- a plain `extern class` binding over
+// `java.util.Random` plus a handful of convenience methods already expressible with what's shipped.
+//
+// ```
+// use random;
+//
+// fn main() {
+//     var rng = random_new(42 as Long);
+//     let dmg = rng.int(5, 10);      // inclusive both ends
+//     let crit = rng.boolean();
+//     let spread = rng.float();
+// }
+// ```
+//
+// Real, disclosed scope cut: no `choose(items)` over an arbitrary `Vec<T>`/array this pass (the
+// doc's own sketch mentions it) -- that needs a real generic METHOD on a non-generic struct (`T`
+// introduced fresh by the method itself, not the receiver's own already-resolved type param), a
+// shape this compiler's generic-instantiation machinery has never been proven to support (every
+// existing generic method -- `Vec<T>::push`, `HashMap<V>::register`, ... -- gets its own type
+// param from the RECEIVER's own concrete type, never fresh per call). Worth a real, separate try
+// once there's an actual caller who needs it.
+extern class JRandomHc = "java.util.Random" {
+    fn new(seed: Long) -> Self;
+    fn nextInt(&self, bound: Int) -> Int;
+    fn nextFloat(&self) -> Float;
+    fn nextDouble(&self) -> Double;
+    fn nextBoolean(&self) -> Bool;
+}
+
+struct Random {
+    inner: JRandomHc,
+}
+
+fn random_new(seed: Long) -> Random {
+    return Random { inner: JRandomHc::new(seed) };
+}
+
+impl Random {
+    // Real INCLUSIVE range on both ends (`rng.int(5, 10)` can return 5 OR 10), matching the doc's
+    // own `rng.int(5..=10)` sketch in spirit -- written as two plain `Int` params rather than a
+    // real range literal, since a range's own bounds aren't otherwise exposed as read-able values
+    // from an `Expr::Range` this pass (a real, narrower cut, not a design objection to the nicer
+    // syntax).
+    fn int(&self, lo: Int, hi_inclusive: Int) -> Int {
+        return lo + self.inner.nextInt(hi_inclusive - lo + 1);
+    }
+
+    fn float(&self) -> Float {
+        return self.inner.nextFloat();
+    }
+
+    fn double(&self) -> Double {
+        return self.inner.nextDouble();
+    }
+
+    fn boolean(&self) -> Bool {
+        return self.inner.nextBoolean();
+    }
+}
