@@ -1,0 +1,27 @@
+// Real Tuple2<A, B> -- ordinary two-type-param generic struct, no new compiler machinery. Also
+// directly unblocks a comprehension TUPLE RESULT, previously impossible (no tuple type existed
+// at all): `result_expr` was already allowed to be any expression, including a call.
+use tuple;
+use vec;
+
+fn main() {
+    let p = tuple2(3, "three");
+    print(p.item0);  // 3
+    print(p.item1);  // three
+
+    let q = tuple2("x", 9.5f);
+    print(q.item0);  // x
+    print(q.item1);  // 9.5
+
+    // Comprehension tuple result -- (x, x*x) pairs, via tuple2(x, x*x).
+    let nums = [1, 2, 3, 4];
+    let pairs: Vec<Tuple2<Int, Int>> = [tuple2(x, x * x) for x in nums];
+    print(pairs.length());       // 4
+    print(pairs.get(0).item0);   // 1
+    print(pairs.get(0).item1);   // 1
+    print(pairs.get(2).item0);   // 3
+    print(pairs.get(2).item1);   // 9
+    print(pairs.get(3).item1);   // 16
+
+    print("done");
+}

@@ -147,8 +147,20 @@ under one new `Expr` variant's own `gen_expr` arm.
 ## Explicitly deferred (not silently dropped — tracked here)
 
 - Multiple `for` clauses / cartesian products (`for x in xs for y in ys`).
-- Tuple results (this language has no tuple type at all today — a separate, much bigger
-  prerequisite than anything comprehensions themselves would need).
+- ~~Tuple results~~ — **unblocked, 2026-09-17**: `stdlib/tuple.hotc`'s own `Tuple2<A, B>` (an
+  ordinary two-type-param generic struct, needing zero new compiler machinery) means `[tuple2(x, x
+  * x) for x in nums]` -- a real tuple-shaped comprehension result -- already works TODAY, no
+  special comprehension-side syntax needed (`result_expr` was always allowed to be any expression,
+  including a call). No `(a, b)` LITERAL syntax landed alongside it (a real, disclosed narrower
+  scope -- `tuple2(a, b)` is the available constructor). Landing this surfaced a real, genuine gap
+  in comprehensions themselves, now fixed: `check_comprehension` registered the result struct type
+  but never explicitly registered its own `.push()` method -- `gen_comprehension`'s synthesized
+  bytecode calls `.push()` directly, bypassing the ordinary `check_method_call` path that would
+  normally trigger `ensure_method_instantiated`, so a result element type that had never ALSO been
+  `.push()`-ed anywhere else via ordinary checked code (every earlier example happened to reuse
+  `Vec<Int>`/`Vec<String>`, already registered elsewhere) got a real `NoSuchMethodError` at RUNTIME
+  even though checking/codegen both reported success. Verified against `examples/
+  tuple_and_comprehension.hotc`.
 - Nested comprehensions (`[[y for y in row] for row in grid]`).
 - The ECS-flavored extension floated in the original proposal (`[entity for entity in world if
   entity.has<Health>()]`) — genuinely interesting given this project's own ECS/codegen work, but a

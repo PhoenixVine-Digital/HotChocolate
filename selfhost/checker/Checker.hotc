@@ -1470,6 +1470,18 @@ impl TyChecker {
             self.error("comprehension result expects " + expected_elem + ", got " + rn);
         }
         self.ensure_instantiated(expected_type);
+        // `gen_comprehension`'s own synthesized bytecode calls `.push(...)` on the result `Vec`
+        // directly -- HAND-EMITTED, not derived from a real, checked `MethodCall` AST node the
+        // way an ordinary `x.push(y);` in real source would be -- so the ordinary path that
+        // would otherwise trigger `ensure_method_instantiated` (`check_method_call`) never runs
+        // for it. Real gap found testing a comprehension whose result element type had never
+        // been `.push()`-ed anywhere else in the SAME program via ordinary checked code (every
+        // earlier comprehension example happened to also use `Vec<Int>`/`Vec<String>` elsewhere,
+        // which silently already had `push` registered) -- `Vec$Tuple2$Int$Int` genuinely never
+        // got its own `push` method emitted at all, a real `NoSuchMethodError` at RUNTIME even
+        // though checking/codegen both reported success. Explicit here, mirroring `ensure_
+        // instantiated` right above it for the struct itself.
+        self.ensure_method_instantiated(expected_type, "push");
         return TyStruct { name: expected_type };
     }
 

@@ -1,0 +1,35 @@
+// A real, generic two-value bundle -- see `IDEAS.md`'s own note (buried inside `COMPREHENSIONS_
+// IDEAS.md`'s "Explicitly deferred" list: "this language has no tuple type at all today"). Opt-in
+// via `use tuple;`. Needed ZERO new compiler machinery: `Tuple2<A, B>` is an ordinary two-type-
+// param generic struct, exactly the same shape `stdlib/collections.hotc`'s own `Entry2<K, V>`
+// already proved out this session -- no new parser/checker/codegen work at all.
+//
+// ```
+// use tuple;
+//
+// fn main() {
+//     let p = tuple2(3, "three");
+//     print(p.item0);   // 3
+//     print(p.item1);   // "three"
+//
+//     // Directly unblocks a real comprehension result this language previously couldn't
+//     // express at all (`COMPREHENSIONS_IDEAS.md`'s own deferred "tuple results" item) --
+//     // `result_expr` was always allowed to be ANY expression, including an ordinary call, so
+//     // this needed nothing new on the comprehension side either:
+//     let pairs: Vec<Tuple2<Int, Int>> = [tuple2(x, x * x) for x in [1, 2, 3]];
+// }
+// ```
+//
+// Real, disclosed scope cut: no `(a, b)` LITERAL syntax this pass (a real parser/AST addition,
+// not attempted here) -- `tuple2(a, b)` is the real, available constructor. Scoped to TWO values
+// only: a real third type parameter on `StructDecl` (`Tuple3<A, B, C>`) isn't supported by this
+// compiler's own generics machinery today (`type_param`/`type_param2` cap out at two) -- worth
+// its own separate extension if a real caller needs three, not attempted speculatively here.
+struct Tuple2<A, B> {
+    item0: A,
+    item1: B,
+}
+
+fn tuple2<A, B>(a: A, b: B) -> Tuple2<A, B> {
+    return Tuple2<A, B> { item0: a, item1: b };
+}
