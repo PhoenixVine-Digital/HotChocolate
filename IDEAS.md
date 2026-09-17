@@ -311,7 +311,7 @@ stays in `[0, 1)`. Full example regression suite: zero new failures.
 Self-hosting verified to a true fixed point (no compiler changes at all
 beyond registering `"random"` as a known stdlib topic in `Driver.hotc`).
 
-### Compile-time asset existence checks
+### ~~Compile-time asset existence checks~~ — shipped 2026-09-17
 
 ```
 let texture = asset("textures/player.png");
@@ -319,23 +319,38 @@ let texture = asset("textures/player.png");
 
 ```
 let texture = asset("textures/plauer.png");
-// compile error: asset 'textures/plauer.png' not found in <configured assets dir>
+// compile error: asset 'textures/plauer.png' not found (looked in '<assets-dir>/textures/plauer.png')
 ```
 
 A misspelled resource path is a real, common bug class in game/engine
 code (and doubly so in Minecraft modding specifically, where texture/
 sound/model paths are just string literals with zero compiler help
-today) — and unlike most of this backlog, it's genuinely simple: a
-`asset("...")` builtin (or `extern`-adjacent syntax) that resolves
-against a compiler-configured assets directory (a CLI flag or a
-`hotChocolate { }` Gradle DSL entry, same shape as `compilerHome`) and
-fails to compile if the file isn't there. **Scope this narrowly**: just
-existence-checking a path string, returning `String` (the resolved/
-validated path) — no `Asset<Texture>` typed-resource machinery, no
-asset-type inference, no build-time asset transformation. Those are
-real, bigger ideas (see the `@gpu`/typestate entries below for the
-general shape of "types that track resource state") but conflating them
-with this one keeps a genuinely cheap, high-value check from shipping.
+today). Scoped exactly as planned: just existence-checking a path string
+-- no `Asset<Texture>` typed-resource machinery, no asset-type inference,
+no build-time transformation. `asset(...)` needed ZERO checker changes at
+all: `Checker.hotc`'s own `check_call` already trusts any unknown callee
+(the same fallback `print`/`read_line` already ride), so the whole
+feature landed as `Driver.hotc`-only: a `--assets-dir <path>` CLI flag
+(off/`""` by default -- no flag means no check, `asset(...)` still just
+compiles as a plain string passthrough) and `check_assets`, which walks
+every fn/method/system body looking for the call and verifies the path
+against a real `java.io.File.exists()`. Real, disclosed narrower scope:
+only recognizes the call directly in a `let`/`var` init, a `return`
+value, a bare statement, or one level inside an `if`/`while`/`for`/
+`try`/`match` body (recursed into) -- not arbitrarily deep inside a
+larger expression (`asset("x") + "y"`) -- covers the doc's own real
+motivating shape without needing a second, general expression-tree
+walker just for this one diagnostic. Runs AFTER `strip_dev_code` (an
+`asset(...)` call a release build's `if dev {}` already dropped is
+never checked at all, correctly). `Codegen.hotc`'s own intrinsic case
+(alongside `print`/`read_line`) is a one-line passthrough: by the time
+codegen runs, the path was already verified (or the compile already
+failed), so `asset(...)` just codegens its own string-literal argument
+directly. Verified against `examples/asset_existence_check.hotc` (a real
+existing file, found correctly) and a deliberately misspelled path
+(confirmed: a real, clear compile-time `RuntimeException` naming the
+missing file and the exact path it looked for). Full example regression
+suite: zero new failures. Self-hosting verified to a true fixed point.
 
 ### ~~`@dev` — conditionally-compiled debug-only code~~ — shipped 2026-09-17
 
@@ -468,8 +483,17 @@ all for anything a mod registers later, at class-load time, that this
 compile never saw) — worth deciding explicitly whether that's just "use
 `if`/`if let` chains instead of `match` for registry values" (no new
 mechanism, a real, available answer today) before designing anything
-bigger. Revisit only if the "chain of `if`s" answer turns out to be
-genuinely painful in a real registry-heavy mod, not preemptively.
+bigger.
+
+**Decided, 2026-09-17**: no new `match` mechanism for registry values.
+`if`/`if let` chains are the real, sufficient answer — this was never
+blocked on anything, just left open pending a concrete reason to prefer
+a `_`-catch-all `match` over an ordinary chain, and no such reason
+materialized (this project has yet to write a real registry-heavy mod
+where the chain was reported as painful). Revisit only if that changes
+in a real caller's own code, not preemptively — the broader "open
+registries as a first-class `enum` alternative" idea this sub-question
+lives inside stays open on its own merits, unrelated to this one.
 
 ### A minimal import/visibility system (motivated by a real shared library, not by taste)
 

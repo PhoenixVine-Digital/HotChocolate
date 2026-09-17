@@ -2389,6 +2389,16 @@ impl CodeGen {
                     self.mv.visitMethodInsn(182, "java/io/BufferedReader", "readLine", "()Ljava/lang/String;", false); // INVOKEVIRTUAL
                     return "String";
                 }
+                // `asset("textures/player.png")` -- see `IDEAS.md`'s own "Compile-time asset
+                // existence checks" entry. By the time codegen ever reaches this, `Driver.hotc`'s
+                // own `check_assets` has ALREADY verified the path exists (or the whole compile
+                // already failed before codegen ran at all) -- real, disclosed narrow scope this
+                // pass: `asset(...)` carries no other runtime behavior, it just IS the string
+                // (`gen_expr` on the argument directly, same value, same bytecode a bare string
+                // literal would produce).
+                if callee == "asset" {
+                    return self.gen_expr(args.get(0));
+                }
                 // Same-class static call only this phase -- every `FnDecl` this codegen ever
                 // sees was compiled into `self.owner` by `compile_program` below, so there's no
                 // cross-class or cross-package call target to resolve, unlike a real `extern

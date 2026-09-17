@@ -1,0 +1,12 @@
+// Real compile-time asset existence checks -- `asset("...")` is checked against a configured
+// `--assets-dir` (Driver.hotc's own check_assets), and otherwise just IS the string at runtime.
+// Run this file two ways:
+//   ./gradlew run --args="run examples/asset_existence_check.hotc"
+//     (no --assets-dir: no check at all, compiles and runs fine either way)
+//   ./gradlew run --args="--assets-dir examples/assets_test_dir run examples/asset_existence_check.hotc"
+//     (real existence check against examples/assets_test_dir/textures/player.png, which exists)
+fn main() {
+    let texture = asset("textures/player.png");
+    print(texture);
+    print("done");
+}

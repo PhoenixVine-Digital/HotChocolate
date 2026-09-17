@@ -69,6 +69,8 @@ extern class JFileCli = "java.io.File" {
     fn isFile(&self) -> Bool;
     fn getPath(&self) -> String;
     fn getName(&self) -> String;
+    // `--assets-dir`'s own `check_assets` is the one real caller -- see that fn's own header.
+    fn exists(&self) -> Bool;
 }
 
 // `run_cli`'s own "run" mode (`SelfhostCLI run <path>`, mirroring `hc run`'s "compile AND
@@ -595,6 +597,17 @@ pub fn run_cli(args: [String]) {
         check_module_dirs_flag = true;
         off = off + 1;
     }
+    // `--assets-dir <path>` -- see `IDEAS.md`'s own "Compile-time asset existence checks" entry.
+    // A seventh independently-optional leading flag, taking a real argument like `--classpath`
+    // does. Off (empty string) by default -- `check_assets` itself is a real no-op when this is
+    // `""`, so `asset("...")` still parses and compiles (as a plain string passthrough, see
+    // `Codegen.hotc`'s own intrinsic case) even with no directory configured; the flag only turns
+    // ON real existence verification.
+    var assets_dir = "";
+    if args[off] == "--assets-dir" {
+        assets_dir = args[off + 1];
+        off = off + 2;
+    }
     if args[off] == "doc" {
         run_doc_cli(args, off, target, explain_schedule, quiet_schedule, classpath, dev_mode);
         return;
@@ -629,6 +642,10 @@ pub fn run_cli(args: [String]) {
     }
     prog = merge_program(resolve_stdlib_modules(prog.uses, target), prog);
     prog = strip_dev_code(prog, dev_mode);
+    // Runs AFTER `strip_dev_code`, deliberately -- an `asset(...)` call inside an `if dev { ... }`
+    // block that a release build already dropped should never be checked at all (it will never
+    // actually compile in), not flagged as a false positive.
+    check_assets(&prog, assets_dir);
 
     // See `name_collides_with_decl`'s own header, right above `parse_directory`: the entry class
     // name is mangled -- ONLY when it would otherwise collide -- never a struct's own name (which
@@ -1129,6 +1146,98 @@ fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
         si = si + 1;
     }
     return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources };
+}
+
+// `asset("textures/player.png")` -- see `IDEAS.md`'s own "Compile-time asset existence checks"
+// entry. Real, disclosed narrower scope than a full expression-tree walk: only recognizes the
+// call directly in a `let`/`var` initializer, a `return` value, a bare statement, or one level
+// inside an `if`/`while`/`for`/`try`/`match` body (recursed into) -- NOT arbitrarily deep inside
+// a larger expression (`asset("x") + "y"`'s own nested position, say). Covers the doc's own real
+// motivating shape (`let texture = asset("textures/player.png");`) without needing a second,
+// parallel general expression walker just for this one diagnostic. A no-op entirely when
+// `assets_dir` is `""` (the flag's own default -- opt-in, not forced on every compile).
+fn check_assets(prog: &Program, assets_dir: String) {
+    if assets_dir == "" { return; }
+    var fi = 0;
+    while fi < prog.fns.length() {
+        check_assets_in_stmts(&prog.fns.get(fi).body, assets_dir);
+        fi = fi + 1;
+    }
+    var ii = 0;
+    while ii < prog.impls.length() {
+        let im = prog.impls.get(ii);
+        var mi = 0;
+        while mi < im.methods.length() {
+            check_assets_in_stmts(&im.methods.get(mi).body, assets_dir);
+            mi = mi + 1;
+        }
+        var smi = 0;
+        while smi < im.static_methods.length() {
+            check_assets_in_stmts(&im.static_methods.get(smi).body, assets_dir);
+            smi = smi + 1;
+        }
+        ii = ii + 1;
+    }
+    var sy = 0;
+    while sy < prog.systems.length() {
+        check_assets_in_stmts(&prog.systems.get(sy).run_body, assets_dir);
+        sy = sy + 1;
+    }
+}
+
+fn check_one_asset_expr(e: &Expr, assets_dir: String) {
+    match e {
+        Call { callee, args } => {
+            if callee == "asset" && args.length() == 1 {
+                match args.get(0) {
+                    StringLit { value } => {
+                        let full = assets_dir + "/" + value;
+                        let ff = JFileCli::new(full);
+                        if !ff.exists() {
+                            throw ParseError::new("asset '" + value + "' not found (looked in '" + full + "')");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_assets_in_stmts(ss: &Vec<Stmt>, assets_dir: String) {
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Let { name, mutable, init, declared_type, line } => { check_one_asset_expr(&init, assets_dir); }
+            ExprStmt { expr, line } => { check_one_asset_expr(&expr, assets_dir); }
+            Return { value, line } => {
+                match value {
+                    Some { value: v } => { check_one_asset_expr(&v, assets_dir); }
+                    None => {}
+                }
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                check_assets_in_stmts(&then_body, assets_dir);
+                match else_body {
+                    Some { value: eb } => { check_assets_in_stmts(&eb, assets_dir); }
+                    None => {}
+                }
+            }
+            While { cond, body, line } => { check_assets_in_stmts(&body, assets_dir); }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => { check_assets_in_stmts(&body, assets_dir); }
+            Try { try_block, catches, line } => { check_assets_in_stmts(&try_block, assets_dir); }
+            Match { subject, arms, line } => {
+                var ai = 0;
+                while ai < arms.length() {
+                    check_assets_in_stmts(&arms.get(ai).body, assets_dir);
+                    ai = ai + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
 }
 
 fn stdlib_topic_path(topic: String) -> String {
