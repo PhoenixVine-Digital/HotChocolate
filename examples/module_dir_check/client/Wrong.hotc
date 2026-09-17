@@ -1,0 +1,5 @@
+module wrong.name;
+
+fn wrong_helper() -> Int {
+    return 1;
+}

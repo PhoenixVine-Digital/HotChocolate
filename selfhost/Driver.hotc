@@ -288,6 +288,91 @@ fn name_collides_with_decl(name: String, structs: &Vec<StructDecl>, enums: &Vec<
     return false;
 }
 
+// `--check-module-dirs` -- see `IDEAS.md`'s own entry and `run_cli`'s own header for the full
+// design. A real, disclosed diagnostic pass: parses every real `.hotc` file under `dir_path`
+// a SECOND time (redundant with `parse_directory`'s own real merge, but this is a compile-time
+// diagnostic, not perf-critical -- same "accept a second parse" cost this session's own nested-
+// generic-literal lookahead already takes) purely to read back `Parser.hotc`'s own `current_
+// module` for that ONE file, then compares it against the module a DIRECTORY-derived name would
+// suggest. A mismatch prints a warning (never a hard error -- "surface it," not "block the
+// build," matching how `check_systems`'s own per-conflict warning already behaves).
+fn check_module_dirs(dir_path: String) {
+    let files = collect_hotc_files(dir_path);
+    var i = 0;
+    while i < files.length() {
+        let path = files.get(i);
+        let src = read_source_file(path);
+        var lex = lexer_new(src);
+        let toks = lex.tokenize();
+        var p = parser_new(toks);
+        let discarded_prog = p.parse_program(); // only `p.current_module`, read after, matters here
+        let declared = p.current_module;
+        let expected = expected_module_for_path(dir_path, path);
+        if expected != "" && declared != expected {
+            print("warning: '" + path + "' declares module '" + declared + "', but its own directory location suggests module '" + expected + "' -- move the file to match, or fix the 'module' declaration");
+        } else if expected == "" && declared != "" {
+            print("warning: '" + path + "' declares module '" + declared + "', but it sits directly in the source root (no subdirectory) -- expected no 'module' declaration there, or move the file into a matching subdirectory");
+        }
+        i = i + 1;
+    }
+}
+
+// Real, cross-platform normalization -- `java.io.File.getPath()` (`collect_hotc_files`'s own
+// `e.getPath()`) returns the PLATFORM-NATIVE separator (backslash on Windows), but every other
+// path convention this codebase already uses (`"examples/battle"`, `stdlib_topic_path`, ...)
+// assumes forward slashes -- replacing backslash with forward slash here means this check
+// behaves identically regardless of which platform actually produced the path.
+fn normalize_path_seps_hc(s: String) -> String {
+    var out = "";
+    var i = 0;
+    while i < s.length() {
+        let cp = s.codePointAt(i);
+        if cp == CP_BACKSLASH { out = out + "/"; } else { out = out + codepoint_to_string(cp); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn replace_slashes_with_dots_hc(s: String) -> String {
+    var out = "";
+    var i = 0;
+    while i < s.length() {
+        let cp = s.codePointAt(i);
+        if cp == CP_SLASH { out = out + "."; } else { out = out + codepoint_to_string(cp); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// The module name a file's own DIRECTORY LOCATION suggests -- `""` for a file directly in
+// `dir_path` itself (no subdirectory at all, so no module expected). `file_path` is always
+// `dir_path` plus some real subpath (`collect_hotc_files`'s own recursion only ever descends
+// FROM `dir_path`), so stripping that prefix, then the trailing filename, then replacing every
+// remaining "/" with "." gives the expected dot-joined module string directly.
+fn expected_module_for_path(dir_path: String, file_path: String) -> String {
+    var dp = normalize_path_seps_hc(dir_path);
+    if dp.length() > 0 && dp.codePointAt(dp.length() - 1) == CP_SLASH {
+        dp = dp.substring(0, dp.length() - 1);
+    }
+    var rel = normalize_path_seps_hc(file_path);
+    let idx = rel.indexOf(dp);
+    if idx == 0 {
+        rel = rel.substring(dp.length(), rel.length());
+    }
+    if rel.length() > 0 && rel.codePointAt(0) == CP_SLASH {
+        rel = rel.substring(1, rel.length());
+    }
+    let last_slash = last_index_of_char(rel, CP_SLASH);
+    if last_slash < 0 {
+        return "";
+    }
+    let dir_part = rel.substring(0, last_slash);
+    if dir_part == "" {
+        return "";
+    }
+    return replace_slashes_with_dots_hc(dir_part);
+}
+
 fn parse_directory(dir_path: String) -> Program {
     var files = collect_hotc_files(dir_path);
     files = sort_str_vec(files);
@@ -497,6 +582,19 @@ pub fn run_cli(args: [String]) {
         classpath = split_on_char(args[off + 1], sep.codePointAt(0));
         off = off + 2;
     }
+    // `--check-module-dirs` -- see `IDEAS.md`'s own entry (the real motivating case: files moved
+    // into subdirectories while directory-mode compilation was still non-recursive got silently
+    // excluded; recursive scanning fixed THAT half, this flag catches the other -- a file whose
+    // own `module a.b.c;` declaration doesn't match where it actually lives). Off by default (a
+    // smaller project with no real module/directory discipline shouldn't be forced into it) --
+    // a sixth independently-optional leading flag, stacking the same way. Scoped to directory-
+    // mode compiles only (`check_module_dirs`'s own header) -- a single-file compile has no
+    // source root to compute a relative path against at all.
+    var check_module_dirs_flag = false;
+    if args[off] == "--check-module-dirs" {
+        check_module_dirs_flag = true;
+        off = off + 1;
+    }
     if args[off] == "doc" {
         run_doc_cli(args, off, target, explain_schedule, quiet_schedule, classpath, dev_mode);
         return;
@@ -522,6 +620,9 @@ pub fn run_cli(args: [String]) {
     // real multi-file test project) -- immediately overwritten by whichever real branch applies.
     var prog = parse_source_string("");
     if f.isDirectory() {
+        if check_module_dirs_flag {
+            check_module_dirs(path);
+        }
         prog = parse_directory(path);
     } else {
         prog = parse_source_file(path);

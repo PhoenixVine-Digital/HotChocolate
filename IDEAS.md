@@ -529,16 +529,25 @@ caught only because the build broke downstream). Recursive scanning
 the other half — catching a *mismatched* module/directory before it
 causes a confusing error, not just after.
 
-Real middle ground: an opt-in check (`hc build --check-module-dirs`, or
-a `hotChocolate { }` Gradle DSL flag), off by default — surfaces the
-mistake for a project that *wants* Java-style directory discipline (a
-larger, multi-team project where the convention actually earns its
-keep, or exactly the shape `kubejs-aisle-tool` has now adopted) without
-forcing it on a smaller project with no real module structure to
-verify. Scoped to directory-mode compiles specifically — a single
-arbitrary file (`hc build foo.hotc`) has no meaningful "source root" to
-compute a relative path against at all, so there's nothing to check
-there regardless of the flag.
+**Shipped, 2026-09-17**: `--check-module-dirs`, an opt-in leading CLI flag (off
+by default, same "surface it, don't force it" reasoning this entry's own
+middle-ground sketch already called for). `Driver.hotc`'s own `check_module_
+dirs` parses every real `.hotc` file under the target directory a SECOND
+time (redundant with the real merge, but this is a compile-time diagnostic,
+not perf-critical) purely to read back its own declared `module a.b.c;`
+string, computes the module a DIRECTORY-derived name would suggest
+(`expected_module_for_path`, strip the source root, strip the filename,
+replace remaining `/` with `.`), and prints a warning — never a hard error
+— on any mismatch. Cross-platform by construction: `java.io.File.getPath()`
+returns the PLATFORM-NATIVE separator, so `normalize_path_seps_hc` maps
+backslash to forward slash before any string comparison, rather than
+assuming either convention. Scoped to directory-mode compiles only, exactly
+as planned — a single-file compile has no source root to check against.
+Verified against `examples/module_dir_check/` (a `client/Right.hotc`
+correctly matching, a `client/Wrong.hotc` declaring `module wrong.name;`
+correctly flagged, and a root-level `main.hotc` with no module declaration
+correctly silent) both with and without the flag. Full example regression
+suite: zero new failures. Self-hosting verified to a true fixed point.
 
 ### ECS with ownership-derived system scheduling
 
