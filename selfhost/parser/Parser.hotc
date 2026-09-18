@@ -1211,12 +1211,12 @@ impl Parser {
         self.no_struct_lit = false;
         let then_body = self.block();
         var arms = empty_matcharm_vec();
-        arms.push(MatchArm { variant_name: variant_name, field_names: field_names, bind_names: bind_names, body: then_body, is_literal: false, literal: IntLit { value: 0 } });
+        arms.push(MatchArm { variant_name: variant_name, field_names: field_names, bind_names: bind_names, body: then_body, is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
         if self.match_kind(ELSE) {
             let else_body = self.block();
-            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: else_body, is_literal: false, literal: IntLit { value: 0 } });
+            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: else_body, is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
         } else {
-            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec(), is_literal: false, literal: IntLit { value: 0 } });
+            arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
         }
         return Match { subject: subject, arms: arms, line: start_line };
     }
@@ -1317,13 +1317,13 @@ impl Parser {
         if let Some { value: lit } = lit_found {
             self.expect(FATARROW);
             let body = self.block();
-            return MatchArm { variant_name: "$literal", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body, is_literal: true, literal: lit };
+            return MatchArm { variant_name: "$literal", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body, is_literal: true, literal: lit, is_positional: false };
         }
         let head0 = self.expect(IDENT).text;
         if head0 == "_" {
             self.expect(FATARROW);
             let body = self.block();
-            return MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body, is_literal: false, literal: IntLit { value: 0 } };
+            return MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: body, is_literal: false, literal: IntLit { value: 0 }, is_positional: false };
         }
         var head = head0;
         if self.check(COLONCOLON) {
@@ -1337,6 +1337,7 @@ impl Parser {
         // the first place -- this subset had turned that "only if present" into "always required".
         var field_names = empty_str_vec();
         var bind_names = empty_str_vec();
+        var is_positional = false;
         if self.check(LBRACE) {
             self.advance();
             if !self.check(RBRACE) {
@@ -1351,10 +1352,27 @@ impl Parser {
                 }
             }
             self.expect(RBRACE);
+        } else if self.check(LPAREN) {
+            // `Goblin(hp)` -- positional pattern sugar, see `Ast.hc`'s own `MatchArm.
+            // is_positional` header. Only bare bind names here (no `field: name` renaming --
+            // the whole point is a SHORTER spelling for the common one/two-field case), bound
+            // in DECLARATION-ORDER position; `field_names` stays empty (the parser has no way
+            // to know the variant's own real field names yet), resolved later by `Checker.hotc`/
+            // `Codegen.hotc` from the variant's own already-known field table.
+            is_positional = true;
+            self.advance();
+            if !self.check(RPAREN) {
+                bind_names.push(self.expect(IDENT).text);
+                while self.match_kind(COMMA) {
+                    if self.check(RPAREN) { break; }
+                    bind_names.push(self.expect(IDENT).text);
+                }
+            }
+            self.expect(RPAREN);
         }
         self.expect(FATARROW);
         let body = self.block();
-        return MatchArm { variant_name: head, field_names: field_names, bind_names: bind_names, body: body, is_literal: false, literal: IntLit { value: 0 } };
+        return MatchArm { variant_name: head, field_names: field_names, bind_names: bind_names, body: body, is_literal: false, literal: IntLit { value: 0 }, is_positional: is_positional };
     }
 
     // === One `fn` declaration form: `fn name(params) [-> RetType] { block }` ===
@@ -2651,7 +2669,7 @@ fn empty_catchclause_vec() -> Vec<CatchClause> {
 }
 
 fn empty_matcharm_vec() -> Vec<MatchArm> {
-    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec(), is_literal: false, literal: IntLit { value: 0 } });
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
     return Vec { data: v.data, len: 0 };
 }
 

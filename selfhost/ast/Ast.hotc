@@ -299,6 +299,14 @@ pub struct MatchArm {
     body: Vec<Stmt>,
     is_literal: Bool,
     literal: Expr,
+    // `Goblin(hp)` -- positional pattern sugar for `Goblin { hp: hp }`, see `IDEAS.md`'s own
+    // "Pattern matching sugar: positional enum patterns" entry. `field_names` is EMPTY for a
+    // positional arm (the parser has no way to know the variant's own real field NAMES yet, only
+    // the checker does) -- `bind_names` alone carries the binding names, in DECLARATION-ORDER
+    // position; `Checker.hotc`'s own `check_match`/`Codegen.hotc`'s own match codegen resolve the
+    // real field name at each position from the variant's own already-known field table
+    // (`variant_field_info`/`variant_field_names`) when this is `true`.
+    is_positional: Bool,
 }
 
 pub struct Param {

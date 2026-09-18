@@ -930,7 +930,7 @@ fn empty_expr_vec3() -> Vec<Expr> {
 }
 
 fn empty_matcharm_vec3() -> Vec<MatchArm> {
-    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec2(), bind_names: empty_str_vec2(), body: empty_stmt_vec3(), is_literal: false, literal: IntLit { value: 0 } });
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec2(), bind_names: empty_str_vec2(), body: empty_stmt_vec3(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
     return Vec { data: v.data, len: 0 };
 }
 
@@ -1066,7 +1066,7 @@ fn subst_arm_list(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<M
     var i = 0;
     while i < arms.length() {
         let a = arms.get(i);
-        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: subst_stmt_list(a.body, type_param, arg), is_literal: a.is_literal, literal: subst_expr(a.literal, type_param, arg) });
+        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: subst_stmt_list(a.body, type_param, arg), is_literal: a.is_literal, literal: subst_expr(a.literal, type_param, arg), is_positional: a.is_positional });
         i = i + 1;
     }
     return out;
@@ -4906,10 +4906,31 @@ impl TyChecker {
                 // body is checked, below.
                 self.push_scope();
                 var fj = 0;
-                while fj < arm.field_names.length() {
-                    let fname = arm.field_names.get(fj);
+                // Real loop bound is `bind_names.length()`, not `field_names.length()` --
+                // `Goblin(hp)` (`arm.is_positional`) leaves `field_names` EMPTY (the parser has
+                // no way to know the variant's own real field names), so looping on IT would
+                // never run at all for a positional arm. Both are the same length for the
+                // ordinary `{ field: name }` form anyway (built together, one push per binding).
+                while fj < arm.bind_names.length() {
                     let bname = arm.bind_names.get(fj);
                     var fty = "?";
+                    // `Goblin(hp)` resolves `hp` to whichever field sits at POSITION `fj` in the
+                    // variant's own declared field table (`variant_field_info`, DECLARATION
+                    // order) -- the ordinary `{ field: name }` form already names the real field
+                    // directly, so only the positional shape needs this extra lookup.
+                    var fname = "";
+                    if arm.is_positional {
+                        let vinfo_for_pos = self.variant_field_info.get(sn + "#" + arm.variant_name);
+                        if let Some { value: vfp } = vinfo_for_pos {
+                            if fj < vfp.field_names.length() {
+                                fname = vfp.field_names.get(fj);
+                            } else {
+                                self.error("'" + arm.variant_name + "' has fewer than " + JString::valueOf(fj + 1) + " field(s), but the pattern binds " + JString::valueOf(arm.bind_names.length()));
+                            }
+                        }
+                    } else {
+                        fname = arm.field_names.get(fj);
+                    }
                     // Prefer the ARM's OWN variant's dedicated field table (`variant_field_info`,
                     // keyed "OwnerName#VariantName") over the enum-wide union `self.structs.get(sn)`
                     // -- the same real gap `check_struct_lit` already had and fixed (see that fn's own

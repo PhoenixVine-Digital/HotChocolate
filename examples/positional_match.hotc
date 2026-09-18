@@ -1,0 +1,26 @@
+// Real positional enum-pattern sugar -- `Goblin(hp)` binds by DECLARATION-ORDER position,
+// shorter than the equivalent `Goblin { hp: hp }`.
+enum Enemy {
+    Goblin { hp: Int },
+    Dragon { hp: Int, fire: Bool },
+    Ghost,
+}
+
+fn describe(e: Enemy) -> String {
+    match e {
+        Goblin(hp) => { return "goblin with {hp} hp"; }
+        Dragon(hp, fire) => {
+            if fire { return "fire dragon, {hp} hp"; }
+            return "dragon, {hp} hp";
+        }
+        Ghost => { return "a ghost"; }
+    }
+}
+
+fn main() {
+    print(describe(Goblin { hp: 5 }));
+    print(describe(Dragon { hp: 100, fire: true }));
+    print(describe(Dragon { hp: 80, fire: false }));
+    print(describe(Ghost));
+    print("done");
+}

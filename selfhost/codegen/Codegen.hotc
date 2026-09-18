@@ -4441,8 +4441,23 @@ impl CodeGen {
                         // which pushes one around exactly the same span.
                         self.push_var_scope();
                         var fj = 0;
-                        while fj < arm.field_names.length() {
-                            let fname = arm.field_names.get(fj);
+                        // Real loop bound is `bind_names.length()`, not `field_names.length()` --
+                        // `Goblin(hp)` (`arm.is_positional`) leaves `field_names` EMPTY (mirrors
+                        // `Checker.hotc`'s own identical `check_match` fix, same real gap).
+                        while fj < arm.bind_names.length() {
+                            // `Goblin(hp)` resolves `hp` to whichever field sits at POSITION `fj`
+                            // in `variant_fnames` (already DECLARATION order, straight off
+                            // `variant_field_names` -- no extra lookup needed, unlike the
+                            // checker's own twin fix, which had to reach into a different
+                            // registry for this).
+                            var fname = "";
+                            if arm.is_positional {
+                                if has_variant_fields && fj < variant_fnames.length() {
+                                    fname = variant_fnames.get(fj);
+                                }
+                            } else {
+                                fname = arm.field_names.get(fj);
+                            }
                             let bname = arm.bind_names.get(fj);
                             var fty = self.field_type_of(sty, fname);
                             if has_variant_fields {
@@ -6710,7 +6725,7 @@ fn empty_expr_vec_cg() -> Vec<Expr> {
 }
 
 fn empty_matcharm_vec_cg() -> Vec<MatchArm> {
-    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec4(), bind_names: empty_str_vec4(), body: empty_stmt_vec2(), is_literal: false, literal: IntLit { value: 0 } });
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec4(), bind_names: empty_str_vec4(), body: empty_stmt_vec2(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
     return Vec { data: v.data, len: 0 };
 }
 
@@ -6842,7 +6857,7 @@ fn subst_arm_list_cg(arms: Vec<MatchArm>, type_param: String, arg: String) -> Ve
     var i = 0;
     while i < arms.length() {
         let a = arms.get(i);
-        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: subst_stmt_list_cg(a.body, type_param, arg), is_literal: a.is_literal, literal: subst_expr_cg(a.literal, type_param, arg) });
+        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: subst_stmt_list_cg(a.body, type_param, arg), is_literal: a.is_literal, literal: subst_expr_cg(a.literal, type_param, arg), is_positional: a.is_positional });
         i = i + 1;
     }
     return out;

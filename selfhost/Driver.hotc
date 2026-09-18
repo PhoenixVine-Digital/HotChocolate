@@ -1095,7 +1095,7 @@ fn strip_dev_blocks_list(ss: Vec<Stmt>, dev_mode: Bool) -> Vec<Stmt> {
                 var ai = 0;
                 while ai < arms.length() {
                     let a = arms.get(ai);
-                    new_arms.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: strip_dev_blocks_list(a.body, dev_mode), is_literal: a.is_literal, literal: a.literal });
+                    new_arms.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: strip_dev_blocks_list(a.body, dev_mode), is_literal: a.is_literal, literal: a.literal, is_positional: a.is_positional });
                     ai = ai + 1;
                 }
                 out.push(Match { subject: subject, arms: new_arms, line: line });

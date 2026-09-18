@@ -1146,20 +1146,33 @@ arbitrary block rather than a single method call, which circles back to
 the "no closures yet" blocker above. Worth revisiting once closures exist;
 until then `drop` already covers the actual use case.
 
-### Pattern matching sugar: positional enum patterns
+### ~~Pattern matching sugar: positional enum patterns~~ — shipped 2026-09-17
 
 ```
 match enemy {
-    Goblin(hp) -> ...
+    Goblin(hp) => { ... }
+    Dragon(hp, fire) => { ... }
 }
 ```
 
 `match` already destructures by field name (`Circle { radius }`) — this
 is purely a shorter spelling for single/few-field variants, binding by
-declared position instead of requiring the `{ field: name }` form. Small,
-uncontroversial, not worth doing until it's actually annoying someone —
-the existing form isn't broken, just more verbose for the common
-one-or-two-field-variant case.
+declared position instead of requiring the `{ field: name }` form.
+`Ast.hc`'s own `MatchArm` gained one new `is_positional: Bool` field
+(threaded through all 13 construction sites across the compiler);
+`field_names` stays EMPTY for a positional arm (the parser has no way to
+know the variant's own real field names, only the checker/codegen do) --
+`Checker.hotc`'s own `check_match` and `Codegen.hotc`'s own match
+codegen both resolve each binding's real field name from the variant's
+own already-known, declaration-ordered field table (`variant_field_info`
+/`variant_field_names`) at the bind's own POSITION instead of reading
+`field_names` directly, with a real, clear error if the pattern binds
+more values than the variant actually has. Verified against `examples/
+positional_match.hotc`: a one-field variant, a two-field variant
+(binding both `hp` and `fire` correctly), and a bare zero-field variant
+matched alongside the positional ones in the SAME `match`. Full example
+regression suite: zero new failures. Self-hosting verified to a true
+fixed point.
 
 ## Considered and declined (kept for the reasoning, not as a TODO)
 
