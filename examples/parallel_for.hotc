@@ -1,0 +1,27 @@
+// Real `parallel for` -- desugars entirely into PhoenixPool::spawn + join_all_and_shutdown, so
+// @sendable's own EXISTING lambda-capture-safety check automatically verifies the loop element's
+// own type is safe to hand to a background task. See Parser.hotc's own `parallel_for_stmts`
+// header for the full design and v1 scope cuts (single-expression body only).
+use phoenix;
+use vec;
+
+@sendable
+struct Counter { value: Int }
+
+fn main() {
+    var items: Vec<Counter> = Vec<Counter> { data: [], len: 0 };
+    var i = 0;
+    while i < 5 {
+        items.push(Counter { value: i });
+        i = i + 1;
+    }
+
+    parallel for c in items { c.value = c.value * 10; }
+
+    var j = 0;
+    while j < items.length() {
+        print(items.get(j).value);
+        j = j + 1;
+    }
+    print("done");
+}

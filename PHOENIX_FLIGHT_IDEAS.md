@@ -116,14 +116,62 @@ equivalent) — the point being the API shape itself makes "results only
 ever cross back onto the main thread through one narrow, checked door"
 the default, not something the caller has to remember every time.
 
-## Belongs to `IDEAS.md`'s ECS entry, not duplicated here
+## ~~Belongs to `IDEAS.md`'s ECS entry, not duplicated here~~ — the general-purpose half shipped, 2026-09-17
 
-`parallel for entity in entities { }` / `@parallel fn` — compiler-
-verified "these tasks can't alias the same `&mut` state" — is the exact
-same design work `IDEAS.md`'s "ECS with ownership-derived system
-scheduling" entry already tracks (a system's `&`/`&mut` component
-params *are* the scheduling signal). Phoenix Flight would be the
-runtime that ECS entry's scheduler ultimately dispatches work onto once
-both exist, not a second, competing design for the same problem — see
-that entry (now cross-referencing this file) rather than tracking
-compiler-enforced parallel safety twice.
+`parallel for entity in entities { }` — compiler-verified "this can't
+alias shared state it shouldn't touch" — landed as a REAL, general-
+purpose language construct, separate from (and dispatched onto the SAME
+runtime as) ECS's own `&`/`&mut`-driven system scheduler, which already
+had its own real parallel dispatch. The move/borrow checker itself
+needed ZERO new code: `parallel for x in arr { expr; }` desugars
+ENTIRELY, at PARSE TIME, into ordinary already-proven pieces -- a fresh
+`PhoenixPool`, one `pool.spawn(|| expr as PhoenixObject)` per element
+(each capturing the CURRENT element via an ordinary zero-param lambda
+literal), collected into a `Vec<PhoenixTask>`, then `join_all_and_
+shutdown` before the statement completes -- so `@sendable`'s own
+EXISTING lambda-capture-safety check (already wired to `PhoenixPool::
+spawn`'s lambda argument) automatically verifies the element's own type
+(and anything else `expr` captures) is safe to hand to a background
+task, with no new safety-checking code at all. `Parser.hotc`'s own
+`block()` splices the desugared statement sequence directly in, and
+`"phoenix"` (plus its own transitive `"vec"` dependency) auto-injects
+into `Program.uses` the same way ECS's own `phoenix` dependency already
+does, so a program using `parallel for` doesn't need to also write `use
+phoenix;` itself.
+
+Real, disclosed v1 scope cuts:
+- The loop body must be exactly ONE expression statement (a single
+  `x.field = ...;`/`x.method(...);`-shaped line) -- lambda literals in
+  this language only ever support a single-expression body (the same
+  real, pre-existing limit `HOTC_MC_IDEAS.md`'s own "trailing-block DSL
+  syntax" entry already flags). A real, previously-hit bug this surfaced
+  and fixed: an EARLIER version bound the source array via an ordinary
+  `let __pf_arr = arr_expr;`, which genuinely MOVED `arr_expr` when it
+  was a bare identifier (the ordinary, non-`parallel` `for` never moves
+  its own source) -- making the caller's own array unusable after the
+  loop. Fixed by embedding `arr_expr` directly into the desugared `.
+  length()`/`.get(idx)` calls instead (safe: struct-literal field values
+  are never move-checked, and `Vec<T>::length`/`::get` both take `&self`
+  regardless).
+- Only the `Vec<T>`-iteration shape, not the range shape
+  (`parallel for i in a..b { }`).
+- A fixed worker count (4), not sized to the real element count --
+  "correctness first," the same real, disclosed cost `ECS_IDEAS.md`'s
+  own per-`run_all()` pool already accepts.
+- The body's own expression must actually produce a real value (boxed
+  via the automatic `as PhoenixObject` wrap) -- a bare call to a
+  `Unit`-returning method as the WHOLE body has nothing real to box;
+  not attempted here.
+
+Verified against `examples/parallel_for.hotc` (a real `@sendable`
+struct, mutated correctly, values proven correct after the loop) and a
+deliberate negative test (capturing a non-`@sendable` struct correctly
+rejected with the exact same error `PhoenixPool::spawn`'s own lambda
+argument already produces). Full example regression suite: zero new
+failures. Self-hosting verified to a true fixed point.
+
+ECS's own `@parallel fn`/systems-level scheduling (a DIFFERENT
+mechanism -- comparing DECLARED systems pairwise by their own `&`/
+`&mut` component params, not a single loop's element-independence) is
+unaffected and unchanged; see `IDEAS.md`'s "ECS with ownership-derived
+system scheduling" entry for that one.

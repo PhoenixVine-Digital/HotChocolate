@@ -47,10 +47,18 @@ pub struct Parser {
     // top -- see `parse_program`'s own header for why a real per-declaration override isn't
     // needed (nothing in this subset re-parents a struct into a DIFFERENT module mid-file).
     current_module: String,
+    // `parallel for x in arr { expr; }` -- see this file's own `parallel_for_stmts` header for
+    // the full design. A unique counter (avoids two `parallel for` sites in the same file
+    // colliding on the SAME local variable names once desugared) and a flag noting whether
+    // `"phoenix"` needs auto-injecting into `Program.uses` (mirroring `Driver.hotc`'s own `ecs`
+    // -> `phoenix` transitive dependency -- a program using `parallel for` needs `PhoenixPool`/
+    // `PhoenixTask` regardless of whether it ALSO wrote `use phoenix;` itself).
+    parallel_for_counter: Int,
+    needs_phoenix: Bool,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "" };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false };
 }
 
 impl Parser {
@@ -899,15 +907,143 @@ impl Parser {
 
     // === Statements ===
 
+    // `parallel for x in arr { expr; }` -- see the `Parser` struct's own `parallel_for_counter`/
+    // `needs_phoenix` header for the design summary. Desugars ENTIRELY into ordinary, already-
+    // proven statements/expressions -- a fresh `PhoenixPool`, a `Vec<PhoenixTask>` built by
+    // spawning one task per element (each capturing `x`, the CURRENT element, via an ordinary
+    // zero-param lambda literal), then `join_all_and_shutdown` before continuing -- so NEITHER the
+    // checker NOR codegen need a single new line of code: `@sendable`'s own EXISTING lambda-
+    // capture-safety check (already wired to `PhoenixPool::spawn`'s own lambda argument)
+    // automatically verifies `x`'s own type (and anything else `expr` captures) is safe to hand to
+    // a background task -- exactly the guarantee this feature exists for. Real, disclosed v1
+    // scope cuts:
+    // - `expr` must be a single EXPRESSION (the body's own `{ ... }` must contain exactly one
+    //   `ExprStmt`) -- lambda literals in this language only ever support a single-expression
+    //   body (the same real, pre-existing limit `HOTC_MC_IDEAS.md`'s own "trailing-block DSL
+    //   syntax" entry already flags), so there's no way to wrap a genuinely multi-statement body
+    //   as the spawned task's own closure without a bigger, separate lambda-body extension.
+    // - only the `Vec<T>`-iteration shape (`parallel for x in arr { ... }`), not the range shape
+    //   (`parallel for i in a..b { ... }`) -- `.length()`/`.get(i)` are real `Vec<T>` methods
+    //   either way, so this is scoped to that one common real source shape for now.
+    // - a fixed worker count (4) this pass, not sized to the real element count -- "correctness
+    //   first," the same real, disclosed cost `ECS_IDEAS.md`'s own per-`run_all()` pool already
+    //   accepts.
+    fn parallel_for_stmts(&mut self, start_line: Int) -> Vec<Stmt> {
+        self.expect(PARALLEL);
+        self.expect(FOR);
+        let var_name = self.expect(IDENT).text;
+        self.expect(IN);
+        self.no_struct_lit = true;
+        let arr_expr = self.expression();
+        self.no_struct_lit = false;
+        let body = self.block();
+        if body.length() != 1 {
+            throw ParseError::new("'parallel for' body must be exactly one expression statement (a single 'x.method(...);'-shaped line), got " + JString3::valueOf(body.length()) + " statements");
+        }
+        var inner_expr = IntLit { value: 0 };
+        var got_expr = false;
+        match body.get(0) {
+            ExprStmt { expr, line } => { inner_expr = expr; got_expr = true; }
+            _ => {}
+        }
+        if !got_expr {
+            throw ParseError::new("'parallel for' body must be a single expression statement (a bare 'x.method(...);'-shaped line), not a let/if/while/etc.");
+        }
+        self.needs_phoenix = true;
+        let n = self.parallel_for_counter;
+        self.parallel_for_counter = n + 1;
+        let suffix = JString3::valueOf(n);
+        let pool_name = "__pf_pool" + suffix;
+        let tasks_name = "__pf_tasks" + suffix;
+        let idx_name = "__pf_i" + suffix;
+
+        var out = empty_stmt_vec();
+        // NO intermediate `let __pf_arrN = arr_expr;` here -- deliberately: that would be a real
+        // `let x = someVar;` MOVE of `arr_expr` when it's a bare identifier (`Checker.hotc`'s own
+        // move-checking, `TyChecker.moved`), making the CALLER's own array/`Vec` unusable after
+        // the loop -- a real regression an EARLIER version of this had, caught testing it (the
+        // ordinary, non-`parallel` `for x in arr { }` never moves `arr` either, see README's own
+        // "Loops" section). `arr_expr` is instead embedded DIRECTLY into two struct-literal-
+        // shaped `MethodCall` nodes below (`.length()`, `.get(idx)`) -- safe because struct-
+        // literal field VALUES are deliberately never move-checked (same exemption sharing one
+        // already-built value elsewhere in a struct literal already relies on), and because
+        // `Vec<T>::length`/`::get` both take `&self`, never moving their receiver regardless.
+        // `var __pf_poolN = PhoenixPool::new(4);`
+        var pool_args = empty_expr_vec();
+        pool_args.push(IntLit { value: 4 });
+        out.push(Let { name: pool_name, mutable: true, init: StaticCall { type_name: "PhoenixPool", method: "new", args: pool_args }, declared_type: none_string(), line: start_line });
+        // var __pf_tasksN = Vec<PhoenixTask> { data: [], len: 0 };
+        var tasks_fnames = empty_str_vec();
+        tasks_fnames.push("data");
+        tasks_fnames.push("len");
+        var tasks_fvals = empty_expr_vec();
+        tasks_fvals.push(ArrayLit { elements: empty_expr_vec() });
+        tasks_fvals.push(IntLit { value: 0 });
+        out.push(Let { name: tasks_name, mutable: true, init: StructLit { name: "Vec$PhoenixTask", field_names: tasks_fnames, field_values: tasks_fvals, generic_base: none_string() }, declared_type: none_string(), line: start_line });
+        // var __pf_iN = 0;
+        out.push(Let { name: idx_name, mutable: true, init: IntLit { value: 0 }, declared_type: none_string(), line: start_line });
+        // while __pf_iN < __pf_arrN.length() { let x = __pf_arrN.get(__pf_iN); __pf_tasksN.push(__pf_poolN.spawn(|| expr)); __pf_iN = __pf_iN + 1; }
+        let len_call = MethodCall { recv: arr_expr, method: "length", args: empty_expr_vec() };
+        let cond = Binary { op: "<", left: Ident { name: idx_name }, right: len_call };
+        var get_args = empty_expr_vec();
+        get_args.push(Ident { name: idx_name });
+        let get_call = MethodCall { recv: arr_expr, method: "get", args: get_args };
+        // `mutable: true` (a real `var`, not `let`) -- Phase 3 borrow checking only allows
+        // assigning into a local's own fields (`x.value = ...;`) when the BINDING itself is
+        // `var`; the whole point of a real `parallel for` body is usually mutating the current
+        // element, so this has to be mutable to be useful at all.
+        let elem_let = Let { name: var_name, mutable: true, init: get_call, declared_type: none_string(), line: start_line };
+        // `PhoenixCallable::call(&self) -> PhoenixObject` -- every spawned lambda's own body has
+        // to resolve to a real `PhoenixObject` (see `stdlib/phoenix.hotc`'s own established
+        // convention, e.g. `pool.spawn(|| "{step(1)}" as PhoenixObject)`), even though this
+        // feature always discards the actual result (`join_all_and_shutdown` never reads a task's
+        // own return value) -- wrapping `expr` in the SAME `as PhoenixObject` cast automatically
+        // means the caller never has to write it themselves. Real, disclosed v1 consequence: this
+        // needs `expr` to actually produce a real value (an `Int`/`Bool`/struct/etc, boxed by the
+        // cast) -- a bare call to a `Unit`-returning method as the WHOLE body wouldn't have
+        // anything real to box; not attempted here, matches the single-expression-body cut above.
+        let lambda = Lambda { params: empty_str_vec(), body: Cast { expr: inner_expr, target_type: "PhoenixObject" } };
+        var spawn_args = empty_expr_vec();
+        spawn_args.push(lambda);
+        let spawn_call = MethodCall { recv: Ident { name: pool_name }, method: "spawn", args: spawn_args };
+        var push_args = empty_expr_vec();
+        push_args.push(spawn_call);
+        let push_call = MethodCall { recv: Ident { name: tasks_name }, method: "push", args: push_args };
+        let push_stmt = ExprStmt { expr: push_call, line: start_line };
+        let incr = Assign { name: idx_name, value: Binary { op: "+", left: Ident { name: idx_name }, right: IntLit { value: 1 } } };
+        let incr_stmt = ExprStmt { expr: incr, line: start_line };
+        var while_body = empty_stmt_vec();
+        while_body.push(elem_let);
+        while_body.push(push_stmt);
+        while_body.push(incr_stmt);
+        out.push(While { cond: cond, body: while_body, line: start_line });
+        // __pf_poolN.join_all_and_shutdown(__pf_tasksN);
+        var join_args = empty_expr_vec();
+        join_args.push(Ident { name: tasks_name });
+        let join_call = MethodCall { recv: Ident { name: pool_name }, method: "join_all_and_shutdown", args: join_args };
+        out.push(ExprStmt { expr: join_call, line: start_line });
+        return out;
+    }
+
     fn block(&mut self) -> Vec<Stmt> {
         self.expect(LBRACE);
         if self.check(RBRACE) {
             self.advance();
             return empty_stmt_vec();
         }
-        var stmts = vec_of(self.statement());
+        var stmts = empty_stmt_vec();
         while !self.check(RBRACE) {
-            stmts.push(self.statement());
+            if self.check(PARALLEL) {
+                let start_line = self.peek().line;
+                let desugared = self.parallel_for_stmts(start_line);
+                var di = 0;
+                while di < desugared.length() {
+                    stmts.push(desugared.get(di));
+                    di = di + 1;
+                }
+            } else {
+                stmts.push(self.statement());
+            }
         }
         self.expect(RBRACE);
         return stmts;
@@ -2272,6 +2408,12 @@ impl Parser {
                 }
                 fns.push(fd);
             }
+        }
+        // `parallel for` needs `PhoenixPool`/`PhoenixTask` regardless of whether this program
+        // ever wrote `use phoenix;` itself -- same "auto-inject a transitive dependency" pattern
+        // `Driver.hotc`'s own `ecs` -> `phoenix` topic dependency already establishes.
+        if self.needs_phoenix {
+            uses.push("phoenix");
         }
         return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }

@@ -95,6 +95,8 @@ pub enum TokType {
     INTERFACE, DYN, ENUM, MATCH, BY, SEALED, EXTERN, CLASS, MODULE, PUB, OPEN, EXTEND, STATIC, AS,
     TRY, CATCH, THROW, EXTENDS, OVERRIDE, NULL, IS, USE,
     BREAK, CONTINUE, DEV,
+    // `parallel for x in arr { expr; }` -- see `Parser.hotc`'s own header for the full design.
+    PARALLEL,
     // See `Ast.hc`'s own `ComponentDecl`/`SystemDecl` header -- `ECS_IDEAS.md`'s own design doc
     // for the full feature these two keywords introduce.
     COMPONENT, SYSTEM,
@@ -166,6 +168,7 @@ fn build_keywords() -> Registry<TokType> {
     kw.register("break", BREAK);
     kw.register("continue", CONTINUE);
     kw.register("dev", DEV);
+    kw.register("parallel", PARALLEL);
     return kw;
 }
 
