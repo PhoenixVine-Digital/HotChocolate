@@ -1,5 +1,32 @@
 # Real hashed collections — design doc
 
+**Status, 2026-09-22 (`@derive(Eq, Hash)`)**: a real, not-previously-tracked feature (not one of
+this doc's own original "Explicitly deferred" items) -- this file's own header on `interface
+Hashable`/`interface Eq` already documented the required opt-in boilerplate for a struct-keyed
+`HashMap2<K, V>` (`impl Hashable for ItemStack { fn hash_key(&self) -> Int { ... } }`/`impl Eq for
+ItemStack { fn equals(&self, other: &ItemStack) -> Bool { ... } }`, see `examples/
+hashmap2_itemstack.hotc`'s own hand-written version); `@derive(Eq, Hash)` on the struct declaration
+now generates both automatically, field by field. Pure parser-level AST synthesis (`Parser.hotc`'s
+own `derive_impls`, called right after `struct_decl()` returns, before the struct is pushed) --
+desugars entirely into ordinary `impl Eq for X { ... }`/`impl Hashable for X { ... }` blocks
+(reusing the fact multiple interfaces on one struct already works, see `Codegen.hotc`'s own
+`struct_interfaces_of` fix), so neither `Checker.hotc` nor `Codegen.hotc` needed a single new line.
+Field-type dispatch: `Int`/`Bool`/`Char`/`Byte`/`Long`/`Float`/`Double`/`String` fields compare with
+`==` (already exact for all of them) and hash via `(value as Int)` (a legitimate, lossy-but-valid
+narrowing -- `Bool`'s `0`/`1` JVM representation is bit-identical to `Int`'s, so that cast is a
+real, safe no-op) or `hash_string_hc` for `String`; any OTHER field type (a nested struct/enum)
+dispatches through `.equals(...)`/`.hash_key()` instead, trusting that type to implement `Eq`/
+`Hashable` itself. `needs_collections` (mirroring `parallel for`'s own `needs_phoenix`) auto-injects
+`use collections;` regardless of whether the program wrote it, since `Eq`/`Hashable` themselves
+only exist there. Scope cut, disclosed in `derive_impls`'s own header: a nullable field (`Int?`,
+`String?`) isn't specifically supported (falls through to the nested-type dispatch, a real "no such
+method" compile error, not silent wrongness). Verified with `examples/derive_eq_hash.hotc`
+(`@derive(Eq, Hash)` on a 3-field struct feeding a real `HashMap2`, plus a bare `@derive(Eq)` on a
+2-field struct with no `Hash`) -- every line matches hand-computed expected output exactly. Full
+example regression sweep: zero new failures (same canonical 5-failure set: `drop.hc`, `long_test.
+hc`, `phoenix_virtual_threads.hc`, `stress_test.hotc`, `test_serializable.hotc`). Self-hosting
+verified to a true fixed point.
+
 **Status, 2026-09-17 (backlog close-out)**: two of this doc's own "Explicitly deferred" items
 shipped -- iteration helpers (`keys()`/`values()`/`entries()`, added to `HashMap<V>`/
 `IntHashMap<V>`/`HashMap2<K, V>` alike) and `HashSet`/`IntHashSet` (thin wrappers reusing

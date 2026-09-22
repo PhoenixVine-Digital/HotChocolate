@@ -1,0 +1,43 @@
+// `@derive(Eq, Hash)` -- auto-generates `impl Eq for X`/`impl Hashable for X` field by field,
+// so `ItemStack` (see `examples/hashmap2_itemstack.hotc`'s own HAND-WRITTEN version) never has
+// to spell out `equals`/`hash_key` by hand.
+use collections;
+
+@derive(Eq, Hash)
+struct ItemStack2 {
+    item_id: Int,
+    count: Int,
+    label: String,
+}
+
+@derive(Eq)
+struct Point2 {
+    x: Int,
+    y: Int,
+}
+
+fn main() {
+    let a = ItemStack2 { item_id: 5, count: 3, label: "sword" };
+    let b = ItemStack2 { item_id: 5, count: 3, label: "sword" };
+    let c = ItemStack2 { item_id: 5, count: 99, label: "sword" };
+
+    print(a.equals(&b)); // true
+    print(a.equals(&c)); // false
+    print(a.hash_key() == b.hash_key()); // true
+
+    var m = hash_map2_new(a, "first");
+    m.register(b, "second (overwrites, same key)");
+    m.register(c, "third (different key)");
+    match m.get(a) {
+        Some { value } => { print(value); } // "second (overwrites, same key)"
+        None => { print("MISS"); }
+    }
+
+    let p1 = Point2 { x: 1, y: 2 };
+    let p2 = Point2 { x: 1, y: 2 };
+    let p3 = Point2 { x: 9, y: 9 };
+    print(p1.equals(&p2)); // true
+    print(p1.equals(&p3)); // false
+
+    print("done");
+}

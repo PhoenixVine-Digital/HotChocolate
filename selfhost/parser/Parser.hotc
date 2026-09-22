@@ -55,10 +55,16 @@ pub struct Parser {
     // `PhoenixTask` regardless of whether it ALSO wrote `use phoenix;` itself).
     parallel_for_counter: Int,
     needs_phoenix: Bool,
+    // `@derive(Eq, Hash)` -- see `derive_impls`'s own header. `Eq`/`Hashable` (the interfaces the
+    // synthesized `impl` blocks target) are only declared in `stdlib/collections.hotc`, so a
+    // program using `@derive` needs `"collections"` auto-injected into `Program.uses` regardless
+    // of whether it ALSO wrote `use collections;` itself -- same transitive-dependency pattern
+    // `needs_phoenix` right above already establishes for `parallel for`.
+    needs_collections: Bool,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false };
 }
 
 impl Parser {
@@ -1022,6 +1028,106 @@ impl Parser {
         join_args.push(Ident { name: tasks_name });
         let join_call = MethodCall { recv: Ident { name: pool_name }, method: "join_all_and_shutdown", args: join_args };
         out.push(ExprStmt { expr: join_call, line: start_line });
+        return out;
+    }
+
+    // `@derive(Eq, Hash)` on a `struct` -- synthesizes real `impl Eq for Name { fn equals(&self,
+    // other: &Name) -> Bool { ... } }` / `impl Hashable for Name { fn hash_key(&self) -> Int {
+    // ... } }` blocks, field by field, so a caller of `HashMap2<Name, V>` (or anything else
+    // wanting real value equality on `Name`) never has to hand-write the boilerplate this file's
+    // own `stdlib/collections.hotc` header already documents as the required opt-in (see
+    // `examples/hashmap2_itemstack.hotc`'s own hand-written `impl Hashable for ItemStack`/`impl Eq
+    // for ItemStack` for exactly what this generates automatically instead). Pure parser-level AST
+    // synthesis, same strategy `parallel_for_stmts`/`Driver.hotc`'s own `@dev` pass already use --
+    // desugars entirely into ordinary, already-checked/already-codegenned `impl` blocks, so
+    // NEITHER `Checker.hotc` NOR `Codegen.hotc` need a single new line for this feature (multiple
+    // interfaces on one struct already works -- see `Codegen.hotc`'s own `struct_interfaces_of`
+    // fix -- so `Eq`+`Hashable` together on the same struct is safe).
+    //
+    // **Field-type dispatch, real and disclosed.** Equality: `Int`/`Bool`/`Char`/`Byte`/`Long`/
+    // `Float`/`Double`/`String` fields compare with `==` (already exact for every one of those --
+    // `String` goes through null-safe `Objects.equals`/`.equals()`, see `Codegen.hotc`'s own
+    // `gen_binary` header); any OTHER field type (a nested struct/enum) dispatches through
+    // `.equals(other.field)` instead, trusting that field's own type to implement `Eq` itself (a
+    // real, clear "no such method" compile error if it doesn't, rather than silently falling back
+    // to `==`'s own reference-identity gap on a plain struct field -- see that fn's own header).
+    // Hashing: the same seven numeric-ish primitives combine via `(value as Int)` (a legitimate,
+    // lossy-but-valid narrowing per `Codegen.hotc`'s own `gen_cast` -- `Bool`'s `0`/`1`
+    // representation on the JVM stack is bit-identical to `Int`'s, so the cast is a real, safe
+    // no-op there too, not just for the numeric pairs `gen_cast` has dedicated opcodes for);
+    // `String` calls `hash_string_hc` (`stdlib/collections.hotc`'s own hand-rolled polynomial
+    // hash -- exactly why `needs_collections` auto-injects that topic, not just for `Hashable`'s
+    // own declaration); anything else dispatches through `.hash_key()`, same "trust the nested
+    // type's own derive/impl" reasoning as `equals` above. Both fold via the standard `h = h * 31
+    // + fieldHash` polynomial shape (`Object.hashCode()`'s own convention) -- zero fields yields
+    // `true`/`0` respectively, not an error (an empty marker struct is a legitimate, if unusual,
+    // hash-map key). Scope cut, disclosed: a NULLABLE field (`Int?`, `String?`, ...) is matched by
+    // EXACT type-name string in `is_derive_numeric_type_hc`/the `String` check below, so the
+    // trailing `?` always misses and falls through to the `.hash_key()`/`.equals()` dispatch meant
+    // for nested struct/enum fields -- a real, clear "no such method" compile error for a nullable
+    // field, not silent wrongness, but not specifically supported this pass either (not attempted:
+    // `==`'s own reference-identity gap on a nullable NON-String type -- see `Codegen.hotc`'s own
+    // `gen_binary` header -- means naively stripping the `?` here wouldn't actually be correct for
+    // every nullable primitive anyway).
+    fn derive_impls(&mut self, sd: &StructDecl, kinds: &Vec<String>) -> Vec<ImplDecl> {
+        var out = empty_impl_decl_vec();
+        var wants_eq = false;
+        var wants_hash = false;
+        var ki = 0;
+        while ki < kinds.length() {
+            let k = kinds.get(ki);
+            if k == "Eq" {
+                wants_eq = true;
+            } else if k == "Hash" {
+                wants_hash = true;
+            } else {
+                throw ParseError::new("'@derive(" + k + ")' isn't supported -- only 'Eq' and 'Hash' can be derived");
+            }
+            ki = ki + 1;
+        }
+        if wants_eq || wants_hash {
+            // `Eq`/`Hashable` are only declared in `stdlib/collections.hotc` -- see
+            // `needs_collections`'s own header.
+            self.needs_collections = true;
+        }
+        if wants_eq {
+            var eq_expr = BoolLit { value: true };
+            var has_field = false;
+            var fi = 0;
+            while fi < sd.fields.length() {
+                let f = sd.fields.get(fi);
+                let one = derive_field_eq_expr(&f);
+                if has_field {
+                    eq_expr = Binary { op: "&&", left: eq_expr, right: one };
+                } else {
+                    eq_expr = one;
+                    has_field = true;
+                }
+                fi = fi + 1;
+            }
+            var eq_body = empty_stmt_vec();
+            eq_body.push(Return { value: some_expr(eq_expr), line: 0 });
+            var eq_params = empty_param_vec();
+            eq_params.push(Param { name: "other", type_name: sd.name, is_ref: true, is_mut_ref: false });
+            var eq_methods = empty_fn_decl_vec();
+            eq_methods.push(FnDecl { name: "equals", params: eq_params, ret_type: some_string("Bool"), body: eq_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
+            out.push(ImplDecl { struct_name: sd.name, methods: eq_methods, static_methods: empty_fn_decl_vec(), interface_name: some_string("Eq"), delegate_field: none_string() });
+        }
+        if wants_hash {
+            var hash_expr = IntLit { value: 0 };
+            var hi = 0;
+            while hi < sd.fields.length() {
+                let f = sd.fields.get(hi);
+                let fh = derive_field_hash_expr(&f);
+                hash_expr = Binary { op: "+", left: Binary { op: "*", left: hash_expr, right: IntLit { value: 31 } }, right: fh };
+                hi = hi + 1;
+            }
+            var hash_body = empty_stmt_vec();
+            hash_body.push(Return { value: some_expr(hash_expr), line: 0 });
+            var hash_methods = empty_fn_decl_vec();
+            hash_methods.push(FnDecl { name: "hash_key", params: empty_param_vec(), ret_type: some_string("Int"), body: hash_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
+            out.push(ImplDecl { struct_name: sd.name, methods: hash_methods, static_methods: empty_fn_decl_vec(), interface_name: some_string("Hashable"), delegate_field: none_string() });
+        }
         return out;
     }
 
@@ -2187,6 +2293,11 @@ impl Parser {
             // `@run_if(condition_fn)` -- see `Ast.hc`'s own `SystemDecl.run_if` header. `""` when
             // no `@run_if` was written.
             var pending_run_if = "";
+            // `@derive(Eq, Hash)` -- see `derive_impls`'s own header for the full design. A list
+            // (not a single bare directive) since both can be requested together on one struct,
+            // same `Vec<String>` "empty means not written at all" convention `pending_after`/
+            // `pending_before` right above already use for their own multi-target lists.
+            var pending_derive = empty_str_vec2();
             while self.check(AT) {
                 if self.tokens.get(self.pos + 1).kind == STRING {
                     pending_annotation = some_annotation(self.annotation());
@@ -2227,6 +2338,13 @@ impl Parser {
                         self.expect(LPAREN);
                         pending_run_if = self.expect(IDENT).text;
                         self.expect(RPAREN);
+                    } else if directive == "derive" {
+                        self.expect(LPAREN);
+                        pending_derive.push(self.expect(IDENT).text);
+                        while self.match_kind(COMMA) {
+                            pending_derive.push(self.expect(IDENT).text);
+                        }
+                        self.expect(RPAREN);
                     } else {
                         throw ParseError::new("unknown compiler directive '@" + directive + "'");
                     }
@@ -2243,6 +2361,11 @@ impl Parser {
             // since there's only ONE valid target to check for instead of many invalid ones.
             if pending_sendable && !self.check(STRUCT) {
                 throw ParseError::new("'@sendable' is only supported on 'struct' declarations");
+            }
+            // `@derive` is only meaningful on `struct` -- same single-gate shape `@sendable`
+            // right above uses.
+            if pending_derive.length() > 0 && !self.check(STRUCT) {
+                throw ParseError::new("'@derive' is only supported on 'struct' declarations");
             }
             // `@dev` is only meaningful on a top-level `fn` -- same single-gate shape `@sendable`
             // right above uses (one valid target, checked here, rather than `@must_use`'s own
@@ -2269,6 +2392,14 @@ impl Parser {
                 let sd = self.struct_decl();
                 if pending_sendable {
                     sendable_struct_names.push(sd.name);
+                }
+                if pending_derive.length() > 0 {
+                    let synth = self.derive_impls(&sd, &pending_derive);
+                    var dsi = 0;
+                    while dsi < synth.length() {
+                        impls.push(synth.get(dsi));
+                        dsi = dsi + 1;
+                    }
                 }
                 if has_pending_annotation {
                     if let Some { value: ann } = pending_annotation {
@@ -2433,6 +2564,12 @@ impl Parser {
         if self.needs_phoenix {
             uses.push("phoenix");
         }
+        // `@derive(Eq, Hash)` needs `Eq`/`Hashable` (both declared in `stdlib/collections.hotc`)
+        // regardless of whether this program ever wrote `use collections;` itself -- see
+        // `needs_collections`'s own header.
+        if self.needs_collections {
+            uses.push("collections");
+        }
         return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
 
@@ -2562,6 +2699,53 @@ impl Parser {
         self.expect(SEMI);
         return StaticDecl { name: name, type_name: type_name, value: value };
     }
+}
+
+// `derive_impls`'s own field-type dispatch -- these seven are the ones that combine directly as
+// `(value as Int)` for hashing (see that fn's own header for why `Bool` is safe here too), and
+// compare directly with `==` for equality (already exact for every one of them). `String` is
+// deliberately NOT in this list -- it shares the `==` equality path but needs a different,
+// dedicated hashing path (`hash_string_hc`, not a cast).
+fn is_derive_numeric_type_hc(ty: String) -> Bool {
+    if ty == "Int" { return true; }
+    if ty == "Bool" { return true; }
+    if ty == "Char" { return true; }
+    if ty == "Byte" { return true; }
+    if ty == "Long" { return true; }
+    if ty == "Float" { return true; }
+    if ty == "Double" { return true; }
+    return false;
+}
+
+// One field's own `self.field == other.field` (numeric/`String`) or `self.field.equals(other.
+// field)` (anything else -- a nested struct/enum, dispatching to ITS OWN `Eq` impl) -- see
+// `derive_impls`'s own header for the full field-type-dispatch design.
+fn derive_field_eq_expr(f: &Param) -> Expr {
+    let lhs = FieldAccess { obj: Ident { name: "self" }, field: f.name };
+    let rhs = FieldAccess { obj: Ident { name: "other" }, field: f.name };
+    if is_derive_numeric_type_hc(f.type_name) || f.type_name == "String" {
+        return Binary { op: "==", left: lhs, right: rhs };
+    }
+    var args = empty_expr_vec();
+    args.push(rhs);
+    return MethodCall { recv: lhs, method: "equals", args: args };
+}
+
+// One field's own hash contribution -- `(self.field as Int)` for the seven numeric-ish
+// primitives, `hash_string_hc(self.field)` for `String` (`stdlib/collections.hotc`'s own hand-
+// rolled polynomial hash), or `self.field.hash_key()` for anything else (a nested struct/enum,
+// dispatching to ITS OWN `Hashable` impl) -- see `derive_impls`'s own header.
+fn derive_field_hash_expr(f: &Param) -> Expr {
+    let lhs = FieldAccess { obj: Ident { name: "self" }, field: f.name };
+    if is_derive_numeric_type_hc(f.type_name) {
+        return Cast { expr: lhs, target_type: "Int" };
+    }
+    if f.type_name == "String" {
+        var args = empty_expr_vec();
+        args.push(lhs);
+        return Call { callee: "hash_string_hc", args: args };
+    }
+    return MethodCall { recv: lhs, method: "hash_key", args: empty_expr_vec() };
 }
 
 // `String` has no built-in `startsWith` in this compiler's own intrinsic set (`length`/
