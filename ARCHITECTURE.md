@@ -3950,6 +3950,21 @@ fn main() {
   compiles to a package-private class, so cross-module code that
   shouldn't reach it can't even link against it, `IllegalAccessError` at
   load time if something tries. (See `examples/modules/`.)
+  **Correction, 2026-09-23: this describes the original (retired
+  Kotlin) compiler's design, not `selfhost/`'s actual current
+  behavior.** `Parser.hotc`'s own top-level parse loop just calls
+  `self.match_kind(PUB)` and discards the result — no field anywhere
+  records it, and `Codegen.hotc`'s own `gen_struct`/`gen_interface`/
+  `gen_enum` unconditionally emit `ACC_PUBLIC` on every class
+  regardless (`class_access = 33` in `gen_struct`, `1537` in
+  `gen_interface`, ...) — there is no package-private codegen path at
+  all in the self-hosted port. `InternalConfig` in this section's own
+  first example is NOT actually invisible outside its module today,
+  despite what its comment claims. Found while building the real,
+  differently-scoped `priv` visibility check below (`priv` marks a
+  TYPE invisible to other FILES in a directory-mode compile — a
+  compile-time, name-based check, not JVM access control at all —
+  distinct from what this bullet describes and not a fix for it).
 - **`open interface X`** — marks a trait as allowed to receive new
   methods from `extend` blocks in other modules. Orthogonal to `sealed`:
   `sealed` is about the closed set of *implementers* (what `match`
@@ -3986,6 +4001,14 @@ its top-level `pub fn`/`pub static` land as ordinary static members
 directly on *that file's own first* declared struct's class — a real
 name Java code can reference by writing it, not a hidden one. Only a
 file with no struct at all falls back to an internal `$Fns` holder.
+**Same correction as the `pub` bullet above applies here too**: nothing
+in `FnDecl`/`StaticDecl` (or anywhere else in `Ast.hc`) actually
+records whether a `pub` was written at all — `Parser.hotc` discards it
+unconditionally for these too, the same as for struct/interface/enum —
+so there is no data left by the time `Codegen.hotc` places a fn/static
+on its holder class to distinguish a `pub` one from a private one in
+the first place. This whole paragraph describes the original compiler's
+design, not `selfhost/`'s current, real behavior.
 
 ```
 module defs;
@@ -4038,7 +4061,59 @@ being renamed to the directory's own basename).
 See `examples/modules/` for a working two-module example (`extend`
 reaching across module boundaries, a private struct genuinely
 inaccessible cross-module — verified with `javap`, not just by reading
-the source).
+the source). **This `javap` verification, like the `pub` corrections
+above, predates the self-hosted migration** — almost certainly run
+against the original Kotlin compiler, never re-run against `selfhost/`
+(which, per those corrections, emits every struct class `ACC_PUBLIC`
+unconditionally today; a fresh `javap` run against `selfhost/`'s own
+output would show this).
+
+### `priv` — a minimal cross-file visibility check (directory-mode compiles only)
+
+**Shipped, 2026-09-23.** Not a fix for `pub`'s own lapsed enforcement above, and not real per-scope
+resolution either — see `IDEAS.md`'s own "A minimal import/visibility system" entry for the full
+design and the real, disclosed scope cuts. The short version: `priv struct Foo { ... }` / `priv
+enum` / `priv interface` marks a top-level TYPE invisible to every OTHER file in the same
+directory-mode compile (not a JVM access-control mechanism at all — a compile-time, name-based
+check, run by `Driver.hotc`'s own `check_private_visibility` before `merge_program` ever collapses
+per-file identity away). Scoped to types only, not `fn`/`static`, and to type-NAME-shaped
+references only (struct-literal/static-call/cast/`is`/arena-constructor targets, every field/
+param/return type string, `extends`/`impl ... for`/`extend` targets) — never bare value/call
+references, since those would need real local-scope tracking to avoid false positives on an
+unrelated local variable sharing a name with another file's private type.
+
+```
+// lib.hotc
+priv struct Cache { hits: Int }
+struct Point { x: Int, y: Int }
+fn make_cache() -> Cache { return Cache { hits: 0 }; }
+fn describe_point(p: Point) -> String { return "({p.x}, {p.y})"; }
+```
+
+```
+// main.hotc, same directory
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    print(describe_point(p));   // fine -- uses the public surface only
+    let c = make_cache();       // fine -- never NAMES Cache directly
+    // let c2: Cache = make_cache();  -- would be a real compile error:
+    // 'Cache' is declared 'priv' in lib.hotc and can't be referenced from main.hotc
+}
+```
+
+A real, previously-latent `Vec<T>` monomorphization gap was found building the enforcement pass
+itself: the natural-looking implementation (parse every file once into a `Vec<Program>`, check
+it, then merge) compiles fine as source but crashes with `NoClassDefFoundError: Vec$Program` the
+moment the compiled class is actually loaded — `Program` is by far the largest struct in this AST,
+and this is the same broader class of gap already documented above for `Vec<Vec<T>>` struct
+fields, just one level shallower and on a much bigger struct. Fixed by never constructing that
+`Vec<Program>` at all: `check_private_visibility` takes the raw file-path list and re-parses every
+file itself (twice — once to collect every `priv` name, once to walk every file's own references),
+at the cost of parsing each file in a directory twice instead of once. Not perf-critical, same
+tolerance `check_module_dirs` (right below) already established. Verified against
+`examples/priv_visibility_ok/` (a valid consumer) and `examples/priv_visibility_violation/` (a
+consumer directly naming the private type, correctly rejected with the exact error above). Full
+example regression suite: zero new failures. Self-hosting verified to a true fixed point.
 
 ### Global state: `pub static NAME: Type = initExpr;`
 

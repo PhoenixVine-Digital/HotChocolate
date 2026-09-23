@@ -966,6 +966,18 @@ pub struct Program {
     // `components` so a resource is never accidentally archetype-matched, and a component is
     // never accidentally treated as a world-wide singleton).
     resources: Vec<ComponentDecl>,
+    // `priv struct Foo { ... }` / `priv enum` / `priv interface` -- the DECLARED name of every
+    // top-level type marked `priv` (see IDEAS.md's own "A minimal import/visibility system"
+    // entry). Same bare-directive side-channel shape `dev_fn_names`/`must_use_fn_names` above
+    // already use, for the identical reason (`StructDecl`/`EnumDecl`/`InterfaceDecl` each already
+    // have plenty of constructor call sites across synthesis passes that have no business knowing
+    // this feature exists). `Driver.hotc`'s own `check_private_visibility` is the only reader --
+    // see that fn's own header for the real, disclosed scope this enforces (a name-based check
+    // across FILES in a directory-mode compile, run BEFORE `merge_program` collapses per-file
+    // identity away entirely -- there is no way to recover which file a merged declaration came
+    // from afterward, which is exactly why this can't be a `Checker.hotc` pass on the merged
+    // `Program` the way most other checks are).
+    private_type_names: Vec<String>,
 }
 
 // `/// text` lines immediately before a `struct`/`fn`, parsed into structured sections rather than

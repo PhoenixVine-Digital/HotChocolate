@@ -98,7 +98,7 @@ pub enum TokType {
     CHAR,
     ISTRING_BEGIN, ISTRING_PART, ISTRING_END,
     FN, STRUCT, LET, VAR, IF, ELSE, WHILE, FOR, IN, RETURN, TRUE, FALSE, IMPL, MUT, ARENA,
-    INTERFACE, DYN, ENUM, MATCH, BY, SEALED, EXTERN, CLASS, MODULE, PUB, OPEN, EXTEND, STATIC, AS,
+    INTERFACE, DYN, ENUM, MATCH, BY, SEALED, EXTERN, CLASS, MODULE, PUB, PRIV, OPEN, EXTEND, STATIC, AS,
     TRY, CATCH, THROW, EXTENDS, OVERRIDE, NULL, IS, USE,
     BREAK, CONTINUE, DEV,
     // `parallel for x in arr { expr; }` -- see `Parser.hotc`'s own header for the full design.
@@ -182,6 +182,7 @@ fn build_keywords() -> Registry<TokType> {
     kw.register("class", CLASS);
     kw.register("module", MODULE);
     kw.register("pub", PUB);
+    kw.register("priv", PRIV);
     kw.register("open", OPEN);
     kw.register("extend", EXTEND);
     kw.register("use", USE);

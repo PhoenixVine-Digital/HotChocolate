@@ -378,6 +378,17 @@ fn expected_module_for_path(dir_path: String, file_path: String) -> String {
 fn parse_directory(dir_path: String) -> Program {
     var files = collect_hotc_files(dir_path);
     files = sort_str_vec(files);
+    // `check_private_visibility` needs each file's own identity, which is impossible to recover
+    // once `merge_program` collapses everything into one flat `Program` -- so it has to run
+    // BEFORE the merge below, not after. See that fn's own header for why it re-parses every file
+    // itself (twice) rather than this fn collecting a `Vec<Program>` to hand it: a real, disclosed
+    // `Vec<T>` monomorphization gap found the hard way -- `Program` is by far the largest struct
+    // in this whole AST (dozens of fields, several already `Vec<...>` themselves), and a bare
+    // `Vec<Program>` compiles cleanly as SOURCE but crashes with `NoClassDefFoundError: Vec$
+    // Program` the moment the compiled class is actually LOADED -- the same broader class of gap
+    // this session already found for `Vec<Vec<T>>` struct fields, just one level shallower and on
+    // a much bigger struct. Re-parsing avoids ever constructing that Vec at all.
+    check_private_visibility(&files);
     var prog = parse_source_file(files.get(0));
     var i = 1;
     while i < files.length() {
@@ -1038,6 +1049,7 @@ fn merge_program(a: Program, b: Program) -> Program {
         components: merge_component_decl_vec(a.components, b.components),
         systems: merge_system_decl_vec(a.systems, b.systems),
         resources: merge_component_decl_vec(a.resources, b.resources),
+        private_type_names: merge_str_vec(a.private_type_names, b.private_type_names),
     };
 }
 
@@ -1149,7 +1161,7 @@ fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
         new_systems.push(SystemDecl { name: sysd.name, run_params: sysd.run_params, run_body: strip_dev_blocks_list(sysd.run_body, dev_mode), after: sysd.after, before: sysd.before, has_profile: sysd.has_profile, has_main_thread: sysd.has_main_thread, run_if: sysd.run_if });
         si = si + 1;
     }
-    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources };
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources, private_type_names: prog.private_type_names };
 }
 
 // `asset("textures/player.png")` -- see `IDEAS.md`'s own "Compile-time asset existence checks"
@@ -1400,6 +1412,317 @@ fn check_deterministic_expr(e: &Expr, fn_name: String) {
         BoolLit { value } => {}
         Ident { name } => {}
         NullLit => {}
+    }
+}
+
+// Splits a decorated type-name string (`"&mut Vec<Foo>"`, `"[Foo]"`, `"Foo?"`, `"Result<Foo,
+// Bar>"`, ...) into its bare identifier words, pushing each into `out` -- deliberately crude (a
+// codepoint scan collecting maximal runs of anything that ISN'T one of the handful of separator
+// characters a decorated type string can ever contain: `&`, `?`, `<`, `>`, `,`, `[`, `]`,
+// whitespace), not a real type-grammar parser. Good enough for `check_private_visibility`'s own
+// purpose (does this decorated type string MENTION a given bare name anywhere) without needing a
+// real parser for every one of this AST's several decorated-type-string shapes -- pushing "Vec"
+// AND "Foo" both for `"Vec<Foo>"` is exactly the point (either one could be the private name being
+// checked for).
+fn is_type_str_sep(c: Int) -> Bool {
+    if c == CP_AMP { return true; }
+    if c == CP_QUESTION { return true; }
+    if c == CP_LT { return true; }
+    if c == CP_GT { return true; }
+    if c == CP_COMMA { return true; }
+    if c == CP_LBRACKET { return true; }
+    if c == CP_RBRACKET { return true; }
+    if c == CP_SPACE { return true; }
+    return false;
+}
+
+fn push_type_name_words(s: String, out: &mut Vec<String>) {
+    var i = 0;
+    var cur = "";
+    while i < s.length() {
+        let c = s.codePointAt(i);
+        if is_type_str_sep(c) {
+            if cur != "" { out.push(cur); }
+            cur = "";
+        } else {
+            cur = cur + codepoint_to_string(c);
+        }
+        i = i + 1;
+    }
+    if cur != "" { out.push(cur); }
+}
+
+fn push_opt_type_name_words(o: Option<String>, out: &mut Vec<String>) {
+    match o {
+        Some { value: s } => { push_type_name_words(s, out); }
+        None => {}
+    }
+}
+
+fn collect_private_refs_params(params: &Vec<Param>, out: &mut Vec<String>) {
+    var i = 0;
+    while i < params.length() {
+        push_type_name_words(params.get(i).type_name, out);
+        i = i + 1;
+    }
+}
+
+fn collect_private_refs_fn(f: &FnDecl, out: &mut Vec<String>) {
+    push_opt_type_name_words(f.ret_type, out);
+    collect_private_refs_params(&f.params, out);
+    collect_private_refs_stmts(&f.body, out);
+}
+
+fn collect_private_refs_fns(fns: &Vec<FnDecl>, out: &mut Vec<String>) {
+    var i = 0;
+    while i < fns.length() {
+        collect_private_refs_fn(&fns.get(i), out);
+        i = i + 1;
+    }
+}
+
+// Every TYPE-NAME-shaped reference anywhere in ONE file's own already-parsed `Program` -- see
+// `check_private_visibility`'s own header for exactly why this is scoped to type-name POSITIONS
+// only (struct-literal/static-call/cast/`is`/arena-constructor targets, plus every field/param/
+// return type string, plus `extends`/`impl ... for`/`extend` target names), never bare value/call
+// references.
+fn collect_type_refs_in_program(prog: &Program, out: &mut Vec<String>) {
+    var si = 0;
+    while si < prog.structs.length() {
+        let sd = prog.structs.get(si);
+        push_opt_type_name_words(sd.super_class, out);
+        collect_private_refs_params(&sd.fields, out);
+        si = si + 1;
+    }
+    var ei = 0;
+    while ei < prog.enums.length() {
+        let ed = prog.enums.get(ei);
+        var vi = 0;
+        while vi < ed.variants.length() {
+            collect_private_refs_params(&ed.variants.get(vi).fields, out);
+            vi = vi + 1;
+        }
+        ei = ei + 1;
+    }
+    var ii = 0;
+    while ii < prog.interfaces.length() {
+        let ifd = prog.interfaces.get(ii);
+        var pi2 = 0;
+        while pi2 < ifd.parents.length() {
+            out.push(ifd.parents.get(pi2));
+            pi2 = pi2 + 1;
+        }
+        var mi = 0;
+        while mi < ifd.methods.length() {
+            let m = ifd.methods.get(mi);
+            push_type_name_words(m.ret_type, out);
+            collect_private_refs_params(&m.params, out);
+            match m.body {
+                Some { value: b } => { collect_private_refs_stmts(&b, out); }
+                None => {}
+            }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var imi = 0;
+    while imi < prog.impls.length() {
+        let imd = prog.impls.get(imi);
+        out.push(imd.struct_name);
+        push_opt_type_name_words(imd.interface_name, out);
+        collect_private_refs_fns(&imd.methods, out);
+        collect_private_refs_fns(&imd.static_methods, out);
+        imi = imi + 1;
+    }
+    var exi = 0;
+    while exi < prog.extend_decls.length() {
+        let exd = prog.extend_decls.get(exi);
+        out.push(exd.target);
+        collect_private_refs_fns(&exd.methods, out);
+        exi = exi + 1;
+    }
+    collect_private_refs_fns(&prog.fns, out);
+}
+
+fn collect_private_refs_stmts(ss: &Vec<Stmt>, out: &mut Vec<String>) {
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Let { name, mutable, init, declared_type, line } => {
+                push_opt_type_name_words(declared_type, out);
+                collect_private_refs_expr(&init, out);
+            }
+            ExprStmt { expr, line } => { collect_private_refs_expr(&expr, out); }
+            Return { value, line } => {
+                match value {
+                    Some { value: v } => { collect_private_refs_expr(&v, out); }
+                    None => {}
+                }
+            }
+            Throw { value, line } => { collect_private_refs_expr(&value, out); }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                collect_private_refs_expr(&cond, out);
+                collect_private_refs_stmts(&then_body, out);
+                match else_body {
+                    Some { value: eb } => { collect_private_refs_stmts(&eb, out); }
+                    None => {}
+                }
+            }
+            While { cond, body, line } => {
+                collect_private_refs_expr(&cond, out);
+                collect_private_refs_stmts(&body, out);
+            }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                collect_private_refs_expr(&range_start, out);
+                collect_private_refs_expr(&range_end, out);
+                collect_private_refs_expr(&arr_expr, out);
+                collect_private_refs_stmts(&body, out);
+            }
+            Try { try_block, catches, line } => {
+                collect_private_refs_stmts(&try_block, out);
+                var ci = 0;
+                while ci < catches.length() {
+                    push_type_name_words(catches.get(ci).catch_type, out);
+                    collect_private_refs_stmts(&catches.get(ci).catch_block, out);
+                    ci = ci + 1;
+                }
+            }
+            Match { subject, arms, line } => {
+                collect_private_refs_expr(&subject, out);
+                var ai = 0;
+                while ai < arms.length() {
+                    collect_private_refs_stmts(&arms.get(ai).body, out);
+                    ai = ai + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+fn collect_private_refs_expr_list(es: &Vec<Expr>, out: &mut Vec<String>) {
+    var i = 0;
+    while i < es.length() {
+        collect_private_refs_expr(&es.get(i), out);
+        i = i + 1;
+    }
+}
+
+fn collect_private_refs_expr(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Call { callee, args } => { collect_private_refs_expr_list(&args, out); }
+        MethodCall { recv, method, args } => {
+            collect_private_refs_expr(&recv, out);
+            collect_private_refs_expr_list(&args, out);
+        }
+        StaticCall { type_name, method, args } => {
+            out.push(type_name);
+            collect_private_refs_expr_list(&args, out);
+        }
+        SafeCall { recv, method, args } => {
+            collect_private_refs_expr(&recv, out);
+            collect_private_refs_expr_list(&args, out);
+        }
+        Binary { op, left, right } => { collect_private_refs_expr(&left, out); collect_private_refs_expr(&right, out); }
+        Unary { op, expr } => { collect_private_refs_expr(&expr, out); }
+        FieldAccess { obj, field } => { collect_private_refs_expr(&obj, out); }
+        Assign { name, value } => { collect_private_refs_expr(&value, out); }
+        FieldAssign { obj, field, value } => { collect_private_refs_expr(&obj, out); collect_private_refs_expr(&value, out); }
+        StructLit { name, field_names, field_values, generic_base } => {
+            out.push(name);
+            push_opt_type_name_words(generic_base, out);
+            collect_private_refs_expr_list(&field_values, out);
+        }
+        ArrayLit { elements } => { collect_private_refs_expr_list(&elements, out); }
+        ArrayRepeat { value, count } => { collect_private_refs_expr(&value, out); collect_private_refs_expr(&count, out); }
+        Index { arr, index } => { collect_private_refs_expr(&arr, out); collect_private_refs_expr(&index, out); }
+        Slice { arr, start, end, inclusive } => { collect_private_refs_expr(&arr, out); collect_private_refs_expr(&start, out); collect_private_refs_expr(&end, out); }
+        IndexAssign { arr, index, value } => { collect_private_refs_expr(&arr, out); collect_private_refs_expr(&index, out); collect_private_refs_expr(&value, out); }
+        IndexFieldGet { arr_name, index, field } => { collect_private_refs_expr(&index, out); }
+        IndexFieldSet { arr_name, index, field, value } => { collect_private_refs_expr(&index, out); collect_private_refs_expr(&value, out); }
+        Cast { expr, target_type } => { push_type_name_words(target_type, out); collect_private_refs_expr(&expr, out); }
+        IsCheck { expr, target_type } => { push_type_name_words(target_type, out); collect_private_refs_expr(&expr, out); }
+        Lambda { params, body } => { collect_private_refs_expr(&body, out); }
+        TryOp { expr } => { collect_private_refs_expr(&expr, out); }
+        SafeFieldAccess { recv, field } => { collect_private_refs_expr(&recv, out); }
+        Elvis { left, right } => { collect_private_refs_expr(&left, out); collect_private_refs_expr(&right, out); }
+        StringInterp { literals, exprs } => { collect_private_refs_expr_list(&exprs, out); }
+        Comprehension { result_expr, var_name, iter_expr, cond } => {
+            collect_private_refs_expr(&result_expr, out);
+            collect_private_refs_expr(&iter_expr, out);
+            match cond {
+                Some { value: c } => { collect_private_refs_expr(&c, out); }
+                None => {}
+            }
+        }
+        NamedArg { name, value } => { collect_private_refs_expr(&value, out); }
+        ArenaNew { struct_name, count } => { out.push(struct_name); collect_private_refs_expr(&count, out); }
+        ExternStaticFieldSet { type_name, field, value } => { collect_private_refs_expr(&value, out); }
+        _ => {}
+    }
+}
+
+// A minimal import/visibility check for directory-mode compiles -- see IDEAS.md's own "A minimal
+// import/visibility system" entry for the motivating case (a shared library's internal helper
+// TYPES leaking into a consumer's flat namespace) and the real, disclosed scope this delivers:
+// name-based reference detection across FILES, not real per-scope resolution, and scoped to TOP-
+// LEVEL TYPES only (`priv struct`/`enum`/`interface` -- see `Parser.hotc`'s own `PRIV` gate for
+// why `fn`/`static` aren't included: this walker only ever looks at type-NAME-shaped positions,
+// and a bare value/call reference would need tracking LOCAL scope too, or a local variable/param
+// sharing a name with another file's private type -- `let vec = ...;` shadowing an unrelated
+// `priv struct Vec` a world away -- would be a real false positive). Must run BEFORE `merge_
+// program` ever collapses per-file identity away -- there is no way to recover which file a merged
+// declaration came from afterward, which is why `parse_directory` calls this on the raw file PATH
+// list, before merging, rather than this being a `Checker.hotc` pass on the final merged `Program`
+// the way most other checks are. Takes file PATHS, not already-parsed `Program`s, and re-parses
+// every file itself, twice (once per pass below) -- deliberately, not an oversight: a
+// `Vec<Program>` built once and reused across both passes compiles fine as SOURCE but crashes
+// with `NoClassDefFoundError: Vec$Program` the moment the compiled class is actually LOADED
+// (`Program` is by far the largest struct in this AST, and this is the same broader `Vec<T>`
+// monomorphization gap this session already found for `Vec<Vec<T>>` struct fields, just one level
+// shallower and on a much bigger struct) -- re-parsing sidesteps it entirely by never
+// constructing that Vec at all. Not perf-critical either way (matching `check_module_dirs`'s own
+// header): real project sizes here are dozens of files, not thousands.
+fn check_private_visibility(files: &Vec<String>) {
+    // Pass 1: parse every file once just to collect its own `priv` type names -- `all_names`/
+    // `all_owners` is a flat parallel pair (one entry per `priv` declaration anywhere in the
+    // whole directory, its own declaring file alongside it), same convention `event_names`/
+    // `handler_event_names` already establish in `Parser.hotc` for the identical reason (no
+    // `Vec<Vec<T>>`/nested-struct-`Vec` shape anywhere).
+    var all_names = empty_str_vec2();
+    var all_owners = empty_str_vec2();
+    var fi = 0;
+    while fi < files.length() {
+        let p = parse_source_file(files.get(fi));
+        var ni = 0;
+        while ni < p.private_type_names.length() {
+            all_names.push(p.private_type_names.get(ni));
+            all_owners.push(files.get(fi));
+            ni = ni + 1;
+        }
+        fi = fi + 1;
+    }
+    if all_names.length() == 0 { return; }
+    // Pass 2: parse every file a SECOND time (re-parsing is the whole point -- see this fn's own
+    // header on why a `Vec<Program>` collected once and reused across both passes isn't safe to
+    // build), walk each one's own type-name-shaped references, and check every OTHER file's
+    // `priv` names against them.
+    var gi = 0;
+    while gi < files.length() {
+        let cp = parse_source_file(files.get(gi));
+        var referenced = empty_str_vec2();
+        collect_type_refs_in_program(&cp, &mut referenced);
+        var ni2 = 0;
+        while ni2 < all_names.length() {
+            if all_owners.get(ni2) != files.get(gi) {
+                if str_vec_contains(&referenced, all_names.get(ni2)) {
+                    throw ParseError::new("'" + all_names.get(ni2) + "' is declared 'priv' in " + all_owners.get(ni2) + " and can't be referenced from " + files.get(gi));
+                }
+            }
+            ni2 = ni2 + 1;
+        }
+        gi = gi + 1;
     }
 }
 

@@ -1,0 +1,8 @@
+// Same library shape as priv_visibility_ok/lib.hotc -- `Cache` is `priv`.
+priv struct Cache {
+    hits: Int,
+}
+
+fn make_cache() -> Cache {
+    return Cache { hits: 0 };
+}

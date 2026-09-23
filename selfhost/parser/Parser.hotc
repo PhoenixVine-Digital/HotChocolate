@@ -2617,6 +2617,7 @@ impl Parser {
         var fn_doc_data = empty_doc_comment_vec();
         var uses = empty_str_vec();
         var sendable_struct_names = empty_str_vec();
+        var private_type_names = empty_str_vec();
         var components = empty_component_decl_vec();
         var systems = empty_system_decl_vec();
         var resources = empty_component_decl_vec();
@@ -2810,6 +2811,16 @@ impl Parser {
             // parsed purely so real HC source that uses it doesn't fail to parse; consumed and
             // otherwise ignored.
             self.match_kind(PUB);
+            // `priv struct Foo { ... }` / `priv enum` / `priv interface` -- see IDEAS.md's own "A
+            // minimal import/visibility system" entry. Only meaningful on a top-level TYPE
+            // declaration (real, disclosed v1 scope: not `fn`/`static` -- the actual motivating
+            // case is a shared library's internal helper TYPES leaking into a consumer's
+            // namespace, and restricting to types keeps `Driver.hotc`'s own `check_private_
+            // visibility` walker looking only at type-name-shaped references, which is both a
+            // smaller walker and a much lower false-positive surface than tracking arbitrary
+            // value/call references too). Gated the same single-check way `@sendable`/`@derive`/
+            // `@tunable` already are right below, rather than repeating the reject once per arm.
+            let is_priv = self.match_kind(PRIV);
             // `@sendable` is only meaningful on `struct` -- checked HERE (after `pub`, before
             // dispatching on which declaration kind follows) rather than repeating a reject in
             // every OTHER arm's own body the way `@must_use`'s reverse restriction does below,
@@ -2833,6 +2844,9 @@ impl Parser {
             // declaration-kind keywords the loop right below this one dispatches on?) rather than
             // a long negation -- easier to keep in sync with that chain's own real member list.
             var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE);
+            if is_priv && !(self.check(STRUCT) || self.check(ENUM) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN)) {
+                throw ParseError::new("'priv' is only supported on top-level 'struct'/'enum'/'interface' declarations");
+            }
             if pending_dev && next_is_other_decl_kind {
                 throw ParseError::new("'@dev' is only supported on top-level 'fn' declarations");
             }
@@ -2864,6 +2878,9 @@ impl Parser {
                 let sd = self.struct_decl();
                 if pending_sendable {
                     sendable_struct_names.push(sd.name);
+                }
+                if is_priv {
+                    private_type_names.push(sd.name);
                 }
                 if pending_derive.length() > 0 {
                     let synth = self.derive_impls(&sd, &pending_derive);
@@ -2918,7 +2935,11 @@ impl Parser {
                 if has_pending_doc {
                     throw ParseError::new("doc comments aren't supported on 'enum' declarations");
                 }
-                enums.push(self.enum_decl());
+                let ed = self.enum_decl();
+                if is_priv {
+                    private_type_names.push(ed.name);
+                }
+                enums.push(ed);
             } else if self.check(EXTERN) && self.tokens.get(self.pos + 1).kind == INTERFACE {
                 if has_pending_annotation {
                     throw ParseError::new("annotations aren't supported on 'extern interface' declarations");
@@ -2969,7 +2990,11 @@ impl Parser {
                 if has_pending_doc {
                     throw ParseError::new("doc comments aren't supported on 'interface' declarations");
                 }
-                interfaces.push(self.interface_decl());
+                let ifd = self.interface_decl();
+                if is_priv {
+                    private_type_names.push(ifd.name);
+                }
+                interfaces.push(ifd);
             } else if self.check(EXTEND) {
                 if has_pending_annotation {
                     throw ParseError::new("annotations aren't supported on 'extend' blocks");
@@ -3198,7 +3223,7 @@ impl Parser {
             fns.push(build_event_emit_fn(ev_name, &ev_fields, &ev_handlers));
             evi = evi + 1;
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources, private_type_names: private_type_names };
     }
 
     // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field

@@ -1,0 +1,9 @@
+// Consumer file, same directory-mode compile as lib.hotc. Uses lib.hotc's PUBLIC surface
+// (`Point`, `describe_point`, `make_cache`) freely -- never names the library's own `priv Cache`
+// directly, so this compiles cleanly.
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    print(describe_point(p));
+    let c = make_cache(); // gets a Cache back without ever naming the type itself
+    print("done");
+}

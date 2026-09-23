@@ -1,0 +1,20 @@
+// A tiny "shared library" file: `Cache` is an internal helper type, not meant to be constructed
+// or named by a consumer file -- marked `priv` so `main.hotc` (a different file, same directory)
+// can't reach it. `describe_point` is the library's real, PUBLIC surface: it takes and returns
+// ordinary types, so a consumer never needs to name `Cache` at all.
+priv struct Cache {
+    hits: Int,
+}
+
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+fn make_cache() -> Cache {
+    return Cache { hits: 0 };
+}
+
+fn describe_point(p: Point) -> String {
+    return "({p.x}, {p.y})";
+}

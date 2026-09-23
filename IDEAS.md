@@ -561,6 +561,39 @@ detection alone (a clear compile error naming both declaration sites)
 gets 80% of the value for a fraction of the design cost of real
 scoping.
 
+**Shipped, 2026-09-23 (the narrower "collision detection" version, not real scoping)**: `priv
+struct Foo { ... }` / `priv enum` / `priv interface` marks a top-level TYPE as not visible outside
+the file that declares it, in a directory-mode compile -- referencing it from any OTHER file in
+the same compile is a real, named compile error (`'Foo' is declared 'priv' in lib.hotc and can't
+be referenced from main.hotc`), run BEFORE the checker ever sees a merged program. Deliberately the
+narrower of the two options this entry's own "real design questions" paragraph above floats: NOT
+real per-scope resolution (no "library" concept, no cross-compile dependency mechanism -- that
+whole design question is untouched, still open, still tied to `HOTC_MC_IDEAS.md`'s own blocker),
+just name-based reference detection across files, matching the "collision detection alone" framing
+almost exactly. Also scoped to TYPES only, not `fn`/`static` -- a real, disclosed narrowing beyond
+even that: the actual motivating case is a shared library's internal helper TYPES leaking into a
+consumer's namespace, and restricting to type-NAME-shaped positions (struct-literal/static-call/
+cast/`is`/arena-constructor targets, every field/param/return type string, `extends`/`impl ... for`
+/`extend` targets) keeps the walker's false-positive surface low -- a bare value/call reference
+would also need tracking LOCAL scope, since an unrelated local variable/parameter sharing a name
+with another file's private TYPE (`let vec = ...;` vs. a `priv struct Vec` a world away) would
+otherwise be a real false positive. `Driver.hotc`'s own `check_private_visibility` is the real
+enforcement (`Parser.hotc`'s own `PRIV` token/gate is parse-only); it runs on the raw file-path
+list, re-parsing every file itself rather than the natural-looking "collect each file's own
+`Program` into a `Vec<Program>` first" approach -- found a real, previously-latent `Vec<T>`
+monomorphization gap doing exactly that (`Vec<Program>` compiles fine as source, then
+`NoClassDefFoundError: Vec$Program` the moment the compiled class actually loads -- `Program` is
+by far this AST's largest struct, and this is the same broader class of gap already found this
+session for `Vec<Vec<T>>` struct fields, just one level shallower and on a much bigger struct);
+re-parsing sidesteps it entirely, at the cost of parsing each file in a directory twice instead of
+once (not perf-critical, same tolerance `check_module_dirs` already established). Verified against
+`examples/priv_visibility_ok/` (a library file's `priv struct Cache` + public `Point`/
+`describe_point`/`make_cache`, a consumer file using the public surface freely without ever naming
+`Cache`, including receiving one back from `make_cache()` through type inference alone) and
+`examples/priv_visibility_violation/` (the same library, but the consumer directly declares `let
+c: Cache = ...;` -- correctly rejected with the exact error above). Full example regression suite:
+zero new failures. Self-hosting verified to a true fixed point.
+
 ### Verify a declared `module` matches the file's directory path (opt-in, not a hard requirement)
 
 Real gap surfaced by this session's own directory-mode work: `module

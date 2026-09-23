@@ -1,0 +1,8 @@
+// Violation: names `Cache` directly (a declared parameter type) even though it's `priv` in
+// lib.hotc, a different file in the same directory-mode compile. `check_private_visibility`
+// should reject this with a compile error naming both the type and its declaring file, before
+// the checker/codegen ever run.
+fn main() {
+    let c: Cache = make_cache();
+    print("unreachable");
+}
