@@ -15,13 +15,15 @@ module hc.selfhost.types;
 // (no `Arena`/`Dyn`/`Enum`/`JavaExtern` variants -- see `Checker.hotc`'s own long-standing header
 // for why: no arena structs, no interface/dyn types). `Float`/`Double` used to be missing too (this
 // comment used to say so) -- ported the same scoped way `Long` already was: real arithmetic/
-// comparison/cast/slot support (see `Codegen.hotc`'s own `alloc_slot` header), but no literal
-// syntax -- `Parser.hotc`'s `primary()` never grew a case for the lexer's own pre-existing `FLOAT`/
-// `DOUBLE` token kinds, so a value only arrives via `as Float`/`as Double` casts or an extern call,
-// same as `Long` already did via `as Long`/`JLong::parseLong`. `Char`/`Byte` landed the SAME way
-// later still (see `examples/char_byte_primitives.hotc`) -- no new lexer token kind needed there
-// either, since neither has literal syntax. Both are JVM int-category primitives (same operand-
-// stack representation and arithmetic/comparison opcodes `Int` already uses -- `IADD`/`IF_ICMPEQ`/
+// comparison/cast/slot support (see `Codegen.hotc`'s own `alloc_slot` header). `Long`/`Char` BOTH
+// now have real literal syntax too (`123L`, `'a'` -- fixed 2026-09-23, see `ARCHITECTURE.md`'s own
+// matching entry and `Ast.hc`'s own `Expr.LongLit`/`Expr.CharLit` headers); this comment used to
+// say neither did (`Long` only reachable via `as Long`, silently truncating through `Int`-width
+// precision first when it WAS written as a suffixed numeral) -- stale as of that fix. `Byte` is
+// the one still genuinely cast-only (`as Byte`), a disclosed, intentional scope cut matching
+// Java's own lack of a byte-literal suffix, not an oversight. `Char`/`Byte` are BOTH JVM int-
+// category primitives (same operand-stack representation and arithmetic/comparison opcodes
+// `Int` already uses -- `IADD`/`IF_ICMPEQ`/
 // etc. work unchanged), so the real NEW work for them was narrower than `Long`/`Float`/`Double`
 // needed: real narrowing-cast opcodes (`i2c`=146/`i2b`=145, since `Int` -> `Char`/`Byte` can
 // genuinely lose information, unlike widening to `Int` which is a free relabel) and real per-type

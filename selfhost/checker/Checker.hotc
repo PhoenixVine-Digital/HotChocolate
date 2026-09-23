@@ -951,6 +951,8 @@ fn subst_expr(e: &Expr, type_param: String, arg: String) -> Expr {
         IntLit { value } => { return IntLit { value: value }; }
         FloatLit { text } => { return FloatLit { text: text }; }
         DoubleLit { text } => { return DoubleLit { text: text }; }
+        LongLit { text } => { return LongLit { text: text }; }
+        CharLit { value } => { return CharLit { value: value }; }
         StringLit { value } => { return StringLit { value: value }; }
         StringInterp { literals, exprs } => { return StringInterp { literals: literals, exprs: subst_expr_list(exprs, type_param, arg) }; }
         BoolLit { value } => { return BoolLit { value: value }; }
@@ -1100,6 +1102,8 @@ impl TyChecker {
             IntLit { value } => { return TyInt; }
             FloatLit { text } => { return TyFloat; }
             DoubleLit { text } => { return TyDouble; }
+            LongLit { text } => { return TyLong; }
+            CharLit { value } => { return TyChar; }
             StringLit { value } => { return TyStr; }
             StringInterp { literals, exprs } => { return self.check_string_interp(exprs); }
             BoolLit { value } => { return TyBool; }

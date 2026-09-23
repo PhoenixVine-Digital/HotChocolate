@@ -50,6 +50,7 @@ extern class LexError = "java.lang.RuntimeException" {
 pub static CP_NEWLINE: Int = 10;
 pub static CP_SPACE: Int = 32;
 pub static CP_QUOTE: Int = 34;
+pub static CP_SINGLE_QUOTE: Int = 39;
 pub static CP_LPAREN: Int = 40;
 pub static CP_RPAREN: Int = 41;
 pub static CP_STAR: Int = 42;
@@ -90,6 +91,11 @@ pub static CP_CARET: Int = 94;
 
 pub enum TokType {
     INT, LONG, FLOAT, DOUBLE, STRING, IDENT,
+    // `'a'` -- a real `Char` literal. `Token.text` is the resolved code point's own DECIMAL
+    // STRING (`"97"`, not `"a"`) -- `char_literal`'s own header explains why resolving the
+    // escape/code-point once, at lex time, is safe here (unlike `Float`/`Double`/`Long`, which
+    // defer their own real parse to `Codegen.hotc` -- see `Ast.hc`'s own `Expr.CharLit` header).
+    CHAR,
     ISTRING_BEGIN, ISTRING_PART, ISTRING_END,
     FN, STRUCT, LET, VAR, IF, ELSE, WHILE, FOR, IN, RETURN, TRUE, FALSE, IMPL, MUT, ARENA,
     INTERFACE, DYN, ENUM, MATCH, BY, SEALED, EXTERN, CLASS, MODULE, PUB, OPEN, EXTEND, STATIC, AS,
@@ -413,6 +419,19 @@ impl Lexer {
                     throw LexError::new("Unterminated string at line " + JString::valueOf(start_line));
                 }
                 self.pos = self.pos + 1;
+            } else if p == CP_SINGLE_QUOTE {
+                // A `Char` literal (`'{'`, `'}'`) inside a nested `${...}` expression -- same
+                // "skip over it so its own `{`/`}` doesn't confuse THIS scan's depth counting"
+                // reasoning the `CP_QUOTE` string-skip right above already has.
+                self.pos = self.pos + 1;
+                while !self.is_at_end() && self.peek() != CP_SINGLE_QUOTE {
+                    if self.peek() == CP_BACKSLASH { self.pos = self.pos + 1; }
+                    self.pos = self.pos + 1;
+                }
+                if self.is_at_end() {
+                    throw LexError::new("Unterminated char literal at line " + JString::valueOf(start_line));
+                }
+                self.pos = self.pos + 1;
             } else if p == CP_NEWLINE {
                 self.line = self.line + 1;
                 self.pos = self.pos + 1;
@@ -489,9 +508,40 @@ impl Lexer {
         return out;
     }
 
+    // `'a'` / `'\n'` / `'\''` -- a real `Char` literal, exactly one code point between single
+    // quotes. Resolves the escape/code-point HERE, at lex time (same escape set `string_tokens`
+    // already supports, minus interpolation -- a `Char` can never hold more than one code point,
+    // so `${...}` inside one would be meaningless), rather than deferring to `Codegen.hotc` the
+    // way `Float`/`Double`/`Long` literals do -- there's no precision to lose resolving a SINGLE
+    // code point early, unlike parsing a many-digit numeral. `Token.text` carries the resolved
+    // code point as a plain decimal string (`"97"` for `'a'`), reusing `Parser.hotc`'s own
+    // `parse_int` to read it back, same convention `number()`'s own `INT` tokens already use.
+    fn char_literal(&mut self, start_line: Int) -> Token {
+        if self.is_at_end() {
+            throw LexError::new("Unterminated char literal at line " + JString::valueOf(start_line));
+        }
+        var cp = self.advance();
+        if cp == CP_BACKSLASH && !self.is_at_end() {
+            let esc = self.advance();
+            if esc == CP_LOWER_N { cp = CP_NEWLINE; }
+            else if esc == CP_LOWER_T { cp = 9; } // tab
+            else if esc == CP_SINGLE_QUOTE { cp = CP_SINGLE_QUOTE; }
+            else if esc == CP_QUOTE { cp = CP_QUOTE; }
+            else if esc == CP_BACKSLASH { cp = CP_BACKSLASH; }
+            else if esc == CP_ZERO { cp = 0; } // NUL
+            else { cp = esc; }
+        }
+        if self.is_at_end() || self.peek() != CP_SINGLE_QUOTE {
+            throw LexError::new("Char literal must hold exactly one code point at line " + JString::valueOf(start_line));
+        }
+        self.advance(); // closing quote
+        return Token { kind: CHAR, text: JString::valueOf(cp), line: start_line };
+    }
+
     fn next_token(&mut self) -> Vec<Token> {
         let start_line = self.line;
         let c = self.advance();
+        if c == CP_SINGLE_QUOTE { return vec_of(self.char_literal(start_line)); }
         if JCharacter::isDigit(c) { return vec_of(self.number(c, start_line)); }
         if JCharacter::isLetter(c) || c == CP_UNDERSCORE { return vec_of(self.identifier(start_line)); }
         if c == CP_QUOTE { return self.string_tokens(start_line); }

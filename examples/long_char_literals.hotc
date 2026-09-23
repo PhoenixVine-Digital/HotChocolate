@@ -1,0 +1,22 @@
+// Real `Long` literal precision (no more silent Int-width truncation) and a real `Char` literal.
+fn main() {
+    // A value well outside Int's 32-bit range (Int max is 2147483647) -- this used to silently
+    // truncate through `parse_int` before being cast to Long.
+    let big: Long = 9999999999L;
+    print(big); // 9999999999
+
+    let small: Long = 42L;
+    print(small); // 42
+    print(small + 1L); // 43
+
+    let a: Char = 'a';
+    print(a); // a
+    let newline: Char = '\n';
+    print(newline as Int); // 10
+    let quote: Char = '\'';
+    print(quote as Int); // 39
+    let brace: Char = '{'; // must not confuse string-interpolation brace scanning
+    print(brace); // {
+
+    print("done");
+}

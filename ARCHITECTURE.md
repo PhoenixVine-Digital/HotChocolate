@@ -111,6 +111,29 @@ right now against `./gradlew run --args="run examples/<file>.hc"`:
   instruction for `arr[i] = x` on a category-2 element). See the
   "`Float` / `Double`" section below for details. `examples/floats.hc`
   now compiles and runs with fully correct output end to end.
+- **Fixed 2026-09-23**: `123L` used to parse (`Lexer.hotc`'s own `number()`
+  already tokenized the `L`/`l` suffix as a distinct `LONG` kind), but
+  `Parser.hotc` routed it through `IntLit` + `as Long` — the digits got
+  parsed at `Int`'s own 32-bit precision FIRST, so any literal naming a
+  value outside `Int`'s range (`9999999999L`) silently truncated before
+  the cast ever ran (`examples/long_test.hc`'s own `10000000000L` case
+  was hitting exactly this, previously a known-failing example). Fixed
+  with a real `LongLit { text }` AST node (mirroring `FloatLit`/
+  `DoubleLit`'s own "keep the source text, parse only at the point
+  `Codegen.hotc` needs a real LDC constant" deferral) and a new
+  `JLongCg::valueOf(String)` extern binding, parsing the full text
+  directly at real 64-bit precision. Real `Char` literal syntax
+  (`'a'`, `'\n'`, `'\''`) added the same day — a genuinely new lexer
+  scanning mode (`char_literal`, single-quoted, one code point,
+  resolved at lex time since there's no precision to lose parsing a
+  single code point early), reusing `Char`'s already-real int-category
+  codegen. `find_matching_brace` (string-interpolation's own brace-
+  depth scanner) also learned to skip over a `Char` literal the same
+  way it already skipped double-quoted strings, so a `Char` literal
+  holding `{`/`}` inside an interpolated expression (`"{describe('{')}"
+  `) doesn't confuse the scan. `Byte` still has no literal syntax
+  (matches Java's own lack of one — only reachable via `as Byte`), a
+  disclosed, intentional scope cut, not an oversight.
 - **Fixed 2026-09-03**: `is` runtime type checks (`expr is Type`) —
   `is` was lexed as a keyword but never consumed anywhere in the
   parser. Ported as a new `Expr.IsCheck` AST node sharing `as`'s own

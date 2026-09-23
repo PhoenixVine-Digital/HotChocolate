@@ -722,22 +722,24 @@ impl Parser {
             let t = self.advance();
             return IntLit { value: parse_int(t.text) };
         }
-        // `123L` -- a real, pre-existing gap found porting a stateful "manager" class needing a
-        // literal `-1L`/`Long` sentinel value: `Lexer.hotc`'s own `number` already produces a
-        // real, distinct `LONG` token kind for an `L`/`l`-suffixed numeral (its own `text` never
-        // includes the suffix -- already stripped during lexing), but `primary()` never checked
-        // for it at all, so EVERY `L`-suffixed literal anywhere in ANY `.hotc` program failed to
-        // parse, unconditionally -- only reachable indirectly before now (an extern method
-        // returning `Long`, or `expr as Long`). Rewritten as that exact same `Cast` shape here
-        // (`IntLit` wrapped in `as Long`) rather than adding a whole new dedicated AST node +
-        // checker + codegen path -- reuses the already-correct `I2L` conversion `gen_cast` has
-        // had all session. A real, disclosed narrower scope: the digits are parsed through
-        // `parse_int`'s own `Int`-width precision first, so a literal naming a value outside
-        // `Int`'s own 32-bit range (`9999999999L`) would silently truncate -- no real `.hotc`
-        // source (here or in this compiler's own self-hosted sources) does that today.
+        // `123L` -- a real `Long` literal, full 64-bit precision. An EARLIER version of this
+        // parsed the digits through `parse_int`'s own `Int`-width precision first, then wrapped
+        // the result in `as Long` -- correct for a small literal, but silently truncating any
+        // value naming something outside `Int`'s own 32-bit range (`9999999999L`), which defeats
+        // half the point of having `Long` at all. Real `LongLit { text }` now instead (see
+        // `Ast.hc`'s own header) -- `Codegen.hotc`'s own `JLongCg::valueOf(String)` parses the
+        // FULL text directly as a real `Long` only once a real LDC constant is actually needed.
         if self.check(LONG) {
             let t2 = self.advance();
-            return Cast { expr: IntLit { value: parse_int(t2.text) }, target_type: "Long" };
+            return LongLit { text: t2.text };
+        }
+        // `'a'` -- a real `Char` literal. `Lexer.hotc`'s own `char_literal` already resolved the
+        // escape/code-point at lex time; `Token.text` here is just that resolved code point's
+        // own decimal string, read back via `parse_int` (same convention `INT` tokens already
+        // use for their own `IntLit { value }`).
+        if self.check(CHAR) {
+            let t3 = self.advance();
+            return CharLit { value: parse_int(t3.text) };
         }
         // `arena Name[count]` -- see `Ast.hc`'s own `ArenaNew` header.
         if self.check(ARENA) {

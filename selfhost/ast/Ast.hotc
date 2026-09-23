@@ -30,6 +30,22 @@ pub enum Expr {
     // into a real LDC constant only at the point `gen_expr` actually needs one, never earlier.
     FloatLit { text: String },
     DoubleLit { text: String },
+    // `123L`/`123l` -- a real `Long` literal, full 64-bit precision. Stored as source text (same
+    // "parse only at the point `gen_expr` actually needs a real LDC constant" reasoning
+    // `FloatLit`/`DoubleLit` already use right above), NOT routed through `IntLit` + `as Long`
+    // the way an earlier version of this feature did -- that path parsed the digits through
+    // `parse_int`'s own `Int`-width precision FIRST, so any literal naming a value outside
+    // `Int`'s 32-bit range (`9999999999L`) silently truncated before the cast ever ran. See
+    // `Codegen.hotc`'s own `JLongCg::valueOf(String)` header for the real fix (parses the FULL
+    // text directly as a `Long`, same "host `valueOf(String)` parses AND boxes in one call"
+    // mechanism `FloatLit`/`DoubleLit` already use).
+    LongLit { text: String },
+    // `'a'` -- a real `Char` literal (a single Unicode code point between single quotes).
+    // Stored as the code point's own `Int` value directly (not source text -- there's no
+    // "parse at codegen time" deferral needed here the way `Float`/`Double`/`Long` literals want,
+    // since `Lexer.hotc`'s own `char_literal` already resolves the escape/code-point at LEX time,
+    // same "resolve once, as early as possible" choice `IntLit`'s own `value: Int` already makes).
+    CharLit { value: Int },
     StringLit { value: String },
     // `"a{x}b{y}c"` -- `literals.length() == exprs.length() + 1` (interleaved: lit0, expr0, lit1,
     // expr1, ..., litN), same convention the real compiler's own `Expr.StringInterp` already uses.

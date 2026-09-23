@@ -1692,6 +1692,8 @@ impl CodeGen {
             IntLit { value } => {}
             FloatLit { text } => {}
             DoubleLit { text } => {}
+            LongLit { text } => {}
+            CharLit { value } => {}
             StringLit { value } => {}
             StringInterp { literals, exprs } => { self.collect_lambda_captures_list(exprs, exclude, out); }
             BoolLit { value } => {}
@@ -2269,6 +2271,28 @@ impl CodeGen {
                 let boxed2 = JDoubleCg::valueOf(text);
                 self.mv.visitLdcInsn(boxed2 as JObject4);
                 return "Double";
+            }
+            // `123L` -- `java.lang.Long.valueOf(String)` parses the FULL text directly as a real
+            // 64-bit value, same "host `valueOf(String)` parses AND boxes in one call" mechanism
+            // `FloatLit`/`DoubleLit` right above already use -- see `Ast.hc`'s own `Expr.LongLit`
+            // header for why this replaced an earlier, Int-width-truncating `IntLit` + `as Long`
+            // desugaring.
+            LongLit { text } => {
+                let boxed3 = JLongCg::valueOf(text);
+                self.mv.visitLdcInsn(boxed3 as JObject4);
+                return "Long";
+            }
+            // `'a'` -- a real code-point value, same int-category representation/opcodes `Int`
+            // already uses (see `Ast.hc`'s own `Expr.CharLit` header) -- reuses `IntLit`'s own
+            // exact `SIPUSH`-or-`LDC` branching right above, just tagged `"Char"` on return.
+            CharLit { value } => {
+                if value >= -32768 && value <= 32767 {
+                    self.mv.visitIntInsn(17, value); // SIPUSH
+                } else {
+                    let boxed4 = JIntegerCg::valueOf(value);
+                    self.mv.visitLdcInsn(boxed4 as JObject4);
+                }
+                return "Char";
             }
             BoolLit { value } => {
                 if value { self.mv.visitInsn(4); } else { self.mv.visitInsn(3); } // ICONST_1 / ICONST_0
@@ -6569,6 +6593,13 @@ extern class JFloatCg = "java/lang/Float" {
 extern class JDoubleCg = "java/lang/Double" {
     static fn valueOf(s: String) -> JDoubleCg;
 }
+// `LongLit`'s own host-side boxing call -- same mechanism as `JFloatCg`/`JDoubleCg` right above,
+// just for `java.lang.Long` -- `valueOf(String)` parses the FULL text at real 64-bit precision,
+// which is the whole reason `LongLit` exists as its own AST node instead of routing through
+// `IntLit` + `as Long` (see `Ast.hc`'s own `Expr.LongLit` header).
+extern class JLongCg = "java/lang/Long" {
+    static fn valueOf(s: String) -> JLongCg;
+}
 
 // Array types are represented as the plain string `"[ElemType]"` -- same convention (and same
 // duplicated-helper pattern, `_cg` suffix here only to dodge the flat cross-module function
@@ -6742,6 +6773,8 @@ fn subst_expr_cg(e: &Expr, type_param: String, arg: String) -> Expr {
         IntLit { value } => { return IntLit { value: value }; }
         FloatLit { text } => { return FloatLit { text: text }; }
         DoubleLit { text } => { return DoubleLit { text: text }; }
+        LongLit { text } => { return LongLit { text: text }; }
+        CharLit { value } => { return CharLit { value: value }; }
         StringLit { value } => { return StringLit { value: value }; }
         StringInterp { literals, exprs } => { return StringInterp { literals: literals, exprs: subst_expr_list_cg(exprs, type_param, arg) }; }
         BoolLit { value } => { return BoolLit { value: value }; }

@@ -20,6 +20,8 @@ fn dump_expr(e: Expr) -> String {
         IntLit { value } => { return "Int(" + JString::valueOf(value) + ")"; }
         FloatLit { text } => { return "Float(" + text + ")"; }
         DoubleLit { text } => { return "Double(" + text + ")"; }
+        LongLit { text } => { return "Long(" + text + ")"; }
+        CharLit { value } => { return "Char(" + JString::valueOf(value) + ")"; }
         StringLit { value } => { return "Str(" + value + ")"; }
         StringInterp { literals, exprs } => { return "Interp(" + dump_args(exprs) + ")"; }
         BoolLit { value } => {
