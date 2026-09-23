@@ -218,14 +218,21 @@ private fun findLocalBinding(fnDecl: PsiElement, name: String): PsiElement? {
     for (forStmt in elementsOfType(fnDecl, HCElementTypes.FOR_STMT)) {
         val n = declaredName(forStmt); if (n?.text == name) return n
     }
+    // Comprehension bound variable -- see `HCAnnotator.collectLocalNames`'s own header for why
+    // `declaredName` (first direct-child `IDENT`) is safe here too.
+    for (comp in elementsOfType(fnDecl, HCElementTypes.COMPREHENSION_EXPR)) {
+        val n = declaredName(comp); if (n?.text == name) return n
+    }
     for (catchClause in elementsOfType(fnDecl, HCElementTypes.CATCH_CLAUSE)) {
         val n = declaredName(catchClause); if (n?.text == name) return n
     }
     for (pattern in elementsOfType(fnDecl, HCElementTypes.VARIANT_PATTERN)) {
         val kids = directChildren(pattern)
-        val braceIdx = kids.indexOfFirst { it.node?.elementType == HCTokenTypes.LBRACE }
-        if (braceIdx < 0) continue
-        for (kid in kids.drop(braceIdx + 1)) {
+        // `{ field: bind }` or `(bind1, bind2)` (positional sugar) -- see `HCAnnotator.
+        // collectLocalNames`'s own header for why both delimiters are checked here.
+        val openIdx = kids.indexOfFirst { it.node?.elementType == HCTokenTypes.LBRACE || it.node?.elementType == HCTokenTypes.LPAREN }
+        if (openIdx < 0) continue
+        for (kid in kids.drop(openIdx + 1)) {
             if (kid.node?.elementType == HCTokenTypes.IDENT && kid.text == name) return kid
         }
     }

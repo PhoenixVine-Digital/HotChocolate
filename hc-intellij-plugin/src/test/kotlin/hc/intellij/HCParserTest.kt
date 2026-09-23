@@ -150,6 +150,61 @@ class HCParserTest : BasePlatformTestCase() {
         }
     }
 
+    // Bitwise `^` and real `<<`/`>>`/`>>>` shift -- see `HCTokenTypes.OPERATORS`'s and
+    // `HCPsiParser.shift`'s own headers for why `>>`/`>>>` are assembled from consecutive `>`
+    // tokens rather than being their own lexer token (nested-generic-closing ambiguity). Also
+    // confirms a nested generic type annotation's closing `>>` still parses correctly as a TYPE,
+    // not swallowed as a shift operator -- same sanity check the real compiler's own
+    // `bitwise_shift_xor.hotc` example performs.
+    fun `test bitwise xor and shift operators parse with no syntax errors`() {
+        for (src in listOf(
+            "fn f() { print(5 ^ 3); }\n",
+            "fn f() { print(1 << 4); }\n",
+            "fn f() { print(16 >> 2); }\n",
+            "fn f() { print(-1 >>> 28); }\n",
+            "fn f() { let bigA: Long = 1L << 40; }\n",
+            // A SECOND `<<` use in the same file, immediately after the first -- the shape that
+            // actually caught a real bug: `shift`'s own token-count-to-advance-by originally used
+            // `op.length` (2 for the string "<<"), but `<<` is ONE real lexer token, not two, so
+            // that advanced past the operand following it too, corrupting every later argument.
+            "fn f() { print(1 << 4); print(3 << 2); }\n",
+        )) {
+            val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hotc", HCLanguage, src)
+            val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+            assertTrue("unexpected parse error(s) in `$src`: ${errors.map { it.errorDescription }}", errors.isEmpty())
+        }
+    }
+
+    fun `test nested generic closing shift-shaped angle brackets still parse as a type`() {
+        val src = "fn f() {\n    var outer: Vec<Int> = vec_of(1);\n    var nested: Vec<Vec<Int>> = vec_of(outer);\n}\n"
+        val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hotc", HCLanguage, src)
+        val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+        assertTrue("unexpected parse error(s) in `$src`: ${errors.map { it.errorDescription }}", errors.isEmpty())
+    }
+
+    // `Goblin(hp)` -- positional match-pattern sugar, see `HCPsiParser.variantPattern`'s own
+    // header.
+    fun `test positional match patterns parse as VARIANT_PATTERN`() {
+        val src = "enum Enemy {\n    Goblin { hp: Int },\n    Ghost,\n}\nfn f(e: Enemy) -> String {\n    match e {\n        Goblin(hp) => { return \"g\"; }\n        Ghost => { return \"gh\"; }\n    }\n}\n"
+        assertParsesAs(src, HCElementTypes.VARIANT_PATTERN)
+    }
+
+    // `[result_expr for var_name in iter_expr]` / `... if cond` -- list comprehensions, see
+    // `HCPsiParser.arrayLiteral`'s own header.
+    fun `test list comprehensions parse as COMPREHENSION_EXPR`() {
+        assertParsesAs("fn f(xs: [Int]) { let ys: Vec<Int> = [x * x for x in xs]; }\n", HCElementTypes.COMPREHENSION_EXPR)
+        assertParsesAs("fn f(xs: [Int]) { let ys: Vec<Int> = [x for x in xs if x > 2]; }\n", HCElementTypes.COMPREHENSION_EXPR)
+    }
+
+    fun `test plain array literals and array-repeat still parse as ARRAY_LIT_EXPR, not COMPREHENSION_EXPR`() {
+        val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hotc", HCLanguage, "fn f() { let a = [1, 2, 3]; let b = [0; 5]; let c: [Int] = []; }\n")
+        val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+        assertTrue("unexpected parse error(s): ${errors.map { it.errorDescription }}", errors.isEmpty())
+        val allElements = PsiTreeUtil.findChildrenOfType(psiFile, com.intellij.psi.PsiElement::class.java)
+        assertEquals(3, allElements.count { it.node?.elementType == HCElementTypes.ARRAY_LIT_EXPR })
+        assertTrue(allElements.none { it.node?.elementType == HCElementTypes.COMPREHENSION_EXPR })
+    }
+
     private fun assertParsesAs(src: String, expected: com.intellij.psi.tree.IElementType) {
         val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hotc", HCLanguage, src)
         val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)

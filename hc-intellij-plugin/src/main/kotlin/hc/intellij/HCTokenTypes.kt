@@ -94,7 +94,17 @@ object HCTokenTypes {
 
     // Multi-char operators must be tried before their single-char prefix (`==` before `=`, `&&`
     // before `&`, ...) -- `HCLexer` walks this list in order for exactly that reason.
+    //
+    // **Fixed 2026-09-23** -- added `^` (bitwise XOR) and `<<` (left shift). `>>`/`>>>` (right
+    // shift) deliberately do NOT get their own multi-char entries here, mirroring the real
+    // compiler's own `Lexer.hotc` `LTLT` header exactly: a lone `>` still has to close one level
+    // of a nested generic type annotation (`Vec<Vec<Int>>`), so merging two/three consecutive
+    // `>`s at the LEXER level would break that. `<<` has no such ambiguity (real type syntax never
+    // opens two angle brackets back-to-back without an identifier between them), so it's real,
+    // its own token here -- same asymmetry the real compiler's own `Lexer.hotc` makes. `HCPsi
+    // Parser.shift`'s own header covers how `>>`/`>>>` get assembled instead, at the PARSER level.
     val OPERATORS: List<String> = listOf(
-        "==", "!=", "<=", ">=", "&&", "||", "+", "-", "*", "/", "%", "=", "<", ">", "!", "&", "|", "?",
+        "==", "!=", "<=", ">=", "&&", "||", "<<", "+", "-", "*", "/", "%", "=", "<", ">", "!", "&",
+        "|", "^", "?",
     )
 }

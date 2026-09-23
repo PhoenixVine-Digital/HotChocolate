@@ -4446,3 +4446,55 @@ addressed here — each is its own, considerably larger grammar gap (a whole new
 shape apiece, not a missing keyword), left as an explicit follow-up rather than folded into this
 one.
 
+**The four items above, closed out, 2026-09-23**:
+
+- **Bitwise `^` and real `<<`/`>>`/`>>>` shift.** Added `^` and `<<` to `HCTokenTypes.OPERATORS`
+  (`>>`/`>>>` deliberately still don't get their own lexer token, mirroring the real compiler's own
+  `Lexer.hotc` `LTLT` header exactly: a lone `>` still has to close a nested generic,
+  `Vec<Vec<Int>>`). New `bitwiseXor` precedence level (between `|` and `&`) and a new `shift`
+  level (between `comparison` and `term`) in `HCPsiParser.kt`, assembling `>>`/`>>>` from
+  consecutive bare `>` tokens via the existing `lookAheadIsOp` helper, same technique the real
+  compiler's own `is_double_gt`/`is_triple_gt` use. **Real bug found and fixed along the way**:
+  the first cut advanced `repeat(op.length)` lexer tokens per shift operator (2 for `"<<"`, 2/3 for
+  `">>"`/`">>>"`) — correct by coincidence for `>>`/`>>>` (two/three separate single-char tokens),
+  but wrong for `<<` (ONE real 2-character token, not two), silently eating the operand after it
+  too and corrupting every following argument in the same call. Only surfaced with a SECOND `<<`
+  use in the same file (`bitwise_shift_xor.hotc`'s own `print(1 << 4); print(3 << 2);` — a single
+  isolated `1 << 4` test case never exercises this misalignment). Fixed by tracking token COUNT
+  separately from operator text.
+- **Positional match patterns** (`Goblin(hp)`). New `LPAREN` branch in `HCPsiParser.variantPattern`,
+  parallel to the existing `LBRACE` one, mirroring the real compiler's own `Parser.hotc`
+  `match_arm` header (bare bind names only, no field renaming, bound by declaration-order position
+  — resolved against the variant's real field order by a real compile, not this parser). Found and
+  fixed two related false positives along the way: `HCAnnotator.collectLocalNames` and
+  `HCReferences.findLocalBinding` both only ever looked for an `LBRACE` inside a `VARIANT_PATTERN`
+  to find bind names, so a positional pattern's own binds were invisible to both go-to-definition
+  and the unresolved-reference checker — `Goblin(hp) => { return hp; }` was flagging `hp` itself as
+  a real, false "unresolved reference" the moment positional patterns started parsing at all.
+- **List comprehensions** (`[result_expr for var_name in iter_expr if cond]`). `HCPsiParser
+  .arrayLiteral` rewritten to decide its element type (`ARRAY_LIT_EXPR`/`COMPREHENSION_EXPR`) AFTER
+  parsing the first inner expression rather than committing up front — mirrors the real compiler's
+  own `array_lit`'s three-way `;`/`for`/`,` dispatch. Same false-positive class as positional
+  patterns: `HCAnnotator.collectLocalNames`/`HCReferences.findLocalBinding` didn't know
+  `COMPREHENSION_EXPR` had its own bound variable, so `[x * x for x in xs]` flagged its own `x` as
+  unresolved. Fixed the same way (both functions reuse `declaredName`'s existing "first direct-
+  child `IDENT`" extraction, safe here because `result_expr`/`iter_expr`/`cond` are always full
+  expression subtrees, never a bare `IDENT` token directly under `COMPREHENSION_EXPR` itself).
+- **Tuples** — turned out not to be a parser gap at all. `Tuple2<A, B>` (`stdlib/tuple.hotc`) is an
+  ordinary two-type-param generic struct with a plain `tuple2(a, b)` constructor function; the
+  real compiler needed zero new parser/checker/codegen work for it (see that file's own header),
+  and neither did this plugin — `tuple_and_comprehension.hotc`'s own failure was purely the
+  comprehension syntax on the SAME line (`[tuple2(x, x * x) for x in nums]`), fixed by the item
+  above.
+
+Verified via the same discipline as every other pass: full test suite (343 tests, up from 336)
+before/after, zero new failures. The two failures that remain (`test real stdlib files parse with
+no syntax errors`, `test real example programs produce no unexpected annotator errors`) are
+unrelated to all four items above and were already failing before this pass started — a separate,
+disclosed nested-generic-struct-literal gap (`Vec<Entry<V>> { ... }`, `looksLikeGenericLit`'s own
+bounded lookahead only ever handles ONE level of `<...>` nesting, matching the real compiler's own
+identically-scoped `looks_like_generic_lit`) plus a broader, pre-existing annotator allowlist gap
+(the directive-name check doesn't yet know about `@derive`/`@requires`/`@ensures`/`@tunable`/
+`@deterministic`/lifecycle annotations, and a few stdlib collection constructors like
+`hash_map_new` aren't in scope for name resolution) — neither attempted in this pass.
+

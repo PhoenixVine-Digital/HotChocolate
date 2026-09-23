@@ -282,14 +282,29 @@ class HCAnnotator : Annotator {
         for (forStmt in elementsOfType(fnDecl, HCElementTypes.FOR_STMT)) {
             declaredName(forStmt)?.let { names += it.text }
         }
+        // `[result_expr for var_name in iter_expr if cond]` -- `var_name`'s own binding, same
+        // "first direct-child IDENT" extraction `declaredName` already uses for `FOR_STMT`'s loop
+        // variable right above (safe here for the identical reason: `result_expr`/`iter_expr`/
+        // `cond` are always full expression subtrees, never a bare `IDENT` token directly under
+        // `COMPREHENSION_EXPR` itself -- even a bare-name result like `[x for x in xs]`'s `x` is
+        // wrapped in its own `REF_EXPR`, see `HCPsiParser.identLed`'s own header). Missing this
+        // produced a real, false "unresolved reference" on every comprehension's own bound
+        // variable the moment `COMPREHENSION_EXPR` itself started parsing successfully.
+        for (comp in elementsOfType(fnDecl, HCElementTypes.COMPREHENSION_EXPR)) {
+            declaredName(comp)?.let { names += it.text }
+        }
         for (catchClause in elementsOfType(fnDecl, HCElementTypes.CATCH_CLAUSE)) {
             declaredName(catchClause)?.let { names += it.text }
         }
         for (pattern in elementsOfType(fnDecl, HCElementTypes.VARIANT_PATTERN)) {
             val kids = directChildren(pattern)
-            val braceIdx = kids.indexOfFirst { it.node?.elementType == HCTokenTypes.LBRACE }
-            if (braceIdx < 0) continue
-            for (kid in kids.drop(braceIdx + 1)) {
+            // `{ field: bind }` (brace-delimited) or `(bind1, bind2)` (positional sugar -- see
+            // `HCPsiParser.variantPattern`'s own header) -- whichever delimiter is present, every
+            // `IDENT` after it is a real bind name (over-including a brace pattern's own FIELD
+            // name too, same disclosed over-inclusion this fn's own header already covers).
+            val openIdx = kids.indexOfFirst { it.node?.elementType == HCTokenTypes.LBRACE || it.node?.elementType == HCTokenTypes.LPAREN }
+            if (openIdx < 0) continue
+            for (kid in kids.drop(openIdx + 1)) {
                 if (kid.node?.elementType == HCTokenTypes.IDENT) names += kid.text
             }
         }

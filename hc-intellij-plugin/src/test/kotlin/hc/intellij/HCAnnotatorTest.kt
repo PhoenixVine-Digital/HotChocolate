@@ -24,6 +24,26 @@ class HCAnnotatorTest : BasePlatformTestCase() {
         assertTrue("unexpected error(s) for a valid quoted annotation: $errs", errs.isEmpty())
     }
 
+    // **Added 2026-09-23** -- a positional match-pattern bind (`Goblin(hp)`) used to be invisible
+    // to `collectLocalNames` entirely (it only ever looked for an `LBRACE`, never an `LPAREN`),
+    // so referencing `hp` inside the arm body produced a real, false "unresolved reference" error
+    // on perfectly valid code.
+    fun `test positional match-pattern bind is not flagged as unresolved`() {
+        val src = "enum Enemy {\n    Goblin { hp: Int },\n}\nfn f(e: Enemy) -> Int {\n    match e {\n        Goblin(hp) => { return hp; }\n    }\n}\n"
+        val errs = errors(src)
+        assertTrue("unexpected error(s) for a valid positional-pattern bind: $errs", errs.none { it.contains("unresolved reference") })
+    }
+
+    // **Added 2026-09-23** -- a comprehension's own bound variable (`x` in `[x*x for x in xs]`)
+    // used to be invisible to `collectLocalNames` entirely, producing a real, false "unresolved
+    // reference" the moment `COMPREHENSION_EXPR` itself started parsing successfully (see
+    // `HCAnnotator.collectLocalNames`'s own header).
+    fun `test comprehension bound variable is not flagged as unresolved`() {
+        val src = "fn f(xs: [Int]) -> Vec<Int> {\n    let ys: Vec<Int> = [x * x for x in xs];\n    return ys;\n}\n"
+        val errs = errors(src)
+        assertTrue("unexpected error(s) for a valid comprehension: $errs", errs.none { it.contains("unresolved reference") })
+    }
+
     fun `test at-serializable before fn is flagged`() {
         val errs = errors("@serializable\nfn f() {}\n")
         assertTrue("expected an @serializable-placement error, got: $errs", errs.any { it.contains("@serializable") })

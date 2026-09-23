@@ -722,10 +722,11 @@ object HCPsiParser : PsiParser {
         }
     }
 
-    // `Variant`, `Variant::Nested`, `Variant { a, b }`, `Variant { field: binding }`, or `_`
-    // (`_` is an ordinary `IDENT` in this lexer -- `_` is a valid Java identifier-start character
-    // -- so no special-casing is needed here at all, unlike this file's own first, incorrect
-    // attempt which checked for an `OPERATOR` token that `_` never actually lexes as).
+    // `Variant`, `Variant::Nested`, `Variant { a, b }`, `Variant { field: binding }`,
+    // `Variant(bind1, bind2)` (positional sugar, see below), or `_` (`_` is an ordinary `IDENT` in
+    // this lexer -- `_` is a valid Java identifier-start character -- so no special-casing is
+    // needed here at all, unlike this file's own first, incorrect attempt which checked for an
+    // `OPERATOR` token that `_` never actually lexes as).
     private fun variantPattern(b: PsiBuilder) = node(b, HCElementTypes.VARIANT_PATTERN) {
         expect(b, HCTokenTypes.IDENT, "a variant name")
         if (b.tokenType == HCTokenTypes.COLONCOLON) {
@@ -742,6 +743,21 @@ object HCPsiParser : PsiParser {
                 }
             }
             expect(b, HCTokenTypes.RBRACE, "'}'")
+        } else if (b.tokenType == HCTokenTypes.LPAREN) {
+            // `Goblin(hp)` -- positional pattern sugar, binding by declaration-order position
+            // instead of `{ field: bind }`. See the real compiler's own `Parser.hotc` `match_arm`
+            // header: only bare bind names here (no `field: name` renaming, no field NAMES at all
+            // -- this parser has no way to know the variant's own real field order, resolved by a
+            // real compile instead), same "trust it, parse the shape, let a real compile validate
+            // it" leniency this whole file already uses elsewhere.
+            b.advanceLexer()
+            while (b.tokenType != HCTokenTypes.RPAREN && !b.eof()) {
+                expect(b, HCTokenTypes.IDENT, "a binding name")
+                if (b.tokenType != HCTokenTypes.RPAREN) {
+                    if (b.tokenType == HCTokenTypes.COMMA) b.advanceLexer() else break
+                }
+            }
+            expect(b, HCTokenTypes.RPAREN, "')'")
         }
     }
 
@@ -879,10 +895,47 @@ object HCPsiParser : PsiParser {
     // expr` `unary()` handles below (line ~787 at time of writing): this level only ever fires
     // once a LEFT operand is already parsed and the parser is looking for an infix operator, a
     // position a leading unary `&` never appears in.
-    private fun bitwiseOr(b: PsiBuilder) = binaryLevel(b, setOf("|"), ::bitwiseAnd)
+    private fun bitwiseOr(b: PsiBuilder) = binaryLevel(b, setOf("|"), ::bitwiseXor)
+    // Bitwise `^` (XOR) -- slots between `|` and `&`, matching the real compiler's own
+    // `bitwise_or`/`bitwise_xor`/`bitwise_and` chain (`selfhost/parser/Parser.hotc`). Missing
+    // for the same reason `|`/`&` originally were (see `bitwiseOr`'s own header): a separate,
+    // independently-maintained grammar, so a real operator the compiler already supports just
+    // never got a matching precedence level here until now.
+    private fun bitwiseXor(b: PsiBuilder) = binaryLevel(b, setOf("^"), ::bitwiseAnd)
     private fun bitwiseAnd(b: PsiBuilder) = binaryLevel(b, setOf("&"), ::equality)
     private fun equality(b: PsiBuilder) = binaryLevel(b, setOf("==", "!="), ::comparison)
-    private fun comparison(b: PsiBuilder) = binaryLevel(b, setOf("<", "<=", ">", ">="), ::term)
+    private fun comparison(b: PsiBuilder) = binaryLevel(b, setOf("<", "<=", ">", ">="), ::shift)
+    // Real `<<`/`>>`/`>>>` -- slots between `comparison` and `term`, matching the real compiler's
+    // own `shift` (`selfhost/parser/Parser.hotc`) and its C/Java-matching precedence. `<<` is its
+    // own real lexer token (see `HCTokenTypes.OPERATORS`'s own header); `>>`/`>>>` are assembled
+    // here from two/three consecutive bare `>` tokens instead, greedy-longest-match first (three
+    // before two), for the exact same reason the real compiler's own `is_double_gt`/`is_triple_gt`
+    // do it at the parser level rather than the lexer: a lone `>` still has to close a nested
+    // generic (`Vec<Vec<Int>>`), and this check only ever runs from real expression-operand
+    // position, never from `typeRef`'s own separate grammar path, so the two can never collide.
+    private fun shift(b: PsiBuilder) {
+        var marker = b.mark()
+        term(b)
+        while (true) {
+            // Token COUNT to consume, not character count: `<<` is one real lexer token (see
+            // `HCTokenTypes.OPERATORS`), but `>>`/`>>>` are two/three separate bare `>` tokens --
+            // `op.length` would be right for the latter two by coincidence but wrong for `<<`
+            // (advancing 2 TOKENS would eat the operand after it too).
+            val tokenCount = when {
+                b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<<" -> 1
+                b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == ">" && b.lookAheadIsOp(1, ">") && b.lookAheadIsOp(2, ">") -> 3
+                b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == ">" && b.lookAheadIsOp(1, ">") -> 2
+                else -> 0
+            }
+            if (tokenCount == 0) break
+            repeat(tokenCount) { b.advanceLexer() }
+            term(b)
+            val precede = marker.precede()
+            marker.done(HCElementTypes.BINARY_EXPR)
+            marker = precede
+        }
+        marker.drop()
+    }
     private fun term(b: PsiBuilder) = binaryLevel(b, setOf("+", "-"), ::factor)
     private fun factor(b: PsiBuilder) = binaryLevel(b, setOf("*", "/", "%"), ::castExpr)
 
@@ -1141,22 +1194,47 @@ object HCPsiParser : PsiParser {
     // `[e1, e2, ...]` / `[value; count]` -- both start identically (`[`, then one expression), so
     // this dispatches on whether a `;` or `,`/`]` follows that first expression, same lookahead
     // shape the real parser uses.
-    private fun arrayLiteral(b: PsiBuilder) = node(b, HCElementTypes.ARRAY_LIT_EXPR) {
+    // `[e1, e2, ...]` / `[value; count]` / `[result_expr for var_name in iter_expr if cond]` --
+    // the three shapes share one opening `[` and first expression, so which they turn out to be
+    // is only known AFTER parsing that first expression (a `;`, a `for`, or a `,`/`]` follows --
+    // see the real compiler's own `Parser.hotc` `array_lit` header for the identical dispatch).
+    // Can't use the `node(...)` helper here since it commits to an element type up front; a raw
+    // marker lets the actual shape decide which one `.done()` gets at the end, same technique
+    // `binaryLevel` already uses for the same "decide the node type after the fact" reason.
+    private fun arrayLiteral(b: PsiBuilder) {
+        val m = b.mark()
         b.advanceLexer() // [
-        if (b.tokenType != HCTokenTypes.RBRACKET) {
-            expression(b)
-            if (b.tokenType == HCTokenTypes.SEMI) {
+        if (b.tokenType == HCTokenTypes.RBRACKET) {
+            b.advanceLexer()
+            m.done(HCElementTypes.ARRAY_LIT_EXPR)
+            return
+        }
+        expression(b)
+        val kind = when {
+            b.tokenType == HCTokenTypes.SEMI -> {
                 b.advanceLexer()
                 expression(b)
-            } else {
+                HCElementTypes.ARRAY_LIT_EXPR
+            }
+            b.atKw("for") -> {
+                b.advanceLexer()
+                expect(b, HCTokenTypes.IDENT, "a loop variable name")
+                expectKw(b, "in")
+                expression(b)
+                if (b.atKw("if")) { b.advanceLexer(); expression(b) }
+                HCElementTypes.COMPREHENSION_EXPR
+            }
+            else -> {
                 while (b.tokenType == HCTokenTypes.COMMA) {
                     b.advanceLexer()
                     if (b.tokenType == HCTokenTypes.RBRACKET) break
                     expression(b)
                 }
+                HCElementTypes.ARRAY_LIT_EXPR
             }
         }
         expect(b, HCTokenTypes.RBRACKET, "']'")
+        m.done(kind)
     }
 
     // `Ident {` alone is genuinely ambiguous with a bare block (`if x { ... }`'s own `then`

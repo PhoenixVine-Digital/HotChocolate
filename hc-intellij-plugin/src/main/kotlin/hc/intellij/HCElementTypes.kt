@@ -77,6 +77,7 @@ object HCElementTypes {
     val ELVIS_EXPR = HCElementType("ELVIS_EXPR")
     val FIELD_INIT = HCElementType("FIELD_INIT")
     val ARRAY_LIT_EXPR = HCElementType("ARRAY_LIT_EXPR")
+    val COMPREHENSION_EXPR = HCElementType("COMPREHENSION_EXPR")
     val IF_EXPR = HCElementType("IF_EXPR")
     val MATCH_EXPR = HCElementType("MATCH_EXPR")
     val PAREN_EXPR = HCElementType("PAREN_EXPR")
