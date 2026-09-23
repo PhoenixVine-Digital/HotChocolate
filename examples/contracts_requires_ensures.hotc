@@ -1,0 +1,17 @@
+// `@requires`/`@ensures` -- design-by-contract, compiled to real assertions in DEV builds only
+// (piggybacking on `@dev`'s own strip-in-release machinery), gone entirely in a `--release` build.
+// `ContractError` (the exception both throw) is auto-synthesized -- no `extern class` needed here.
+
+@requires(hp >= 0)
+@ensures(result >= 0)
+fn damage(hp: Int, amount: Int) -> Int {
+    let next = hp - amount;
+    if next < 0 { return 0; }
+    return next;
+}
+
+fn main() {
+    print(damage(10, 3)); // 7
+    print(damage(10, 100)); // 0 (clamped, both requires and ensures hold)
+    print("done");
+}

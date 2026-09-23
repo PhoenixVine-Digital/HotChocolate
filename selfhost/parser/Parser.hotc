@@ -95,10 +95,16 @@ pub struct Parser {
     // `tunable_set`/`tunable_names` from this list ONLY when it's non-empty (so a program that
     // never uses `@tunable` gets zero extra generated code).
     tunable_names: Vec<String>,
+    // `@requires(cond)`/`@ensures(cond)` -- see `apply_contract`'s own header. `ContractError`
+    // (the exception type both throw) isn't in any stdlib topic at all -- it's synthesized
+    // directly into `Program.externs` by `parse_program`'s own tail, ONLY when at least one
+    // `@requires`/`@ensures` was actually seen (mirrors `tunable_names`'s own "zero extra
+    // generated code when unused" discipline).
+    needs_contracts: Bool,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2() };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false };
 }
 
 impl Parser {
@@ -2543,6 +2549,15 @@ impl Parser {
             // `@sendable`; only meaningful on a top-level `static` declared `Float` (checked once
             // the static itself is parsed, since only THEN is its declared type known).
             var pending_tunable = false;
+            // `@requires(cond)`/`@ensures(cond)` -- see `apply_contract`'s own header. Each takes
+            // a real parenthesized EXPRESSION (not a bare identifier list like `@after(A, B)`),
+            // so parsed via `self.expression()` right where the directive itself is recognized --
+            // only ONE of each is supported per `fn` (a real, disclosed scope cut; multiple
+            // conditions can already be written as one `cond1 && cond2` by the caller).
+            var pending_requires = none_expr();
+            var has_pending_requires = false;
+            var pending_ensures = none_expr();
+            var has_pending_ensures = false;
             while self.check(AT) {
                 if self.tokens.get(self.pos + 1).kind == STRING {
                     pending_annotation = some_annotation(self.annotation());
@@ -2592,6 +2607,16 @@ impl Parser {
                         self.expect(RPAREN);
                     } else if directive == "tunable" {
                         pending_tunable = true;
+                    } else if directive == "requires" {
+                        self.expect(LPAREN);
+                        pending_requires = some_expr(self.expression());
+                        has_pending_requires = true;
+                        self.expect(RPAREN);
+                    } else if directive == "ensures" {
+                        self.expect(LPAREN);
+                        pending_ensures = some_expr(self.expression());
+                        has_pending_ensures = true;
+                        self.expect(RPAREN);
                     } else {
                         throw ParseError::new("unknown compiler directive '@" + directive + "'");
                     }
@@ -2627,6 +2652,11 @@ impl Parser {
             var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE);
             if pending_dev && next_is_other_decl_kind {
                 throw ParseError::new("'@dev' is only supported on top-level 'fn' declarations");
+            }
+            // `@requires`/`@ensures` are only meaningful on a top-level `fn` -- same gate `@dev`
+            // right above uses.
+            if (has_pending_requires || has_pending_ensures) && next_is_other_decl_kind {
+                throw ParseError::new("'@requires'/'@ensures' are only supported on top-level 'fn' declarations");
             }
             // `@after`/`@before`/`@profile` are only meaningful on `system` -- same single up-
             // front gate `@sendable` uses right above, rather than repeating the reject in every
@@ -2830,7 +2860,7 @@ impl Parser {
                     tii = tii + 1;
                 }
             } else {
-                let fd = self.fn_decl();
+                var fd = self.fn_decl();
                 if has_pending_annotation {
                     if let Some { value: ann2 } = pending_annotation {
                         fn_annotation_names.push(fd.name);
@@ -2848,6 +2878,10 @@ impl Parser {
                         fn_doc_names.push(fd.name);
                         fn_doc_data.push(docv2);
                     }
+                }
+                if has_pending_requires || has_pending_ensures {
+                    self.needs_contracts = true;
+                    fd = apply_contract(fd, has_pending_requires, pending_requires, has_pending_ensures, pending_ensures);
                 }
                 fns.push(fd);
             }
@@ -2887,6 +2921,17 @@ impl Parser {
             fns.push(build_tunable_get_fn(&self.tunable_names));
             fns.push(build_tunable_set_fn(&self.tunable_names));
             fns.push(build_tunable_names_fn(&self.tunable_names));
+        }
+        // `@requires`/`@ensures` -- see `apply_contract`'s own header. `ContractError` isn't
+        // declared in any stdlib topic (there was no existing "exceptions" topic to hang it off
+        // of) -- synthesized directly into `Program.externs` here instead, the same "only when
+        // actually used" discipline every other `needs_*` flag in this fn already follows.
+        if self.needs_contracts {
+            var ctor_params = empty_param_vec();
+            ctor_params.push(Param { name: "msg", type_name: "String", is_ref: false, is_mut_ref: false });
+            var ctor_methods = empty_extern_method_vec();
+            ctor_methods.push(ExternMethod { name: "new", params: ctor_params, ret_type: "Self", is_static: false, is_ctor: true });
+            externs.push(ExternClassDecl { name: "ContractError", binary_name: "java.lang.RuntimeException", methods: ctor_methods, fields: empty_extern_field_vec(), is_interface: false });
         }
         return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
@@ -3017,6 +3062,124 @@ impl Parser {
         self.expect(SEMI);
         return StaticDecl { name: name, type_name: type_name, value: value };
     }
+}
+
+// `@requires(cond)`/`@ensures(cond)` -- design-by-contract, compiled to real assertions in DEV
+// builds only, gone entirely in RELEASE. The real trick this whole feature piggybacks on: every
+// generated check is wrapped in `if dev { ... }`, the EXACT shape `Driver.hotc`'s own, already-
+// shipped `strip_dev_code`/`strip_dev_blocks_list` pass already recognizes and strips -- see that
+// fn's own header (`Ident { name: "dev" }` as the condition, recognized ONLY by that literal
+// shape). `--release` drops the whole `if dev { ... }` block (and everything inside it, INCLUDING
+// the condition expression itself) before the checker ever sees it; the default (no `--release`)
+// keeps it, inlined as ordinary always-executed code. Zero NEW strip machinery needed -- this is
+// pure reuse of `@dev`'s own existing infrastructure, exactly as `IDEAS.md`'s own brainstormed
+// note for this feature called for. `ContractError` (declared nowhere in any stdlib topic --
+// synthesized straight into `Program.externs`, see `parse_program`'s own tail) is what gets
+// thrown on a real violation.
+//
+// `@requires(cond)`: prepends ONE check to the very start of the fn body, checked once at entry.
+// `@ensures(cond)`: rewrites EVERY explicit `return expr;` throughout the WHOLE body (recursing
+// into `if`/`while`/`for`/`try`/`match`, mirroring `strip_dev_blocks_list`'s own exact recursion
+// shape) into `let result = expr; if dev { if !(cond) { throw ContractError::new(...); } }
+// return result;` -- binding the return value to a REAL local named literally `result` (not an
+// AST substitution of the user's own `cond` expression) is what lets `cond` reference `result`
+// (e.g. `@ensures(result >= 0)`) using nothing more than ORDINARY variable lookup; `cond` itself
+// is never rewritten at all.
+//
+// Real, disclosed scope cuts: only ONE `@requires` and ONE `@ensures` per `fn` (multiple
+// conditions are already expressible as one `cond1 && cond2`); a bare `return;` (no value) is
+// left completely UNCHECKED by `@ensures` (there's no value to bind `result` to); a `Unit`-
+// returning fn that falls off the end of its body with no explicit `return` at all is likewise
+// unchecked (there's no `Return` node to intercept there either) -- `@ensures` only ever fires on
+// an EXPLICIT `return expr;`, not on every possible exit path.
+fn build_contract_check_stmt(cond: &Expr, msg: String) -> Stmt {
+    var throw_args = empty_expr_vec();
+    throw_args.push(StringLit { value: msg });
+    var inner_body = empty_stmt_vec();
+    inner_body.push(Throw { value: StaticCall { type_name: "ContractError", method: "new", args: throw_args }, line: 0 });
+    var dev_body = empty_stmt_vec();
+    dev_body.push(If { cond: Unary { op: "!", expr: cond }, then_body: inner_body, else_body: none_stmt_vec(), line: 0, narrow_name: "", narrow_is_eq: false });
+    return If { cond: Ident { name: "dev" }, then_body: dev_body, else_body: none_stmt_vec(), line: 0, narrow_name: "", narrow_is_eq: false };
+}
+
+// `apply_contract`'s own `@ensures` half -- see `build_contract_check_stmt`'s own header for the
+// full design. `ens_cond` (not `cond`) is this fn's own parameter name specifically to avoid
+// shadowing every `Stmt` variant's OWN `cond` field (`If`/`While`) inside this fn's own `match`
+// arms below -- a real, easy-to-miss naming trap this fn's own recursion would otherwise walk
+// straight into.
+fn rewrite_ensures_returns(ss: Vec<Stmt>, ens_cond: &Expr, fn_name: String) -> Vec<Stmt> {
+    var out = empty_stmt_vec();
+    var i = 0;
+    while i < ss.length() {
+        let s = ss.get(i);
+        match s {
+            Return { value, line } => {
+                var was_value = false;
+                if let Some { value: v } = value {
+                    out.push(Let { name: "result", mutable: false, init: v, declared_type: none_string(), line: line });
+                    out.push(build_contract_check_stmt(ens_cond, "ensures failed in '" + fn_name + "'"));
+                    out.push(Return { value: some_expr(Ident { name: "result" }), line: line });
+                    was_value = true;
+                }
+                if !was_value {
+                    out.push(Return { value: none_expr(), line: line });
+                }
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                var new_else = none_stmt_vec();
+                if let Some { value: eb } = else_body {
+                    new_else = some_stmt_vec(rewrite_ensures_returns(eb, ens_cond, fn_name));
+                }
+                out.push(If { cond: cond, then_body: rewrite_ensures_returns(then_body, ens_cond, fn_name), else_body: new_else, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq });
+            }
+            While { cond, body, line } => {
+                out.push(While { cond: cond, body: rewrite_ensures_returns(body, ens_cond, fn_name), line: line });
+            }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: rewrite_ensures_returns(body, ens_cond, fn_name), line: line });
+            }
+            Try { try_block, catches, line } => {
+                out.push(Try { try_block: rewrite_ensures_returns(try_block, ens_cond, fn_name), catches: catches, line: line });
+            }
+            Match { subject, arms, line } => {
+                var new_arms = empty_matcharm_vec();
+                var ai = 0;
+                while ai < arms.length() {
+                    let a = arms.get(ai);
+                    new_arms.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: rewrite_ensures_returns(a.body, ens_cond, fn_name), is_literal: a.is_literal, literal: a.literal, is_positional: a.is_positional });
+                    ai = ai + 1;
+                }
+                out.push(Match { subject: subject, arms: new_arms, line: line });
+            }
+            _ => { out.push(s); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// The single entry point `parse_program`'s own plain-`fn` dispatch branch calls once a `fn` had
+// `@requires`/`@ensures` -- see `build_contract_check_stmt`'s own header for the full design.
+fn apply_contract(fd: FnDecl, has_req: Bool, req: Option<Expr>, has_ens: Bool, ens: Option<Expr>) -> FnDecl {
+    var body = fd.body;
+    if has_req {
+        if let Some { value: rc } = req {
+            var new_body = empty_stmt_vec();
+            new_body.push(build_contract_check_stmt(&rc, "requires failed in '" + fd.name + "'"));
+            var i = 0;
+            while i < body.length() {
+                new_body.push(body.get(i));
+                i = i + 1;
+            }
+            body = new_body;
+        }
+    }
+    if has_ens {
+        if let Some { value: ec } = ens {
+            body = rewrite_ensures_returns(body, &ec, fd.name);
+        }
+    }
+    return FnDecl { name: fd.name, params: fd.params, ret_type: fd.ret_type, body: body, type_param: fd.type_param, type_bounds: fd.type_bounds, self_is_mut: fd.self_is_mut, type_param2: fd.type_param2, type_bounds2: fd.type_bounds2 };
 }
 
 // `typestate_decl`'s own small "have I seen this state name before" check -- a local, narrow

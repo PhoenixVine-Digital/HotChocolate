@@ -1058,6 +1058,37 @@ intended way to know what's actually valid. No actual in-game debug-console UI i
 pass either -- that's a real, separate follow-up (a window/graphics-topic feature) that would
 consume `tunable_get`/`tunable_set`/`tunable_names` as its own backend.
 
+### `@requires`/`@ensures` -- design-by-contract, dev-only
+
+**Status, 2026-09-22 (real, disclosed SUBSET shipped)**: `@requires(hp >= 0) @ensures(result >=
+0) fn damage(hp: Int, amount: Int) -> Int { ... }` compiles to real assertions in DEV builds,
+gone entirely in `--release`. The real trick this piggybacks on, exactly as originally
+brainstormed: every generated check is wrapped in `if dev { ... }`, the EXACT shape `Driver.hotc`'s
+own, already-shipped `strip_dev_code`/`strip_dev_blocks_list` pass already recognizes and strips
+-- `--release` drops the whole block (condition expression included) before the checker ever
+sees it, the default keeps it as ordinary always-executed code. Zero NEW strip machinery, zero
+`Checker.hotc`/`Codegen.hotc` changes -- pure reuse of `@dev`'s own existing infrastructure via
+`Parser.hotc`'s own `apply_contract`. `@requires(cond)` prepends one check at the top of the fn
+body; `@ensures(cond)` rewrites EVERY explicit `return expr;` throughout the whole body (recursing
+through `if`/`while`/`for`/`try`/`match`, mirroring `strip_dev_blocks_list`'s own recursion shape)
+into `let result = expr; if dev { if !(cond) { throw ContractError::new(...); } } return
+result;` -- binding the return value to a real local literally named `result` is what lets `cond`
+reference it (`@ensures(result >= 0)`) via ordinary variable lookup, no AST substitution needed.
+`ContractError` (declared in no stdlib topic) is synthesized directly into `Program.externs` only
+when actually used. Verified BOTH directions live, not just the happy path: a real `@requires`
+violation throws `"requires failed in 'damage'"` and a real `@ensures` violation throws
+`"ensures failed in 'broken_clamp'"` in a dev build; the SAME two violating programs compiled
+with `--release` silently return the raw, un-checked, wrong value instead (`-8`, `-90`) --
+confirming the strip is real, not just present-but-inert. Full example regression sweep clean,
+self-hosting verified to a true fixed point.
+
+Real, disclosed scope cuts: only one `@requires` and one `@ensures` per `fn` (multiple conditions
+already expressible as `cond1 && cond2`); a bare `return;` (no value) is completely unchecked by
+`@ensures` (nothing to bind `result` to); a `Unit`-returning fn that falls off the end with no
+explicit `return` is likewise unchecked (no `Return` node to intercept). No `@invariant` (a
+struct-level, checked-on-every-public-method-boundary condition) -- a real, larger follow-up if a
+concrete need for it ever comes up.
+
 ### State machine syntax
 
 ```
