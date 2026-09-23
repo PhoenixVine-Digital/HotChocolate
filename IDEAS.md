@@ -1011,6 +1011,27 @@ sinking design time into this.
 
 ### Lifecycle annotations (`@update`/`@fixed_update`/`@render`/`@startup`)
 
+**Status, 2026-09-23 (real, disclosed SUBSET shipped -- the cheap first cut this entry's own
+header recommends)**: `@startup fn init_world() { ... }` / `@update fn move_player(dt: Float) {
+... }` (also `@fixed_update`/`@render`) mark a plain top-level fn as belonging to a lifecycle
+category; `Parser.hotc`'s own tail synthesizes ONE dispatcher per category actually used
+(`run_startup()`/`run_update(dt)`/`run_fixed_update(dt)`/`run_render(dt)`), each calling every fn
+in that category in DECLARATION order. Pure parser-level AST synthesis (`build_lifecycle_
+dispatcher_fn`), same "collect names, generate one dispatcher" strategy `@tunable` already
+established -- zero `Checker.hotc`/`Codegen.hotc` changes. Answers this entry's own real design
+question ("what actually PROVIDES the loop") with the cheap option it names as the right first
+cut: this is purely descriptive metadata plus a callable dispatcher, NOT a runtime HC would need
+to own -- a host application (a hand-written loop, today; a future HC-owned game-loop runtime,
+later) calls `run_update(dt)`/etc. itself, on whatever cadence it already has. Real, disclosed
+scope cut: a uniform signature per category is ENFORCED (`@startup` must take zero params,
+`@update`/`@fixed_update`/`@render` exactly one `Float` -- checked once, right when each marked
+fn is parsed, with a real, named error otherwise) so the dispatcher never needs per-fn signature
+introspection at call-site-generation time. Verified with `examples/lifecycle_annotations.hotc`:
+two `@startup` fns run in declaration order, then `run_update`/`run_fixed_update`/`run_render`
+each call their own marked fn with `dt` threaded through correctly; a wrong-signature `@update` fn
+hits the real, disclosed compile error. Full example regression sweep clean, self-hosting
+verified to a true fixed point.
+
 ```
 @fixed_update
 fn physics(delta: Duration) { ... }

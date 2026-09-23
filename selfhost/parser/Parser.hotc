@@ -2488,6 +2488,14 @@ impl Parser {
         var must_use_fn_names = empty_str_vec();
         var dev_fn_names = empty_str_vec();
         var deterministic_fn_names = empty_str_vec();
+        // `@startup`/`@update`/`@fixed_update`/`@render` -- see `build_lifecycle_dispatcher_fn`'s
+        // own header. Each is its own flat name list (same accumulator shape `dev_fn_names`/
+        // `deterministic_fn_names` already use), consumed ONLY by `parse_program`'s own tail --
+        // nothing else in the pipeline needs to know this feature exists.
+        var startup_fn_names = empty_str_vec();
+        var update_fn_names = empty_str_vec();
+        var fixed_update_fn_names = empty_str_vec();
+        var render_fn_names = empty_str_vec();
         var struct_doc_names = empty_str_vec();
         var struct_doc_data = empty_doc_comment_vec();
         var fn_doc_names = empty_str_vec();
@@ -2557,6 +2565,15 @@ impl Parser {
             // `@deterministic` -- see `Ast.hc`'s own `Program.deterministic_fn_names` header.
             // Same bare-directive shape/gate as `@dev` right above.
             var pending_deterministic = false;
+            // `@startup`/`@update`/`@fixed_update`/`@render` -- see `build_lifecycle_dispatcher_
+            // fn`'s own header. Same bare-directive shape/gate as `@dev`/`@deterministic` above;
+            // real param-signature validation happens once the `fn` itself is actually parsed
+            // (`@startup` must be zero-param, the other three exactly one `Float` param), since
+            // only THEN is the signature known.
+            var pending_startup = false;
+            var pending_update = false;
+            var pending_fixed_update = false;
+            var pending_render = false;
             // `@sendable` -- see `Ast.hc`'s own `Program.sendable_struct_names` header. Same bare-
             // directive distinction as `@must_use` right below, and same "only on struct" gate as
             // Phoenix Flight's own `PhoenixPool::spawn` needs to actually check anything -- see
@@ -2650,6 +2667,14 @@ impl Parser {
                         self.expect(RPAREN);
                     } else if directive == "tunable" {
                         pending_tunable = true;
+                    } else if directive == "startup" {
+                        pending_startup = true;
+                    } else if directive == "update" {
+                        pending_update = true;
+                    } else if directive == "fixed_update" {
+                        pending_fixed_update = true;
+                    } else if directive == "render" {
+                        pending_render = true;
                     } else if directive == "requires" {
                         self.expect(LPAREN);
                         pending_requires = some_expr(self.expression());
@@ -2698,6 +2723,10 @@ impl Parser {
             }
             if pending_deterministic && next_is_other_decl_kind {
                 throw ParseError::new("'@deterministic' is only supported on top-level 'fn' declarations");
+            }
+            var has_pending_lifecycle = pending_startup || pending_update || pending_fixed_update || pending_render;
+            if has_pending_lifecycle && next_is_other_decl_kind {
+                throw ParseError::new("'@startup'/'@update'/'@fixed_update'/'@render' are only supported on top-level 'fn' declarations");
             }
             // `@requires`/`@ensures` are only meaningful on a top-level `fn` -- same gate `@dev`
             // right above uses.
@@ -2922,6 +2951,24 @@ impl Parser {
                 if pending_deterministic {
                     deterministic_fn_names.push(fd.name);
                 }
+                if pending_startup {
+                    if fd.params.length() != 0 {
+                        throw ParseError::new("'@startup' fn '" + fd.name + "' must take zero parameters, got " + JString3::valueOf(fd.params.length()));
+                    }
+                    startup_fn_names.push(fd.name);
+                }
+                if pending_update {
+                    check_lifecycle_dt_param(&fd, "@update");
+                    update_fn_names.push(fd.name);
+                }
+                if pending_fixed_update {
+                    check_lifecycle_dt_param(&fd, "@fixed_update");
+                    fixed_update_fn_names.push(fd.name);
+                }
+                if pending_render {
+                    check_lifecycle_dt_param(&fd, "@render");
+                    render_fn_names.push(fd.name);
+                }
                 if has_pending_doc {
                     if let Some { value: docv2 } = pending_doc {
                         fn_doc_names.push(fd.name);
@@ -2981,6 +3028,21 @@ impl Parser {
             var ctor_methods = empty_extern_method_vec();
             ctor_methods.push(ExternMethod { name: "new", params: ctor_params, ret_type: "Self", is_static: false, is_ctor: true });
             externs.push(ExternClassDecl { name: "ContractError", binary_name: "java.lang.RuntimeException", methods: ctor_methods, fields: empty_extern_field_vec(), is_interface: false });
+        }
+        // `@startup`/`@update`/`@fixed_update`/`@render` -- see `build_lifecycle_dispatcher_fn`'s
+        // own header. Each dispatcher is only generated when its own category actually has at
+        // least one marked fn -- a program using none of these gets zero extra generated code.
+        if startup_fn_names.length() > 0 {
+            fns.push(build_lifecycle_dispatcher_fn("run_startup", &startup_fn_names, false));
+        }
+        if update_fn_names.length() > 0 {
+            fns.push(build_lifecycle_dispatcher_fn("run_update", &update_fn_names, true));
+        }
+        if fixed_update_fn_names.length() > 0 {
+            fns.push(build_lifecycle_dispatcher_fn("run_fixed_update", &fixed_update_fn_names, true));
+        }
+        if render_fn_names.length() > 0 {
+            fns.push(build_lifecycle_dispatcher_fn("run_render", &render_fn_names, true));
         }
         return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
@@ -3241,6 +3303,48 @@ fn str_vec_contains_ts(v: &Vec<String>, target: String) -> Bool {
         i = i + 1;
     }
     return false;
+}
+
+// `@update`/`@fixed_update`/`@render` -- see `build_lifecycle_dispatcher_fn`'s own header. All
+// three share one uniform, real, disclosed scope-cut signature (exactly one `Float` delta-time
+// parameter) so `parse_program`'s own tail can generate ONE call shape (`fn_name(dt)`) per
+// dispatcher regardless of which specific fns it's calling -- no per-fn signature introspection
+// needed at CALL-SITE-GENERATION time, only here, once, right when each fn is first parsed.
+fn check_lifecycle_dt_param(fd: &FnDecl, directive_text: String) {
+    if fd.params.length() != 1 || fd.params.get(0).type_name != "Float" {
+        throw ParseError::new("'" + directive_text + "' fn '" + fd.name + "' must take exactly one 'Float' parameter (the delta time)");
+    }
+}
+
+// `@startup`/`@update`/`@fixed_update`/`@render` -- lifecycle annotations for any HC program with
+// a game loop, ECS-shaped or not (see `IDEAS.md`'s own "Lifecycle annotations" entry). Pure
+// parser-level AST synthesis, same "collect names, generate ONE dispatcher fn" strategy `@tunable`
+// already established -- zero `Checker.hotc`/`Codegen.hotc` changes. `parse_program`'s own tail
+// calls this once per category (`run_startup`/`run_update`/`run_fixed_update`/`run_render`),
+// ONLY when that category actually has at least one marked fn, generating a single dispatcher
+// that calls every one of them, in DECLARATION order, passing `dt` through unchanged where the
+// category takes one. This deliberately punts the real design question `IDEAS.md`'s own entry
+// raises ("what actually PROVIDES the loop") to the cheapest possible answer it names as the
+// right first cut: this is purely descriptive metadata plus a callable dispatcher -- nothing
+// here spins up an actual loop/timer/frame-pump. A host application (a hand-written `while true {
+// ... }`, or a future HC-owned game-loop runtime) calls `run_update(dt)`/etc. itself, on whatever
+// cadence it already has.
+fn build_lifecycle_dispatcher_fn(dispatcher_name: String, names: &Vec<String>, has_dt_param: Bool) -> FnDecl {
+    var params = empty_param_vec();
+    if has_dt_param {
+        params.push(Param { name: "dt", type_name: "Float", is_ref: false, is_mut_ref: false });
+    }
+    var body = empty_stmt_vec();
+    var i = 0;
+    while i < names.length() {
+        var args = empty_expr_vec();
+        if has_dt_param {
+            args.push(Ident { name: "dt" });
+        }
+        body.push(ExprStmt { expr: Call { callee: names.get(i), args: args }, line: 0 });
+        i = i + 1;
+    }
+    return FnDecl { name: dispatcher_name, params: params, ret_type: none_string(), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
 }
 
 // `derive_impls`'s own field-type dispatch -- these seven are the ones that combine directly as

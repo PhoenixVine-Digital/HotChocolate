@@ -1,0 +1,37 @@
+// Lifecycle annotations -- `@startup`/`@update`/`@fixed_update`/`@render` are pure descriptive
+// metadata: this generates ONE dispatcher per category (`run_startup`/`run_update`/
+// `run_fixed_update`/`run_render`) that calls every marked fn, in declaration order. A host
+// application (this `main`, standing in for a hand-written game loop) calls the dispatchers
+// itself, on whatever cadence it wants -- nothing here owns an actual loop/timer.
+@startup
+fn init_world() {
+    print("startup: init_world");
+}
+
+@startup
+fn init_audio() {
+    print("startup: init_audio");
+}
+
+@update
+fn move_player(dt: Float) {
+    print("update: move_player dt={dt}");
+}
+
+@fixed_update
+fn physics_step(dt: Float) {
+    print("fixed_update: physics_step dt={dt}");
+}
+
+@render
+fn draw_scene(dt: Float) {
+    print("render: draw_scene dt={dt}");
+}
+
+fn main() {
+    run_startup();
+    run_update(0.016f);
+    run_fixed_update(0.02f);
+    run_render(0.016f);
+    print("done");
+}
