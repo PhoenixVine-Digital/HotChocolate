@@ -1057,6 +1057,37 @@ right first cut.
 
 ### Events/signals as a language construct
 
+**Status, 2026-09-23 (real, disclosed SUBSET shipped -- the compile-time-wired version this
+entry's own header recommends)**: `event PlayerDied(name: String, cause: String);` declares an
+event's own payload shape (a real param list, parsed exactly like a `fn`'s own); `handle
+PlayerDied(name, cause) { ... }` registers a handler (MULTIPLE `handle` blocks for the same event
+are real and expected, called in declaration order). Firing is just calling the auto-generated
+`emit_PlayerDied(name, cause)` dispatcher directly -- no separate `emit` keyword/statement at
+all, since the dispatcher is an ordinary, callable top-level `fn` once synthesized, and ordinary
+call-site type-checking already validates its arguments for free. Pure parser-level AST
+synthesis (`event_decl`/`on_decl`/`build_event_emit_fn` in `Parser.hotc`) -- zero `Checker.hotc`/
+`Codegen.hotc` changes, and genuinely zero runtime subscription machinery, exactly the cheap
+option this entry's own header names as the right call over a dynamic system. Real, disclosed
+naming deviation from the brainstormed syntax: the handler keyword is `handle`, not the more
+obvious `on` -- found the hard way that `on` collides HARD with this compiler's OWN source
+(`Checker.hotc`'s own `check_field_access_on_type`/`check_field_assign_on_type` use bare `on`/
+`on0` pervasively as a real local/param name; reserving it broke this compiler's own self-
+compile, caught immediately by the self-hosting fixed-point check this whole backlog sweep relies
+on). A second real, previously-latent gap hit building this: a doubly-nested generic `Vec<Vec
+<Param>>` used AS A STRUCT FIELD TYPE (on `Parser` itself) crashes with `NoClassDefFoundError:
+Vec$Vec$Param` -- a broader version of the already-known `Vec<Vec<String>>.set()` gap (see
+`COLLECTIONS_IDEAS.md`), this time triggered by the FIELD DECLARATION itself, not a method call.
+Worked around the same way that earlier gap was: flattened `event`'s own per-event field lists
+into three parallel flat Vecs (`event_field_counts`/`event_field_names`/`event_field_types`)
+instead of storing a real `Vec<Vec<Param>>`, reconstructing a plain (single-level, unaffected)
+`Vec<Param>` on demand via `event_params_for`'s own linear scan. Verified with `examples/
+events_signals.hotc`: two handlers for the same event both fire, in order, with the right
+payload; a `handle` naming a never-declared event, and one with the wrong binding count, both
+hit their own real, disclosed error paths. Full example regression sweep clean, self-hosting
+verified to a true fixed point (recovered mid-pass from a bad bootstrap sync caused by the first
+of the two bugs above -- restored from the last good git-committed bootstrap rather than
+debugging forward against a broken compiler).
+
 ```
 event PlayerDied(player: Entity);
 event DamageTaken(target: Entity, amount: Int);

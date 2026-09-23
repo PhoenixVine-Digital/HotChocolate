@@ -1,0 +1,24 @@
+// Events/signals -- compile-time-wired, zero runtime subscription machinery. `event` declares a
+// payload shape; `handle` blocks (multiple allowed, same event) register a handler; firing is
+// just calling the auto-generated `emit_Name(...)` dispatcher, which calls every handler in
+// declaration order.
+event PlayerDied(name: String, cause: String);
+event ScoreChanged(delta: Int);
+
+handle PlayerDied(name, cause) {
+    print("death effect for {name} ({cause})");
+}
+
+handle PlayerDied(name, cause) {
+    print("logging death: {name} died to {cause}");
+}
+
+handle ScoreChanged(delta) {
+    print("score delta: {delta}");
+}
+
+fn main() {
+    emit_PlayerDied("Steve", "fall damage");
+    emit_ScoreChanged(10);
+    print("done");
+}

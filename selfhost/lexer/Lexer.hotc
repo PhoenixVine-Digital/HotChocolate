@@ -123,6 +123,14 @@ pub enum TokType {
     // struct/method typing -- "used a resource before it's ready" becomes a real "no such method"
     // compile error).
     TYPESTATE, STATE,
+    // `event Name(field: Type, ...);` / `handle Name(bind, ...) { body }` -- see `Parser.hotc`'s
+    // own `event_decl`/`on_decl` headers for the full design (compile-time-wired events/signals,
+    // zero runtime subscription machinery). Named `handle`, not the more obvious `on` (matching
+    // the brainstormed syntax) -- `on` collides HARD with this compiler's OWN source (`Checker.
+    // hotc`'s own `check_field_access_on_type`/`check_field_assign_on_type` use bare `on`/`on0`
+    // as a real, pervasive local/param name throughout their own field-access-type-resolution
+    // logic, found the hard way: reserving `on` broke this compiler's own self-compile).
+    EVENT, HANDLE,
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
@@ -193,6 +201,8 @@ fn build_keywords() -> Registry<TokType> {
     kw.register("sequence", SEQUENCE);
     kw.register("typestate", TYPESTATE);
     kw.register("state", STATE);
+    kw.register("event", EVENT);
+    kw.register("handle", HANDLE);
     return kw;
 }
 

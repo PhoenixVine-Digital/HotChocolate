@@ -101,10 +101,37 @@ pub struct Parser {
     // `@requires`/`@ensures` was actually seen (mirrors `tunable_names`'s own "zero extra
     // generated code when unused" discipline).
     needs_contracts: Bool,
+    // `event Name(field: Type, ...);` / `handle Name(bind, ...) { body }` -- see `event_decl`'s
+    // own header for the full design. `event_names`/`event_field_counts` are parallel Vecs
+    // (declaration order, index-aligned) rather than a `Registry` -- this file has no dependency
+    // on `stdlib/registry.hotc`'s own `Registry<T>` (a real stdlib TOPIC, resolved through the
+    // ordinary user-program `use`/`resolve_stdlib_modules` machinery, not available to the self-
+    // hosted compiler's own bootstrap-merged source files), so a small hand-rolled linear scan
+    // (`event_params_for`) is simpler than introducing that dependency for what's always a
+    // handful of events per program. Each event's own FIELDS are stored FLATTENED across
+    // `event_field_names`/`event_field_types` (concatenated in event-declaration order,
+    // `event_field_counts` giving each event's own slice length) rather than as a real `Vec<Vec
+    // <Param>>` field -- a real, previously-hit gap found the hard way: a doubly-nested generic
+    // Vec AS A STRUCT FIELD TYPE (not just a `.set()` call, the earlier-found narrower version of
+    // this same gap) crashes this compiler's own self-compile with `NoClassDefFoundError: Vec$
+    // Vec$Param` -- monomorphizing `Vec<Vec<T>>` itself isn't reliable yet, so this field simply
+    // never has that shape, avoiding the gap entirely rather than fixing it. `handler_event_names`/
+    // `handler_fn_names` are likewise a FLAT pair of parallel Vecs (one entry per `handle` block
+    // seen, in declaration order across the WHOLE file, regardless of which event each one
+    // names) -- `parse_program`'s own tail filters this flat pair down to one event's own
+    // handlers via `handlers_for_event`'s own linear scan.
+    event_names: Vec<String>,
+    event_field_counts: Vec<Int>,
+    event_field_names: Vec<String>,
+    event_field_types: Vec<String>,
+    event_handler_counter: Int,
+    handler_event_names: Vec<String>,
+    handler_fn_names: Vec<String>,
+    pending_event_fns: Vec<FnDecl>,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false, event_names: empty_str_vec2(), event_field_counts: empty_int_vec_ev(), event_field_names: empty_str_vec2(), event_field_types: empty_str_vec2(), event_handler_counter: 0, handler_event_names: empty_str_vec2(), handler_fn_names: empty_str_vec2(), pending_event_fns: empty_fn_decl_vec() };
 }
 
 impl Parser {
@@ -1334,6 +1361,86 @@ impl Parser {
         }
         self.expect(RBRACE);
         return TypestateResult { structs: out_structs, impls: out_impls };
+    }
+
+    // `event PlayerDied(player: Entity, cause: String);` -- events/signals, compile-time-wired
+    // (see `IDEAS.md`'s own "Events/signals as a language construct" entry, which explicitly
+    // recommends this cheaper, zero-runtime-cost version over a genuinely dynamic subscription
+    // system). Declares an event's own payload SHAPE only -- a real param list, exactly like a
+    // `fn`'s own, parsed via the same `param_list()` every `fn`/`extern method` already uses --
+    // recorded into `self.event_names`/`self.event_field_counts`/`self.event_field_names`/`self.
+    // event_field_types` (see that field's own header) for `on_decl`/`parse_program`'s tail to
+    // read back later. No struct, no `Checker.hotc`/
+    // `Codegen.hotc` code, and no AST node of its own at all -- this declaration produces NOTHING
+    // in the final `Program` directly; it only feeds the TWO real things that do (each `handle`
+    // block's own synthesized handler `fn`, and `parse_program`'s own tail-synthesized `emit_
+    // Name` dispatcher, see `on_decl`'s and that tail code's own headers).
+    fn event_decl(&mut self) -> Unit {
+        self.expect(EVENT);
+        let name = self.expect(IDENT).text;
+        let params = self.param_list();
+        self.expect(SEMI);
+        if str_vec_contains_ts(&self.event_names, name) {
+            throw ParseError::new("event '" + name + "' is declared more than once");
+        }
+        self.event_names.push(name);
+        self.event_field_counts.push(params.length());
+        var pi = 0;
+        while pi < params.length() {
+            let p = params.get(pi);
+            self.event_field_names.push(p.name);
+            self.event_field_types.push(p.type_name);
+            pi = pi + 1;
+        }
+    }
+
+    // `handle PlayerDied(player) { spawn_death_effect(player); }` -- a real, disclosed ORDER
+    // dependency (same "declared before used" constraint `unit`/`typestate` already have): the
+    // named `event` must already have been parsed earlier in the file, since this needs its real
+    // field TYPES (only the bind NAMES are written here, positionally matched to `event`'s own
+    // declared fields, same convention `typestate`'s own positional-binding-free field reuse
+    // establishes and positional `match` patterns established before that). Named `handle`, not
+    // the more obvious `on` (matching the brainstormed syntax) -- `on` collides hard with this
+    // compiler's OWN source (see `Lexer.hotc`'s own `HANDLE` token header for the real, found-
+    // the-hard-way reason). Desugars into a fresh, uniquely-named top-level handler `fn __on_
+    // <Name>_<N>(bind1: Type1, ...) { <body> }` (queued in `self.pending_event_fns`, appended to
+    // the real `Program.fns` only once `parse_program` reaches its own tail -- `handle` can only
+    // ever appear at the top level, unlike `sequence`, but the SAME queuing shape is reused for
+    // consistency) -- MULTIPLE `handle` blocks for the same event are real and expected (`self.
+    // handler_event_names`/`self.handler_fn_names`, a flat parallel pair, records EVERY one
+    // across the whole file, in declaration order); `parse_program`'s own tail generates ONE
+    // `emit_Name` dispatcher per declared event that calls every one of ITS OWN handlers, in
+    // that same order.
+    fn on_decl(&mut self) -> Unit {
+        self.expect(HANDLE);
+        let name = self.expect(IDENT).text;
+        var binds = empty_str_vec();
+        self.expect(LPAREN);
+        if !self.check(RPAREN) {
+            binds.push(self.expect(IDENT).text);
+            while self.match_kind(COMMA) {
+                binds.push(self.expect(IDENT).text);
+            }
+        }
+        self.expect(RPAREN);
+        let fields = event_params_for(&self.event_names, &self.event_field_counts, &self.event_field_names, &self.event_field_types, name);
+        if binds.length() != fields.length() {
+            throw ParseError::new("'handle " + name + "(...)' expects " + JString3::valueOf(fields.length()) + " binding(s) (matching 'event " + name + "'), got " + JString3::valueOf(binds.length()));
+        }
+        let body = self.block();
+        let n = self.event_handler_counter;
+        self.event_handler_counter = n + 1;
+        let handler_name = "__on_" + name + "_" + JString3::valueOf(n);
+        var handler_params = empty_param_vec();
+        var bi = 0;
+        while bi < binds.length() {
+            let ftype = fields.get(bi).type_name;
+            handler_params.push(Param { name: binds.get(bi), type_name: ftype, is_ref: false, is_mut_ref: false });
+            bi = bi + 1;
+        }
+        self.pending_event_fns.push(FnDecl { name: handler_name, params: handler_params, ret_type: none_string(), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
+        self.handler_event_names.push(name);
+        self.handler_fn_names.push(handler_name);
     }
 
     // `sequence { npc.say("hi"); wait(2.0); npc.say("bye"); wait_until(|| player_near(npc)); }` --
@@ -2717,7 +2824,7 @@ impl Parser {
             // scattered per-branch rejects below). Positive check (IS it one of the other
             // declaration-kind keywords the loop right below this one dispatches on?) rather than
             // a long negation -- easier to keep in sync with that chain's own real member list.
-            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE);
+            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE);
             if pending_dev && next_is_other_decl_kind {
                 throw ParseError::new("'@dev' is only supported on top-level 'fn' declarations");
             }
@@ -2934,6 +3041,28 @@ impl Parser {
                     impls.push(tr.impls.get(tii));
                     tii = tii + 1;
                 }
+            } else if self.check(EVENT) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'event' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'event' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'event' declarations");
+                }
+                self.event_decl();
+            } else if self.check(HANDLE) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'handle' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'handle' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'handle' declarations");
+                }
+                self.on_decl();
             } else {
                 var fd = self.fn_decl();
                 if has_pending_annotation {
@@ -3043,6 +3172,23 @@ impl Parser {
         }
         if render_fn_names.length() > 0 {
             fns.push(build_lifecycle_dispatcher_fn("run_render", &render_fn_names, true));
+        }
+        // `event`/`on` -- see `event_decl`/`on_decl`'s own headers. Every synthesized handler
+        // `fn` (one per `on` block) gets appended to the real top-level `fns` list here; ONE
+        // `emit_Name` dispatcher is generated per DECLARED event, calling every handler
+        // registered for it.
+        var pei = 0;
+        while pei < self.pending_event_fns.length() {
+            fns.push(self.pending_event_fns.get(pei));
+            pei = pei + 1;
+        }
+        var evi = 0;
+        while evi < self.event_names.length() {
+            let ev_name = self.event_names.get(evi);
+            let ev_fields = event_params_for(&self.event_names, &self.event_field_counts, &self.event_field_names, &self.event_field_types, ev_name);
+            let ev_handlers = handlers_for_event(&self.handler_event_names, &self.handler_fn_names, ev_name);
+            fns.push(build_event_emit_fn(ev_name, &ev_fields, &ev_handlers));
+            evi = evi + 1;
         }
         return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
@@ -3303,6 +3449,72 @@ fn str_vec_contains_ts(v: &Vec<String>, target: String) -> Bool {
         i = i + 1;
     }
     return false;
+}
+
+// `on_decl`'s own "look up this event's declared field list" step -- a real, disclosed order
+// dependency: throws when `target` was never declared via `event` earlier in the file (`on`
+// always requires it).
+// Reconstructs `target`'s own field `Param` list ON DEMAND from the FLAT storage `event_decl`
+// populates (see `Parser`'s own `event_field_counts`/`event_field_names`/`event_field_types`
+// header for why those are flat rather than a real `Vec<Vec<Param>>` field) -- the RETURN value
+// here is a plain, single-level `Vec<Param>` (no nesting at all), so this itself hits no
+// monomorphization gap; only a doubly-nested generic STORED AS A FIELD does.
+fn event_params_for(names: &Vec<String>, field_counts: &Vec<Int>, field_names: &Vec<String>, field_types: &Vec<String>, target: String) -> Vec<Param> {
+    var offset = 0;
+    var i = 0;
+    while i < names.length() {
+        let cnt = field_counts.get(i);
+        if names.get(i) == target {
+            var out = empty_param_vec();
+            var j = 0;
+            while j < cnt {
+                out.push(Param { name: field_names.get(offset + j), type_name: field_types.get(offset + j), is_ref: false, is_mut_ref: false });
+                j = j + 1;
+            }
+            return out;
+        }
+        offset = offset + cnt;
+        i = i + 1;
+    }
+    throw ParseError::new("'handle " + target + "(...)' names an event that was never declared with 'event " + target + "(...);'");
+}
+
+// `parse_program`'s own tail -- every handler `fn` name registered for `target`, in the SAME
+// declaration order `on_decl` recorded them (`handler_event_names`/`handler_fn_names` are a flat
+// pair spanning EVERY event in the file, not just `target`'s own).
+fn handlers_for_event(handler_event_names: &Vec<String>, handler_fn_names: &Vec<String>, target: String) -> Vec<String> {
+    var out = empty_str_vec2();
+    var i = 0;
+    while i < handler_event_names.length() {
+        if handler_event_names.get(i) == target {
+            out.push(handler_fn_names.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// `parse_program`'s own tail -- one `emit_Name(field1: Type1, ...)` dispatcher per DECLARED
+// event (generated even for zero handlers -- firing an event nobody's listening to yet is a
+// normal no-op, not an error), calling every one of its own handlers, forwarding the same
+// arguments, in declaration order.
+fn build_event_emit_fn(name: String, fields: &Vec<Param>, handler_names: &Vec<String>) -> FnDecl {
+    var params = empty_param_vec();
+    var fwd_args = empty_expr_vec();
+    var fi = 0;
+    while fi < fields.length() {
+        let f = fields.get(fi);
+        params.push(Param { name: f.name, type_name: f.type_name, is_ref: false, is_mut_ref: false });
+        fwd_args.push(Ident { name: f.name });
+        fi = fi + 1;
+    }
+    var body = empty_stmt_vec();
+    var hi = 0;
+    while hi < handler_names.length() {
+        body.push(ExprStmt { expr: Call { callee: handler_names.get(hi), args: fwd_args }, line: 0 });
+        hi = hi + 1;
+    }
+    return FnDecl { name: "emit_" + name, params: params, ret_type: none_string(), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
 }
 
 // `@update`/`@fixed_update`/`@render` -- see `build_lifecycle_dispatcher_fn`'s own header. All
@@ -3661,6 +3873,12 @@ fn empty_stmt_vec() -> Vec<Stmt> {
 fn empty_param_vec() -> Vec<Param> {
     var v = vec_of(Param { name: "_", type_name: "_", is_ref: false, is_mut_ref: false });
     return Vec { data: v.data, len: 0 };
+}
+// `event_field_counts`'s own empty seed -- same "seed via a real value, then reset `len` to 0"
+// convention every other `empty_*_vec` helper here already uses.
+fn empty_int_vec_ev() -> Vec<Int> {
+    var seed = vec_of(0);
+    return Vec { data: seed.data, len: 0 };
 }
 fn none_expr() -> Option<Expr> {
     var v = vec_of(Some { value: IntLit { value: 0 } });
