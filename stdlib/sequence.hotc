@@ -1,0 +1,32 @@
+// Coroutines for game-logic sequencing -- `sequence { npc.say("hi"); wait(2.0); npc.say("bye");
+// wait_until(|| player_near(npc)); }` reads top-to-bottom like ordinary sequential code, but each
+// `wait`/`wait_until` genuinely suspends without blocking the main game loop or any other
+// sequence. Real virtual-thread-backed suspension (JDK 21+ virtual threads truly unmount from
+// their carrier thread while blocked on `Thread.sleep` -- see `stdlib/phoenix_virtual.hotc`'s own
+// header), not a hand-rolled state machine and not polling on the caller's own thread. Write
+// `sequence { ... }` directly -- see `Parser.hotc`'s own `sequence_stmts` header for how the
+// parser auto-injects `use sequence;` the moment it sees one, the same "transitive dependency,
+// no explicit `use` required" pattern `parallel for`'s own `needs_phoenix` already established.
+use phoenix_virtual;
+
+extern class JThreadHc = "java.lang.Thread" {
+    static fn sleep(millis: Long) -> Unit;
+}
+
+// Suspends the CURRENT sequence's own virtual thread for `seconds` (fractional allowed, e.g.
+// `wait(0.5)`) -- see this file's own header for why this doesn't block anything else.
+fn wait(seconds: Float) {
+    let millis = (seconds * 1000.0f) as Long;
+    JThreadHc::sleep(millis);
+}
+
+// Polls `cond` every 50ms until it returns `true`. Real, disclosed v1 scope cut: this is POLLING,
+// not a real condition-variable wakeup, so a condition that becomes true between polls still
+// resumes within 50ms, not instantly -- fine for game-logic timing (an NPC noticing the player
+// got close doesn't need sub-frame precision), but a real event-driven wakeup is a possible
+// follow-up if 50ms latency ever actually matters for some concrete use case.
+fn wait_until(cond: &dyn PhoenixSupplier) {
+    while !(cond.get() as Bool) {
+        JThreadHc::sleep(50L);
+    }
+}

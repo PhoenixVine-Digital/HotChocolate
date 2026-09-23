@@ -944,6 +944,34 @@ needs runtime-variable subscription.
 
 ### Coroutines for game-logic sequencing
 
+**Status, 2026-09-22 (real, disclosed SUBSET shipped -- via virtual threads, not a CPS
+transform)**: this entry's own original blocker ("no closures yet, and spinning up a REAL
+`java.lang.Thread` per in-flight coroutine would be a real resource cost") is resolved
+differently than originally envisioned: closures/lambdas exist now (used throughout this
+backlog's own later entries), AND JDK 21's virtual threads (`stdlib/phoenix_virtual.hotc`,
+already shipped) make "one thread per coroutine" a NON-issue -- a virtual thread genuinely
+unmounts from its carrier thread while blocked on `Thread.sleep`, so thousands of them blocked
+concurrently cost nothing like a real platform thread would. `sequence { npc.say("hi"); wait
+(2.0f); npc.say("bye"); wait_until(|| player_near(npc) as PhoenixObject); }` (`Parser.hotc`'s own
+`sequence_stmts`) desugars into spawning the block's own body (as a synthesized top-level helper
+fn) onto a fresh `PhoenixVirtualPool`; `wait`/`wait_until` (`stdlib/sequence.hotc`, a new topic,
+transitively requiring `phoenix_virtual` and therefore `--target 21`+) do the real suspending via
+`Thread.sleep`-based blocking/polling. Genuinely non-blocking of the caller and of every OTHER
+sequence -- confirmed with `examples/sequence_coroutines.hotc`, where the caller's own very next
+line prints BEFORE the sequence's own first line, and the sequence's three steps still land in
+their own correct relative order. Zero `Checker.hotc`/`Codegen.hotc` changes -- pure `Parser.hotc`
+AST synthesis, same strategy `parallel for`/`@dev` already established. **What this is NOT**:
+the CPS/resumable-state-machine transform originally sketched below (no per-`await`-point resume
+labels, no captured-locals-as-persisted-fields) -- this is real, correct suspension, just
+implemented with a cheap real thread instead of a compiled state machine. Real, disclosed scope
+cuts: `wait_until` POLLS every 50ms (not a real condition-variable wakeup -- fine for game-logic
+timing, not for sub-frame precision); the spawned task's own handle is discarded, so a running
+`sequence` can't currently be `.join()`ed/cancelled from the statement that started it; `--target
+17` callers get a real, clear compile error naming `phoenix_virtual`, not a silent fallback. Full
+example regression sweep clean (same canonical failure set, `phoenix_virtual_threads.hc` itself
+now ALSO passes when the sweep is run at `--target 21`, confirming that failure was always just a
+target-flag artifact, not a real defect). Self-hosting verified to a true fixed point.
+
 ```
 coroutine enemy_attack(enemy: &mut Enemy) {
     await 500ms;

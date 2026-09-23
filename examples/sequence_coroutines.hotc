@@ -1,0 +1,26 @@
+// Coroutines for game-logic sequencing -- `sequence { ... }` desugars into a real
+// PhoenixVirtualPool-spawned virtual thread; `wait`/`wait_until` genuinely suspend it without
+// blocking the caller. This example proves the caller keeps running WHILE the sequence's own
+// `wait` is still pending: it prints "main: still running" before the sequence's own delayed
+// print ever lands.
+struct Counter3 {
+    n: Int,
+}
+
+fn player_near() -> Bool {
+    return true;
+}
+
+fn main() {
+    var c = Counter3 { n: 0 };
+    sequence {
+        print("seq: step 1");
+        wait(0.2f);
+        print("seq: step 2 (after wait)");
+        wait_until(|| player_near() as PhoenixObject);
+        print("seq: step 3 (after wait_until)");
+    }
+    print("main: still running");
+    wait(0.5f); // let the sequence finish before the process exits
+    print("done");
+}

@@ -1323,6 +1323,14 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // templates` never got Vec's own impl block merged in), corrupting the emitted method
         // descriptor.
         out = add_stdlib_topic_and_deps("vec", out, target);
+    } else if topic == "sequence" {
+        // `stdlib/sequence.hotc`'s own `wait_until`'s `&dyn PhoenixSupplier` param and its
+        // `JThreadHc::sleep`-based `wait`/`wait_until` bodies both run on a REAL virtual thread
+        // (`sequence { ... }`'s own desugared `PhoenixVirtualPool::new()`/`.spawn(...)` -- see
+        // `Parser.hotc`'s own `sequence_stmts` header) -- `phoenix_virtual`'s own `min_target_for_
+        // topic` gate (21) is what actually enforces this transitively, naming ITSELF (not
+        // `sequence`) in the error if a caller compiles at `--target 17`.
+        out = add_stdlib_topic_and_deps("phoenix_virtual", out, target);
     } else if topic == "phoenix_virtual" {
         // Virtual-thread `PhoenixPool` variant (see `stdlib/phoenix_virtual.hotc`'s own header) --
         // a NEW, separate type from `PhoenixPool` itself, but it reuses `PhoenixTask`/
@@ -1365,8 +1373,8 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
         // cross-topic dependency here already follows. See `COLLECTIONS_IDEAS.md`.
         out = add_stdlib_topic_and_deps("vec", out, target);
         out = add_stdlib_topic_and_deps("option", out, target);
-    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" && topic != "audio" && topic != "input" && topic != "collections" && topic != "random" && topic != "tuple" {
-        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics, audio, input, collections, random, tuple");
+    } else if topic != "vec" && topic != "option" && topic != "result" && topic != "phoenix" && topic != "ecs" && topic != "phoenix_virtual" && topic != "math" && topic != "window" && topic != "graphics" && topic != "audio" && topic != "input" && topic != "collections" && topic != "random" && topic != "tuple" && topic != "sequence" {
+        throw ParseError::new("unknown stdlib module 'use " + topic + ";' -- expected one of vec, registry, option, result, io, phoenix, phoenix_virtual, ecs, math, window, graphics, audio, input, collections, random, tuple, sequence");
     }
     out.push(topic);
     return out;

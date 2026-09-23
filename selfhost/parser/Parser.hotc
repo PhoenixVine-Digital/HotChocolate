@@ -70,10 +70,21 @@ pub struct Parser {
     // of whether it ALSO wrote `use collections;` itself -- same transitive-dependency pattern
     // `needs_phoenix` right above already establishes for `parallel for`.
     needs_collections: Bool,
+    // `sequence { ... }` -- see `sequence_stmts`'s own header. `sequence_counter` avoids two
+    // `sequence` sites in the same file colliding on the same synthesized helper-fn/local names
+    // once desugared (mirrors `parallel_for_counter` exactly); `needs_sequence` auto-injects
+    // `"sequence"` into `Program.uses` (mirrors `needs_phoenix`/`needs_collections`);
+    // `pending_seq_fns` collects each `sequence` block's own synthesized top-level helper `fn` --
+    // `sequence_stmts` can be called from ANYWHERE inside a fn body (any nesting depth `block()`
+    // reaches), far from `parse_program`'s own top-level `fns` list, so the synthesized fn is
+    // queued here and only actually appended to `fns` once `parse_program` reaches its own return.
+    sequence_counter: Int,
+    needs_sequence: Bool,
+    pending_seq_fns: Vec<FnDecl>,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec() };
 }
 
 impl Parser {
@@ -1210,6 +1221,77 @@ impl Parser {
         return UnitDeclResult { sd: sd, im: im, ctor_fn: ctor_fn };
     }
 
+    // `sequence { npc.say("hi"); wait(2.0); npc.say("bye"); wait_until(|| player_near(npc)); }` --
+    // coroutines for game-logic sequencing. Pure AST desugaring, same "expand into already-
+    // proven, already-checked constructs" strategy `parallel_for_stmts`/`@dev` already use --
+    // NEITHER `Checker.hotc` NOR `Codegen.hotc` need a single new line for this feature.
+    //
+    // The real trick: a `sequence` block's body can be an arbitrary STATEMENT LIST (any number of
+    // statements, unlike `parallel_for_stmts`'s own single-expression-body restriction), but
+    // `Lambda.body` (`Ast.hc`) is a single `Expr`, and spawning onto `PhoenixVirtualPool` (see
+    // `stdlib/sequence.hotc`'s own header) needs a `&dyn PhoenixCallable` lambda. Resolved by
+    // NOT inlining the body into the lambda at all: the whole statement list becomes a fresh,
+    // synthesized TOP-LEVEL `fn __seq_fnN() -> Int { <body>; return 0; }` (queued in `self.
+    // pending_seq_fns`, since `sequence` can appear at any nesting depth `block()` reaches, far
+    // from `parse_program`'s own top-level `fns` list -- only actually appended there once
+    // `parse_program` reaches its own return), and the spawned lambda becomes the trivial single-
+    // expression `|| __seq_fnN() as PhoenixObject` -- the SAME "wrap a call in `as PhoenixObject`"
+    // convention `parallel_for_stmts` already established for its own single-expression body
+    // (the dummy `-> Int { ...; return 0; }` gives that cast something real to box, same
+    // disclosed reasoning as `parallel_for_stmts`'s own header on why a bare `Unit`-returning
+    // body wouldn't have anything to box).
+    //
+    // The `sequence { ... }` STATEMENT itself desugars into three ordinary statements: create a
+    // fresh `PhoenixVirtualPool`, spawn the lambda above onto it (the `PhoenixTask` handle is
+    // bound but not currently exposed back to the caller -- see this fn's own scope-cut note
+    // below), then immediately `shutdown()` the pool (graceful -- refuses new submissions, but
+    // the one already-spawned task keeps running to completion regardless, same contract
+    // `PhoenixPool::shutdown`'s own header documents). `wait`/`wait_until` (`stdlib/
+    // sequence.hotc`) do the real suspending, entirely as ordinary function calls inside the
+    // synthesized fn's body -- genuinely non-blocking because they run on a virtual thread
+    // (`needs_sequence` auto-injects `use sequence;`, which transitively needs `use
+    // phoenix_virtual;`, itself gated to `--target 21`+ -- a real, disclosed hard requirement:
+    // `sequence` on `--target 17` is a real, clear compile error naming `phoenix_virtual`, not a
+    // silent fallback to blocking the caller's own thread).
+    //
+    // Scope cut, disclosed: the spawned `PhoenixTask` handle is discarded, not returned to the
+    // caller -- there's currently no way to `.join()`/`.cancel()` a running `sequence` from the
+    // statement that started it. A real, possible follow-up (`let handle = sequence { ... };`,
+    // using `sequence` as an EXPRESSION rather than a bare statement) if a concrete use case
+    // (cancelling an NPC's dialogue sequence early, say) ever needs it -- not attempted this pass.
+    fn sequence_stmts(&mut self, start_line: Int) -> Vec<Stmt> {
+        self.expect(SEQUENCE);
+        let body = self.block();
+        self.needs_sequence = true;
+        let n = self.sequence_counter;
+        self.sequence_counter = n + 1;
+        let suffix = JString3::valueOf(n);
+        let fn_name = "__seq_fn" + suffix;
+        let pool_name = "__seq_pool" + suffix;
+        let task_name = "__seq_task" + suffix;
+
+        var seq_body = empty_stmt_vec();
+        var bi = 0;
+        while bi < body.length() {
+            seq_body.push(body.get(bi));
+            bi = bi + 1;
+        }
+        seq_body.push(Return { value: some_expr(IntLit { value: 0 }), line: start_line });
+        let seq_fn = FnDecl { name: fn_name, params: empty_param_vec(), ret_type: some_string("Int"), body: seq_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+        self.pending_seq_fns.push(seq_fn);
+
+        var out = empty_stmt_vec();
+        out.push(Let { name: pool_name, mutable: true, init: StaticCall { type_name: "PhoenixVirtualPool", method: "new", args: empty_expr_vec() }, declared_type: none_string(), line: start_line });
+        let lambda = Lambda { params: empty_str_vec(), body: Cast { expr: Call { callee: fn_name, args: empty_expr_vec() }, target_type: "PhoenixObject" } };
+        var spawn_args = empty_expr_vec();
+        spawn_args.push(lambda);
+        let spawn_call = MethodCall { recv: Ident { name: pool_name }, method: "spawn", args: spawn_args };
+        out.push(Let { name: task_name, mutable: true, init: spawn_call, declared_type: none_string(), line: start_line });
+        let shutdown_call = MethodCall { recv: Ident { name: pool_name }, method: "shutdown", args: empty_expr_vec() };
+        out.push(ExprStmt { expr: shutdown_call, line: start_line });
+        return out;
+    }
+
     fn block(&mut self) -> Vec<Stmt> {
         self.expect(LBRACE);
         if self.check(RBRACE) {
@@ -1225,6 +1307,14 @@ impl Parser {
                 while di < desugared.length() {
                     stmts.push(desugared.get(di));
                     di = di + 1;
+                }
+            } else if self.check(SEQUENCE) {
+                let start_line2 = self.peek().line;
+                let desugared2 = self.sequence_stmts(start_line2);
+                var di2 = 0;
+                while di2 < desugared2.length() {
+                    stmts.push(desugared2.get(di2));
+                    di2 = di2 + 1;
                 }
             } else {
                 stmts.push(self.statement());
@@ -2662,6 +2752,20 @@ impl Parser {
         // `needs_collections`'s own header.
         if self.needs_collections {
             uses.push("collections");
+        }
+        // `sequence { ... }` needs `wait`/`wait_until` (`stdlib/sequence.hotc`) regardless of
+        // whether this program ever wrote `use sequence;` itself -- see `needs_sequence`'s own
+        // header. Each `sequence` block's own synthesized helper `fn` (queued in `pending_seq_
+        // fns` by `sequence_stmts`, however deeply nested the block that created it was) gets
+        // appended to the real top-level `fns` list here, the first point in this fn where that
+        // list is fully assembled but not yet handed to `Program`.
+        if self.needs_sequence {
+            uses.push("sequence");
+            var sfi = 0;
+            while sfi < self.pending_seq_fns.length() {
+                fns.push(self.pending_seq_fns.get(sfi));
+                sfi = sfi + 1;
+            }
         }
         return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
