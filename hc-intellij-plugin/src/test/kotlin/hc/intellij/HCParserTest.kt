@@ -91,6 +91,73 @@ class HCParserTest : BasePlatformTestCase() {
         assertTrue("expected a RESOURCE_DECL node in `$src`", hasResourceDecl)
     }
 
+    // **Added 2026-09-23** -- `unit`/`typestate`/`event`/`handle`/`parallel`/`sequence` were all
+    // real reserved keywords in the actual compiler that this plugin's lexer/parser never learned
+    // (see `HCTokenTypes.KEYWORDS`'s own header) -- every real use of any of them previously
+    // tokenized as a plain `IDENT` and produced real, false parse-error squiggles. One test per
+    // shape, same reasoning `test resource declarations parse as RESOURCE_DECL` above already
+    // uses, pinning down both "no parse error" and "the right element type" together.
+    fun `test unit declarations parse as UNIT_DECL`() {
+        assertParsesAs("unit Meters(Float);\n", HCElementTypes.UNIT_DECL)
+    }
+
+    fun `test typestate declarations parse as TYPESTATE_DECL with nested STATE_DECL`() {
+        val src = "typestate Door {\n    state Open { }\n    state Closed { }\n    impl Open { fn close(&self) -> Closed { return Closed { }; } }\n}\n"
+        assertParsesAs(src, HCElementTypes.TYPESTATE_DECL)
+        assertParsesAs(src, HCElementTypes.STATE_DECL)
+    }
+
+    fun `test event and handle declarations parse as EVENT_DECL and HANDLE_DECL`() {
+        val src = "event Died(cause: String);\nhandle Died(cause) { print(cause); }\n"
+        assertParsesAs(src, HCElementTypes.EVENT_DECL)
+        assertParsesAs(src, HCElementTypes.HANDLE_DECL)
+    }
+
+    fun `test parallel-for and sequence statements parse as PARALLEL_STMT and SEQUENCE_STMT`() {
+        assertParsesAs("fn f(xs: [Int]) { parallel for x in xs { print(x); } }\n", HCElementTypes.PARALLEL_STMT)
+        assertParsesAs("fn f() { sequence { print(1); } }\n", HCElementTypes.SEQUENCE_STMT)
+    }
+
+    // Array slicing, `arr[start..end]` / `arr[start..=end]` -- see the real compiler's own
+    // `Ast.hc` `Expr.Slice` header. Both the exclusive and inclusive spellings, plus confirming a
+    // plain `arr[i]` still parses as the ordinary `INDEX_EXPR` (not a false-positive SLICE_EXPR).
+    fun `test array slicing parses as SLICE_EXPR`() {
+        assertParsesAs("fn f(xs: [Int]) { let ys = xs[1..3]; }\n", HCElementTypes.SLICE_EXPR)
+        assertParsesAs("fn f(xs: [Int]) { let ys = xs[1..=3]; }\n", HCElementTypes.SLICE_EXPR)
+    }
+
+    fun `test plain array indexing still parses as INDEX_EXPR, not SLICE_EXPR`() {
+        val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hotc", HCLanguage, "fn f(xs: [Int]) { let y = xs[1]; }\n")
+        val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+        assertTrue("unexpected parse error(s): ${errors.map { it.errorDescription }}", errors.isEmpty())
+        val allElements = PsiTreeUtil.findChildrenOfType(psiFile, com.intellij.psi.PsiElement::class.java)
+        assertTrue(allElements.any { it.node?.elementType == HCElementTypes.INDEX_EXPR })
+        assertTrue(allElements.none { it.node?.elementType == HCElementTypes.SLICE_EXPR })
+    }
+
+    // `'a'`, `'\n'`, `'\''` -- see the real compiler's own `Lexer.hotc` `char_literal` header.
+    fun `test char literals parse as LITERAL_EXPR with a CHAR token`() {
+        for (src in listOf(
+            "fn f() { let c = 'a'; }\n",
+            "fn f() { let c = '\\n'; }\n",
+            "fn f() { let c = '\\''; }\n",
+        )) {
+            val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hotc", HCLanguage, src)
+            val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+            assertTrue("unexpected parse error(s) in `$src`: ${errors.map { it.errorDescription }}", errors.isEmpty())
+            val allElements = PsiTreeUtil.findChildrenOfType(psiFile, com.intellij.psi.PsiElement::class.java)
+            assertTrue("expected a CHAR token in `$src`", allElements.any { it.node?.elementType == HCTokenTypes.CHAR })
+        }
+    }
+
+    private fun assertParsesAs(src: String, expected: com.intellij.psi.tree.IElementType) {
+        val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hotc", HCLanguage, src)
+        val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+        assertTrue("unexpected parse error(s) in `$src`: ${errors.map { it.errorDescription }}", errors.isEmpty())
+        val allElements = PsiTreeUtil.findChildrenOfType(psiFile, com.intellij.psi.PsiElement::class.java)
+        assertTrue("expected a $expected node in `$src`", allElements.any { it.node?.elementType == expected })
+    }
+
     // Same sweep as the real-example-programs test above, but over `stdlib/*.hotc` -- NOT covered
     // by that one (it only walks `examples/`). This is exactly the class of file that broke and
     // went uncaught: every `extern class` with a `static NAME: Type;` FIELD (not a method) --

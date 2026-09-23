@@ -47,9 +47,15 @@ private val STATEMENT_KEYWORDS = listOf(
     "fn", "struct", "enum", "interface", "extern", "impl", "let", "var", "if", "else", "while",
     "for", "in", "match", "return", "break", "continue", "true", "false", "null", "self", "arena",
     "static", "module", "pub", "try", "catch", "throw", "sealed", "dev", "mut",
+    // **Fixed 2026-09-23** -- these were all real reserved keywords already (some since
+    // 2026-09-11, the rest added the same day array slicing landed) but never made it into THIS
+    // list, a separate hardcoded set from `HCTokenTypes.KEYWORDS` -- so completion never
+    // suggested them even though the parser/lexer/highlighter already knew them.
+    "use", "component", "system", "resource", "unit", "parallel", "sequence", "typestate",
+    "state", "event", "handle",
 )
 
-private val PRIMITIVE_TYPE_NAMES = listOf("Int", "Long", "Float", "Double", "Bool", "String")
+private val PRIMITIVE_TYPE_NAMES = listOf("Int", "Long", "Float", "Double", "Bool", "String", "Char")
 
 private object HCCompletionProvider : CompletionProvider<CompletionParameters>() {
     override fun addCompletions(parameters: CompletionParameters, context: ProcessingContext, result: CompletionResultSet) {

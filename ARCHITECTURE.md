@@ -4386,3 +4386,63 @@ internal application. Left alone, documented, not worth a third blind
 attempt at outguessing JitPack's own undocumented internal packaging
 heuristics for a cosmetic, non-fatal warning.
 
+## IntelliJ plugin (`hc-intellij-plugin/`)
+
+A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/
+references/completion, not a thin wrapper) that mirrors the actual compiler's own grammar closely
+enough to navigate real `.hc`/`.hotc` code by, without being a byte-for-byte port — see
+`HCPsiParser.kt`'s and `HCLexer.kt`'s own file headers for exactly what's simplified. Because it's
+a second, independently-maintained implementation of the same grammar, it structurally lags the
+real compiler: a new keyword/AST shape landing in `selfhost/lexer/Lexer.hotc`/`selfhost/parser/
+Parser.hotc` doesn't automatically teach this plugin about it, and the gap shows up as real, false
+"unexpected token" parse-error squiggles on code the actual compiler accepts cleanly.
+
+**Caught up, 2026-09-23**: seven real reserved keywords the real compiler had gained across
+several recent features but this plugin's lexer never learned — `unit` (units-as-types),
+`parallel`/`sequence` (parallel-for / coroutines), `typestate`/`state` (typestates), `event`/
+`handle` (events/signals) — plus real `Char` literal lexing (`'a'`, `'\n'`, `'\''`, mirroring
+`Lexer.hotc`'s own `char_literal`; `Long`'s `L`-suffix literal was already handled here, just
+never wired into `LITERAL_EXPR`'s CHAR-less token set). New PSI declaration/statement shapes added
+to match: `UNIT_DECL`, `TYPESTATE_DECL` (with nested `STATE_DECL`), `EVENT_DECL`, `HANDLE_DECL`,
+`PARALLEL_STMT` (`parallel for x in expr { }`), `SEQUENCE_STMT` (`sequence { }`). Array slicing
+(`arr[start..end]`/`arr[start..=end]`, the same day it landed in the real compiler — see this
+file's own "Added 2026-09-23" entry above) got a new `SLICE_EXPR`, parsed in `HCPsiParser`'s own
+postfix-loop by peeking for `DOTDOT`/`DOTDOTEQ` right after the first bracketed expression, same
+as the real compiler's `postfix_loop`. All of the above are parse-shape-only, same "trust it, let
+a real compile reject anything actually invalid" leniency this whole plugin already uses
+elsewhere — no attempt at replicating the real compiler's own semantic validation for any of them
+(e.g. `typestate`'s "every `impl S` needs a matching `state S`" check, or `unit`'s base-type
+restriction). The separate, hardcoded keyword list `HCCompletionContributor.STATEMENT_KEYWORDS`
+uses for Ctrl+Space suggestions had independently fallen behind the same way (missing `use`/
+`component`/`system`/`resource` from an EARLIER round of this same gap, on top of the seven above)
+— caught up too, plus `Char` added to `PRIMITIVE_TYPE_NAMES`.
+
+**Also fixed the same day: go-to-definition on stdlib/external-library names never resolved at
+all.** `HCReferences.filesInScope` (the function every reference-resolution path in the plugin
+funnels through) only ever searched the clicked file's own directory plus same-directory siblings
+— a real, disclosed heuristic matching `hc run <dir>`'s own flat-namespace-per-directory
+semantics, but one that has no way to reach `stdlib/*.hotc` at all, since it lives in its own
+top-level directory, sibling to `examples/`, not inside it. Every stdlib struct/enum/`extern
+class` (`Vec`, `Option`, `Registry`, every `extern class` binding a real JDK type) was therefore
+unreachable by Ctrl+B/Ctrl+Click even though the SAME resolution machinery already handles an
+`extern class` alias correctly once it can find the declaration at all (`isTypeDecl` already
+covers `EXTERN_CLASS_DECL`). Fixed by widening `filesInScope` to also search the nearest ancestor
+directory literally named `stdlib`, found by walking up from the clicked file's own directory
+(capped at 8 levels, first match wins) — a project-layout heuristic in the same spirit as
+`HCRunConfiguration.kt`'s own "shell out to this project's own gradlew" assumption, not a real
+project-config lookup (this plugin has no notion of "where is this project's stdlib" beyond
+"look for a directory with that literal name"). Jumping only ever lands on the stdlib
+DECLARATION itself (an `extern class Foo = "java.lang.Foo" { ... }` binding, not the real JDK
+class `Foo` any further) — a real, disclosed scope cut, not attempted this pass.
+
+Full plugin test suite (`HCLexerTest`/`HCParserTest`/`HCAnnotatorTest`/`HCReferencesTest`/...,
+328 tests before this pass) confirmed zero new failures from any of the above, plus new targeted
+tests for every new shape (`HCParserTest`'s new unit/typestate/event/handle/parallel/sequence/
+slice/char-literal tests, `HCReferencesTest`'s new stdlib-resolution test). Four pre-existing
+failures (real bitwise-shift-operator, comprehension, positional-match-pattern, and tuple syntax
+this plugin's parser has never supported at all — confirmed pre-existing by reproducing them
+against the untouched baseline before starting this pass) are unrelated, disclosed, and NOT
+addressed here — each is its own, considerably larger grammar gap (a whole new expression/pattern
+shape apiece, not a missing keyword), left as an explicit follow-up rather than folded into this
+one.
+

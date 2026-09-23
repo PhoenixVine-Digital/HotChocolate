@@ -15,6 +15,7 @@ object HCTokenTypes {
     val IDENT = HCTokenType("IDENT")
     val INT = HCTokenType("INT")
     val LONG = HCTokenType("LONG")
+    val CHAR = HCTokenType("CHAR")
     val FLOAT = HCTokenType("FLOAT")
     val DOUBLE = HCTokenType("DOUBLE")
     val STRING = HCTokenType("STRING")
@@ -75,6 +76,14 @@ object HCTokenTypes {
         // `resource Name { ... }` -- a real reserved keyword too (`Lexer.hotc`'s own `kw.register
         // ("resource", RESOURCE)`), added alongside the compiler's own resource-injection feature.
         "resource",
+        // **Fixed 2026-09-23** -- `unit`/`parallel`/`sequence`/`typestate`/`state`/`event`/
+        // `handle` are all real reserved keywords in the actual compiler (`Lexer.hotc`'s own
+        // `kw.register` calls for each), added across several recent language features (units-
+        // as-types, `parallel for`, `sequence` coroutines, `typestate`, events/signals) that this
+        // plugin's lexer never learned -- every real use of any of them tokenized as a plain
+        // `IDENT`, producing the same false "unexpected token" flagging `use`/`component`/
+        // `system` had before the earlier fix right above.
+        "unit", "parallel", "sequence", "typestate", "state", "event", "handle",
     )
 
     val SYMBOLS: Map<String, HCTokenType> = mapOf(

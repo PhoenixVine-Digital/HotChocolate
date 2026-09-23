@@ -81,6 +81,7 @@ internal fun literalExprType(expr: PsiElement): String? {
         HCTokenTypes.FLOAT -> "Float"
         HCTokenTypes.DOUBLE -> "Double"
         HCTokenTypes.STRING -> "String"
+        HCTokenTypes.CHAR -> "Char"
         HCTokenTypes.TRUE, HCTokenTypes.FALSE -> "Bool"
         else -> null
     }

@@ -129,6 +129,10 @@ object HCPsiParser : PsiParser {
             b.atKw("component") -> componentDecl(b)
             b.atKw("resource") -> resourceDecl(b)
             b.atKw("system") -> systemDecl(b)
+            b.atKw("unit") -> unitDecl(b)
+            b.atKw("typestate") -> typestateDecl(b)
+            b.atKw("event") -> eventDecl(b)
+            b.atKw("handle") -> handleDecl(b)
             b.atKw("fn") -> fnDecl(b)
             b.atKw("static") -> staticDecl(b)
             b.atKw("impl") -> implDecl(b)
@@ -190,6 +194,71 @@ object HCPsiParser : PsiParser {
         paramList(b)
         block(b)
         expect(b, HCTokenTypes.RBRACE, "'}'")
+    }
+
+    // `unit Name(Base);` -- units-as-types (see the real compiler's own `Parser.hotc` `unit_decl`
+    // header). `Base` must be one of Int/Long/Float/Double there; not re-validated here, same
+    // "trust it, let a later pass reject" leniency this whole file already uses elsewhere.
+    private fun unitDecl(b: PsiBuilder) = node(b, HCElementTypes.UNIT_DECL) {
+        expectKw(b, "unit")
+        expect(b, HCTokenTypes.IDENT, "a unit name")
+        expect(b, HCTokenTypes.LPAREN, "'('")
+        expect(b, HCTokenTypes.IDENT, "a base type name")
+        expect(b, HCTokenTypes.RPAREN, "')'")
+        expect(b, HCTokenTypes.SEMI, "';'")
+    }
+
+    // `typestate Name { state S1 { fields } state S2 { fields } impl S1 { ... } }` -- see the real
+    // compiler's own `Parser.hotc` `typestate_decl` header. Each `state`/`impl` reuses ordinary
+    // field-list/impl-block grammar directly, same as the real compiler's own desugaring.
+    private fun typestateDecl(b: PsiBuilder) = node(b, HCElementTypes.TYPESTATE_DECL) {
+        expectKw(b, "typestate")
+        expect(b, HCTokenTypes.IDENT, "a typestate name")
+        expect(b, HCTokenTypes.LBRACE, "'{'")
+        while (b.tokenType != HCTokenTypes.RBRACE && !b.eof()) {
+            val before = b.currentOffset
+            when {
+                b.atKw("state") -> node(b, HCElementTypes.STATE_DECL) {
+                    b.advanceLexer()
+                    expect(b, HCTokenTypes.IDENT, "a state name")
+                    fieldList(b)
+                }
+                b.atKw("impl") -> implDecl(b)
+                else -> b.error("expected 'state' or 'impl'")
+            }
+            if (b.currentOffset == before) { b.error("unexpected token"); b.advanceLexer() }
+        }
+        expect(b, HCTokenTypes.RBRACE, "'}'")
+    }
+
+    // `event Name(field: Type, ...);` -- events/signals (see the real compiler's own `Parser.hotc`
+    // `event_decl` header). Field list is an ordinary param list, same grammar a `fn`'s own params
+    // already use.
+    private fun eventDecl(b: PsiBuilder) = node(b, HCElementTypes.EVENT_DECL) {
+        expectKw(b, "event")
+        expect(b, HCTokenTypes.IDENT, "an event name")
+        paramList(b)
+        expect(b, HCTokenTypes.SEMI, "';'")
+    }
+
+    // `handle Name(bind1, bind2) { body }` -- an event handler (see the real compiler's own
+    // `Parser.hotc` `on_decl` header -- named `handle`, not `on`, to avoid a real keyword
+    // collision found in the real compiler's own source). Binds are bare names, not typed params
+    // (their types come from the matching `event` declaration instead), so this doesn't reuse
+    // `paramList`.
+    private fun handleDecl(b: PsiBuilder) = node(b, HCElementTypes.HANDLE_DECL) {
+        expectKw(b, "handle")
+        expect(b, HCTokenTypes.IDENT, "an event name")
+        expect(b, HCTokenTypes.LPAREN, "'('")
+        if (b.tokenType != HCTokenTypes.RPAREN) {
+            expect(b, HCTokenTypes.IDENT, "a binding name")
+            while (b.tokenType == HCTokenTypes.COMMA) {
+                b.advanceLexer()
+                expect(b, HCTokenTypes.IDENT, "a binding name")
+            }
+        }
+        expect(b, HCTokenTypes.RPAREN, "')'")
+        block(b)
     }
 
     private fun moduleDecl(b: PsiBuilder) = node(b, HCElementTypes.MODULE_DECL) {
@@ -561,6 +630,21 @@ object HCPsiParser : PsiParser {
             b.atKw("continue") -> node(b, HCElementTypes.CONTINUE_STMT) { b.advanceLexer(); expect(b, HCTokenTypes.SEMI, "';'") }
             b.atKw("try") -> tryStmt(b)
             b.atKw("throw") -> node(b, HCElementTypes.THROW_STMT) { b.advanceLexer(); expression(b); expect(b, HCTokenTypes.SEMI, "';'") }
+            // `parallel for x in arr_expr { body }` / `sequence { ... }` -- pure statement-level
+            // AST desugaring in the real compiler (`Parser.hotc`'s own `parallel_for_stmts`/
+            // `sequence_stmts`); this plugin only needs the outer shape, not what each expands to.
+            // `parallel for`'s body is real-compiler-restricted to exactly one statement, but
+            // that's a semantic constraint, not a grammar one -- parsed as an ordinary block here,
+            // same "trust it, let a later pass reject" leniency this whole file already uses.
+            b.atKw("parallel") -> node(b, HCElementTypes.PARALLEL_STMT) {
+                b.advanceLexer()
+                expectKw(b, "for")
+                expect(b, HCTokenTypes.IDENT, "a loop variable name")
+                expectKw(b, "in")
+                expression(b)
+                block(b)
+            }
+            b.atKw("sequence") -> node(b, HCElementTypes.SEQUENCE_STMT) { b.advanceLexer(); block(b) }
             b.tokenType == HCTokenTypes.LBRACE -> block(b)
             else -> node(b, HCElementTypes.EXPR_STMT) {
                 expression(b)
@@ -901,9 +985,18 @@ object HCPsiParser : PsiParser {
                 b.tokenType == HCTokenTypes.LBRACKET -> {
                     b.advanceLexer()
                     expression(b)
+                    // `arr[start..end]` / `arr[start..=end]` -- array slicing (see the real
+                    // compiler's own `Ast.hc` `Expr.Slice` header). Mirrors `Parser.hotc`'s own
+                    // `postfix_loop` exactly: peek for `DOTDOT`/`DOTDOTEQ` right after the first
+                    // bracketed expression before committing to a plain `INDEX_EXPR`.
+                    val isSlice = b.tokenType == HCTokenTypes.DOTDOT || b.tokenType == HCTokenTypes.DOTDOTEQ
+                    if (isSlice) {
+                        b.advanceLexer()
+                        expression(b)
+                    }
                     expect(b, HCTokenTypes.RBRACKET, "']'")
                     val precede = marker.precede()
-                    marker.done(HCElementTypes.INDEX_EXPR)
+                    marker.done(if (isSlice) HCElementTypes.SLICE_EXPR else HCElementTypes.INDEX_EXPR)
                     marker = precede
                     isBareIdent = false
                 }
@@ -1189,7 +1282,7 @@ object HCPsiParser : PsiParser {
 
     private val LITERAL_TOKENS = setOf(
         HCTokenTypes.INT, HCTokenTypes.LONG, HCTokenTypes.FLOAT, HCTokenTypes.DOUBLE,
-        HCTokenTypes.STRING, HCTokenTypes.TRUE, HCTokenTypes.FALSE, HCTokenTypes.NULL_KW,
+        HCTokenTypes.CHAR, HCTokenTypes.STRING, HCTokenTypes.TRUE, HCTokenTypes.FALSE, HCTokenTypes.NULL_KW,
     )
 
     private fun PsiBuilder.lookAheadIsKw(steps: Int, text: String): Boolean {

@@ -47,6 +47,7 @@ private val EXPR_KINDS = TokenSet.create(
     HCElementTypes.BINARY_EXPR, HCElementTypes.UNARY_EXPR, HCElementTypes.BORROW_EXPR, HCElementTypes.CAST_EXPR,
     HCElementTypes.INSTANCE_OF_EXPR, HCElementTypes.CALL_EXPR, HCElementTypes.STATIC_CALL_EXPR,
     HCElementTypes.FIELD_ACCESS_EXPR, HCElementTypes.METHOD_CALL_EXPR, HCElementTypes.INDEX_EXPR,
+    HCElementTypes.SLICE_EXPR,
     HCElementTypes.STRUCT_LIT_EXPR, HCElementTypes.ARRAY_LIT_EXPR, HCElementTypes.IF_EXPR, HCElementTypes.MATCH_EXPR,
     HCElementTypes.PAREN_EXPR, HCElementTypes.REF_EXPR, HCElementTypes.LITERAL_EXPR, HCElementTypes.STRING_INTERP_EXPR,
     HCElementTypes.CLASS_LIT_EXPR,

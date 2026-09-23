@@ -103,6 +103,19 @@ class HCReferencesTest : BasePlatformTestCase() {
         assertEquals("Status", resolvedText(src))
     }
 
+    // **Added 2026-09-23** -- `filesInScope`'s own widening: a name declared in a `stdlib/`
+    // subdirectory (real project layout -- `stdlib/*.hotc` sits alongside `examples/`, not INSIDE
+    // it) used to be invisible to go-to-definition entirely, since the old same-directory-only
+    // heuristic never looked there. `addFileToProject("stdlib/...")` creates a real `stdlib`
+    // subdirectory under this test's virtual project root, exercising the exact same
+    // `PsiDirectory.findSubdirectory("stdlib")` walk-up `findStdlibDir` uses against a real
+    // checkout.
+    fun `test type reference resolves to a struct declared in the project's stdlib directory`() {
+        myFixture.addFileToProject("stdlib/vec.hotc", "struct Vec { }\n")
+        val src = "fn f(v: <caret>Vec) {}\n"
+        assertEquals("Vec", resolvedText(src))
+    }
+
     // Real-example sweep: proves reference resolution doesn't CRASH on any real, already-working
     // example file -- doesn't assert every reference resolves (many legitimately won't, e.g. extern
     // class members), just that touching every ident's reference is safe. Directory-grouped

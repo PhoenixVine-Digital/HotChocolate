@@ -2,6 +2,7 @@ package hc.intellij
 
 import com.intellij.openapi.util.TextRange
 import com.intellij.patterns.PlatformPatterns
+import com.intellij.psi.PsiDirectory
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiReference
@@ -99,11 +100,36 @@ internal fun declaredName(decl: PsiElement): PsiElement? =
 internal fun elementsOfType(root: PsiElement, type: HCElementType): List<PsiElement> =
     PsiTreeUtil.collectElements(root) { it.node?.elementType == type }.toList()
 
-// Current file plus every same-directory `.hc`/`.hotc` sibling -- same disclosed heuristic as
-// `HCAnnotator.collectTopLevelValueNames`'s own header (real multi-file `hc run <dir>` programs
-// share one flat namespace across every file in a directory).
-internal fun filesInScope(file: PsiFile): List<PsiFile> =
-    listOf(file) + (file.containingDirectory?.files?.filter { it !== file && it.language == HCLanguage } ?: emptyList())
+// The nearest ancestor directory named `stdlib`, found by walking up from the file's own
+// directory -- a real, disclosed heuristic (not a project-config lookup, since this plugin has no
+// notion of "where is this project's stdlib") that happens to match this repo's own layout
+// (`examples/**/*.hotc` alongside a root-level `stdlib/` -- see `HCRunConfiguration.kt`'s own
+// header for the analogous "shell out to this project's own gradlew" assumption). Capped at 8
+// levels so a file opened outside any HotChocolate-shaped project just quietly finds nothing
+// rather than climbing to filesystem root. First match wins -- real projects have exactly one.
+private fun findStdlibDir(file: PsiFile): PsiDirectory? {
+    var dir = file.containingDirectory
+    var depth = 0
+    while (dir != null && depth < 8) {
+        dir.findSubdirectory("stdlib")?.let { return it }
+        dir = dir.parentDirectory
+        depth++
+    }
+    return null
+}
+
+// Current file, every same-directory `.hc`/`.hotc` sibling, and every `.hc`/`.hotc` file in the
+// project's `stdlib/` directory (if found) -- widened 2026-09-23 specifically so go-to-definition
+// on a stdlib name (`Vec`, `Option`, `Registry`, an `extern class` binding a real JDK type, ...)
+// actually resolves: `stdlib/*.hotc` lives outside every example's own directory, so it was never
+// reachable through the plain same-directory heuristic below. Same disclosed heuristic as
+// `HCAnnotator.collectTopLevelValueNames`'s own header for the same-directory half (real multi-
+// file `hc run <dir>` programs share one flat namespace across every file in a directory).
+internal fun filesInScope(file: PsiFile): List<PsiFile> {
+    val sameDir = file.containingDirectory?.files?.filter { it !== file && it.language == HCLanguage } ?: emptyList()
+    val stdlib = findStdlibDir(file)?.files?.filter { it !== file && it.language == HCLanguage } ?: emptyList()
+    return listOf(file) + sameDir + stdlib
+}
 
 internal fun baseTypeNameOf(typeRef: PsiElement): String? {
     val kids = directChildren(typeRef)

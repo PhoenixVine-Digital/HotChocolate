@@ -35,7 +35,7 @@ class HCSyntaxHighlighter : SyntaxHighlighterBase() {
         val key = when (tokenType) {
             HCTokenTypes.KEYWORD -> HCHighlightKeys.KEYWORD
             HCTokenTypes.TRUE, HCTokenTypes.FALSE, HCTokenTypes.NULL_KW -> HCHighlightKeys.KEYWORD_LITERAL
-            HCTokenTypes.STRING, HCTokenTypes.ISTRING_BEGIN, HCTokenTypes.ISTRING_PART, HCTokenTypes.ISTRING_END -> HCHighlightKeys.STRING
+            HCTokenTypes.STRING, HCTokenTypes.ISTRING_BEGIN, HCTokenTypes.ISTRING_PART, HCTokenTypes.ISTRING_END, HCTokenTypes.CHAR -> HCHighlightKeys.STRING
             HCTokenTypes.INT, HCTokenTypes.LONG, HCTokenTypes.FLOAT, HCTokenTypes.DOUBLE -> HCHighlightKeys.NUMBER
             HCTokenTypes.LINE_COMMENT -> HCHighlightKeys.LINE_COMMENT
             HCTokenTypes.DOC_COMMENT -> HCHighlightKeys.DOC_COMMENT

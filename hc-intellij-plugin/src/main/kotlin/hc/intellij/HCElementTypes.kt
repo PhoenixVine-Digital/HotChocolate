@@ -26,6 +26,11 @@ object HCElementTypes {
     val COMPONENT_DECL = HCElementType("COMPONENT_DECL")
     val RESOURCE_DECL = HCElementType("RESOURCE_DECL")
     val SYSTEM_DECL = HCElementType("SYSTEM_DECL")
+    val UNIT_DECL = HCElementType("UNIT_DECL")
+    val TYPESTATE_DECL = HCElementType("TYPESTATE_DECL")
+    val STATE_DECL = HCElementType("STATE_DECL")
+    val EVENT_DECL = HCElementType("EVENT_DECL")
+    val HANDLE_DECL = HCElementType("HANDLE_DECL")
 
     val TYPE_PARAM_LIST = HCElementType("TYPE_PARAM_LIST")
     val PARAM_LIST = HCElementType("PARAM_LIST")
@@ -50,6 +55,8 @@ object HCElementTypes {
     val CATCH_CLAUSE = HCElementType("CATCH_CLAUSE")
     val THROW_STMT = HCElementType("THROW_STMT")
     val EXPR_STMT = HCElementType("EXPR_STMT")
+    val PARALLEL_STMT = HCElementType("PARALLEL_STMT")
+    val SEQUENCE_STMT = HCElementType("SEQUENCE_STMT")
 
     val BINARY_EXPR = HCElementType("BINARY_EXPR")
     val UNARY_EXPR = HCElementType("UNARY_EXPR")
@@ -61,6 +68,7 @@ object HCElementTypes {
     val FIELD_ACCESS_EXPR = HCElementType("FIELD_ACCESS_EXPR")
     val METHOD_CALL_EXPR = HCElementType("METHOD_CALL_EXPR")
     val INDEX_EXPR = HCElementType("INDEX_EXPR")
+    val SLICE_EXPR = HCElementType("SLICE_EXPR")
     val ASSIGN_EXPR = HCElementType("ASSIGN_EXPR")
     val STRUCT_LIT_EXPR = HCElementType("STRUCT_LIT_EXPR")
     val TRY_OP_EXPR = HCElementType("TRY_OP_EXPR")
