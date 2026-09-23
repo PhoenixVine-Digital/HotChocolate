@@ -395,6 +395,35 @@ verified to a true fixed point.
 
 ### Typestate types: resource lifecycle tracked in the type system
 
+**Status, 2026-09-22 (real, disclosed SUBSET shipped -- via ordinary distinct structs, NOT
+phantom generics)**: this entry's own original claim ("real, implementable using infrastructure
+that already exists -- monomorphized generics... just a phantom type parameter... to gate which
+`impl<State>` block's methods are callable") turned out NOT to hold up as written: checked
+`Parser.hotc`'s own `impl_decl` directly, and `impl Texture<Loading> { ... }`/`impl Texture<T> {
+... }` parse IDENTICALLY today -- the trailing `<...>` after an impl's struct name is parsed and
+UNCONDITIONALLY DISCARDED (`skip_optional_type_params`), never distinguished per concrete
+instantiation. Building the ORIGINAL phantom-generic design for real would need genuine per-
+instantiation impl-block dispatch in `Checker.hotc`'s own method-registration/monomorphization
+machinery -- a real, deep change, not a parser-level trick.
+`typestate Texture { state Loading { ... } state Ready { ... } impl Loading { fn poll(&self) ->
+Ready { ... } } impl Ready { fn draw(&self, ...) { ... } } }` (`Parser.hotc`'s own
+`typestate_decl`) ships the SAME real payoff a much simpler way: each `state S { fields }`/`impl
+S { ... }` hoists to an ORDINARY, INDEPENDENT top-level struct/impl (no shared `Texture<State>`
+family, no phantom parameter at all) -- `Loading` genuinely has no `.draw()` method, so using it
+before it's `Ready` is a real "no such method" error, confirmed live (`examples/
+typestate_texture.hotc`'s own negative-path check: calling `.width()` on a `TextureLoading`
+value fails at codegen with "no such method... on it", not silently). Zero `Checker.hotc`/
+`Codegen.hotc` changes for THAT part. `typestate_decl` adds exactly one new real check beyond
+what plain top-level structs already give: every `impl S { ... }` inside the block must name an
+`S` actually declared as a `state` in the SAME block (confirmed catching a real typo -- `impl
+TextureRedy` when only `state TextureReady` was declared -- as a named parse-time error).
+Disclosed, real gaps versus the original vision: no move-checking that actually CONSUMES the old
+state on a transition call (this compiler's move-checking tracks bare locals, not method
+RECEIVERS -- calling `.poll()` twice on the same `Loading` value isn't rejected), and the user
+picks each state's own struct name directly rather than writing `Texture<Loading>` (a real
+naming-collision responsibility across the whole file, same as any other top-level struct). Full
+example regression sweep clean, self-hosting verified to a true fixed point.
+
 ```
 struct Texture<State> { ... }
 

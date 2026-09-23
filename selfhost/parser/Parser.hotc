@@ -39,6 +39,14 @@ pub struct UnitDeclResult {
     ctor_fn: FnDecl,
 }
 
+// Parser-internal only -- the return shape of `typestate_decl` (a `typestate` block can declare
+// any number of `state`s and `impl`s, not a fixed count like `UnitDeclResult`'s three). Not part
+// of the real AST.
+pub struct TypestateResult {
+    structs: Vec<StructDecl>,
+    impls: Vec<ImplDecl>,
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: Int,
@@ -1225,6 +1233,64 @@ impl Parser {
         let ctor_fn = FnDecl { name: ctor_name, params: ctor_params, ret_type: some_string(name), body: ctor_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
 
         return UnitDeclResult { sd: sd, im: im, ctor_fn: ctor_fn };
+    }
+
+    // `typestate Texture { state Loading { path: String } state Ready { path: String, width:
+    // Int } impl Loading { fn poll(&self) -> Ready { ... } } impl Ready { fn width(&self) -> Int
+    // { ... } } }` -- a resource whose valid OPERATIONS differ by its own current state
+    // ("used a `Texture` before it's ready" becomes a real "no such method" compile error, not a
+    // runtime null-check), the way `Texture<Loading>`/`Texture<Ready>` was originally brainstormed
+    // in `IDEAS.md`.
+    //
+    // Real, disclosed scope cut versus that original phantom-generic-type-parameter framing:
+    // each `state S { fields }` hoists to an ORDINARY, INDEPENDENT top-level `struct S { fields
+    // }` (and each `impl S { ... }` to an ordinary top-level `impl S { ... }`) -- there is no
+    // shared `Texture<State>` generic family, no auto-renaming of a bare state name into a
+    // mangled `TextureReady`-style name, and no move-checking that actually CONSUMES the old
+    // state on a transition method call (this compiler's existing move-checking only tracks bare
+    // local variables, not method RECEIVERS -- calling `.poll()` twice on the same `Loading`
+    // value is not currently rejected). What IS real and enforced: `Loading` genuinely has no
+    // `.width()` method (an ordinary, already-proven "no such method" checker error -- ZERO new
+    // Checker.hotc/Codegen.hotc code for THAT part), and this fn adds exactly one new, real
+    // compile-time check beyond what plain top-level structs already give you: every `impl S {
+    // ... }` inside a `typestate` block must name an `S` that was actually declared as a `state`
+    // in that SAME block (catches a real, easy-to-make typo -- `impl Redy { ... }` inside a block
+    // that only declared `state Ready` -- as a real, named error instead of silently registering
+    // orphaned methods on a struct that happens to not exist yet). The user picks each state's
+    // own struct name directly (a real naming-collision responsibility across the whole file,
+    // same as any other top-level struct -- `TextureLoading`/`TextureReady` rather than bare
+    // `Loading`/`Ready`, if more than one typestate machine in the same program would otherwise
+    // want the same state name).
+    fn typestate_decl(&mut self) -> TypestateResult {
+        self.expect(TYPESTATE);
+        let ts_name = self.expect(IDENT).text;
+        self.expect(LBRACE);
+        var state_names = empty_str_vec();
+        var out_structs = empty_struct_decl_vec();
+        var out_impls = empty_impl_decl_vec();
+        while !self.check(RBRACE) {
+            if self.check(STATE) {
+                self.advance();
+                let sname = self.expect(IDENT).text;
+                if str_vec_contains_ts(&state_names, sname) {
+                    throw ParseError::new("typestate '" + ts_name + "' declares state '" + sname + "' more than once");
+                }
+                let fields = self.struct_fields();
+                state_names.push(sname);
+                let mod0 = self.current_module_opt();
+                out_structs.push(StructDecl { name: sname, type_param: none_string(), fields: fields, is_arena: false, module_name: mod0, super_class: none_string(), type_param2: none_string() });
+            } else if self.check(IMPL) {
+                let imd = self.impl_decl();
+                if !str_vec_contains_ts(&state_names, imd.struct_name) {
+                    throw ParseError::new("typestate '" + ts_name + "' has an 'impl " + imd.struct_name + "' block, but no 'state " + imd.struct_name + "' was declared in it");
+                }
+                out_impls.push(imd);
+            } else {
+                throw ParseError::new("expected 'state' or 'impl' inside 'typestate " + ts_name + "' block");
+            }
+        }
+        self.expect(RBRACE);
+        return TypestateResult { structs: out_structs, impls: out_impls };
     }
 
     // `sequence { npc.say("hi"); wait(2.0); npc.say("bye"); wait_until(|| player_near(npc)); }` --
@@ -2558,7 +2624,7 @@ impl Parser {
             // scattered per-branch rejects below). Positive check (IS it one of the other
             // declaration-kind keywords the loop right below this one dispatches on?) rather than
             // a long negation -- easier to keep in sync with that chain's own real member list.
-            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT);
+            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE);
             if pending_dev && next_is_other_decl_kind {
                 throw ParseError::new("'@dev' is only supported on top-level 'fn' declarations");
             }
@@ -2742,6 +2808,27 @@ impl Parser {
                 structs.push(ud.sd);
                 impls.push(ud.im);
                 fns.push(ud.ctor_fn);
+            } else if self.check(TYPESTATE) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'typestate' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'typestate' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'typestate' declarations");
+                }
+                let tr = self.typestate_decl();
+                var tsi = 0;
+                while tsi < tr.structs.length() {
+                    structs.push(tr.structs.get(tsi));
+                    tsi = tsi + 1;
+                }
+                var tii = 0;
+                while tii < tr.impls.length() {
+                    impls.push(tr.impls.get(tii));
+                    tii = tii + 1;
+                }
             } else {
                 let fd = self.fn_decl();
                 if has_pending_annotation {
@@ -2930,6 +3017,18 @@ impl Parser {
         self.expect(SEMI);
         return StaticDecl { name: name, type_name: type_name, value: value };
     }
+}
+
+// `typestate_decl`'s own small "have I seen this state name before" check -- a local, narrow
+// helper (not a reusable general-purpose one) rather than depending on `Driver.hotc`'s own
+// similarly-named `str_vec_contains`, since that lives in a different phase file.
+fn str_vec_contains_ts(v: &Vec<String>, target: String) -> Bool {
+    var i = 0;
+    while i < v.length() {
+        if v.get(i) == target { return true; }
+        i = i + 1;
+    }
+    return false;
 }
 
 // `derive_impls`'s own field-type dispatch -- these seven are the ones that combine directly as

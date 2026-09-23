@@ -111,6 +111,12 @@ pub enum TokType {
     // enforced `+`/`-`/`*`/`/`/`==` operator overloads generated automatically -- `Ticks + Degrees`
     // is a genuine, checker-caught type error, not just a naming convention).
     UNIT,
+    // `typestate Name { state S1 { fields } ... impl S1 { methods } ... }` -- see `Parser.hotc`'s
+    // own `typestate_decl` header for the full design (a resource whose valid OPERATIONS differ
+    // by its own current state, e.g. `TextureLoading` vs `TextureReady`, enforced by ordinary
+    // struct/method typing -- "used a resource before it's ready" becomes a real "no such method"
+    // compile error).
+    TYPESTATE, STATE,
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
@@ -179,6 +185,8 @@ fn build_keywords() -> Registry<TokType> {
     kw.register("dev", DEV);
     kw.register("parallel", PARALLEL);
     kw.register("sequence", SEQUENCE);
+    kw.register("typestate", TYPESTATE);
+    kw.register("state", STATE);
     return kw;
 }
 

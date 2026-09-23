@@ -1,0 +1,40 @@
+// Typestate -- `TextureLoading` has no `.width()`; `TextureReady` has no `.poll()`. Using a
+// resource before it's ready is a real "no such method" compile error, not a runtime null-check.
+typestate Texture {
+    state TextureLoading {
+        path: String,
+    }
+    state TextureReady {
+        path: String,
+        width: Int,
+        height: Int,
+    }
+
+    impl TextureLoading {
+        fn poll(&self) -> TextureReady {
+            return TextureReady { path: self.path, width: 64, height: 64 };
+        }
+    }
+
+    impl TextureReady {
+        fn width(&self) -> Int {
+            return self.width;
+        }
+        fn height(&self) -> Int {
+            return self.height;
+        }
+    }
+}
+
+fn main() {
+    let loading = TextureLoading { path: "assets/player.png" };
+    let ready = loading.poll();
+    print(ready.width());  // 64
+    print(ready.height()); // 64
+    print(ready.path);     // assets/player.png
+
+    // A real compile error -- uncomment to see it:
+    // print(loading.width());
+
+    print("done");
+}
