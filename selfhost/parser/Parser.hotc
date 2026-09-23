@@ -30,6 +30,15 @@ pub struct FieldBinding {
     bind: String,
 }
 
+// Parser-internal only -- the return shape of `unit_decl` (HC has no tuples, and a `unit`
+// declaration synthesizes THREE separate top-level decls at once: the newtype struct itself, its
+// operator-overload `impl` block, and a free constructor fn). Not part of the real AST.
+pub struct UnitDeclResult {
+    sd: StructDecl,
+    im: ImplDecl,
+    ctor_fn: FnDecl,
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: Int,
@@ -1129,6 +1138,76 @@ impl Parser {
             out.push(ImplDecl { struct_name: sd.name, methods: hash_methods, static_methods: empty_fn_decl_vec(), interface_name: some_string("Hashable"), delegate_field: none_string() });
         }
         return out;
+    }
+
+    // `unit Name(Base);` -- units-as-types: a distinct newtype struct wrapping a numeric
+    // primitive (`Int`/`Long`/`Float`/`Double`), with real `+`/`-`/`*`/`/`/`==` operator overloads
+    // generated automatically (reusing `Checker.hotc`'s own EXISTING operator-overload dispatch --
+    // see that file's own `check_binary` header: a plain struct method named `add`/`sub`/`mul`/
+    // `div`/`eq` already lets `+`/`-`/`*`/`/`/`==` dispatch to it instead of requiring a built-in
+    // numeric type, ZERO Checker.hotc/Codegen.hotc changes needed for this feature at all). The
+    // real payoff: `Ticks + Degrees` is a genuine, checker-caught type error (`check_binary`'s own
+    // `en != rn` mismatch against `add`'s declared `other: Ticks` parameter), not just a naming
+    // convention a caller could still accidentally violate.
+    //
+    // Generates, per `unit Ticks(Int);`:
+    // - `struct Ticks { value: Int }` (`value` is an ordinary, publicly-accessible field, same as
+    //   every other struct field in this subset -- no accessor method needed for reading it back
+    //   out).
+    // - `impl Ticks { fn add(&self, other: &Ticks) -> Ticks { ... } fn sub(...) ... fn eq(...) ...
+    //   fn mul(&self, factor: Int) -> Ticks { ... } fn div(...) ... }` -- `add`/`sub`/`eq` take
+    //   ANOTHER `Ticks` (same-unit arithmetic/equality); `mul`/`div` take a bare `Int` SCALAR
+    //   (`t * 3`, real unit-times-scalar multiplication, not unit-times-unit -- units-of-units
+    //   aren't attempted this pass, see this fn's own scope-cut note below).
+    // - `fn ticks(v: Int) -> Ticks { return Ticks { value: v }; }` -- a free constructor,
+    //   lowercasing the unit's own name. Real, disclosed scope cut versus the brainstormed
+    //   `20.ticks` POSTFIX-LITERAL sugar: that needs a genuine parser-level lookahead keyed off a
+    //   registry of every unit suffix declared so far in THIS file (order-sensitive, since this is
+    //   a single top-to-bottom token-stream pass with no forward declarations) and was judged a
+    //   separate, riskier follow-up rather than bundling it in here -- `ticks(20)` gets the same
+    //   real type-safety win via ordinary, already-proven call syntax.
+    //
+    // Scope cut, disclosed: ordering operators (`<`/`<=`/`>`/`>=`) aren't overloadable at all
+    // under this compiler's existing convention (`operator_method_name`'s own fixed list stops at
+    // `add`/`sub`/`mul`/`div`/`rem`/`eq`) -- comparing two units needs `t1.value < t2.value`
+    // directly, not `t1 < t2`. Only `Int`/`Long`/`Float`/`Double` may be wrapped (validated right
+    // below) -- a `String`/struct-wrapping "unit" isn't a coherent concept for this feature (no
+    // numeric `+`/`-`/`*`/`/` to generate in the first place).
+    fn unit_decl(&mut self) -> UnitDeclResult {
+        self.expect(UNIT);
+        let name = self.expect(IDENT).text;
+        self.expect(LPAREN);
+        let base = self.expect(IDENT).text;
+        self.expect(RPAREN);
+        self.expect(SEMI);
+        if base != "Int" && base != "Long" && base != "Float" && base != "Double" {
+            throw ParseError::new("'unit " + name + "(" + base + ")' -- the wrapped base type must be one of Int, Long, Float, Double, got '" + base + "'");
+        }
+        var fields = empty_param_vec();
+        fields.push(Param { name: "value", type_name: base, is_ref: false, is_mut_ref: false });
+        let mod0 = self.current_module_opt();
+        let sd = StructDecl { name: name, type_param: none_string(), fields: fields, is_arena: false, module_name: mod0, super_class: none_string(), type_param2: none_string() };
+
+        var methods = empty_fn_decl_vec();
+        methods.push(unit_binop_fn("add", "+", name));
+        methods.push(unit_binop_fn("sub", "-", name));
+        methods.push(unit_scale_fn("mul", "*", name, base));
+        methods.push(unit_scale_fn("div", "/", name, base));
+        methods.push(unit_eq_fn(name));
+        let im = ImplDecl { struct_name: name, methods: methods, static_methods: empty_fn_decl_vec(), interface_name: none_string(), delegate_field: none_string() };
+
+        let ctor_name = name.toLowerCase();
+        var ctor_params = empty_param_vec();
+        ctor_params.push(Param { name: "v", type_name: base, is_ref: false, is_mut_ref: false });
+        var ctor_fnames = empty_str_vec();
+        ctor_fnames.push("value");
+        var ctor_fvals = empty_expr_vec();
+        ctor_fvals.push(Ident { name: "v" });
+        var ctor_body = empty_stmt_vec();
+        ctor_body.push(Return { value: some_expr(StructLit { name: name, field_names: ctor_fnames, field_values: ctor_fvals, generic_base: none_string() }), line: 0 });
+        let ctor_fn = FnDecl { name: ctor_name, params: ctor_params, ret_type: some_string(name), body: ctor_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+
+        return UnitDeclResult { sd: sd, im: im, ctor_fn: ctor_fn };
     }
 
     fn block(&mut self) -> Vec<Stmt> {
@@ -2372,7 +2451,7 @@ impl Parser {
             // scattered per-branch rejects below). Positive check (IS it one of the other
             // declaration-kind keywords the loop right below this one dispatches on?) rather than
             // a long negation -- easier to keep in sync with that chain's own real member list.
-            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM);
+            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT);
             if pending_dev && next_is_other_decl_kind {
                 throw ParseError::new("'@dev' is only supported on top-level 'fn' declarations");
             }
@@ -2535,6 +2614,20 @@ impl Parser {
                     throw ParseError::new("doc comments aren't supported on 'system' declarations");
                 }
                 systems.push(self.system_decl(pending_after, pending_before, pending_profile, pending_main_thread, pending_run_if));
+            } else if self.check(UNIT) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'unit' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'unit' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'unit' declarations");
+                }
+                let ud = self.unit_decl();
+                structs.push(ud.sd);
+                impls.push(ud.im);
+                fns.push(ud.ctor_fn);
             } else {
                 let fd = self.fn_decl();
                 if has_pending_annotation {
@@ -2746,6 +2839,51 @@ fn derive_field_hash_expr(f: &Param) -> Expr {
         return Call { callee: "hash_string_hc", args: args };
     }
     return MethodCall { recv: lhs, method: "hash_key", args: empty_expr_vec() };
+}
+
+// `unit_decl`'s own `add`/`sub` -- `fn add(&self, other: &Ticks) -> Ticks { return Ticks { value:
+// self.value + other.value }; }`. `op` is `"+"`/`"-"`, `method_name` the operator-overload
+// method name it dispatches through (`Checker.hotc`'s own `operator_method_name`).
+fn unit_binop_fn(method_name: String, op: String, unit_name: String) -> FnDecl {
+    var params = empty_param_vec();
+    params.push(Param { name: "other", type_name: unit_name, is_ref: true, is_mut_ref: false });
+    let combined = Binary { op: op, left: FieldAccess { obj: Ident { name: "self" }, field: "value" }, right: FieldAccess { obj: Ident { name: "other" }, field: "value" } };
+    var fnames = empty_str_vec();
+    fnames.push("value");
+    var fvals = empty_expr_vec();
+    fvals.push(combined);
+    var body = empty_stmt_vec();
+    body.push(Return { value: some_expr(StructLit { name: unit_name, field_names: fnames, field_values: fvals, generic_base: none_string() }), line: 0 });
+    return FnDecl { name: method_name, params: params, ret_type: some_string(unit_name), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+}
+
+// `unit_decl`'s own `mul`/`div` -- unit-times-SCALAR (`fn mul(&self, factor: Int) -> Ticks {
+// return Ticks { value: self.value * factor }; }`), not unit-times-unit (a units-of-units
+// product, e.g. `Ticks * Ticks -> TicksSquared`, isn't a coherent single-declaration concept and
+// isn't attempted this pass).
+fn unit_scale_fn(method_name: String, op: String, unit_name: String, base: String) -> FnDecl {
+    var params = empty_param_vec();
+    params.push(Param { name: "factor", type_name: base, is_ref: false, is_mut_ref: false });
+    let combined = Binary { op: op, left: FieldAccess { obj: Ident { name: "self" }, field: "value" }, right: Ident { name: "factor" } };
+    var fnames = empty_str_vec();
+    fnames.push("value");
+    var fvals = empty_expr_vec();
+    fvals.push(combined);
+    var body = empty_stmt_vec();
+    body.push(Return { value: some_expr(StructLit { name: unit_name, field_names: fnames, field_values: fvals, generic_base: none_string() }), line: 0 });
+    return FnDecl { name: method_name, params: params, ret_type: some_string(unit_name), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+}
+
+// `unit_decl`'s own `eq` -- `Checker.hotc`'s own operator-overload dispatch always returns `Bool`
+// for `==`/`!=` regardless of this method's own declared return type (see `check_binary`'s own
+// header), so this returning `Bool` here is just honest, not load-bearing for that part.
+fn unit_eq_fn(unit_name: String) -> FnDecl {
+    var params = empty_param_vec();
+    params.push(Param { name: "other", type_name: unit_name, is_ref: true, is_mut_ref: false });
+    let cmp = Binary { op: "==", left: FieldAccess { obj: Ident { name: "self" }, field: "value" }, right: FieldAccess { obj: Ident { name: "other" }, field: "value" } };
+    var body = empty_stmt_vec();
+    body.push(Return { value: some_expr(cmp), line: 0 });
+    return FnDecl { name: "eq", params: params, ret_type: some_string("Bool"), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
 }
 
 // `String` has no built-in `startsWith` in this compiler's own intrinsic set (`length`/

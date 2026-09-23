@@ -1,0 +1,29 @@
+// Units-as-types -- `unit Ticks(Int);` generates a distinct newtype struct plus real,
+// checker-enforced `+`/`-`/`*`/`/`/`==` operator overloads. `Ticks + Degrees` is a genuine
+// compile-time type error, not just a naming convention.
+unit Ticks(Int);
+unit Degrees(Float);
+
+fn main() {
+    let a = ticks(20);
+    let b = ticks(5);
+    let sum = a + b;
+    print(sum.value); // 25
+    let diff = a - b;
+    print(diff.value); // 15
+    let scaled = a * 3;
+    print(scaled.value); // 60
+    let halved = a / 2;
+    print(halved.value); // 10
+    print(a == ticks(20)); // true
+    print(a == b); // false
+
+    let d = degrees(90.0f);
+    let d2 = d + degrees(45.0f);
+    print(d2.value); // 135.0
+
+    // Ticks + Degrees would be a real compile error -- uncomment to see it:
+    // let bad = a + d;
+
+    print("done");
+}

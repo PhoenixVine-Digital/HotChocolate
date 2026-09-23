@@ -658,6 +658,23 @@ building standalone before they do.
 
 ### Units-as-types / dimensional arithmetic
 
+**Status, 2026-09-22 (real, disclosed SUBSET shipped)**: `unit Name(Base);` (`Base` one of `Int`/
+`Long`/`Float`/`Double`) now generates a distinct newtype struct (`struct Name { value: Base }`)
+plus real `+`/`-`/`*`/`/`/`==` operator overloads, reusing `Checker.hotc`'s own EXISTING operator-
+overload dispatch (a plain struct method named `add`/`sub`/`mul`/`div`/`eq` -- see that file's own
+`check_binary` header) -- zero `Checker.hotc`/`Codegen.hotc` changes needed, pure `Parser.hotc`
+AST synthesis (`unit_decl`). `Ticks + Degrees` is a genuine, checker-caught type error (confirmed:
+`'+' on 'Ticks' expects Ticks, got Degrees`), not just a naming convention. **What this is NOT**:
+the full dimensional-analysis vision sketched below (`Meters * Seconds` inferring a NEW derived
+unit type on the fly) -- `mul`/`div` here are unit-times-bare-SCALAR only (`ticks(20) * 3`), never
+unit-times-unit; there's no conversion story between compatible units (`Meters` <-> `Feet`) at all.
+A real, much smaller, real subset: same-family arithmetic (`Ticks + Ticks`, `Ticks * 3`) and
+cross-family rejection, not cross-family COMBINATION. The `Duration`-first motivating case below
+is still open -- this ships the general MECHANISM (any `unit` declaration gets the same treatment)
+rather than that one specific `Duration`/`Instant` pair. Verified with `examples/
+units_as_types.hotc`. Full example regression sweep clean, self-hosting verified to a true fixed
+point.
+
 ```
 let speed: MetersPerSecond = 5.0;
 let time: Seconds = 2.0;
