@@ -81,10 +81,16 @@ pub struct Parser {
     sequence_counter: Int,
     needs_sequence: Bool,
     pending_seq_fns: Vec<FnDecl>,
+    // `@tunable static NAME: Float = value;` -- see `build_tunable_get_fn`'s own header. Every
+    // tunable's own NAME (declaration order), collected as they're parsed anywhere in the file's
+    // own top-level `static` list; `parse_program`'s own tail synthesizes `tunable_get`/
+    // `tunable_set`/`tunable_names` from this list ONLY when it's non-empty (so a program that
+    // never uses `@tunable` gets zero extra generated code).
+    tunable_names: Vec<String>,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec() };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2() };
 }
 
 impl Parser {
@@ -2467,6 +2473,10 @@ impl Parser {
             // same `Vec<String>` "empty means not written at all" convention `pending_after`/
             // `pending_before` right above already use for their own multi-target lists.
             var pending_derive = empty_str_vec2();
+            // `@tunable` -- see `build_tunable_get_fn`'s own header. Bare, like `@must_use`/
+            // `@sendable`; only meaningful on a top-level `static` declared `Float` (checked once
+            // the static itself is parsed, since only THEN is its declared type known).
+            var pending_tunable = false;
             while self.check(AT) {
                 if self.tokens.get(self.pos + 1).kind == STRING {
                     pending_annotation = some_annotation(self.annotation());
@@ -2514,6 +2524,8 @@ impl Parser {
                             pending_derive.push(self.expect(IDENT).text);
                         }
                         self.expect(RPAREN);
+                    } else if directive == "tunable" {
+                        pending_tunable = true;
                     } else {
                         throw ParseError::new("unknown compiler directive '@" + directive + "'");
                     }
@@ -2535,6 +2547,11 @@ impl Parser {
             // right above uses.
             if pending_derive.length() > 0 && !self.check(STRUCT) {
                 throw ParseError::new("'@derive' is only supported on 'struct' declarations");
+            }
+            // `@tunable` is only meaningful on a top-level `static` -- same single-gate shape
+            // `@sendable`/`@derive` right above use.
+            if pending_tunable && !self.check(STATIC) {
+                throw ParseError::new("'@tunable' is only supported on top-level 'static' declarations");
             }
             // `@dev` is only meaningful on a top-level `fn` -- same single-gate shape `@sendable`
             // right above uses (one valid target, checked here, rather than `@must_use`'s own
@@ -2648,7 +2665,14 @@ impl Parser {
                 if has_pending_doc {
                     throw ParseError::new("doc comments aren't supported on top-level 'static' declarations");
                 }
-                statics.push(self.static_decl());
+                let sdecl = self.static_decl();
+                if pending_tunable {
+                    if sdecl.type_name != "Float" {
+                        throw ParseError::new("'@tunable' currently only supports 'Float' statics, got '" + sdecl.name + ": " + sdecl.type_name + "'");
+                    }
+                    self.tunable_names.push(sdecl.name);
+                }
+                statics.push(sdecl);
             } else if self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) {
                 if has_pending_annotation {
                     throw ParseError::new("annotations aren't supported on 'interface' declarations");
@@ -2766,6 +2790,16 @@ impl Parser {
                 fns.push(self.pending_seq_fns.get(sfi));
                 sfi = sfi + 1;
             }
+        }
+        // `@tunable` -- see `tunable_names`'s own header and `build_tunable_get_fn`'s. Only
+        // synthesized when at least one `@tunable static` was actually seen -- a program that
+        // never uses this feature gets zero extra generated code, same discipline `needs_
+        // sequence`/`needs_phoenix` right above already follow.
+        if self.tunable_names.length() > 0 {
+            uses.push("vec");
+            fns.push(build_tunable_get_fn(&self.tunable_names));
+            fns.push(build_tunable_set_fn(&self.tunable_names));
+            fns.push(build_tunable_names_fn(&self.tunable_names));
         }
         return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
@@ -2988,6 +3022,83 @@ fn unit_eq_fn(unit_name: String) -> FnDecl {
     var body = empty_stmt_vec();
     body.push(Return { value: some_expr(cmp), line: 0 });
     return FnDecl { name: "eq", params: params, ret_type: some_string("Bool"), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+}
+
+// `@tunable` -- marks a top-level `static NAME: Float = value;` as live-editable from a debug
+// console/UI by NAME STRING, without recompiling. The real insight this whole feature rides on:
+// a plain HC `static` is ALREADY a genuinely mutable JVM static field (`Checker.hotc`'s own
+// `check_assign` header documents `NAME = value;` falling back to `PUTSTATIC` when `NAME` isn't a
+// local -- proven by real ECS/ownership-tracking statics elsewhere in this compiler's own
+// codegen), so there's no new storage mechanism to build at all -- just a way for code that only
+// has the tunable's NAME AS A STRING (a generic debug console, unaware of any specific tunable at
+// compile time) to reach it. `build_tunable_get_fn`/`build_tunable_set_fn` synthesize a single
+// dispatcher function each -- a flat if-chain comparing the requested name against every
+// `@tunable` static's own name, generated by `parse_program`'s own tail (see `tunable_names`'s
+// header) ONLY once, from every tunable collected across the WHOLE file, regardless of how many
+// there are. `build_tunable_names_fn` gives that same debug console a way to enumerate every
+// registered tunable without hardcoding names either. Zero `Checker.hotc`/`Codegen.hotc`
+// changes -- pure AST synthesis reusing already-proven `Assign`/`If`/`Binary("==")` constructs.
+//
+// Scope cut, disclosed: `Float`-only (validated where `@tunable` is parsed, `parse_program`'s own
+// STATIC branch) -- the overwhelmingly common "balance tuning" case (multipliers, speeds,
+// cooldowns), not a general any-type registry (which would need real type-erasure/boxing
+// machinery this compiler doesn't have a clean story for yet, see `Codegen.hotc`'s own primitive-
+// boxing header on `PhoenixTask::join()`'s similar `Object`-erasure cost). An unknown name passed
+// to `tunable_get` returns `0.0f` silently (no exception) -- `tunable_names()` is the intended
+// way for a caller to know what's actually valid, rather than probing with unknown strings.
+fn build_tunable_get_fn(names: &Vec<String>) -> FnDecl {
+    var params = empty_param_vec();
+    params.push(Param { name: "name", type_name: "String", is_ref: false, is_mut_ref: false });
+    var body = empty_stmt_vec();
+    var i = 0;
+    while i < names.length() {
+        let n = names.get(i);
+        var then_body = empty_stmt_vec();
+        then_body.push(Return { value: some_expr(Ident { name: n }), line: 0 });
+        body.push(If { cond: Binary { op: "==", left: Ident { name: "name" }, right: StringLit { value: n } }, then_body: then_body, else_body: none_stmt_vec(), line: 0, narrow_name: "", narrow_is_eq: false });
+        i = i + 1;
+    }
+    body.push(Return { value: some_expr(FloatLit { text: "0.0" }), line: 0 });
+    return FnDecl { name: "tunable_get", params: params, ret_type: some_string("Float"), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+}
+
+// `build_tunable_get_fn`'s own write-side twin -- `NAME = value;` (`Assign`) is the exact same
+// real `PUTSTATIC` fallback that fn's own header explains, just used to WRITE instead of read.
+fn build_tunable_set_fn(names: &Vec<String>) -> FnDecl {
+    var params = empty_param_vec();
+    params.push(Param { name: "name", type_name: "String", is_ref: false, is_mut_ref: false });
+    params.push(Param { name: "value", type_name: "Float", is_ref: false, is_mut_ref: false });
+    var body = empty_stmt_vec();
+    var i = 0;
+    while i < names.length() {
+        let n = names.get(i);
+        var then_body = empty_stmt_vec();
+        then_body.push(ExprStmt { expr: Assign { name: n, value: Ident { name: "value" } }, line: 0 });
+        then_body.push(Return { value: none_expr(), line: 0 });
+        body.push(If { cond: Binary { op: "==", left: Ident { name: "name" }, right: StringLit { value: n } }, then_body: then_body, else_body: none_stmt_vec(), line: 0, narrow_name: "", narrow_is_eq: false });
+        i = i + 1;
+    }
+    return FnDecl { name: "tunable_set", params: params, ret_type: none_string(), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+}
+
+// Every `@tunable` static's own name, as a real `Vec<String>` -- lets a debug console enumerate
+// what's actually valid to pass to `tunable_get`/`tunable_set` instead of guessing names. `names`
+// is never empty when this is called (`parse_program`'s own tail only synthesizes all three
+// tunable fns together, gated on `self.tunable_names.length() > 0`).
+fn build_tunable_names_fn(names: &Vec<String>) -> FnDecl {
+    var body = empty_stmt_vec();
+    var first_args = empty_expr_vec();
+    first_args.push(StringLit { value: names.get(0) });
+    body.push(Let { name: "v", mutable: true, init: Call { callee: "vec_of", args: first_args }, declared_type: none_string(), line: 0 });
+    var i = 1;
+    while i < names.length() {
+        var push_args = empty_expr_vec();
+        push_args.push(StringLit { value: names.get(i) });
+        body.push(ExprStmt { expr: MethodCall { recv: Ident { name: "v" }, method: "push", args: push_args }, line: 0 });
+        i = i + 1;
+    }
+    body.push(Return { value: some_expr(Ident { name: "v" }), line: 0 });
+    return FnDecl { name: "tunable_names", params: empty_param_vec(), ret_type: some_string("Vec$String"), body: body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
 }
 
 // `String` has no built-in `startsWith` in this compiler's own intrinsic set (`length`/

@@ -999,6 +999,36 @@ somewhere to actually put captured locals, which is the same missing
 piece those other entries are waiting on. Revisit together with
 closures, not before.
 
+### `@tunable` -- live-editable debug constants
+
+**Status, 2026-09-22 (real, disclosed SUBSET shipped)**: `@tunable static SPEED_MULT: Float =
+1.5f;` marks a top-level `static` as reachable by NAME STRING from a debug console/UI, without
+recompiling. The real insight this rode on: a plain HC `static` is ALREADY a genuinely mutable
+JVM static field (`NAME = value;` falls back to a real `PUTSTATIC` when `NAME` isn't a local --
+`Checker.hotc`'s own `check_assign` header), so there was no new storage mechanism to build at
+all -- just a way for code that only has the tunable's name AS A STRING to reach it.
+`Parser.hotc`'s own `parse_program` tail synthesizes exactly three functions, ONCE per file, from
+every `@tunable` collected across the whole file (`build_tunable_get_fn`/`build_tunable_set_fn`/
+`build_tunable_names_fn`): `tunable_get(name: String) -> Float`/`tunable_set(name: String, value:
+Float)` (each a flat if-chain comparing `name` against every tunable's own name, dispatching to
+an ordinary `Ident`/`Assign` on the real static) and `tunable_names() -> Vec<String>` (so a debug
+console can enumerate what's valid without hardcoding). Zero `Checker.hotc`/`Codegen.hotc`
+changes -- pure AST synthesis reusing already-proven constructs, same strategy `@derive`/`unit`/
+`sequence` all already established. Verified with `examples/tunable_constants.hotc`: writing
+through `tunable_set` genuinely changes the real static (confirmed by reading it back BOTH
+through `tunable_get` and by naming it directly), and an unknown name/wrong-typed static both hit
+their own disclosed, real error paths. Full example regression sweep clean, self-hosting verified
+to a true fixed point.
+
+Real, disclosed scope cut: `Float`-only (the overwhelmingly common "balance tuning" case --
+multipliers, speeds, cooldowns), not a general any-type registry, which would need real type-
+erasure/boxing machinery this compiler doesn't have a clean story for yet (see `Codegen.hotc`'s
+own `PhoenixTask::join()` header on that exact `Object`-erasure cost elsewhere). An unknown name
+passed to `tunable_get` returns `0.0f` silently rather than throwing -- `tunable_names()` is the
+intended way to know what's actually valid. No actual in-game debug-console UI is part of this
+pass either -- that's a real, separate follow-up (a window/graphics-topic feature) that would
+consume `tunable_get`/`tunable_set`/`tunable_names` as its own backend.
+
 ### State machine syntax
 
 ```
