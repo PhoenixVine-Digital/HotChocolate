@@ -1736,6 +1736,7 @@ impl CodeGen {
                 self.collect_lambda_captures(value, exclude, out);
             }
             Index { arr, index } => { self.collect_lambda_captures(arr, exclude, out); self.collect_lambda_captures(index, exclude, out); }
+            Slice { arr, start, end, inclusive } => { self.collect_lambda_captures(arr, exclude, out); self.collect_lambda_captures(start, exclude, out); self.collect_lambda_captures(end, exclude, out); }
             IndexAssign { arr, index, value } => { self.collect_lambda_captures(arr, exclude, out); self.collect_lambda_captures(index, exclude, out); self.collect_lambda_captures(value, exclude, out); }
             StaticCall { type_name, method, args } => { self.collect_lambda_captures_list(args, exclude, out); }
             ExternStaticFieldGet { type_name, field } => { }
@@ -2972,6 +2973,45 @@ impl CodeGen {
                 let elem = array_elem_type_name_cg(at);
                 self.mv.visitInsn(array_load_opcode_cg(elem));
                 return elem;
+            }
+            Slice { arr, start, end, inclusive } => {
+                let at = self.gen_expr(arr); // pushes arrayref
+                if !is_array_type_name_cg(at) {
+                    throw CodegenError::new("codegen: cannot slice non-array type '" + at + "'");
+                }
+                let elem = array_elem_type_name_cg(at);
+                self.gen_expr(start); // stack: [arrayref, from]
+                self.gen_expr(end); // stack: [arrayref, from, to]
+                if inclusive {
+                    self.mv.visitInsn(4); // ICONST_1
+                    self.mv.visitInsn(96); // IADD -- inclusive end -> exclusive "to"
+                }
+                // `java.util.Arrays.copyOfRange` -- real, disclosed reason this returns a genuine
+                // COPY, not a view (see `Ast.hc`'s own `Expr.Slice` header): the JDK has one typed
+                // overload per real primitive array type this compiler ever emits (`int[]`/`long[]`/
+                // `float[]`/`double[]`/`byte[]`/`char[]`; `Bool` shares `int[]`'s, same as everywhere
+                // else in this file), plus one generic `<T> T[] copyOfRange(T[], int, int)` overload
+                // for every reference element type, which returns the correctly-typed array at
+                // runtime (it inspects `original.getClass()` internally) but is erased to `Object[]`
+                // at the bytecode level -- so a `CHECKCAST` back to the real array descriptor is
+                // needed for the JVM verifier, exactly like `gen_cast`'s own struct/enum branch.
+                if elem == "Long" {
+                    self.mv.visitMethodInsn(184, "java/util/Arrays", "copyOfRange", "([JII)[J", false);
+                } else if elem == "Float" {
+                    self.mv.visitMethodInsn(184, "java/util/Arrays", "copyOfRange", "([FII)[F", false);
+                } else if elem == "Double" {
+                    self.mv.visitMethodInsn(184, "java/util/Arrays", "copyOfRange", "([DII)[D", false);
+                } else if elem == "Byte" {
+                    self.mv.visitMethodInsn(184, "java/util/Arrays", "copyOfRange", "([BII)[B", false);
+                } else if elem == "Char" {
+                    self.mv.visitMethodInsn(184, "java/util/Arrays", "copyOfRange", "([CII)[C", false);
+                } else if is_ref_type(elem) {
+                    self.mv.visitMethodInsn(184, "java/util/Arrays", "copyOfRange", "([Ljava/lang/Object;II)[Ljava/lang/Object;", false);
+                    self.mv.visitTypeInsn(192, self.resolve_descriptor(at)); // CHECKCAST back to the real array type
+                } else {
+                    self.mv.visitMethodInsn(184, "java/util/Arrays", "copyOfRange", "([III)[I", false); // Int/Bool
+                }
+                return at;
             }
             IndexAssign { arr, index, value } => {
                 let at = self.gen_expr(arr); // stack: [arrayref]
@@ -6798,6 +6838,7 @@ fn subst_expr_cg(e: &Expr, type_param: String, arg: String) -> Expr {
         ArrayRepeat { value, count } => { return ArrayRepeat { value: subst_expr_cg(value, type_param, arg), count: subst_expr_cg(count, type_param, arg) }; }
         ArenaNew { struct_name, count } => { return ArenaNew { struct_name: struct_name, count: subst_expr_cg(count, type_param, arg) }; }
         Index { arr, index } => { return Index { arr: subst_expr_cg(arr, type_param, arg), index: subst_expr_cg(index, type_param, arg) }; }
+        Slice { arr, start, end, inclusive } => { return Slice { arr: subst_expr_cg(arr, type_param, arg), start: subst_expr_cg(start, type_param, arg), end: subst_expr_cg(end, type_param, arg), inclusive: inclusive }; }
         IndexAssign { arr, index, value } => { return IndexAssign { arr: subst_expr_cg(arr, type_param, arg), index: subst_expr_cg(index, type_param, arg), value: subst_expr_cg(value, type_param, arg) }; }
         IndexFieldGet { arr_name, index, field } => { return IndexFieldGet { arr_name: arr_name, index: subst_expr_cg(index, type_param, arg), field: field }; }
         IndexFieldSet { arr_name, index, field, value } => { return IndexFieldSet { arr_name: arr_name, index: subst_expr_cg(index, type_param, arg), field: field, value: subst_expr_cg(value, type_param, arg) }; }

@@ -640,8 +640,16 @@ impl Parser {
             } else if self.check(LBRACKET) {
                 self.advance();
                 let idx = self.expression();
-                self.expect(RBRACKET);
-                expr = Index { arr: expr, index: idx };
+                if self.check(DOTDOT) || self.check(DOTDOTEQ) {
+                    let inclusive = self.check(DOTDOTEQ);
+                    self.advance();
+                    let end = self.expression();
+                    self.expect(RBRACKET);
+                    expr = Slice { arr: expr, start: idx, end: end, inclusive: inclusive };
+                } else {
+                    self.expect(RBRACKET);
+                    expr = Index { arr: expr, index: idx };
+                }
             } else if self.check(QUESTION) && self.tokens.get(self.pos + 1).kind == DOT {
                 // `x?.field` / `x?.method(args)` -- safe navigation. See `Ast.hc`'s own
                 // `Expr.SafeCall`/`Expr.SafeFieldAccess` header. Consumed HERE, inside the ordinary

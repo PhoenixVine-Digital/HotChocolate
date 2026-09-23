@@ -1,0 +1,38 @@
+// Array slicing -- `arr[start..end]` (exclusive) / `arr[start..=end]` (inclusive) produces a NEW
+// array (a real copy, since this language's arrays are real JVM arrays with no sub-range-view
+// concept) holding the same element type. Works for primitive-element arrays and reference-element
+// (struct) arrays alike.
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+fn sum_ints(arr: [Int]) -> Int {
+    var total = 0;
+    for i in 0..arr.length {
+        total = total + arr[i];
+    }
+    return total;
+}
+
+fn main() {
+    let nums = [10, 20, 30, 40, 50];
+    let mid = nums[1..4]; // [20, 30, 40]
+    print("mid sum: {sum_ints(mid)}");
+
+    let mid_inclusive = nums[1..=3]; // [20, 30, 40]
+    print("mid_inclusive sum: {sum_ints(mid_inclusive)}");
+
+    let head = nums[0..2]; // [10, 20]
+    print("head len: {head.length}, head[0]: {head[0]}, head[1]: {head[1]}");
+
+    let letters = ['a', 'b', 'c', 'd', 'e'];
+    let mid_chars = letters[1..3];
+    print("mid_chars len: {mid_chars.length}, mid_chars[0]: {mid_chars[0]}");
+
+    let pts = [Point { x: 1, y: 1 }, Point { x: 2, y: 2 }, Point { x: 3, y: 3 }];
+    let pts_slice = pts[1..3];
+    print("pts_slice len: {pts_slice.length}, pts_slice[0].x: {pts_slice[0].x}, pts_slice[1].y: {pts_slice[1].y}");
+
+    print("done");
+}

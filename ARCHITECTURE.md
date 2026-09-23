@@ -134,6 +134,34 @@ right now against `./gradlew run --args="run examples/<file>.hc"`:
   `) doesn't confuse the scan. `Byte` still has no literal syntax
   (matches Java's own lack of one — only reachable via `as Byte`), a
   disclosed, intentional scope cut, not an oversight.
+- **Added 2026-09-23**: array slicing, `arr[start..end]` (exclusive) /
+  `arr[start..=end]` (inclusive), producing a NEW array (a real copy —
+  this language's arrays are real JVM arrays with no sub-range-view
+  concept). A dedicated `Expr::Slice { arr, start, end, inclusive }` AST
+  node rather than promoting `a..b` to a general `Range` expr (`Ast.hc`'s
+  own `Stmt::For` header already explains why range stays non-general —
+  giving it one would cost a match arm in every OTHER `Expr` site); this
+  is the one other place a range-shaped thing is legal, so it gets the
+  same narrow treatment. Parsed in `postfix_loop`'s `[`-branch by peeking
+  for `DOTDOT`/`DOTDOTEQ` right after the first bracketed expression — no
+  lexer change needed, both tokens already existed for `for`-loop ranges.
+  Unlike every other feature shipped this session, this one isn't pure
+  Parser-level desugaring: `Checker.hotc` gained a real `check_slice`
+  (mirrors `check_index`, but returns the array's own type, not the
+  element type), and `Codegen.hotc` gained a real new codegen path —
+  `java.util.Arrays.copyOfRange`, dispatched to the correct typed
+  overload per real primitive array element (`int[]`/`long[]`/`float[]`/
+  `double[]`/`byte[]`/`char[]`; `Bool` shares `int[]`'s the same as
+  everywhere else in this file) or the generic reference-type overload
+  (erased to `Object[]`, needing a `CHECKCAST` back to the real array
+  descriptor for the verifier — same mechanism `gen_cast`'s own
+  struct/enum branch already uses). Verified against both a primitive
+  (`Int`), a `Char`, and a reference (struct array of `Point`) element
+  type in `examples/array_slicing.hotc` — the struct-array case exercises
+  the `CHECKCAST` path specifically. Not a valid assignment target
+  (`arr[a..b] = x` correctly falls through `assignment`'s existing
+  wildcard case to "Invalid assignment target" — slicing only ever
+  reads).
 - **Fixed 2026-09-03**: `is` runtime type checks (`expr is Type`) —
   `is` was lexed as a keyword but never consumed anywhere in the
   parser. Ported as a new `Expr.IsCheck` AST node sharing `as`'s own

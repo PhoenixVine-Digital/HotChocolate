@@ -1368,6 +1368,7 @@ fn check_deterministic_expr(e: &Expr, fn_name: String) {
         ArrayLit { elements } => { check_deterministic_expr_list(&elements, fn_name); }
         ArrayRepeat { value, count } => { check_deterministic_expr(&value, fn_name); check_deterministic_expr(&count, fn_name); }
         Index { arr, index } => { check_deterministic_expr(&arr, fn_name); check_deterministic_expr(&index, fn_name); }
+        Slice { arr, start, end, inclusive } => { check_deterministic_expr(&arr, fn_name); check_deterministic_expr(&start, fn_name); check_deterministic_expr(&end, fn_name); }
         IndexAssign { arr, index, value } => { check_deterministic_expr(&arr, fn_name); check_deterministic_expr(&index, fn_name); check_deterministic_expr(&value, fn_name); }
         IndexFieldGet { arr_name, index, field } => { check_deterministic_expr(&index, fn_name); }
         IndexFieldSet { arr_name, index, field, value } => { check_deterministic_expr(&index, fn_name); check_deterministic_expr(&value, fn_name); }

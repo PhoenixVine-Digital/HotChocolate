@@ -119,6 +119,15 @@ pub enum Expr {
     IndexFieldSet { arr_name: String, index: Expr, field: String, value: Expr },
     Index { arr: Expr, index: Expr },
     IndexAssign { arr: Expr, index: Expr, value: Expr },
+    // `arr[start..end]` / `arr[start..=end]` -- array slicing, produces a NEW array of the same
+    // element type (a real copy, not a view -- this compiler's arrays are real JVM arrays, which
+    // have no sub-range-view concept). Its own dedicated `Expr` variant rather than reusing a
+    // general `Range` expr, for the exact reason `For`'s own header (right below) already gives
+    // for NOT giving range a general `Expr` variant: this is the one other place a range-shaped
+    // thing is legal, so it gets its own narrow, disclosed shape here too instead of costing every
+    // other `Expr` match everywhere a `Range` arm nobody else needs. Not a valid assignment target
+    // (see `Parser.hotc`'s own `assignment`'s wildcard case) -- slicing only ever reads.
+    Slice { arr: Expr, start: Expr, end: Expr, inclusive: Bool },
     // `Alias::new(args)` (a constructor call) or `Alias::method(args)` (a real static method) --
     // distinguished by name lookup (`method == "new"`) at check/codegen time, not by parsing, same
     // as how `StructLit` doesn't distinguish plain-struct from enum-variant construction in the

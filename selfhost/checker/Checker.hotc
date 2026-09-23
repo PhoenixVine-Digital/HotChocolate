@@ -977,6 +977,7 @@ fn subst_expr(e: &Expr, type_param: String, arg: String) -> Expr {
         ArenaNew { struct_name, count } => { return ArenaNew { struct_name: struct_name, count: subst_expr(count, type_param, arg) }; }
         Index { arr, index } => { return Index { arr: subst_expr(arr, type_param, arg), index: subst_expr(index, type_param, arg) }; }
         IndexAssign { arr, index, value } => { return IndexAssign { arr: subst_expr(arr, type_param, arg), index: subst_expr(index, type_param, arg), value: subst_expr(value, type_param, arg) }; }
+        Slice { arr, start, end, inclusive } => { return Slice { arr: subst_expr(arr, type_param, arg), start: subst_expr(start, type_param, arg), end: subst_expr(end, type_param, arg), inclusive: inclusive }; }
         IndexFieldGet { arr_name, index, field } => { return IndexFieldGet { arr_name: arr_name, index: subst_expr(index, type_param, arg), field: field }; }
         IndexFieldSet { arr_name, index, field, value } => { return IndexFieldSet { arr_name: arr_name, index: subst_expr(index, type_param, arg), field: field, value: subst_expr(value, type_param, arg) }; }
         StaticCall { type_name, method, args } => { return StaticCall { type_name: substitute_field_type(type_name, type_param, arg), method: method, args: subst_expr_list(args, type_param, arg) }; }
@@ -1128,6 +1129,7 @@ impl TyChecker {
             ArenaNew { struct_name, count } => { return self.check_arena_new(struct_name, count); }
             Index { arr, index } => { return self.check_index(arr, index); }
             IndexAssign { arr, index, value } => { return self.check_index_assign(arr, index, value); }
+            Slice { arr, start, end, inclusive } => { return self.check_slice(arr, start, end); }
             IndexFieldGet { arr_name, index, field } => { return self.check_index_field_get(arr_name, index, field); }
             IndexFieldSet { arr_name, index, field, value } => { return self.check_index_field_set(arr_name, index, field, value); }
             StaticCall { type_name, method, args } => { return self.check_static_call(type_name, method, args); }
@@ -1512,6 +1514,34 @@ impl TyChecker {
             return TyUnknown;
         }
         return ty_from_name(array_elem_type_name(an));
+    }
+
+    // `arr[start..end]` -- see `Ast.hc`'s own `Expr.Slice` header. Unlike `check_index`, which
+    // returns the ELEMENT type, this returns the SAME array type `arr` itself has: slicing yields
+    // a new array, not a single element.
+    fn check_slice(&mut self, arr: &Expr, start: &Expr, end: &Expr) -> Ty {
+        let at = self.check_expr(arr);
+        let an = ty_name(at);
+        let st = self.check_expr(start);
+        let sn = ty_name(st);
+        if sn != "Int" && sn != "?" {
+            self.error("slice start must be Int, got " + sn);
+        }
+        let et = self.check_expr(end);
+        let en = ty_name(et);
+        if en != "Int" && en != "?" {
+            self.error("slice end must be Int, got " + en);
+        }
+        if an == "?" { return TyUnknown; }
+        if is_arena_type_name_chk(an) {
+            self.error("cannot slice a raw off-heap value");
+            return TyUnknown;
+        }
+        if !is_array_type_name(an) {
+            self.error("type '" + an + "' is not an array, can't slice it");
+            return TyUnknown;
+        }
+        return ty_from_name(an);
     }
 
     // `for var_name in a..b { }` / `for var_name in arr_expr { }` -- see `Ast.hc`'s own `Stmt::For`

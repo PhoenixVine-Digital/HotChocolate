@@ -40,6 +40,11 @@ fn dump_expr(e: Expr) -> String {
         ArrayLit { elements } => { return "[" + dump_args(elements) + "]"; }
         ArrayRepeat { value, count } => { return "[" + dump_expr(value) + "; " + dump_expr(count) + "]"; }
         Index { arr, index } => { return dump_expr(arr) + "[" + dump_expr(index) + "]"; }
+        Slice { arr, start, end, inclusive } => {
+            var sep = "..";
+            if inclusive { sep = "..="; }
+            return dump_expr(arr) + "[" + dump_expr(start) + sep + dump_expr(end) + "]";
+        }
         IndexAssign { arr, index, value } => { return dump_expr(arr) + "[" + dump_expr(index) + "] = " + dump_expr(value); }
         IndexFieldGet { arr_name, index, field } => { return arr_name + "[" + dump_expr(index) + "]." + field; }
         IndexFieldSet { arr_name, index, field, value } => { return arr_name + "[" + dump_expr(index) + "]." + field + " = " + dump_expr(value); }

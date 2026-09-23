@@ -1172,6 +1172,37 @@ somewhere to actually put captured locals, which is the same missing
 piece those other entries are waiting on. Revisit together with
 closures, not before.
 
+### Array slicing (`arr[start..end]` / `arr[start..=end]`)
+
+**Status, 2026-09-23 (shipped)**: `arr[1..4]` (exclusive) / `arr[1..=3]` (inclusive) produces a
+NEW array, a real copy -- this compiler's arrays are real JVM arrays, so there's no sub-range
+"view" concept to give instead. Unlike almost everything else shipped this session, this one is
+NOT pure Parser-level desugaring: `a..b` was deliberately kept OUT of the general `Expr` grammar
+(see `Ast.hc`'s own `Stmt::For` header -- giving range a general `Expr` variant would cost a match
+arm in every other `Expr` site across all four files, for a shape that's legal almost nowhere).
+Slicing is the one other place a range-shaped thing is legal, so it got the same treatment as
+`IndexFieldGet` before it: its own dedicated, narrow `Expr::Slice { arr, start, end, inclusive }`
+node instead of promoting `Range` to something general. Parsed in `Parser.hotc`'s own
+`postfix_loop`, peeking for `DOTDOT`/`DOTDOTEQ` right after the first bracketed expression -- no
+lexer change, both tokens already existed for `for`-loop ranges. `Checker.hotc` gained a real
+`check_slice` (mirrors `check_index`, but returns the array's own type rather than the element
+type). `Codegen.hotc` gained a genuinely new codegen path: `java.util.Arrays.copyOfRange`,
+dispatched to the correct typed overload per real primitive array element this compiler ever
+emits (`int[]`/`long[]`/`float[]`/`double[]`/`byte[]`/`char[]`; `Bool` shares `int[]`'s the same as
+everywhere else in this file) or the generic reference-type overload for a struct/String element
+array (erased to `Object[]` at the bytecode level, needing a `CHECKCAST` back to the real array
+descriptor for the verifier -- same mechanism `gen_cast`'s own struct/enum branch already uses).
+Verified in `examples/array_slicing.hotc` against an `Int` array, a `Char` array, and a struct
+(`Point`) array -- the struct case specifically exercises the `CHECKCAST` path, and all three
+hand-verified correct. `arr[a..b] = x` is not a valid assignment target -- `Parser.hotc`'s own
+`assignment` already falls through to "Invalid assignment target" for any `Expr` shape it doesn't
+explicitly list, so this needed no new code to reject, only NOT adding a `Slice` arm there. Full
+example regression sweep: zero new failures (the flagged cases were all pre-existing/unrelated --
+two interactive stdin-reading examples that only fail non-interactively, a scratch file with no
+`main`, the two known JDK-21-target virtual-thread examples that need a direct JDK 21 `java`
+invocation rather than `./gradlew run`'s own default toolchain, and one slow-but-passing example
+that only tripped a conservative sweep timeout). Self-hosting verified to a true fixed point.
+
 ### `@tunable` -- live-editable debug constants
 
 **Status, 2026-09-22 (real, disclosed SUBSET shipped)**: `@tunable static SPEED_MULT: Float =
