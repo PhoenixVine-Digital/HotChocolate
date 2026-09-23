@@ -1,0 +1,35 @@
+// `@deterministic` -- direct calls to known non-deterministic operations (random_new/nanoTime/
+// currentTimeMillis) are real compile errors; all randomness must be received as a parameter.
+// `@derive(Snapshot)` -- real rewind: `snapshot()` captures state, `restore()` rewinds to it.
+use random;
+
+@derive(Snapshot)
+struct SimState {
+    hp: Int,
+    pos_x: Int,
+}
+
+@deterministic
+fn simulate_tick(sim: SimState, rng: &Random, roll_bound: Int) -> SimState {
+    let roll = rng.int(0, roll_bound);
+    return SimState { hp: sim.hp - roll, pos_x: sim.pos_x + 1 };
+}
+
+fn main() {
+    let rng = random_new(42L);
+    var sim = SimState { hp: 100, pos_x: 0 };
+
+    let saved = sim.snapshot();
+
+    sim = simulate_tick(sim, &rng, 5);
+    sim = simulate_tick(sim, &rng, 5);
+    print(sim.hp);
+    print(sim.pos_x);
+
+    // Rewind back to the saved snapshot -- real state restoration.
+    sim.restore(&saved);
+    print(sim.hp);  // 100 again
+    print(sim.pos_x); // 0 again
+
+    print("done");
+}

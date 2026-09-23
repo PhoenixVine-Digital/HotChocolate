@@ -1115,6 +1115,7 @@ impl Parser {
         var out = empty_impl_decl_vec();
         var wants_eq = false;
         var wants_hash = false;
+        var wants_snapshot = false;
         var ki = 0;
         while ki < kinds.length() {
             let k = kinds.get(ki);
@@ -1122,8 +1123,10 @@ impl Parser {
                 wants_eq = true;
             } else if k == "Hash" {
                 wants_hash = true;
+            } else if k == "Snapshot" {
+                wants_snapshot = true;
             } else {
-                throw ParseError::new("'@derive(" + k + ")' isn't supported -- only 'Eq' and 'Hash' can be derived");
+                throw ParseError::new("'@derive(" + k + ")' isn't supported -- only 'Eq', 'Hash', and 'Snapshot' can be derived");
             }
             ki = ki + 1;
         }
@@ -1169,6 +1172,38 @@ impl Parser {
             var hash_methods = empty_fn_decl_vec();
             hash_methods.push(FnDecl { name: "hash_key", params: empty_param_vec(), ret_type: some_string("Int"), body: hash_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
             out.push(ImplDecl { struct_name: sd.name, methods: hash_methods, static_methods: empty_fn_decl_vec(), interface_name: some_string("Hashable"), delegate_field: none_string() });
+        }
+        // `@derive(Snapshot)` -- rewind support for `@deterministic` simulation state (see
+        // `IDEAS.md`'s own "`@deterministic` + replay/rewind" entry). `snapshot(&self) -> Self`
+        // builds a fresh copy field by field (a real, shallow copy -- a reference-typed field
+        // copies the REFERENCE, not a deep clone of whatever it points to, same disclosed
+        // shallowness `@derive(Eq, Hash)`'s own field-by-field dispatch already has for nested
+        // struct fields); `restore(&mut self, snap: &Self)` writes every field of `snap` back
+        // onto `self` in place. Together: `let saved = state.snapshot(); ...simulate...; state.
+        // restore(&saved);` genuinely rewinds `state` to exactly what it held at the snapshot
+        // point. Not an interface (`Eq`/`Hashable` are real, both declared in `stdlib/
+        // collections.hotc` -- there's no equivalent "Snapshot" interface anywhere, so this is
+        // just two plain inherent methods, `interface_name: None`).
+        if wants_snapshot {
+            var snap_fnames = empty_str_vec();
+            var snap_fvals = empty_expr_vec();
+            var restore_body = empty_stmt_vec();
+            var fi2 = 0;
+            while fi2 < sd.fields.length() {
+                let f2 = sd.fields.get(fi2);
+                snap_fnames.push(f2.name);
+                snap_fvals.push(FieldAccess { obj: Ident { name: "self" }, field: f2.name });
+                restore_body.push(ExprStmt { expr: FieldAssign { obj: Ident { name: "self" }, field: f2.name, value: FieldAccess { obj: Ident { name: "snap" }, field: f2.name } }, line: 0 });
+                fi2 = fi2 + 1;
+            }
+            var snap_body = empty_stmt_vec();
+            snap_body.push(Return { value: some_expr(StructLit { name: sd.name, field_names: snap_fnames, field_values: snap_fvals, generic_base: none_string() }), line: 0 });
+            var restore_params = empty_param_vec();
+            restore_params.push(Param { name: "snap", type_name: sd.name, is_ref: true, is_mut_ref: false });
+            var snap_methods = empty_fn_decl_vec();
+            snap_methods.push(FnDecl { name: "snapshot", params: empty_param_vec(), ret_type: some_string(sd.name), body: snap_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
+            snap_methods.push(FnDecl { name: "restore", params: restore_params, ret_type: none_string(), body: restore_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: true, type_param2: none_string(), type_bounds2: empty_str_vec() });
+            out.push(ImplDecl { struct_name: sd.name, methods: snap_methods, static_methods: empty_fn_decl_vec(), interface_name: none_string(), delegate_field: none_string() });
         }
         return out;
     }
@@ -2452,6 +2487,7 @@ impl Parser {
         var fn_annotation_data = empty_annotation_vec();
         var must_use_fn_names = empty_str_vec();
         var dev_fn_names = empty_str_vec();
+        var deterministic_fn_names = empty_str_vec();
         var struct_doc_names = empty_str_vec();
         var struct_doc_data = empty_doc_comment_vec();
         var fn_doc_names = empty_str_vec();
@@ -2518,6 +2554,9 @@ impl Parser {
             // right below, rather than `@must_use`'s own scattered per-branch rejects -- same
             // practical effect, less repetition).
             var pending_dev = false;
+            // `@deterministic` -- see `Ast.hc`'s own `Program.deterministic_fn_names` header.
+            // Same bare-directive shape/gate as `@dev` right above.
+            var pending_deterministic = false;
             // `@sendable` -- see `Ast.hc`'s own `Program.sendable_struct_names` header. Same bare-
             // directive distinction as `@must_use` right below, and same "only on struct" gate as
             // Phoenix Flight's own `PhoenixPool::spawn` needs to actually check anything -- see
@@ -2576,6 +2615,8 @@ impl Parser {
                     let directive = self.directive();
                     if directive == "must_use" {
                         pending_must_use = true;
+                    } else if directive == "deterministic" {
+                        pending_deterministic = true;
                     } else if directive == "sendable" {
                         pending_sendable = true;
                     } else if directive == "after" {
@@ -2654,6 +2695,9 @@ impl Parser {
             var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE);
             if pending_dev && next_is_other_decl_kind {
                 throw ParseError::new("'@dev' is only supported on top-level 'fn' declarations");
+            }
+            if pending_deterministic && next_is_other_decl_kind {
+                throw ParseError::new("'@deterministic' is only supported on top-level 'fn' declarations");
             }
             // `@requires`/`@ensures` are only meaningful on a top-level `fn` -- same gate `@dev`
             // right above uses.
@@ -2875,6 +2919,9 @@ impl Parser {
                 if pending_dev {
                     dev_fn_names.push(fd.name);
                 }
+                if pending_deterministic {
+                    deterministic_fn_names.push(fd.name);
+                }
                 if has_pending_doc {
                     if let Some { value: docv2 } = pending_doc {
                         fn_doc_names.push(fd.name);
@@ -2935,7 +2982,7 @@ impl Parser {
             ctor_methods.push(ExternMethod { name: "new", params: ctor_params, ret_type: "Self", is_static: false, is_ctor: true });
             externs.push(ExternClassDecl { name: "ContractError", binary_name: "java.lang.RuntimeException", methods: ctor_methods, fields: empty_extern_field_vec(), is_interface: false });
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources };
     }
 
     // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field

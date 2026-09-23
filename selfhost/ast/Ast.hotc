@@ -907,6 +907,15 @@ pub struct Program {
     // `Driver.hotc`'s own `strip_dev_code` is the only reader: in a release build, every fn named
     // here is dropped from `Program.fns` entirely before the checker/codegen ever see it.
     dev_fn_names: Vec<String>,
+    // `@deterministic fn simulate_tick(...) { ... }` -- see `IDEAS.md`'s own "`@deterministic` +
+    // replay/rewind" entry. Same bare-directive side-channel shape `dev_fn_names`/`must_use_fn_
+    // names` above already use. `Driver.hotc`'s own `check_deterministic_fns` is the only reader:
+    // a standalone diagnostic pass (mirrors `check_assets`'s own shape exactly), walking every
+    // named fn's own body for a small, explicit blocklist of known non-deterministic operations
+    // (`random_new`, `nanoTime`, `currentTimeMillis`) -- a real, disclosed narrower scope than a
+    // full taint analysis: only catches a DIRECT call to one of these, not one hidden behind an
+    // un-annotated helper fn.
+    deterministic_fn_names: Vec<String>,
     // `/// ...` immediately before a top-level `struct` or `fn` -- see README's own "Structured
     // doc comments" section. Same flat-side-channel reasoning as `struct_annotation_names`/
     // `must_use_fn_names` above -- `Checker.hotc`'s own `check_doc_sees` (a pass at the very end

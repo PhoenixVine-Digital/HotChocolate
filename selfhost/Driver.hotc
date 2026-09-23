@@ -646,6 +646,9 @@ pub fn run_cli(args: [String]) {
     // block that a release build already dropped should never be checked at all (it will never
     // actually compile in), not flagged as a false positive.
     check_assets(&prog, assets_dir);
+    // Runs AFTER `strip_dev_code` too, same reasoning: a `@deterministic` fn that got dropped
+    // entirely in a release build (it was ALSO `@dev`) should never be checked either.
+    check_deterministic_fns(&prog);
 
     // See `name_collides_with_decl`'s own header, right above `parse_directory`: the entry class
     // name is mangled -- ONLY when it would otherwise collide -- never a struct's own name (which
@@ -1025,6 +1028,7 @@ fn merge_program(a: Program, b: Program) -> Program {
         extend_decls: merge_extend_decl_vec(a.extend_decls, b.extend_decls),
         must_use_fn_names: merge_str_vec(a.must_use_fn_names, b.must_use_fn_names),
         dev_fn_names: merge_str_vec(a.dev_fn_names, b.dev_fn_names),
+        deterministic_fn_names: merge_str_vec(a.deterministic_fn_names, b.deterministic_fn_names),
         struct_doc_names: merge_str_vec(a.struct_doc_names, b.struct_doc_names),
         struct_doc_data: merge_doc_comment_vec(a.struct_doc_data, b.struct_doc_data),
         fn_doc_names: merge_str_vec(a.fn_doc_names, b.fn_doc_names),
@@ -1145,7 +1149,7 @@ fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
         new_systems.push(SystemDecl { name: sysd.name, run_params: sysd.run_params, run_body: strip_dev_blocks_list(sysd.run_body, dev_mode), after: sysd.after, before: sysd.before, has_profile: sysd.has_profile, has_main_thread: sysd.has_main_thread, run_if: sysd.run_if });
         si = si + 1;
     }
-    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources };
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources };
 }
 
 // `asset("textures/player.png")` -- see `IDEAS.md`'s own "Compile-time asset existence checks"
@@ -1237,6 +1241,164 @@ fn check_assets_in_stmts(ss: &Vec<Stmt>, assets_dir: String) {
             _ => {}
         }
         i = i + 1;
+    }
+}
+
+// `@deterministic` -- see `IDEAS.md`'s own "`@deterministic` + replay/rewind" entry and `Ast.hc`'s
+// own `Program.deterministic_fn_names` header. A standalone diagnostic pass (mirrors `check_
+// assets`'s own exact shape, called right after it), NOT a `Checker.hotc`/`TyChecker` change --
+// this never needed threading a new field through that struct's own 50-plus-argument constructor
+// (mirroring `must_use_fns`'s own `Registry<Bool>` would have), since this only ever needs to
+// walk each `@deterministic` fn's OWN body once, looking for a small, explicit, named blocklist
+// of known non-deterministic operations (`is_nondeterministic_name`, right below): direct RNG
+// construction (`random_new`, `stdlib/random.hotc`'s own constructor -- a `@deterministic` fn
+// must receive its `Random` as a PARAMETER instead, from a caller who controls the seed) and
+// wall-clock reads (`nanoTime`/`currentTimeMillis`). Real, disclosed narrower scope than a full
+// taint analysis: only catches a DIRECT call to one of these three names, anywhere in the fn's
+// own expression tree (including nested inside `if`/`while`/`match`/etc, unlike `check_assets`'s
+// own shallower top-level-only scan) -- calling an ORDINARY, un-annotated helper fn that itself
+// happens to call `random_new` internally is NOT caught, since that would need tracking which
+// PLAIN fns are transitively non-deterministic too, a real, larger analysis not attempted here.
+fn is_nondeterministic_name(name: String) -> Bool {
+    if name == "random_new" { return true; }
+    if name == "nanoTime" { return true; }
+    if name == "currentTimeMillis" { return true; }
+    return false;
+}
+
+fn check_deterministic_fns(prog: &Program) {
+    var i = 0;
+    while i < prog.fns.length() {
+        let f = prog.fns.get(i);
+        if str_vec_contains(&prog.deterministic_fn_names, f.name) {
+            check_deterministic_stmts(&f.body, f.name);
+        }
+        i = i + 1;
+    }
+}
+
+fn check_deterministic_stmts(ss: &Vec<Stmt>, fn_name: String) {
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Let { name, mutable, init, declared_type, line } => { check_deterministic_expr(&init, fn_name); }
+            ExprStmt { expr, line } => { check_deterministic_expr(&expr, fn_name); }
+            Return { value, line } => {
+                match value {
+                    Some { value: v } => { check_deterministic_expr(&v, fn_name); }
+                    None => {}
+                }
+            }
+            Throw { value, line } => { check_deterministic_expr(&value, fn_name); }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                check_deterministic_expr(&cond, fn_name);
+                check_deterministic_stmts(&then_body, fn_name);
+                match else_body {
+                    Some { value: eb } => { check_deterministic_stmts(&eb, fn_name); }
+                    None => {}
+                }
+            }
+            While { cond, body, line } => {
+                check_deterministic_expr(&cond, fn_name);
+                check_deterministic_stmts(&body, fn_name);
+            }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                check_deterministic_expr(&range_start, fn_name);
+                check_deterministic_expr(&range_end, fn_name);
+                check_deterministic_expr(&arr_expr, fn_name);
+                check_deterministic_stmts(&body, fn_name);
+            }
+            Try { try_block, catches, line } => { check_deterministic_stmts(&try_block, fn_name); }
+            Match { subject, arms, line } => {
+                check_deterministic_expr(&subject, fn_name);
+                var ai = 0;
+                while ai < arms.length() {
+                    check_deterministic_stmts(&arms.get(ai).body, fn_name);
+                    ai = ai + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+fn check_deterministic_expr_list(es: &Vec<Expr>, fn_name: String) {
+    var i = 0;
+    while i < es.length() {
+        check_deterministic_expr(&es.get(i), fn_name);
+        i = i + 1;
+    }
+}
+
+fn check_deterministic_expr(e: &Expr, fn_name: String) {
+    match e {
+        Call { callee, args } => {
+            if is_nondeterministic_name(callee) {
+                throw ParseError::new("'@deterministic' fn '" + fn_name + "' calls '" + callee + "(...)', a known non-deterministic operation -- pass any randomness/time in as a parameter instead");
+            }
+            check_deterministic_expr_list(&args, fn_name);
+        }
+        MethodCall { recv, method, args } => {
+            if is_nondeterministic_name(method) {
+                throw ParseError::new("'@deterministic' fn '" + fn_name + "' calls '." + method + "(...)', a known non-deterministic operation -- pass any randomness/time in as a parameter instead");
+            }
+            check_deterministic_expr(&recv, fn_name);
+            check_deterministic_expr_list(&args, fn_name);
+        }
+        StaticCall { type_name, method, args } => {
+            if is_nondeterministic_name(method) {
+                throw ParseError::new("'@deterministic' fn '" + fn_name + "' calls '" + type_name + "::" + method + "(...)', a known non-deterministic operation -- pass any randomness/time in as a parameter instead");
+            }
+            check_deterministic_expr_list(&args, fn_name);
+        }
+        SafeCall { recv, method, args } => {
+            if is_nondeterministic_name(method) {
+                throw ParseError::new("'@deterministic' fn '" + fn_name + "' calls '?." + method + "(...)', a known non-deterministic operation -- pass any randomness/time in as a parameter instead");
+            }
+            check_deterministic_expr(&recv, fn_name);
+            check_deterministic_expr_list(&args, fn_name);
+        }
+        Binary { op, left, right } => { check_deterministic_expr(&left, fn_name); check_deterministic_expr(&right, fn_name); }
+        Unary { op, expr } => { check_deterministic_expr(&expr, fn_name); }
+        FieldAccess { obj, field } => { check_deterministic_expr(&obj, fn_name); }
+        Assign { name, value } => { check_deterministic_expr(&value, fn_name); }
+        FieldAssign { obj, field, value } => { check_deterministic_expr(&obj, fn_name); check_deterministic_expr(&value, fn_name); }
+        StructLit { name, field_names, field_values, generic_base } => { check_deterministic_expr_list(&field_values, fn_name); }
+        ArrayLit { elements } => { check_deterministic_expr_list(&elements, fn_name); }
+        ArrayRepeat { value, count } => { check_deterministic_expr(&value, fn_name); check_deterministic_expr(&count, fn_name); }
+        Index { arr, index } => { check_deterministic_expr(&arr, fn_name); check_deterministic_expr(&index, fn_name); }
+        IndexAssign { arr, index, value } => { check_deterministic_expr(&arr, fn_name); check_deterministic_expr(&index, fn_name); check_deterministic_expr(&value, fn_name); }
+        IndexFieldGet { arr_name, index, field } => { check_deterministic_expr(&index, fn_name); }
+        IndexFieldSet { arr_name, index, field, value } => { check_deterministic_expr(&index, fn_name); check_deterministic_expr(&value, fn_name); }
+        Cast { expr, target_type } => { check_deterministic_expr(&expr, fn_name); }
+        IsCheck { expr, target_type } => { check_deterministic_expr(&expr, fn_name); }
+        Lambda { params, body } => { check_deterministic_expr(&body, fn_name); }
+        TryOp { expr } => { check_deterministic_expr(&expr, fn_name); }
+        SafeFieldAccess { recv, field } => { check_deterministic_expr(&recv, fn_name); }
+        Elvis { left, right } => { check_deterministic_expr(&left, fn_name); check_deterministic_expr(&right, fn_name); }
+        StringInterp { literals, exprs } => { check_deterministic_expr_list(&exprs, fn_name); }
+        Comprehension { result_expr, var_name, iter_expr, cond } => {
+            check_deterministic_expr(&result_expr, fn_name);
+            check_deterministic_expr(&iter_expr, fn_name);
+            match cond {
+                Some { value: c } => { check_deterministic_expr(&c, fn_name); }
+                None => {}
+            }
+        }
+        NamedArg { name, value } => { check_deterministic_expr(&value, fn_name); }
+        ArenaNew { struct_name, count } => { check_deterministic_expr(&count, fn_name); }
+        ExternStaticFieldSet { type_name, field, value } => { check_deterministic_expr(&value, fn_name); }
+        ExternStaticFieldGet { type_name, field } => {}
+        IntLit { value } => {}
+        FloatLit { text } => {}
+        DoubleLit { text } => {}
+        LongLit { text } => {}
+        CharLit { value } => {}
+        StringLit { value } => {}
+        BoolLit { value } => {}
+        Ident { name } => {}
+        NullLit => {}
     }
 }
 

@@ -782,6 +782,43 @@ enough of these bugs to justify it — not a first-pick item.
 
 ### `@deterministic` + built-in state replay/rewind
 
+**Status, 2026-09-23 (real, disclosed SUBSET shipped -- a name blocklist, not the whole-program
+effect system this entry's own header calls for)**: this entry's own honest framing still holds --
+a REAL "provably deterministic" guarantee needs whole-program effect-tracking, a materially bigger
+feature than anything else shipped this whole backlog sweep, and that full version is NOT what
+landed. What shipped instead, narrower but real: `@deterministic fn simulate_tick(...) { ... }`
+(`Driver.hotc`'s own `check_deterministic_fns`, a standalone diagnostic pass mirroring `check_
+assets`'s exact shape -- no `Checker.hotc`/`TyChecker` change at all, so none of that struct's own
+50-plus-argument constructor needed touching) walks the marked fn's own body, recursively through
+every nested block AND every sub-expression (stronger than `check_assets`'s own shallower top-
+level-only scan), rejecting a DIRECT call to a small, explicit, named blocklist of known non-
+deterministic operations: `random_new` (`stdlib/random.hotc`'s own RNG constructor -- a
+`@deterministic` fn must receive its `Random` as a parameter from a caller who controls the seed,
+confirmed live: `rng.int(...)` inside the marked fn is fine, `random_new(...)` inside it is a real,
+named compile error) and `nanoTime`/`currentTimeMillis` (wall-clock reads). Real, disclosed gap
+this entry's own header already anticipated: this is a NAME BLOCKLIST, not effect-tracking --
+calling an ordinary, un-annotated helper fn that itself calls `random_new` internally is NOT
+caught (that needs tracking which PLAIN fns are transitively non-deterministic too, the real
+"whole-program purity/effect type system" this entry calls a materially bigger feature, still not
+attempted). `HashMap` iteration order, thread-scheduling-dependent behavior, and arbitrary
+`extern class` calls are ALSO not analyzed at all (same "trust the declaration" gap this entry's
+own header names).
+The replay/rewind half shipped as `@derive(Snapshot)` (extending the ALREADY-shipped `@derive`
+mechanism -- see the "Units-as-types"/"`@derive(Eq, Hash)`" entries -- with a third derivable
+kind, zero new parser/checker/codegen machinery beyond what `derive_impls` already had):
+`snapshot(&self) -> Self` copies every field into a fresh value; `restore(&mut self, snap: &Self)`
+writes every field of a previously-taken snapshot back onto `self` in place -- `let saved = sim.
+snapshot(); ...simulate...; sim.restore(&saved);` genuinely rewinds. Real, disclosed gap: this is
+per-struct, MANUAL snapshotting (the caller decides when to snapshot/restore one specific value),
+NOT the "record every mutation to `@recordable`-marked state efficiently, scrub through a whole
+recorded timeline" event-sourcing system this entry's own header describes -- that remains the
+real, larger follow-up, unattempted. Also a real, SHALLOW copy (a reference-typed field copies the
+reference, not a deep clone of whatever it points to), same disclosed shallowness `@derive(Eq,
+Hash)`'s own field-by-field dispatch already has for nested struct fields. Verified with `examples/
+deterministic_replay.hotc`: a real `@deterministic` violation throws the expected named error; a
+full snapshot/simulate/restore round-trip returns exactly the pre-simulation values. Full example
+regression sweep clean, self-hosting verified to a true fixed point.
+
 Grouping these as one design problem, not two — replay/rewind (record
 every state change, then play/pause/rewind/scrub through them, the kind
 of tool that turns "why did this enemy die" into an actual answerable
