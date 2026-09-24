@@ -47,6 +47,15 @@ pub struct TypestateResult {
     impls: Vec<ImplDecl>,
 }
 
+// Parser-internal only -- the return shape of `state_machine_decl` (a `state Name { ... }` block
+// synthesizes a states enum, an events enum, and a transition fn all at once). Not part of the
+// real AST.
+pub struct StateMachineResult {
+    state_enum: EnumDecl,
+    event_enum: EnumDecl,
+    transition_fn: FnDecl,
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: Int,
@@ -1369,6 +1378,144 @@ impl Parser {
         }
         self.expect(RBRACE);
         return TypestateResult { structs: out_structs, impls: out_impls };
+    }
+
+    // `state PlayerState { Idle { Move -> Walking; } Walking { Stop -> Idle; Attack ->
+    // Attacking; } Attacking { Complete -> Idle; } }` -- see `IDEAS.md`'s own "State machine
+    // syntax" entry. Real, disclosed deviation from that entry's own original sketch: each
+    // transition line drops the leading `on` keyword the sketch used (`on Move -> Walking;`)
+    // and is written as bare `Move -> Walking;` instead -- `on` was already renamed to `handle`
+    // earlier (see `on_decl`'s own header/`HANDLE` token) specifically because it collided with
+    // this compiler's OWN self-hosted source (`Checker.hotc`'s field-access-type-resolution code
+    // uses bare `on`/`on0` as real local variable names throughout). Reintroducing `on` here
+    // would recreate that exact same hazard, and inside a dedicated `StateName { ... }` mini-
+    // grammar `IDENT ARROW IDENT SEMI` is already unambiguous without any leading keyword at
+    // all, so it's dropped rather than replaced with a second keyword.
+    //
+    // Synthesizes, entirely as ordinary already-proven AST shapes (zero new Checker.hotc/
+    // Codegen.hotc code): a fieldless `enum <Machine> { State1 {}, ... }` (one variant per
+    // declared state block, in declaration order), a fieldless `enum <Machine>Event { Event1
+    // {}, ... }` (one variant per unique event name seen, in first-seen order), and a `fn
+    // <Machine>_transition(current: <Machine>, event: <Machine>Event) -> <Machine> { match
+    // current { State1 {} => { match event { Event1 {} => { return Target {}; } ... _ => {
+    // return State1 {}; } } } ... } }` (the no-op wildcard returns a fresh literal of the
+    // OUTER arm's own already-known state, not a re-read of `current` -- see `state_machine_
+    // decl`'s own header on why). Real, disclosed scope cuts (matching `typestate_decl`'s
+    // own precedent of disclosed cuts over the original brainstormed design): states are
+    // fieldless for v1 (a state "carrying its own data", one of the doc's own explicitly-listed
+    // open questions, isn't attempted); an event with no matching transition arm in the CURRENT
+    // state is a silent no-op (the generated `_ => { return current; }` wildcard), not a compile
+    // error or a runtime exception -- the other two options the doc's own open question listed.
+    // Every state name that appears ANYWHERE (as its own declared block OR only as a transition
+    // TARGET) must have its own explicit declared block -- an undeclared target-only name is a
+    // real, named compile error, mirroring `typestate_decl`'s own "every impl S needs a matching
+    // state S" discipline.
+    fn state_machine_decl(&mut self) -> StateMachineResult {
+        self.expect(STATE);
+        let machine_name = self.expect(IDENT).text;
+        self.expect(LBRACE);
+        var state_names = empty_str_vec();
+        var trans_state = empty_str_vec();
+        var trans_event = empty_str_vec();
+        var trans_target = empty_str_vec();
+        while !self.check(RBRACE) {
+            let sname = self.expect(IDENT).text;
+            if str_vec_contains_ts(&state_names, sname) {
+                throw ParseError::new("state machine '" + machine_name + "' declares state '" + sname + "' more than once");
+            }
+            state_names.push(sname);
+            self.expect(LBRACE);
+            while !self.check(RBRACE) {
+                let ename = self.expect(IDENT).text;
+                self.expect(ARROW);
+                let tname = self.expect(IDENT).text;
+                self.expect(SEMI);
+                trans_state.push(sname);
+                trans_event.push(ename);
+                trans_target.push(tname);
+            }
+            self.expect(RBRACE);
+        }
+        self.expect(RBRACE);
+        var ti = 0;
+        while ti < trans_target.length() {
+            let target = trans_target.get(ti);
+            if !str_vec_contains_ts(&state_names, target) {
+                throw ParseError::new("state machine '" + machine_name + "' transitions to '" + target + "', which was never declared as a state (every state needs its own '" + target + "' block, even if empty)");
+            }
+            ti = ti + 1;
+        }
+        var event_names = empty_str_vec();
+        var ei = 0;
+        while ei < trans_event.length() {
+            let ename2 = trans_event.get(ei);
+            if !str_vec_contains_ts(&event_names, ename2) {
+                event_names.push(ename2);
+            }
+            ei = ei + 1;
+        }
+
+        let mod0 = self.current_module_opt();
+
+        var state_variants = empty_variant_vec();
+        var svi = 0;
+        while svi < state_names.length() {
+            state_variants.push(EnumVariant { name: state_names.get(svi), fields: empty_param_vec() });
+            svi = svi + 1;
+        }
+        let state_enum = EnumDecl { name: machine_name, variants: state_variants, type_param: none_string(), module_name: mod0, type_param2: none_string() };
+
+        let event_enum_name = machine_name + "Event";
+        var event_variants = empty_variant_vec();
+        var evi = 0;
+        while evi < event_names.length() {
+            event_variants.push(EnumVariant { name: event_names.get(evi), fields: empty_param_vec() });
+            evi = evi + 1;
+        }
+        let event_enum = EnumDecl { name: event_enum_name, variants: event_variants, type_param: none_string(), module_name: mod0, type_param2: none_string() };
+
+        var outer_arms = empty_matcharm_vec();
+        var osi = 0;
+        while osi < state_names.length() {
+            let cur_state = state_names.get(osi);
+            var inner_arms = empty_matcharm_vec();
+            var tj = 0;
+            while tj < trans_state.length() {
+                if trans_state.get(tj) == cur_state {
+                    var inner_body = empty_stmt_vec();
+                    let target_lit = StructLit { name: trans_target.get(tj), field_names: empty_str_vec(), field_values: empty_expr_vec(), generic_base: none_string() };
+                    inner_body.push(Return { value: some_expr(target_lit), line: 0 });
+                    inner_arms.push(MatchArm { variant_name: trans_event.get(tj), field_names: empty_str_vec(), bind_names: empty_str_vec(), body: inner_body, is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
+                }
+                tj = tj + 1;
+            }
+            // A fresh `StateName {}` literal, NOT `return current;` -- `cur_state` is already
+            // statically known here (it's this exact outer arm's own matched variant), and
+            // avoiding a bare `Ident` read of `current` sidesteps a real move-checker trap:
+            // `check_match` doesn't snapshot/restore moved-state per arm the way `if`/`else`
+            // does (see `Checker.hotc`'s own `check_stmt`'s `Let` header on this "conservative
+            // branch handling" -- once ANY arm moves a name, every arm checked AFTER it sees it
+            // as moved too), so a real `return current;` in one state's own no-op wildcard would
+            // spuriously fail "use of moved value 'current'" while checking the NEXT state's arm.
+            var no_op_body = empty_stmt_vec();
+            let no_op_lit = StructLit { name: cur_state, field_names: empty_str_vec(), field_values: empty_expr_vec(), generic_base: none_string() };
+            no_op_body.push(Return { value: some_expr(no_op_lit), line: 0 });
+            inner_arms.push(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: no_op_body, is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
+
+            var outer_body = empty_stmt_vec();
+            outer_body.push(Match { subject: Ident { name: "event" }, arms: inner_arms, line: 0 });
+            outer_arms.push(MatchArm { variant_name: cur_state, field_names: empty_str_vec(), bind_names: empty_str_vec(), body: outer_body, is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
+            osi = osi + 1;
+        }
+        var fn_body = empty_stmt_vec();
+        fn_body.push(Match { subject: Ident { name: "current" }, arms: outer_arms, line: 0 });
+
+        var params = empty_param_vec();
+        params.push(Param { name: "current", type_name: machine_name, is_ref: false, is_mut_ref: false });
+        params.push(Param { name: "event", type_name: event_enum_name, is_ref: false, is_mut_ref: false });
+        let transition_fn = FnDecl { name: machine_name + "_transition", params: params, ret_type: some_string(machine_name), body: fn_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
+
+        return StateMachineResult { state_enum: state_enum, event_enum: event_enum, transition_fn: transition_fn };
     }
 
     // `event PlayerDied(player: Entity, cause: String);` -- events/signals, compile-time-wired
@@ -2857,7 +3004,7 @@ impl Parser {
             // scattered per-branch rejects below). Positive check (IS it one of the other
             // declaration-kind keywords the loop right below this one dispatches on?) rather than
             // a long negation -- easier to keep in sync with that chain's own real member list.
-            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE) || self.check(CONST);
+            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE) || self.check(CONST) || self.check(STATE);
             if is_priv && !(self.check(STRUCT) || self.check(ENUM) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN)) {
                 throw ParseError::new("'priv' is only supported on top-level 'struct'/'enum'/'interface' declarations");
             }
@@ -3151,6 +3298,20 @@ impl Parser {
                     throw ParseError::new("doc comments aren't supported on 'handle' declarations");
                 }
                 self.on_decl();
+            } else if self.check(STATE) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'state' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'state' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'state' declarations");
+                }
+                let smr = self.state_machine_decl();
+                enums.push(smr.state_enum);
+                enums.push(smr.event_enum);
+                fns.push(smr.transition_fn);
             } else {
                 var fd = self.fn_decl();
                 if is_pub_decl {

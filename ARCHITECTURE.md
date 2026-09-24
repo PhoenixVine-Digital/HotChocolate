@@ -4506,6 +4506,35 @@ expr;` is evaluated once and substituted as a literal everywhere `NAME` is refer
 code (`fold_consts`, mirroring `Checker.hotc`'s own generic-substitution walkers) — no `static`
 field, no `<clinit>` entry, genuinely zero runtime cost. See `examples/const_fn.hotc`.
 
+## State machine syntax (`state Name { ... }`)
+
+**Shipped, 2026-09-24.** See `IDEAS.md`'s own "State machine syntax" entry for the full design and
+disclosed scope. The short version:
+
+```
+state PlayerState {
+    Idle { Move -> Walking; }
+    Walking { Stop -> Idle; Attack -> Attacking; }
+    Attacking { Complete -> Idle; }
+}
+```
+
+Entirely a `Parser.hotc`-level desugaring (zero `Checker.hotc`/`Codegen.hotc` changes) into a
+fieldless states `enum`, a fieldless events `enum` (`PlayerStateEvent`), and a generated
+`PlayerState_transition(current, event) -> PlayerState` fn built from an outer `match current` /
+inner `match event`. An event with no matching arm in the current state is a silent no-op (a
+generated `_ => { return <CurrentState> {}; }` wildcard) — deliberately a *fresh literal of the
+outer arm's own already-known state*, not `return current;`, because `check_match` doesn't
+snapshot/restore move-checker state per arm the way `if`/`else` does; a real `return current;` in
+one state's wildcard would spuriously fail "use of moved value 'current'" while checking the
+*next* state's arm, since a move in one arm leaks forward into every arm checked after it. Real,
+disclosed deviation from `IDEAS.md`'s own original sketch: transition lines drop the leading `on`
+keyword (`Move -> Walking;`, not `on Move -> Walking;`) — `on` was already renamed to `handle`
+earlier specifically because it collided with `Checker.hotc`'s own field-access-type-resolution
+code, which uses bare `on`/`on0` as real local variable names; reusing it here would recreate that
+same self-hosting hazard, and `IDENT ARROW IDENT SEMI` is already unambiguous inside a dedicated
+`StateName { ... }` block without any leading keyword. See `examples/state_machine.hotc`.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/

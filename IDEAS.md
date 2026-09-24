@@ -1367,6 +1367,32 @@ the honest answer probably depends on whether the full event set is
 known statically per state, which needs real thought before committing
 to a runtime behavior.
 
+**Status (2026-09-24): built.** `state Name { State1 { Event -> Target; ... }
+... }` now desugars (entirely in `Parser.hotc`, zero `Checker.hotc`/
+`Codegen.hotc` changes) to a fieldless `enum Name { State1 {}, ... }`, a
+fieldless `enum NameEvent { Event1 {}, ... }`, and a generated
+`Name_transition(current: Name, event: NameEvent) -> Name` fn built with an
+outer `match current` / inner `match event` and a `_ => { return
+<CurrentStateName> {}; }` wildcard per inner match — i.e. an unmatched event
+in the current state is a **silent no-op** (the state doesn't change), one of
+the three options this entry's own open question above listed, picked because
+it needs no new error-reporting machinery and lets a system just fire events
+freely without checking legality first. Every state name referenced ANYWHERE
+(as its own block or only as a transition target) must have its own declared
+`StateName { ... }` block, even if empty — an undeclared target name is a
+real, named parse error, mirroring `typestate`'s own "every impl S needs a
+matching state S" rule. Real, disclosed deviation from this entry's own sketch
+above: each transition line drops the leading `on` keyword (`Move ->
+Walking;`, not `on Move -> Walking;`) — `on` was already renamed to `handle`
+earlier this project specifically because it collided with `Checker.hotc`'s
+own field-access-type-resolution code (which uses bare `on`/`on0` as real
+local variable names), and reusing it here would recreate that exact hazard;
+inside a dedicated `StateName { ... }` block, `IDENT ARROW IDENT SEMI` is
+already unambiguous without any leading keyword at all, so it's dropped
+rather than renamed a second time. Scope cut, disclosed: states are fieldless
+for v1 — "can a state carry its own data" (this entry's other open question)
+isn't attempted. See `examples/state_machine.hotc`.
+
 ### Networking / execution-domain annotations
 
 ```

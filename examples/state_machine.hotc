@@ -1,0 +1,48 @@
+// State machine syntax -- see IDEAS.md's own "State machine syntax" entry. `state Name { ... }`
+// synthesizes a states enum, an events enum, and a `Name_transition(current, event) -> Name`
+// fn -- all ordinary, already-proven AST shapes under the hood. Note there's no leading `on`
+// keyword on each transition line (unlike this feature's own original IDEAS.md sketch): `on`
+// collided with this compiler's own self-hosted source and was already renamed to `handle`
+// elsewhere, so this feature avoids reintroducing it rather than needing a second rename.
+state PlayerState {
+    Idle {
+        Move -> Walking;
+        Attack -> Attacking;
+    }
+    Walking {
+        Stop -> Idle;
+        Attack -> Attacking;
+    }
+    Attacking {
+        Complete -> Idle;
+    }
+}
+
+fn describe(s: &PlayerState) -> String {
+    match s {
+        Idle {} => { return "Idle"; }
+        Walking {} => { return "Walking"; }
+        Attacking {} => { return "Attacking"; }
+    }
+}
+
+fn main() {
+    var s: PlayerState = Idle {};
+    print(describe(s));
+
+    s = PlayerState_transition(s, Move {});
+    print(describe(s));
+
+    s = PlayerState_transition(s, Attack {});
+    print(describe(s));
+
+    // No matching transition arm for 'Move' while 'Attacking' -- a silent no-op, per this
+    // feature's own disclosed design choice (not a compile error, not a runtime exception).
+    s = PlayerState_transition(s, Move {});
+    print(describe(s));
+
+    s = PlayerState_transition(s, Complete {});
+    print(describe(s));
+
+    print("done");
+}
