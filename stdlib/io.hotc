@@ -10,7 +10,7 @@ extern class __PreludeInteger = "java.lang.Integer" {
 }
 extern class __PreludeNumberFormatException = "java.lang.NumberFormatException" {}
 
-fn read_int() -> Option<Int> {
+pub fn read_int() -> Option<Int> {
     let line = read_line().trim();
     try {
         return Option<Int>::Some { value: __PreludeInteger::parseInt(line) };
@@ -19,6 +19,6 @@ fn read_int() -> Option<Int> {
     }
 }
 
-fn read_string() -> String {
+pub fn read_string() -> String {
     return read_line().trim();
 }

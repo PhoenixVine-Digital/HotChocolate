@@ -55,7 +55,7 @@ extern class JClipAudio = "javax.sound.sampled.Clip" interface {
 // Loads a real audio clip once and plays it back on demand -- `Clip::open` decodes and buffers
 // the WHOLE file up front (fine for short sound effects, the real, disclosed use case this is
 // scoped to; not a streaming API for long music tracks).
-struct Sound {
+pub struct Sound {
     clip: JClipAudio,
 }
 

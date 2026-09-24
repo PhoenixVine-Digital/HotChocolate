@@ -65,15 +65,15 @@ extern class Math = "java.lang.Math" {
 // below are all `Float`-based, so without these, clamping/comparing THEIR own components would
 // otherwise need a round-trip cast out to `Double` and back through `Math::abs`/`::min`/`::max`
 // just to negate or compare two numbers already in hand.
-fn abs_int(x: Int) -> Int { if x < 0 { return -x; } return x; }
-fn min_int(a: Int, b: Int) -> Int { if a < b { return a; } return b; }
-fn max_int(a: Int, b: Int) -> Int { if a > b { return a; } return b; }
-fn abs_float(x: Float) -> Float { if x < 0.0f { return -x; } return x; }
-fn min_float(a: Float, b: Float) -> Float { if a < b { return a; } return b; }
-fn max_float(a: Float, b: Float) -> Float { if a > b { return a; } return b; }
-fn abs_long(x: Long) -> Long { if x < (0 as Long) { return -x; } return x; }
-fn min_long(a: Long, b: Long) -> Long { if a < b { return a; } return b; }
-fn max_long(a: Long, b: Long) -> Long { if a > b { return a; } return b; }
+pub fn abs_int(x: Int) -> Int { if x < 0 { return -x; } return x; }
+pub fn min_int(a: Int, b: Int) -> Int { if a < b { return a; } return b; }
+pub fn max_int(a: Int, b: Int) -> Int { if a > b { return a; } return b; }
+pub fn abs_float(x: Float) -> Float { if x < 0.0f { return -x; } return x; }
+pub fn min_float(a: Float, b: Float) -> Float { if a < b { return a; } return b; }
+pub fn max_float(a: Float, b: Float) -> Float { if a > b { return a; } return b; }
+pub fn abs_long(x: Long) -> Long { if x < (0 as Long) { return -x; } return x; }
+pub fn min_long(a: Long, b: Long) -> Long { if a < b { return a; } return b; }
+pub fn max_long(a: Long, b: Long) -> Long { if a > b { return a; } return b; }
 
 // `Float` wrappers for `Math::sqrt`/`::sin`/`::cos`/`::tan`/`::acos` -- unlike `abs`/`min`/`max`
 // right above, there's no way to compute a square root or a trig function directly in HC (no
@@ -84,13 +84,13 @@ fn max_long(a: Long, b: Long) -> Long { if a > b { return a; } return b; }
 // `cos` intrinsic -- unnecessary here, since this file already established the fix (ordinary HC
 // wrapper functions) for `abs`/`min`/`max`'s identical extern-overload limitation; this just
 // extends the SAME convention to the functions that actually needed the `Double` round-trip.
-fn sqrt_float(x: Float) -> Float { return Math::sqrt(x as Double) as Float; }
-fn sin_float(x: Float) -> Float { return Math::sin(x as Double) as Float; }
-fn cos_float(x: Float) -> Float { return Math::cos(x as Double) as Float; }
-fn tan_float(x: Float) -> Float { return Math::tan(x as Double) as Float; }
-fn acos_float(x: Float) -> Float { return Math::acos(x as Double) as Float; }
+pub fn sqrt_float(x: Float) -> Float { return Math::sqrt(x as Double) as Float; }
+pub fn sin_float(x: Float) -> Float { return Math::sin(x as Double) as Float; }
+pub fn cos_float(x: Float) -> Float { return Math::cos(x as Double) as Float; }
+pub fn tan_float(x: Float) -> Float { return Math::tan(x as Double) as Float; }
+pub fn acos_float(x: Float) -> Float { return Math::acos(x as Double) as Float; }
 
-struct Vec2 {
+pub struct Vec2 {
     x: Float,
     y: Float,
 }
@@ -115,7 +115,7 @@ impl Vec2 {
     }
 }
 
-struct Vec3 {
+pub struct Vec3 {
     x: Float,
     y: Float,
     z: Float,
@@ -145,7 +145,7 @@ impl Vec3 {
     }
 }
 
-struct Vec4 {
+pub struct Vec4 {
     x: Float,
     y: Float,
     z: Float,
@@ -176,7 +176,7 @@ impl Vec4 {
 // throughout (`v' = M * v`, same as OpenGL/GLM) -- `transform_vec3`/`transform_vec4` and every
 // `static fn` constructor below (`translation`/`scaling`/`rotation_*`/`perspective`/`look_at`)
 // all agree on this.
-struct Mat4 {
+pub struct Mat4 {
     m00: Float, m01: Float, m02: Float, m03: Float,
     m10: Float, m11: Float, m12: Float, m13: Float,
     m20: Float, m21: Float, m22: Float, m23: Float,
@@ -308,7 +308,7 @@ impl Mat4 {
     }
 }
 
-struct Quaternion {
+pub struct Quaternion {
     x: Float,
     y: Float,
     z: Float,

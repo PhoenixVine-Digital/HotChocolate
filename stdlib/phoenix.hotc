@@ -64,7 +64,7 @@ extern class PhoenixCompletableFuture = "java.util.concurrent.CompletableFuture"
     fn isDone(&self) -> Bool;
 }
 
-struct PhoenixPool {
+pub struct PhoenixPool {
     exec: PhoenixExecutorService,
 }
 
@@ -148,7 +148,7 @@ impl PhoenixPool {
     }
 }
 
-struct PhoenixTask {
+pub struct PhoenixTask {
     raw: PhoenixFuture,
 }
 
@@ -174,7 +174,7 @@ impl PhoenixTask {
     }
 }
 
-struct PhoenixChain {
+pub struct PhoenixChain {
     raw: PhoenixCompletableFuture,
     exec: PhoenixExecutorService,
 }
@@ -212,7 +212,7 @@ impl PhoenixChain {
 // length-1 array (here, `null` -- `PhoenixObject` is a real reference type, so a `null` slot
 // costs nothing and is never read back), then report the real length as `0` directly via the
 // struct literal rather than `vec_of`, which always reports a length of (at least) 1.
-fn join_all(tasks: &Vec<PhoenixTask>) -> Vec<PhoenixObject> {
+pub fn join_all(tasks: &Vec<PhoenixTask>) -> Vec<PhoenixObject> {
     if tasks.length() == 0 {
         return Vec { data: [null as PhoenixObject; 1], len: 0 };
     }

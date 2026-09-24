@@ -396,17 +396,17 @@ pub fn checker_new() -> TyChecker {
     return TyChecker { fn_sigs: sigs, vars: vars, var_scopes: var_scopes, structs: structs, methods: methods, variant_owner: variant_owner, variant_owner_q: variant_owner_q, generic_templates: generic_templates, generic_enum_templates: generic_enum_templates, mono_needed: mono_needed, externs: externs, extern_methods: extern_methods, extern_fields: extern_fields, struct_extends: struct_extends, must_use_fns: must_use_fns, fn_param_names: fn_param_names, enum_variants: enum_variants, static_methods: static_methods, generic_fn_templates: generic_fn_templates, fn_mono_needed: fn_mono_needed, generic_method_templates: generic_method_templates, method_mono_needed: method_mono_needed, statics: statics, errors: errs, loop_depth: 0, cur_ret_ty: "Unit", variant_field_info: variant_field_info, generic_variant_owner: generic_variant_owner, interfaces: interfaces, struct_interfaces: struct_interfaces, arena_structs: arena_structs, sealed_interfaces: sealed_interfaces, interface_supertraits: interface_supertraits, fn_param_is_ref: fn_param_is_ref, method_param_is_ref: method_param_is_ref, static_method_param_is_ref: static_method_param_is_ref, moved: moved, moved_scopes: moved_scopes, fn_param_is_mut_ref: fn_param_is_mut_ref, method_param_is_mut_ref: method_param_is_mut_ref, static_method_param_is_mut_ref: static_method_param_is_mut_ref, mut_capable: mut_capable, mut_capable_scopes: mut_capable_scopes, components: components, resources: resources, warnings: warns, system_order: system_order, system_groups: system_groups, archetype_signatures: archetype_signatures, add_component_types: add_component_types, remove_component_types: remove_component_types };
 }
 
-fn empty_bool_vec_chk() -> Vec<Bool> {
+pub fn empty_bool_vec_chk() -> Vec<Bool> {
     var v = vec_of(true);
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_str_vec2() -> Vec<String> {
+pub fn empty_str_vec2() -> Vec<String> {
     var v = vec_of("__init__");
     return Vec { data: v.data, len: 0 };
 }
 
-fn param_type_names_of4(params: Vec<Param>) -> Vec<String> {
+pub fn param_type_names_of4(params: Vec<Param>) -> Vec<String> {
     var out = empty_str_vec2();
     var i = 0;
     while i < params.length() {
@@ -419,7 +419,7 @@ fn param_type_names_of4(params: Vec<Param>) -> Vec<String> {
 // Joins param/arg type names with "," into one key fragment -- used to build an extern method's
 // full-signature registry key (see `register_extern`'s own header), so two same-arity overloads
 // (Gson's `addProperty(String,String)` vs `addProperty(String,Number)`) get distinct keys.
-fn join_type_names_chk(names: &Vec<String>) -> String {
+pub fn join_type_names_chk(names: &Vec<String>) -> String {
     var out = "";
     var i = 0;
     while i < names.length() {
@@ -430,7 +430,7 @@ fn join_type_names_chk(names: &Vec<String>) -> String {
     return out;
 }
 
-fn opt_string_or2(o: Option<String>, default_val: String) -> String {
+pub fn opt_string_or2(o: Option<String>, default_val: String) -> String {
     if let Some { value: v } = o {
         return v;
     }
@@ -440,7 +440,7 @@ fn opt_string_or2(o: Option<String>, default_val: String) -> String {
 // Linear scan for a field's declared type name, "?" if the struct has no such field -- mirrors
 // `Ty`'s own "?" sentinel for "unknown, don't error on it" so callers can reuse the same
 // `!= "?"` guard pattern already established throughout this file.
-fn find_field_type(info: StructInfo, field: String) -> String {
+pub fn find_field_type(info: StructInfo, field: String) -> String {
     var i = 0;
     while i < info.field_names.length() {
         if info.field_names.get(i) == field {
@@ -464,7 +464,7 @@ extern class JStringChk = "java.lang.String" {
 // intrinsic set above, so built from `codePointAt`/`codepoint_to_string` directly (ASCII
 // lowercase-to-uppercase is just "subtract 32" -- ordinary field names are ASCII identifiers,
 // nothing here needs full Unicode case-folding).
-fn capitalize_first_chk(s: String) -> String {
+pub fn capitalize_first_chk(s: String) -> String {
     if s.length() == 0 { return s; }
     let c0 = s.codePointAt(0);
     var cap0 = c0;
@@ -475,16 +475,16 @@ fn capitalize_first_chk(s: String) -> String {
 // Monomorphized generic instantiations are named `"Base$Arg"` -- `$` specifically because it can
 // never appear in a real HC identifier (see `Parser.hotc`'s `type_name_ref` header), so this
 // split is unambiguous with any real user-written name.
-fn is_mono_name(name: String) -> Bool {
+pub fn is_mono_name(name: String) -> Bool {
     return name.indexOf("$") >= 0;
 }
 
-fn mono_base(name: String) -> String {
+pub fn mono_base(name: String) -> String {
     let idx = name.indexOf("$");
     return name.substring(0, idx);
 }
 
-fn mono_arg(name: String) -> String {
+pub fn mono_arg(name: String) -> String {
     let idx = name.indexOf("$");
     return name.substring(idx + 1, name.length());
 }
@@ -493,13 +493,13 @@ fn mono_arg(name: String) -> String {
 // own enum branch for why a two-param mono name's arg-splitting needs its own logic instead of
 // reusing `mono_arg` (which returns EVERYTHING after the first `$`, correct for a one-param
 // template whose own single arg might itself be a nested mono name, but wrong here).
-fn mono_arg1_of2(name: String) -> String {
+pub fn mono_arg1_of2(name: String) -> String {
     let idx1 = name.indexOf("$");
     let rest = name.substring(idx1 + 1, name.length());
     let idx2 = rest.indexOf("$");
     return rest.substring(0, idx2);
 }
-fn mono_arg2_of2(name: String) -> String {
+pub fn mono_arg2_of2(name: String) -> String {
     let idx1 = name.indexOf("$");
     let rest = name.substring(idx1 + 1, name.length());
     let idx2 = rest.indexOf("$");
@@ -511,32 +511,32 @@ fn mono_arg2_of2(name: String) -> String {
 // operator's own `check_try_op` needs this BEFORE calling `mono_arg1_of2`/`mono_arg2_of2`
 // (neither of which detects the one-arg case safely on its own: `mono_arg2_of2("Box$Int")` would
 // return `"Int"` again, not `""`, since there's no second `$` to bound it against).
-fn is_two_part_mono_chk(name: String) -> Bool {
+pub fn is_two_part_mono_chk(name: String) -> Bool {
     let idx1 = name.indexOf("$");
     if idx1 < 0 { return false; }
     let rest = name.substring(idx1 + 1, name.length());
     return rest.indexOf("$") >= 0;
 }
 
-fn empty_param_vec3() -> Vec<Param> {
+pub fn empty_param_vec3() -> Vec<Param> {
     var v = vec_of(Param { name: "_", type_name: "_", is_ref: false, is_mut_ref: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_variant_vec3() -> Vec<EnumVariant> {
+pub fn empty_variant_vec3() -> Vec<EnumVariant> {
     var v = vec_of(EnumVariant { name: "_", fields: empty_param_vec3() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn none_string3() -> Option<String> {
+pub fn none_string3() -> Option<String> {
     return None;
 }
 
-fn some_string3(s: String) -> Option<String> {
+pub fn some_string3(s: String) -> Option<String> {
     return Some { value: s };
 }
 
-fn empty_stmt_vec3() -> Vec<Stmt> {
+pub fn empty_stmt_vec3() -> Vec<Stmt> {
     var v = vec_of(ExprStmt { expr: IntLit { value: 0 }, line: 0 });
     return Vec { data: v.data, len: 0 };
 }
@@ -544,12 +544,12 @@ fn empty_stmt_vec3() -> Vec<Stmt> {
 // Array types are represented as the plain string `"[ElemType]"` throughout this file (see
 // `Parser.hotc`'s own `type_name_ref` header) -- these two helpers are the only place that
 // convention actually gets parsed back apart.
-fn is_array_type_name(name: String) -> Bool {
+pub fn is_array_type_name(name: String) -> Bool {
     if name.length() < 2 { return false; }
     return name.codePointAt(0) == 91 && name.codePointAt(name.length() - 1) == 93; // '[' / ']'
 }
 
-fn array_elem_type_name(name: String) -> String {
+pub fn array_elem_type_name(name: String) -> String {
     return name.substring(1, name.length() - 1);
 }
 
@@ -558,16 +558,16 @@ fn array_elem_type_name(name: String) -> String {
 // See README's own "Nullable types" section: this pass scopes nullable to `TyStruct`-shaped
 // (struct/extern-class) values only -- `strip_nullable` on a bare `"Int"`/`"Bool"`/etc is never
 // called (nothing ever suffixes those), so it doesn't need to guard against them.
-fn is_nullable_type_name(name: String) -> Bool {
+pub fn is_nullable_type_name(name: String) -> Bool {
     if name.length() < 2 { return false; }
     return name.codePointAt(name.length() - 1) == 63; // '?'
 }
 
-fn strip_nullable(name: String) -> String {
+pub fn strip_nullable(name: String) -> String {
     return name.substring(0, name.length() - 1);
 }
 
-fn is_numeric_ty_name_chk(name: String) -> Bool {
+pub fn is_numeric_ty_name_chk(name: String) -> Bool {
     return name == "Int" || name == "Long" || name == "Float" || name == "Double" || name == "Char" || name == "Byte";
 }
 
@@ -577,7 +577,7 @@ fn is_numeric_ty_name_chk(name: String) -> Bool {
 // nothing struct-shaped is Copy for move-checking purposes, sendable or not). `"?"` (an unknown/
 // uninferred type) is ALSO treated as Copy -- trust it rather than block on a checker gap, same
 // "when unsure, don't reject" honesty `is_arg_type_mismatch` already has elsewhere.
-fn is_copy_ty_name_chk(name: String) -> Bool {
+pub fn is_copy_ty_name_chk(name: String) -> Bool {
     return name == "Int" || name == "Bool" || name == "Long" || name == "Float" || name == "Double" || name == "Char" || name == "Byte" || name == "String" || name == "?";
 }
 
@@ -588,7 +588,7 @@ fn is_copy_ty_name_chk(name: String) -> Bool {
 // avoid the single most common false positive move-checking's own `If`-merge would otherwise hit:
 // an `if special_case { ...moves x...; return y; } return x;` -- the `return x` is only ever
 // reached on the path where the `if` body DIDN'T run, so it must not see that branch's own moves.
-fn stmt_list_diverges_chk(body: &Vec<Stmt>) -> Bool {
+pub fn stmt_list_diverges_chk(body: &Vec<Stmt>) -> Bool {
     if body.length() == 0 { return false; }
     let last = body.get(body.length() - 1);
     match last {
@@ -604,7 +604,7 @@ fn stmt_list_diverges_chk(body: &Vec<Stmt>) -> Bool {
 // An empty `Vec<Vec<String>>` -- `check_systems`'s own per-system read/write-set accumulator,
 // same "seed via a real value, then reset `len` to 0" convention every other `empty_*_vec`
 // helper in this file already uses.
-fn empty_str_vec_vec_ecs() -> Vec<Vec<String>> {
+pub fn empty_str_vec_vec_ecs() -> Vec<Vec<String>> {
     var seed = vec_of(empty_str_vec2());
     return Vec { data: seed.data, len: 0 };
 }
@@ -612,7 +612,7 @@ fn empty_str_vec_vec_ecs() -> Vec<Vec<String>> {
 // Exact, order-sensitive equality between two `Vec<String>` -- `check_method_call_by_type`'s own
 // `World#spawn` gate uses this to dedup archetype signatures (see that fn's own header for why
 // this is order-sensitive rather than canonicalized/sorted).
-fn str_vec_eq_ecs(a: &Vec<String>, b: &Vec<String>) -> Bool {
+pub fn str_vec_eq_ecs(a: &Vec<String>, b: &Vec<String>) -> Bool {
     if a.length() != b.length() { return false; }
     var i = 0;
     while i < a.length() {
@@ -622,7 +622,7 @@ fn str_vec_eq_ecs(a: &Vec<String>, b: &Vec<String>) -> Bool {
     return true;
 }
 
-fn vec_str_vec_contains_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Bool {
+pub fn vec_str_vec_contains_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Bool {
     var i = 0;
     while i < list.length() {
         if str_vec_eq_ecs(&list.get(i), &sig) { return true; }
@@ -631,7 +631,7 @@ fn vec_str_vec_contains_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Bool 
     return false;
 }
 
-fn str_vec_contains_ecs(v: &Vec<String>, s: String) -> Bool {
+pub fn str_vec_contains_ecs(v: &Vec<String>, s: String) -> Bool {
     var i = 0;
     while i < v.length() {
         if v.get(i) == s { return true; }
@@ -644,7 +644,7 @@ fn str_vec_contains_ecs(v: &Vec<String>, s: String) -> Bool {
 // `Registry<Bool>` -- see that registry's own header). A plain boolean wrapper around `Registry
 // <T>.get`'s own `Option<T>` result, so `check_systems`'s own `else if` chain can test it
 // directly instead of needing an `if let` inside a condition position.
-fn resource_known_ecs(resources: &Registry<Bool>, name: String) -> Bool {
+pub fn resource_known_ecs(resources: &Registry<Bool>, name: String) -> Bool {
     let found = resources.get(name);
     if let Some { value: _rk } = found { return true; }
     return false;
@@ -654,7 +654,7 @@ fn resource_known_ecs(resources: &Registry<Bool>, name: String) -> Bool {
 // name ONE concrete component in a conflict warning message; which one (if several) is
 // unspecified, matching this checker's own established "report the first match" convention
 // elsewhere (`find_field_type`, `Registry<T>.get`).
-fn first_shared_component_ecs(haystack: &Vec<String>, needle: &Vec<String>) -> String {
+pub fn first_shared_component_ecs(haystack: &Vec<String>, needle: &Vec<String>) -> String {
     var i = 0;
     while i < haystack.length() {
         let c = haystack.get(i);
@@ -668,7 +668,7 @@ fn first_shared_component_ecs(haystack: &Vec<String>, needle: &Vec<String>) -> S
 // other one also touches (reads or writes) -- two readers of the same component never conflict.
 // See `ECS_IDEAS.md`'s own "Checker" section for why this, not a general alias analysis, is
 // exactly the signal `&`/`&mut` on a `run` param already gives for free.
-fn systems_conflict_ecs(reads_a: &Vec<String>, writes_a: &Vec<String>, reads_b: &Vec<String>, writes_b: &Vec<String>) -> Bool {
+pub fn systems_conflict_ecs(reads_a: &Vec<String>, writes_a: &Vec<String>, reads_b: &Vec<String>, writes_b: &Vec<String>) -> Bool {
     var i = 0;
     while i < writes_a.length() {
         let c = writes_a.get(i);
@@ -693,7 +693,7 @@ fn systems_conflict_ecs(reads_a: &Vec<String>, writes_a: &Vec<String>, reads_b: 
 // fine and NOT forced here (only two `@main_thread` systems specifically are guaranteed unsafe
 // together) -- an ordinary system already correctly conflicts or doesn't purely by its own real
 // component access.
-fn systems_conflict_or_main_thread_ecs(reads_a: &Vec<String>, writes_a: &Vec<String>, main_thread_a: Bool, reads_b: &Vec<String>, writes_b: &Vec<String>, main_thread_b: Bool) -> Bool {
+pub fn systems_conflict_or_main_thread_ecs(reads_a: &Vec<String>, writes_a: &Vec<String>, main_thread_a: Bool, reads_b: &Vec<String>, writes_b: &Vec<String>, main_thread_b: Bool) -> Bool {
     if main_thread_a && main_thread_b { return true; }
     return systems_conflict_ecs(reads_a, writes_a, reads_b, writes_b);
 }
@@ -702,7 +702,7 @@ fn systems_conflict_or_main_thread_ecs(reads_a: &Vec<String>, writes_a: &Vec<Str
 // via `vec_of`, then reset `len` to 0 and push for real" convention doesn't fit here (this needs
 // a KNOWN LENGTH up front, indexable by `.set()`, not built by pushing) -- built by pushing `n`
 // times instead, the simplest correct way to get there.
-fn bool_vec_of_len_ecs(n: Int) -> Vec<Bool> {
+pub fn bool_vec_of_len_ecs(n: Int) -> Vec<Bool> {
     var out = empty_bool_vec_chk();
     var i = 0;
     while i < n {
@@ -714,7 +714,7 @@ fn bool_vec_of_len_ecs(n: Int) -> Vec<Bool> {
 
 // A real, empty `Vec<Int>` -- the grouped topo-sort's own per-round "which original indices did
 // I place into this group" accumulator.
-fn empty_int_vec_ecs() -> Vec<Int> {
+pub fn empty_int_vec_ecs() -> Vec<Int> {
     var v = vec_of(0);
     return Vec { data: v.data, len: 0 };
 }
@@ -722,7 +722,7 @@ fn empty_int_vec_ecs() -> Vec<Int> {
 // Is the system at `idx` ready to be placed next -- its own `@after` target (if any) already
 // placed, and no unplaced system's `@before` names it? See `TyChecker.check_systems`'s own header
 // for the full topological-sort this drives.
-fn system_ready_ecs(idx: Int, names: &Vec<String>, after: &Vec<Vec<String>>, before: &Vec<Vec<String>>, placed: &Vec<Bool>) -> Bool {
+pub fn system_ready_ecs(idx: Int, names: &Vec<String>, after: &Vec<Vec<String>>, before: &Vec<Vec<String>>, placed: &Vec<Bool>) -> Bool {
     let my_name = names.get(idx);
     // Multi-target `@after` -- EVERY named system must already be placed, not just one.
     let my_after = after.get(idx);
@@ -763,7 +763,7 @@ fn system_ready_ecs(idx: Int, names: &Vec<String>, after: &Vec<Vec<String>>, bef
 // needs a TRUE snapshot to restore from before checking the `else` branch (see `snapshot_moved_
 // state`'s own header) -- `.entries` read directly, same "no `.keys()`/iteration method to reuse"
 // reason `sealed_implementers` already reads a `Registry`'s own field directly elsewhere.
-fn clone_bool_registry_chk(r: Registry<Bool>) -> Registry<Bool> {
+pub fn clone_bool_registry_chk(r: Registry<Bool>) -> Registry<Bool> {
     var out = registry_new("__init__", false);
     var i = 0;
     while i < r.entries.length() {
@@ -779,7 +779,7 @@ fn clone_bool_registry_chk(r: Registry<Bool>) -> Registry<Bool> {
 // `If` arm needs once both branches have been checked independently. Only `true` entries are ever
 // copied over: a name un-moved (reassigned) in one branch shouldn't un-move it if the OTHER branch
 // left it moved.
-fn or_true_entries_chk(target: Registry<Bool>, source: Registry<Bool>) {
+pub fn or_true_entries_chk(target: Registry<Bool>, source: Registry<Bool>) {
     var i = 0;
     while i < source.entries.length() {
         let e = source.entries.get(i);
@@ -797,7 +797,7 @@ fn or_true_entries_chk(target: Registry<Bool>, source: Registry<Bool>) {
 // numeric pair still deliberately NOT widened (`Int`+`Long`). `Codegen.hotc`'s own identical
 // `numeric_widen_result_cg` is the duplicated codegen-side twin, same "checker and codegen don't
 // share registries" split this compiler always uses.
-fn numeric_widen_result(ln: String, rn: String) -> String {
+pub fn numeric_widen_result(ln: String, rn: String) -> String {
     if !is_numeric_ty_name_chk(ln) || !is_numeric_ty_name_chk(rn) { return ""; }
     if ln == rn { return ln; }
     if ln == "Double" || rn == "Double" { return "Double"; }
@@ -811,7 +811,7 @@ fn numeric_widen_result(ln: String, rn: String) -> String {
 // something like `Ordering`, either a bigger design than this pass's real motivating cases,
 // `Vec3`-style arithmetic and value equality, actually needed). `Codegen.hotc`'s own identical
 // `operator_method_name_cg` is the duplicated codegen-side twin.
-fn operator_method_name(op: String) -> String {
+pub fn operator_method_name(op: String) -> String {
     if op == "+" { return "add"; }
     if op == "-" { return "sub"; }
     if op == "*" { return "mul"; }
@@ -870,7 +870,7 @@ fn operator_method_name(op: String) -> String {
 // branches: substitute `K` -> its concrete type first, leaving `V` untouched since it doesn't
 // match; substitute `V` next, leaving the now-already-substituted `K` slot untouched since IT
 // doesn't match `V` either) now produce the right final string either order.
-fn substitute_field_type(ftype: String, type_param: String, arg: String) -> String {
+pub fn substitute_field_type(ftype: String, type_param: String, arg: String) -> String {
     if is_array_type_name(ftype) {
         let elem = array_elem_type_name(ftype);
         return "[" + substitute_field_type(elem, type_param, arg) + "]";
@@ -917,19 +917,19 @@ fn substitute_field_type(ftype: String, type_param: String, arg: String) -> Stri
 // garbage base), and never actually cascade into `"RegistryEntry$Int"` at all. Unwrapping one
 // array level first (the same "single array level" scope cut already disclosed elsewhere) fixes
 // it: an array field's cascade target is its ELEMENT type, not the bracketed string itself.
-fn cascade_target(ftype: String) -> String {
+pub fn cascade_target(ftype: String) -> String {
     if is_array_type_name(ftype) {
         return array_elem_type_name(ftype);
     }
     return ftype;
 }
 
-fn empty_expr_vec3() -> Vec<Expr> {
+pub fn empty_expr_vec3() -> Vec<Expr> {
     var v = vec_of(IntLit { value: 0 });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_matcharm_vec3() -> Vec<MatchArm> {
+pub fn empty_matcharm_vec3() -> Vec<MatchArm> {
     var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec2(), bind_names: empty_str_vec2(), body: empty_stmt_vec3(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
     return Vec { data: v.data, len: 0 };
 }
@@ -946,7 +946,7 @@ fn empty_matcharm_vec3() -> Vec<MatchArm> {
 // reference its own still-abstract `T` inside a nested generic construction site (`vec_of<T>`'s
 // own `return Vec<T> { data: [first; 4], len: 1 };`, say) -- every other `Expr`/`Stmt` variant
 // here just recurses into its own sub-expressions unchanged, no type name of its own to fix up.
-fn subst_expr(e: &Expr, type_param: String, arg: String) -> Expr {
+pub fn subst_expr(e: &Expr, type_param: String, arg: String) -> Expr {
     match e {
         IntLit { value } => { return IntLit { value: value }; }
         FloatLit { text } => { return FloatLit { text: text }; }
@@ -1000,7 +1000,7 @@ fn subst_expr(e: &Expr, type_param: String, arg: String) -> Expr {
     }
 }
 
-fn subst_expr_list(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Expr> {
+pub fn subst_expr_list(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Expr> {
     var out = empty_expr_vec3();
     var i = 0;
     while i < es.length() {
@@ -1010,7 +1010,7 @@ fn subst_expr_list(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Expr> 
     return out;
 }
 
-fn subst_stmt(s: Stmt, type_param: String, arg: String) -> Stmt {
+pub fn subst_stmt(s: Stmt, type_param: String, arg: String) -> Stmt {
     match s {
         Let { name, mutable, init, declared_type, line } => { return Let { name: name, mutable: mutable, init: subst_expr(init, type_param, arg), declared_type: declared_type, line: line }; }
         ExprStmt { expr, line } => { return ExprStmt { expr: subst_expr(expr, type_param, arg), line: line }; }
@@ -1038,7 +1038,7 @@ fn subst_stmt(s: Stmt, type_param: String, arg: String) -> Stmt {
     }
 }
 
-fn subst_stmt_list(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stmt> {
+pub fn subst_stmt_list(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stmt> {
     var out = empty_stmt_vec3();
     var i = 0;
     while i < ss.length() {
@@ -1048,7 +1048,7 @@ fn subst_stmt_list(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stmt> 
     return out;
 }
 
-fn subst_catches(cs: Vec<CatchClause>, type_param: String, arg: String) -> Vec<CatchClause> {
+pub fn subst_catches(cs: Vec<CatchClause>, type_param: String, arg: String) -> Vec<CatchClause> {
     var out = empty_catchclause_vec3();
     var i = 0;
     while i < cs.length() {
@@ -1059,12 +1059,12 @@ fn subst_catches(cs: Vec<CatchClause>, type_param: String, arg: String) -> Vec<C
     return out;
 }
 
-fn empty_catchclause_vec3() -> Vec<CatchClause> {
+pub fn empty_catchclause_vec3() -> Vec<CatchClause> {
     var v = vec_of(CatchClause { catch_var: "_", catch_type: "_", catch_block: empty_stmt_vec3() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn subst_arm_list(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<MatchArm> {
+pub fn subst_arm_list(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<MatchArm> {
     var out = empty_matcharm_vec3();
     var i = 0;
     while i < arms.length() {
@@ -1075,19 +1075,19 @@ fn subst_arm_list(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<M
     return out;
 }
 
-fn none_expr3() -> Option<Expr> {
+pub fn none_expr3() -> Option<Expr> {
     return None;
 }
 
-fn some_expr3(e: Expr) -> Option<Expr> {
+pub fn some_expr3(e: Expr) -> Option<Expr> {
     return Some { value: e };
 }
 
-fn none_stmt_list3() -> Option<Vec<Stmt>> {
+pub fn none_stmt_list3() -> Option<Vec<Stmt>> {
     return None;
 }
 
-fn some_stmt_list3(ss: Vec<Stmt>) -> Option<Vec<Stmt>> {
+pub fn some_stmt_list3(ss: Vec<Stmt>) -> Option<Vec<Stmt>> {
     return Some { value: ss };
 }
 
@@ -5681,7 +5681,7 @@ pub struct ReflectedMethod {
 // reaches this fn when `classpath.length() > 0` (checked first, see `class_exists_reflect`'s own
 // header for why the empty case is handled as a wholly separate path instead of going through an
 // empty/dummy `URLClassLoader`).
-fn build_classpath_loader(classpath: &Vec<String>) -> JURLClassLoaderRefX {
+pub fn build_classpath_loader(classpath: &Vec<String>) -> JURLClassLoaderRefX {
     let seed_file = JFileRefX::new(classpath.get(0));
     let seed_uri = seed_file.toURI();
     var urls = [seed_uri.toURL(); classpath.length()];
@@ -5726,22 +5726,22 @@ pub fn class_exists_reflect(binary_name: String, classpath: &Vec<String>) -> Boo
 // dodge-the-flat-namespace convention as `Codegen.hotc`'s own `_cg` duplicates) since
 // `Codegen.hotc` needs its own identical pair (`is_dyn_type_name_cg`/`dyn_interface_name_cg`) and
 // this whole subset's flat top-level function namespace would otherwise collide the two.
-fn is_dyn_type_name_chk(name: String) -> Bool {
+pub fn is_dyn_type_name_chk(name: String) -> Bool {
     if name.length() < 4 { return false; }
     return name.substring(0, 4) == "dyn ";
 }
 
-fn dyn_interface_name_chk(name: String) -> String {
+pub fn dyn_interface_name_chk(name: String) -> String {
     return name.substring(4, name.length());
 }
 
 // `"arena Name"` -- see `Ast.hc`'s own `ArenaNew` header.
-fn is_arena_type_name_chk(name: String) -> Bool {
+pub fn is_arena_type_name_chk(name: String) -> Bool {
     if name.length() < 6 { return false; }
     return name.substring(0, 6) == "arena ";
 }
 
-fn arena_struct_name_chk(name: String) -> String {
+pub fn arena_struct_name_chk(name: String) -> String {
     return name.substring(6, name.length());
 }
 
@@ -5750,7 +5750,7 @@ fn arena_struct_name_chk(name: String) -> String {
 // here for the same reason) -- `self.externs`' own binary names are stored exactly as declared
 // (dot or slash form alike), but `real_method_key`'s own keys are always slash-form
 // (`Class.getName()`, normalized the same way), so `declared_type_to_key` needs this too.
-fn dot_to_slash_reflect(name: String) -> String {
+pub fn dot_to_slash_reflect(name: String) -> String {
     var out = "";
     var i = 0;
     while i < name.length() {
@@ -5771,7 +5771,7 @@ fn dot_to_slash_reflect(name: String) -> String {
 // `verify_extern_signature`'s own `while j < real_methods.length()` loop calls this once per real
 // overload -- for a genuinely overloaded method (more than one match), a by-value `declared_keys`
 // would move on the first iteration and fail to compile ("use of moved value") on the second.
-fn str_vec_eq_reflect(a: &Vec<String>, b: &Vec<String>) -> Bool {
+pub fn str_vec_eq_reflect(a: &Vec<String>, b: &Vec<String>) -> Bool {
     if a.length() != b.length() { return false; }
     var i = 0;
     while i < a.length() {
@@ -5790,7 +5790,7 @@ fn str_vec_eq_reflect(a: &Vec<String>, b: &Vec<String>) -> Bool {
 // which would need real static-FIELD reflection this subset doesn't have) is the only signal
 // available for telling primitives apart -- it returns the primitive's own bare name ("int",
 // "long", ...) for exactly those, so string-comparing it is both simpler and sufficient.
-fn real_method_key(c: JClassRefX) -> String {
+pub fn real_method_key(c: JClassRefX) -> String {
     if c.isArray() {
         let comp = c.getComponentType();
         return "[" + real_method_key(comp);
@@ -5807,7 +5807,7 @@ fn real_method_key(c: JClassRefX) -> String {
     return "L" + dot_to_slash_reflect(name) + ";";
 }
 
-fn empty_reflected_method_vec() -> Vec<ReflectedMethod> {
+pub fn empty_reflected_method_vec() -> Vec<ReflectedMethod> {
     var v = vec_of(ReflectedMethod { is_static: false, param_keys: empty_str_vec2(), ret_key: "?" });
     return Vec { data: v.data, len: 0 };
 }
@@ -5818,7 +5818,7 @@ fn empty_reflected_method_vec() -> Vec<ReflectedMethod> {
 // `class_exists_reflect(binary_name, classpath)` before calling this, with the SAME `classpath`),
 // but `try` still requires at least one -- same restriction this subset's own grammar puts on it,
 // mirroring the real compiler's.
-fn resolve_real_methods(binary_name: String, member_name: String, is_ctor: Bool, classpath: &Vec<String>) -> Vec<ReflectedMethod> {
+pub fn resolve_real_methods(binary_name: String, member_name: String, is_ctor: Bool, classpath: &Vec<String>) -> Vec<ReflectedMethod> {
     var out = empty_reflected_method_vec();
     try {
         var c = JClassRefX::forName("java.lang.Object"); // dummy -- see `class_exists_reflect`'s own header

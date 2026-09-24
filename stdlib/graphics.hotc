@@ -160,7 +160,7 @@ extern class JBufferedImageTex = "java.awt.image.BufferedImage" {
 // dedicated graphics-error type yet), so a caller that ignores the printed log and calls
 // `use_program()`/draws anyway gets whatever the driver does with a broken program (typically:
 // nothing visible, no crash).
-struct Shader {
+pub struct Shader {
     program: Int,
 }
 
@@ -247,7 +247,7 @@ impl Shader {
 // `IntBuffer`, matches that exact GL format/type pairing byte-for-byte on a little-endian
 // machine -- no manual per-channel unpacking needed on the HC side (which has no bitshift
 // operator to do that with even if it were needed).
-struct Texture {
+pub struct Texture {
     id: Int,
 }
 
@@ -301,7 +301,7 @@ impl Texture {
 // used exactly once, in order) and the real index count for a `from_indexed`-built one (drawn
 // with `glDrawElements`) -- `draw()` branches on it rather than adding a second struct, since
 // every other field (`vao`) and every other method already means the same thing either way.
-struct Mesh {
+pub struct Mesh {
     vao: Int,
     vertex_count: Int,
     index_count: Int,
@@ -461,7 +461,7 @@ impl Mesh {
 // bare `HashMap::new()`), which this cache doesn't have at construction time -- so the map itself
 // starts as `None` and is built on the FIRST real `get_or_load` call, once an actual path/`Texture`
 // exists to seed it with.
-struct TextureCache {
+pub struct TextureCache {
     cache: Option<HashMap<Texture>>,
 }
 
@@ -505,7 +505,7 @@ extern class SystemClockGfx = "java.lang.System" {
 // every frame is too noisy to read). Call `tick()` exactly once per frame, anywhere consistent
 // (right after `window.present()` or right before `window.clear()` both work, as long as it's
 // once).
-struct FrameTimer {
+pub struct FrameTimer {
     last_ns: Long,
     delta_seconds: Float,
     fps: Float,

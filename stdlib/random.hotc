@@ -34,11 +34,11 @@ extern class JRandomHc = "java.util.Random" {
     fn nextBoolean(&self) -> Bool;
 }
 
-struct Random {
+pub struct Random {
     inner: JRandomHc,
 }
 
-fn random_new(seed: Long) -> Random {
+pub fn random_new(seed: Long) -> Random {
     return Random { inner: JRandomHc::new(seed) };
 }
 

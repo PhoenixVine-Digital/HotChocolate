@@ -15,7 +15,7 @@ extern class JThreadHc = "java.lang.Thread" {
 
 // Suspends the CURRENT sequence's own virtual thread for `seconds` (fractional allowed, e.g.
 // `wait(0.5)`) -- see this file's own header for why this doesn't block anything else.
-fn wait(seconds: Float) {
+pub fn wait(seconds: Float) {
     let millis = (seconds * 1000.0f) as Long;
     JThreadHc::sleep(millis);
 }
@@ -25,7 +25,7 @@ fn wait(seconds: Float) {
 // resumes within 50ms, not instantly -- fine for game-logic timing (an NPC noticing the player
 // got close doesn't need sub-frame precision), but a real event-driven wakeup is a possible
 // follow-up if 50ms latency ever actually matters for some concrete use case.
-fn wait_until(cond: &dyn PhoenixSupplier) {
+pub fn wait_until(cond: &dyn PhoenixSupplier) {
     while !(cond.get() as Bool) {
         JThreadHc::sleep(50L);
     }

@@ -4652,7 +4652,7 @@ impl CodeGen {
     }
 }
 
-fn comparison_opcode(op: String) -> Int {
+pub fn comparison_opcode(op: String) -> Int {
     if op == "==" { return 159; } // IF_ICMPEQ
     if op == "!=" { return 160; } // IF_ICMPNE
     if op == "<" { return 161; }  // IF_ICMPLT
@@ -4665,7 +4665,7 @@ fn comparison_opcode(op: String) -> Int {
 // already reduced a `Long` comparison down to a real `-1`/`0`/`1` Int, unlike `comparison_opcode`
 // above (`IF_ICMPxx`, a two-operand family comparing two Ints directly -- the JVM has no `Long`
 // equivalent of that).
-fn single_cmp_opcode(op: String) -> Int {
+pub fn single_cmp_opcode(op: String) -> Int {
     if op == "==" { return 153; } // IFEQ
     if op == "!=" { return 154; } // IFNE
     if op == "<" { return 155; }  // IFLT
@@ -4674,7 +4674,7 @@ fn single_cmp_opcode(op: String) -> Int {
     return 158; // IFLE ("<=", and the fallback)
 }
 
-fn ref_cmp_opcode(op: String) -> Int {
+pub fn ref_cmp_opcode(op: String) -> Int {
     if op == "==" { return 165; } // IF_ACMPEQ
     return 166; // IF_ACMPNE
 }
@@ -4682,14 +4682,14 @@ fn ref_cmp_opcode(op: String) -> Int {
 // Anything that isn't a plain JVM int (or other primitive) on the operand stack (`Int`/`Bool`/
 // `Long`/`Float`/`Double`) is a reference type -- `String` and every struct instance alike -- and
 // needs `ALOAD`/`ASTORE` instead of `ILOAD`/`ISTORE`/`LLOAD`/`FLOAD`/`DLOAD`/etc.
-fn is_ref_type(name: String) -> Bool {
+pub fn is_ref_type(name: String) -> Bool {
     return name != "Int" && name != "Bool" && name != "Long" && name != "Float" && name != "Double" && name != "Char" && name != "Byte";
 }
 
 // The real JDK wrapper class for a given primitive type name -- `gen_cast`'s own box/unbox pair
 // (above) is the only reader: boxing calls `<class>.valueOf(...)`, unboxing first `CHECKCAST`s
 // down to `<class>` before calling its own `<x>Value()` method.
-fn box_class_for(ty: String) -> String {
+pub fn box_class_for(ty: String) -> String {
     if ty == "Bool" { return "java/lang/Boolean"; }
     if ty == "Long" { return "java/lang/Long"; }
     if ty == "Float" { return "java/lang/Float"; }
@@ -4700,7 +4700,7 @@ fn box_class_for(ty: String) -> String {
 }
 
 // `<Wrapper>.valueOf(<prim>)` descriptors -- `gen_cast`'s own boxing branch.
-fn box_desc_for(ty: String) -> String {
+pub fn box_desc_for(ty: String) -> String {
     if ty == "Bool" { return "(Z)Ljava/lang/Boolean;"; }
     if ty == "Long" { return "(J)Ljava/lang/Long;"; }
     if ty == "Float" { return "(F)Ljava/lang/Float;"; }
@@ -4711,7 +4711,7 @@ fn box_desc_for(ty: String) -> String {
 }
 
 // `<Wrapper>.<x>Value()` method names -- `gen_cast`'s own unboxing branch.
-fn unbox_method_for(ty: String) -> String {
+pub fn unbox_method_for(ty: String) -> String {
     if ty == "Bool" { return "booleanValue"; }
     if ty == "Long" { return "longValue"; }
     if ty == "Float" { return "floatValue"; }
@@ -4722,7 +4722,7 @@ fn unbox_method_for(ty: String) -> String {
 }
 
 // `<Wrapper>.<x>Value()` descriptors -- `gen_cast`'s own unboxing branch.
-fn unbox_desc_for(ty: String) -> String {
+pub fn unbox_desc_for(ty: String) -> String {
     if ty == "Bool" { return "()Z"; }
     if ty == "Long" { return "()J"; }
     if ty == "Float" { return "()F"; }
@@ -4737,7 +4737,7 @@ fn unbox_desc_for(ty: String) -> String {
 // (category-1, like `Int`, but its own opcode family), everything else keeps the existing
 // `ALOAD`/`ASTORE` vs `ILOAD`/`ISTORE` split. Centralized here instead of repeating the branch at
 // every call site.
-fn load_opcode(ty: String) -> Int {
+pub fn load_opcode(ty: String) -> Int {
     if ty == "Long" { return 22; } // LLOAD
     if ty == "Float" { return 23; } // FLOAD
     if ty == "Double" { return 24; } // DLOAD
@@ -4745,7 +4745,7 @@ fn load_opcode(ty: String) -> Int {
     return 21; // ILOAD
 }
 
-fn store_opcode(ty: String) -> Int {
+pub fn store_opcode(ty: String) -> Int {
     if ty == "Long" { return 55; } // LSTORE
     if ty == "Float" { return 56; } // FSTORE
     if ty == "Double" { return 57; } // DSTORE
@@ -4759,7 +4759,7 @@ fn store_opcode(ty: String) -> Int {
 // `Float`/`Double` existed until now. These three centralize the REAL per-type JVM array opcodes
 // (mirroring `load_opcode`/`store_opcode`'s own local-variable equivalents, right above), used at
 // every array element access site below.
-fn array_load_opcode_cg(ty: String) -> Int {
+pub fn array_load_opcode_cg(ty: String) -> Int {
     if ty == "Long" { return 47; } // LALOAD
     if ty == "Float" { return 48; } // FALOAD
     if ty == "Double" { return 49; } // DALOAD
@@ -4775,7 +4775,7 @@ fn array_load_opcode_cg(ty: String) -> Int {
     return 46; // IALOAD (Int/Bool)
 }
 
-fn array_store_opcode_cg(ty: String) -> Int {
+pub fn array_store_opcode_cg(ty: String) -> Int {
     if ty == "Long" { return 80; } // LASTORE
     if ty == "Float" { return 81; } // FASTORE
     if ty == "Double" { return 82; } // DASTORE
@@ -4791,7 +4791,7 @@ fn array_store_opcode_cg(ty: String) -> Int {
 // real JVM `boolean` at the field/array-descriptor level either -- see `resolve_descriptor`'s own
 // "Bool intentionally maps to I, not Z" header), so a real `T_BOOLEAN` (4) is never used here --
 // `Byte`/`Char` are the two REAL new primitive array kinds this adds.
-fn newarray_atype_cg(ty: String) -> Int {
+pub fn newarray_atype_cg(ty: String) -> Int {
     if ty == "Int" || ty == "Bool" { return 10; } // T_INT
     if ty == "Long" { return 11; } // T_LONG
     if ty == "Float" { return 6; } // T_FLOAT
@@ -4801,7 +4801,7 @@ fn newarray_atype_cg(ty: String) -> Int {
     return -1;
 }
 
-fn empty_str_vec4() -> Vec<String> {
+pub fn empty_str_vec4() -> Vec<String> {
     var v = vec_of("__init__");
     return Vec { data: v.data, len: 0 };
 }
@@ -4810,17 +4810,17 @@ fn empty_str_vec4() -> Vec<String> {
 // `visitTryCatchBlock`) BEFORE emitting any handler's own body -- the `try_block` itself has to be
 // emitted in between, so the labels need to persist across that gap, hence a real `Vec` rather
 // than emitting each handler inline in one pass.
-fn empty_label_vec_cg() -> Vec<Label> {
+pub fn empty_label_vec_cg() -> Vec<Label> {
     var v = vec_of(Label::new());
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_str_vec_vec() -> Vec<Vec<String>> {
+pub fn empty_str_vec_vec() -> Vec<Vec<String>> {
     var v = vec_of(empty_str_vec4());
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_int_vec() -> Vec<Int> {
+pub fn empty_int_vec() -> Vec<Int> {
     var v = vec_of(0);
     return Vec { data: v.data, len: 0 };
 }
@@ -4842,14 +4842,14 @@ extern class CodegenError = "java.lang.RuntimeException" {
 // calls this instead of hardcoding `61` now -- `emit_and_write`, a standalone test-driver helper
 // unrelated to the real `compile_program` pipeline, is the one deliberate exception, still
 // pinned directly to `61`.
-fn classfile_major_for_target(target: Int) -> Int {
+pub fn classfile_major_for_target(target: Int) -> Int {
     return 44 + target;
 }
 
 // Shared by `gen_fn` and `gen_method` -- rebuilds all the cross-function/cross-struct lookup
 // tables from `info` fresh (see `ProgramInfo`'s own header for why: reused across a `compile_
 // program` codegen loop that rebuilds `info` itself fresh every iteration).
-fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info: ProgramInfo, fn_identity: String) -> CodeGen {
+pub fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info: ProgramInfo, fn_identity: String) -> CodeGen {
     var descs = registry_new("__init__", "");
     var rettys = registry_new("__init__", "");
     var fnparamtypes = registry_new("__init__", empty_str_vec4());
@@ -5001,7 +5001,7 @@ fn build_codegen(mv: MethodVisitor2, owner: String, ret_type_name: String, info:
 // enumerate every variant of a concrete enum type without its own dedicated `ProgramInfo` field --
 // everything it needs is already flattened into `variant_tag_keys` by the existing scan, this just
 // re-groups it by the part before the "#".
-fn group_variant_names_by_enum_cg(keys: &Vec<String>) -> Registry<Vec<String>> {
+pub fn group_variant_names_by_enum_cg(keys: &Vec<String>) -> Registry<Vec<String>> {
     // Deliberately two flat passes over `keys` (O(n^2) in the total variant count across the
     // whole program, always tiny) instead of accumulating into a `Vec<Vec<String>>` and mutating
     // an inner entry via `.set(...)` -- that specific shape (a doubly-nested generic instantiation
@@ -5052,7 +5052,7 @@ fn group_variant_names_by_enum_cg(keys: &Vec<String>) -> Registry<Vec<String>> {
 // `StructDecl.module_name` header). Used by `gen_struct`/`gen_enum`'s own top-level emission
 // loop, which already has `structs`/`enums` on hand but no `ProgramInfo`/`CodeGen` receiver yet
 // at the point the class's own header/output-path needs qualifying.
-fn find_struct_module_cg(name: String, structs: &Vec<StructDecl>) -> Option<String> {
+pub fn find_struct_module_cg(name: String, structs: &Vec<StructDecl>) -> Option<String> {
     var base = name;
     if is_mono_name_cg(name) { base = mono_base_cg(name); }
     var i = 0;
@@ -5066,7 +5066,7 @@ fn find_struct_module_cg(name: String, structs: &Vec<StructDecl>) -> Option<Stri
     return none_string();
 }
 
-fn find_enum_module_cg(name: String, enums: &Vec<EnumDecl>) -> Option<String> {
+pub fn find_enum_module_cg(name: String, enums: &Vec<EnumDecl>) -> Option<String> {
     var base = name;
     if is_mono_name_cg(name) { base = mono_base_cg(name); }
     var i = 0;
@@ -5083,14 +5083,14 @@ fn find_enum_module_cg(name: String, enums: &Vec<EnumDecl>) -> Option<String> {
 // `name` unchanged (default package) when `module_name` is `None` -- the single fallback every
 // call site of this relies on to stay backward-compatible with every `.hotc` file that never
 // wrote a `module` declaration at all.
-fn qualify_with_opt_module_cg(name: String, module_name: Option<String>) -> String {
+pub fn qualify_with_opt_module_cg(name: String, module_name: Option<String>) -> String {
     if let Some { value: m } = module_name {
         return dot_to_slash_cg(m) + "/" + name;
     }
     return name;
 }
 
-pub fn gen_fn(cw: &mut ClassWriter2, owner: String, name: String, param_names: Vec<String>, param_type_names: Vec<String>, ret_type_name: String, body: Vec<Stmt>, info: ProgramInfo, annotation: Option<Annotation>) {
+pub fn gen_fn(cw: &mut ClassWriter2, owner: String, name: String, param_names: Vec<String>, param_type_names: Vec<String>, ret_type_name: String, body: Vec<Stmt>, info: ProgramInfo, annotation: Option<Annotation>, access: Int) {
     let param_count = param_names.length();
     // Built inline (not via the standalone `fn_descriptor` helper) so `param_type_names` stays
     // available afterward for the per-param `var_types` registration loop below -- passing the
@@ -5103,7 +5103,7 @@ pub fn gen_fn(cw: &mut ClassWriter2, owner: String, name: String, param_names: V
         di = di + 1;
     }
     desc = desc + ")" + descriptor_of_type(ret_type_name, &info.extern_alias_names, &info.extern_binary_names, &info.module_names, &info.module_values);
-    var mv0 = CodegenShim::visitMethodNoSig(&mut cw, 9, name, desc, ["x"; 0]); // ACC_PUBLIC | ACC_STATIC
+    var mv0 = CodegenShim::visitMethodNoSig(&mut cw, access, name, desc, ["x"; 0]); // caller-supplied: ACC_STATIC always, ACC_PUBLIC only when actually `pub` (see call sites)
     if let Some { value: ann0 } = annotation {
         emit_method_annotation(&mut mv0, ann0);
     }
@@ -5210,7 +5210,7 @@ pub fn gen_method(cw: &mut ClassWriter2, binary_name: String, struct_name: Strin
 // body already returned everywhere, but a genuine instruction at that trailing offset either way
 // -- sidesteps the whole class of "dangling final label" bug family (`match`, but potentially any
 // future construct with the same shape) without needing real reachability analysis.
-fn gen_fallback_return(gen: &mut CodeGen, ret_type_name: String) {
+pub fn gen_fallback_return(gen: &mut CodeGen, ret_type_name: String) {
     if ret_type_name == "Unit" {
         gen.mv.visitInsn(177); // RETURN
     } else if ret_type_name == "Long" {
@@ -5237,7 +5237,7 @@ fn gen_fallback_return(gen: &mut CodeGen, ret_type_name: String) {
 // "used after move inside a loop" problem `compile_program`'s own per-iteration rebuilding
 // comments describe elsewhere in this file -- a borrow never consumes what it points at, so the
 // same `fns`/`structs`/`impls` bindings stay usable across as many calls as needed.
-fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>, impls: &Vec<ImplDecl>, enums: &Vec<EnumDecl>, mono_names: &Vec<String>, fn_mono_names: &Vec<String>, method_mono_names: &Vec<String>, statics: &Vec<StaticDecl>, externs: &Vec<ExternClassDecl>, interfaces: &Vec<InterfaceDecl>, sendable_struct_names: &Vec<String>) -> ProgramInfo {
+pub fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>, impls: &Vec<ImplDecl>, enums: &Vec<EnumDecl>, mono_names: &Vec<String>, fn_mono_names: &Vec<String>, method_mono_names: &Vec<String>, statics: &Vec<StaticDecl>, externs: &Vec<ExternClassDecl>, interfaces: &Vec<InterfaceDecl>, sendable_struct_names: &Vec<String>) -> ProgramInfo {
     // Built once, reused for every descriptor built below (fn/method params or return types
     // naming an extern alias need the real binary name -- see `descriptor_of_type`'s own header).
     // `extern interface`'s own name/binary pairs fold into this SAME table, right alongside
@@ -5874,12 +5874,12 @@ fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>,
     return ProgramInfo { target: target, sendable_struct_names: sendable_names_owned, fn_names: fn_names, fn_descs_list: fn_descs_list, fn_rettys_list: fn_rettys_list, fn_param_types_list: fn_param_types_list, fn_param_names_list: fn_param_names_list, static_names: static_names, static_type_names: static_type_names, generic_fn_names: generic_fn_names, generic_fn_infer_idx: generic_fn_infer_idx, generic_fn_infer_unwrap: generic_fn_infer_unwrap, generic_fn_infer_idx2: generic_fn_infer_idx2, generic_fn_infer_unwrap2: generic_fn_infer_unwrap2, generic_struct_infer_names: generic_struct_infer_names, generic_struct_infer_fields: generic_struct_infer_fields, generic_enum_infer_variant_names: generic_enum_infer_variant_names, generic_enum_infer_owner_names: generic_enum_infer_owner_names, generic_enum_infer_field_names: generic_enum_infer_field_names, enum_names: enum_names, struct_names: struct_names, struct_field_names_list: struct_field_names_list, struct_field_types_list: struct_field_types_list, method_keys: method_keys, method_descs_list: method_descs_list, method_rettys_list: method_rettys_list, method_param_types_list: method_param_types_list, variant_owner_names: variant_owner_names, variant_owner_enums: variant_owner_enums, variant_tag_keys: variant_tag_keys, variant_tag_list: variant_tag_list, extern_alias_names: extern_alias_names, extern_binary_names: extern_binary_names, extern_alias_is_interface: extern_alias_is_interface, extern_method_keys: extern_method_keys, extern_method_descs_list: extern_method_descs_list, extern_method_rettys_list: extern_method_rettys_list, extern_method_static_list: extern_method_static_list, extern_method_ctor_list: extern_method_ctor_list, extern_method_param_types_list: extern_method_param_types_list, extern_field_keys: extern_field_keys, extern_field_descs_list: extern_field_descs_list, extern_field_type_names_list: extern_field_type_names_list, extern_field_static_list: extern_field_static_list, struct_extends_names: struct_extends_names, struct_extends_targets: struct_extends_targets, variant_field_keys: variant_field_keys, variant_field_names_list: variant_field_names_list, variant_field_types_list: variant_field_types_list, module_names: module_names, module_values: module_values, interfaces_raw: interfaces_raw };
 }
 
-fn empty_interface_vec_cg() -> Vec<InterfaceDecl> {
+pub fn empty_interface_vec_cg() -> Vec<InterfaceDecl> {
     var v = vec_of(InterfaceDecl { name: "__init__", methods: empty_interfacemethod_vec_cg(), is_sealed: false, parents: empty_str_vec4(), extern_binary_name: none_string2(), module_name: none_string2(), is_open: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_interfacemethod_vec_cg() -> Vec<InterfaceMethod> {
+pub fn empty_interfacemethod_vec_cg() -> Vec<InterfaceMethod> {
     var v = vec_of(InterfaceMethod { name: "__init__", params: empty_param_vec2(), ret_type: "Unit", body: none_stmt_list_cg() });
     return Vec { data: v.data, len: 0 };
 }
@@ -5909,7 +5909,7 @@ fn empty_interfacemethod_vec_cg() -> Vec<InterfaceMethod> {
 // this is the first time the GENERIC extern-descriptor path was asked to build one, producing a
 // real `NoSuchMethodError` at call time (a syntactically valid but WRONG descriptor, same
 // "compiles clean, fails at link/run time" class of bug as `ClassWriter2`'s own alias mismatch).
-fn extern_descriptor_of_type(name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+pub fn extern_descriptor_of_type(name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
     if name == "Bool" { return "Z"; }
     // Extern method params/returns can't name a LOCAL, module-qualified struct/enum this round --
     // a real, disclosed narrower scope, same class of cut as this file's other extern-method
@@ -5919,12 +5919,12 @@ fn extern_descriptor_of_type(name: String, alias_names: &Vec<String>, alias_bina
     return descriptor_of_type(name, &alias_names, &alias_binaries, &no_modules, &no_modules2);
 }
 
-fn extern_ret_descriptor(ret_type: String, binary_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+pub fn extern_ret_descriptor(ret_type: String, binary_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
     if ret_type == "Self" { return "L" + binary_name + ";"; }
     return extern_descriptor_of_type(ret_type, &alias_names, &alias_binaries);
 }
 
-fn extern_method_descriptor(param_types: Vec<String>, ret_type: String, binary_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+pub fn extern_method_descriptor(param_types: Vec<String>, ret_type: String, binary_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
     var d = "(";
     var i = 0;
     while i < param_types.length() {
@@ -5937,7 +5937,7 @@ fn extern_method_descriptor(param_types: Vec<String>, ret_type: String, binary_n
 // Constructors always return `void` at the real bytecode level regardless of the HC-level
 // `-> Self` annotation -- same real JVM convention `gen_struct`'s own constructor already follows.
 // Real alias tables threaded through, same fix as `extern_method_descriptor`'s own header.
-fn extern_ctor_descriptor(param_types: Vec<String>, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
+pub fn extern_ctor_descriptor(param_types: Vec<String>, alias_names: &Vec<String>, alias_binaries: &Vec<String>) -> String {
     var d = "(";
     var i = 0;
     while i < param_types.length() {
@@ -5972,7 +5972,7 @@ fn extern_ctor_descriptor(param_types: Vec<String>, alias_names: &Vec<String>, a
 // `descriptor_of_type` with EMPTY alias tables (interface method signatures can't reference an
 // extern-class alias this phase -- a real, disclosed narrower scope than `gen_method`'s own, which
 // gets real alias tables from its enclosing struct's own `externs`).
-pub fn gen_interface(target: Int, name: String, methods: Vec<InterfaceMethod>, parents: Vec<String>, module_name: Option<String>, interfaces: &Vec<InterfaceDecl>) {
+pub fn gen_interface(target: Int, name: String, methods: Vec<InterfaceMethod>, parents: Vec<String>, module_name: Option<String>, interfaces: &Vec<InterfaceDecl>, pub_interface_names: &Vec<String>) {
     var cw = ClassWriter2::new(2); // COMPUTE_FRAMES
     let qname = qualify_with_opt_module_cg(name, module_name);
     // Each `extends`ed parent is resolved the SAME way a struct's own `implements` clause is --
@@ -5984,7 +5984,13 @@ pub fn gen_interface(target: Int, name: String, methods: Vec<InterfaceMethod>, p
         parents_arr[exi] = struct_iface_jvm_name(parents.get(exi), interfaces);
         exi = exi + 1;
     }
-    CodegenShim::visitClassHeader(&mut cw, classfile_major_for_target(target), 1537, qname, "java/lang/Object", parents_arr); // ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT
+    // `pub interface Foo { ... }` -- see `Ast.hc`'s own `Program.pub_interface_names` header for
+    // the real fix this is (`pub` used to be discarded unconditionally). Default flipped to
+    // package-private (`ACC_INTERFACE | ACC_ABSTRACT` alone), `ACC_PUBLIC` added back only when
+    // actually marked `pub`.
+    var iface_access = 1536; // ACC_INTERFACE | ACC_ABSTRACT
+    if str_vec_contains_cg(pub_interface_names, name) { iface_access = 1537; } // + ACC_PUBLIC
+    CodegenShim::visitClassHeader(&mut cw, classfile_major_for_target(target), iface_access, qname, "java/lang/Object", parents_arr);
     CodegenShim::visitSource(&mut cw, name + ".hotc");
     let empty_aliases = empty_str_vec4();
     let empty_binaries = empty_str_vec4();
@@ -6022,7 +6028,7 @@ pub fn gen_interface(target: Int, name: String, methods: Vec<InterfaceMethod>, p
 // than one interface (`impl A for Widget { ... }` and `impl B for Widget { ... }`, two SEPARATE
 // `ImplDecl`s sharing one `struct_name`) is real now, not a one-interface-per-struct limit -- see
 // `Ast.hc`'s own `ImplDecl` header, which used to disclose this as a scope cut.
-fn struct_interfaces_of(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<String> {
+pub fn struct_interfaces_of(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < impls.length() {
@@ -6043,7 +6049,7 @@ fn struct_interfaces_of(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<Strin
 // `InterfaceDecl.extern_binary_name` header) -- a struct implementing `Run = "java.lang.Runnable"`
 // needs a real `implements java/lang/Runnable` clause, not `implements Run` (which names a class
 // that was never emitted at all, see `gen_interface`'s own call-site header).
-fn struct_iface_jvm_name(iface_name: String, interfaces: &Vec<InterfaceDecl>) -> String {
+pub fn struct_iface_jvm_name(iface_name: String, interfaces: &Vec<InterfaceDecl>) -> String {
     var i2 = 0;
     while i2 < interfaces.length() {
         let ifd2 = interfaces.get(i2);
@@ -6066,7 +6072,7 @@ fn struct_iface_jvm_name(iface_name: String, interfaces: &Vec<InterfaceDecl>) ->
     return iface_name;
 }
 
-pub fn gen_struct(target: Int, name: String, fields: Vec<Param>, methods: Vec<FnDecl>, static_methods: Vec<FnDecl>, binary_name: String, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>, impls: &Vec<ImplDecl>, enums: &Vec<EnumDecl>, mono_names: &Vec<String>, fn_mono_names: &Vec<String>, method_mono_names: &Vec<String>, statics: &Vec<StaticDecl>, externs: &Vec<ExternClassDecl>, interfaces: &Vec<InterfaceDecl>, super_class: Option<String>, annotation: Option<Annotation>, sendable_struct_names: &Vec<String>) {
+pub fn gen_struct(target: Int, name: String, fields: Vec<Param>, methods: Vec<FnDecl>, static_methods: Vec<FnDecl>, binary_name: String, fns: &Vec<FnDecl>, structs: &Vec<StructDecl>, impls: &Vec<ImplDecl>, enums: &Vec<EnumDecl>, mono_names: &Vec<String>, fn_mono_names: &Vec<String>, method_mono_names: &Vec<String>, statics: &Vec<StaticDecl>, externs: &Vec<ExternClassDecl>, interfaces: &Vec<InterfaceDecl>, super_class: Option<String>, annotation: Option<Annotation>, sendable_struct_names: &Vec<String>, pub_struct_names: &Vec<String>) {
     var cw = ClassWriter2::new(2); // COMPUTE_FRAMES (implies COMPUTE_MAXS; real ASM value is 2, not 4)
     let qname = qualify_with_opt_module_cg(name, find_struct_module_cg(name, &structs));
     let iface_names = struct_interfaces_of(&impls, name);
@@ -6082,13 +6088,18 @@ pub fn gen_struct(target: Int, name: String, fields: Vec<Param>, methods: Vec<Fn
     // single inheritance only, nothing can extend an extends-struct further (real, disclosed scope
     // cut, see README's own "Known limitations" for this feature).
     var super_name = "java/lang/Object";
-    var class_access = 33; // ACC_PUBLIC | ACC_SUPER
+    // `pub struct Foo { ... }` -- see `Ast.hc`'s own `Program.pub_struct_names` header for the
+    // real fix this is (`pub` used to be discarded unconditionally, every struct class always
+    // `ACC_PUBLIC` regardless). Default flipped to package-private (`ACC_SUPER`/`ACC_FINAL |
+    // ACC_SUPER` alone, no `ACC_PUBLIC` bit) -- added back below once the actual `pub`-ness is
+    // known.
+    var class_access = 32; // ACC_SUPER
     var extends_alias = "";
     var is_extends_struct = false;
     if let Some { value: sup } = super_class {
         extends_alias = sup;
         is_extends_struct = true;
-        class_access = 49; // ACC_PUBLIC | ACC_FINAL | ACC_SUPER
+        class_access = 48; // ACC_FINAL | ACC_SUPER
         var sbi = 0;
         while sbi < externs.length() {
             let sxd = externs.get(sbi);
@@ -6098,6 +6109,11 @@ pub fn gen_struct(target: Int, name: String, fields: Vec<Param>, methods: Vec<Fn
             sbi = sbi + 1;
         }
     }
+    // `name` may be a monomorphized instantiation (`"Box$Int"`) -- check against its own
+    // TEMPLATE's declared name, same as every other generic-instantiation lookup in this file.
+    var pub_base_struct = name;
+    if is_mono_name_cg(name) { pub_base_struct = mono_base_cg(name); }
+    if str_vec_contains_cg(pub_struct_names, pub_base_struct) { class_access = class_access + 1; } // + ACC_PUBLIC
     CodegenShim::visitClassHeader(&mut cw, classfile_major_for_target(target), class_access, qname, super_name, struct_interfaces);
     if let Some { value: ann0 } = annotation {
         emit_class_annotation(&mut cw, ann0);
@@ -6229,7 +6245,7 @@ pub fn gen_struct(target: Int, name: String, fields: Vec<Param>, methods: Vec<Fn
         let sm = static_methods.get(smi);
         let smb = static_methods.get(smi); // fresh copy -- `.params` is only safe to read once
         let sinfo = build_program_info(target, &fns, &structs, &impls, &enums, &mono_names, &fn_mono_names, &method_mono_names, &statics, &externs, &interfaces, sendable_struct_names); // fresh every iteration
-        gen_fn(&mut cw, binary_name, sm.name, param_names_of(sm.params), param_type_names_of(smb.params), opt_string_or(sm.ret_type, "Unit"), sm.body, sinfo, none_annotation2());
+        gen_fn(&mut cw, binary_name, sm.name, param_names_of(sm.params), param_type_names_of(smb.params), opt_string_or(sm.ret_type, "Unit"), sm.body, sinfo, none_annotation2(), 9); // ACC_PUBLIC | ACC_STATIC -- impl static methods aren't gated by `pub` (out of scope, see IDEAS.md)
         smi = smi + 1;
     }
 
@@ -6244,10 +6260,19 @@ pub fn gen_struct(target: Int, name: String, fields: Vec<Param>, methods: Vec<Fn
 // one "shape"), this is a trivial no-arg constructor -- different variant literals populate
 // different subsets of fields, so `StructLit`-for-a-variant codegen (see `gen_expr`) sets `tag`
 // and each field via individual `PUTFIELD`s after construction instead.
-pub fn gen_enum(target: Int, name: String, variants: Vec<EnumVariant>, module_name: Option<String>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>) {
+pub fn gen_enum(target: Int, name: String, variants: Vec<EnumVariant>, module_name: Option<String>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, pub_enum_names: &Vec<String>) {
     var cw = ClassWriter2::new(2); // COMPUTE_FRAMES (implies COMPUTE_MAXS; real ASM value is 2, not 4)
     let qname = qualify_with_opt_module_cg(name, module_name);
-    CodegenShim::visitClassHeader(&mut cw, classfile_major_for_target(target), 33, qname, "java/lang/Object", ["x"; 0]); // ACC_PUBLIC | ACC_SUPER
+    // `pub enum Foo { ... }` -- see `Ast.hc`'s own `Program.pub_enum_names` header for the real
+    // fix this is (`pub` used to be discarded unconditionally, every enum class always `ACC_
+    // PUBLIC` regardless). `name` may be a monomorphized instantiation (`"Option$Int"`) -- check
+    // against its own TEMPLATE's declared name, same as every other generic-instantiation lookup
+    // in this file.
+    var pub_base_enum = name;
+    if is_mono_name_cg(name) { pub_base_enum = mono_base_cg(name); }
+    var class_access = 32; // ACC_SUPER (package-private unless marked `pub`)
+    if str_vec_contains_cg(pub_enum_names, pub_base_enum) { class_access = 33; } // + ACC_PUBLIC
+    CodegenShim::visitClassHeader(&mut cw, classfile_major_for_target(target), class_access, qname, "java/lang/Object", ["x"; 0]);
     CodegenShim::visitSource(&mut cw, name + ".hotc");
 
     CodegenShim::visitInstanceField(&mut cw, 1, "tag", "I"); // ACC_PUBLIC
@@ -6436,7 +6461,7 @@ pub fn gen_enum(target: Int, name: String, variants: Vec<EnumVariant>, module_na
     CodegenShim::writeClass(cw, qname + ".class");
 }
 
-fn int_descriptor(param_count: Int) -> String {
+pub fn int_descriptor(param_count: Int) -> String {
     var d = "(";
     var i = 0;
     while i < param_count {
@@ -6456,7 +6481,7 @@ extern class JStringCg = "java.lang.String" {
 // See `Checker.hotc`'s own `capitalize_first_chk` header -- identical, redone independently here
 // (this file doesn't share the checker's own registries or helpers, same split as everywhere
 // else in this codebase).
-fn capitalize_first_cg(s: String) -> String {
+pub fn capitalize_first_cg(s: String) -> String {
     if s.length() == 0 { return s; }
     let c0 = s.codePointAt(0);
     var cap0 = c0;
@@ -6479,7 +6504,7 @@ fn capitalize_first_cg(s: String) -> String {
 // match, and this subset's extern-signature validator requires an EXACT nominal match against a
 // real classpath overload (no implicit String->CharSequence reference-supertype compatibility).
 // `substring`/`length` are already proven-working externs, so this sidesteps the mismatch entirely.
-fn dot_to_slash_cg(name: String) -> String {
+pub fn dot_to_slash_cg(name: String) -> String {
     var out = "";
     var i = 0;
     while i < name.length() {
@@ -6498,7 +6523,7 @@ fn dot_to_slash_cg(name: String) -> String {
 // between `emit_class_annotation`/`emit_method_annotation` (right below) since both just hand this
 // the `AnnotationVisitor2` their own `visitAnnotation` call already produced -- the actual
 // value-by-value emission is identical either way.
-fn emit_annotation_args(av: &mut AnnotationVisitor2, ann: Annotation) {
+pub fn emit_annotation_args(av: &mut AnnotationVisitor2, ann: Annotation) {
     var i = 0;
     while i < ann.args.length() {
         let arg = ann.args.get(i);
@@ -6508,7 +6533,7 @@ fn emit_annotation_args(av: &mut AnnotationVisitor2, ann: Annotation) {
 }
 
 // The NAMED (top-level argument) shape -- `name` is a real arg name here, never `null`.
-fn emit_ann_value(av: &mut AnnotationVisitor2, name: String, value: AnnValue) {
+pub fn emit_ann_value(av: &mut AnnotationVisitor2, name: String, value: AnnValue) {
     match value {
         AnnStr { value: v } => { av.visit(name, v as JObject4); }
         AnnEnumConst { binary_name, const_name } => {
@@ -6531,7 +6556,7 @@ fn emit_ann_value(av: &mut AnnotationVisitor2, name: String, value: AnnValue) {
 // `emit_ann_value` with an empty string. Nested arrays aren't part of the documented grammar (an
 // array of scalar/enum values only, never an array of arrays) -- `AnnArray` here is a real error,
 // not a silently-dropped case.
-fn emit_ann_array_elem(av: &mut AnnotationVisitor2, value: AnnValue) {
+pub fn emit_ann_array_elem(av: &mut AnnotationVisitor2, value: AnnValue) {
     match value {
         AnnStr { value: v } => { CodegenShim::visitArrayString(av, v); }
         AnnEnumConst { binary_name, const_name } => {
@@ -6557,10 +6582,10 @@ pub fn emit_method_annotation(mv: &mut MethodVisitor2, ann: Annotation) {
     av.visitEnd();
 }
 
-fn none_annotation2() -> Option<Annotation> {
+pub fn none_annotation2() -> Option<Annotation> {
     return None;
 }
-fn some_annotation2(a: Annotation) -> Option<Annotation> {
+pub fn some_annotation2(a: Annotation) -> Option<Annotation> {
     return Some { value: a };
 }
 
@@ -6568,7 +6593,7 @@ fn some_annotation2(a: Annotation) -> Option<Annotation> {
 // `Ast.hc`'s own `Program.struct_annotation_names` header for why it's shaped this way. Shared by
 // both the struct-name and fn-name lookups (`compile_program`'s own two call sites), since the
 // shape is identical either way.
-fn find_annotation_cg(names: &Vec<String>, anns: &Vec<Annotation>, target: String) -> Option<Annotation> {
+pub fn find_annotation_cg(names: &Vec<String>, anns: &Vec<Annotation>, target: String) -> Option<Annotation> {
     var i = 0;
     while i < names.length() {
         if names.get(i) == target {
@@ -6586,7 +6611,7 @@ fn find_annotation_cg(names: &Vec<String>, anns: &Vec<Annotation>, target: Strin
 // plain mod/div digit loop is fine -- reuses `Lexer.hotc`'s own `codepoint_to_string` (visible
 // here since every `.hotc` source file compiles as one flat unit) rather than adding a whole new
 // extern class just for int->String.
-fn arity_str_cg(n: Int) -> String {
+pub fn arity_str_cg(n: Int) -> String {
     if n == 0 { return "0"; }
     var v = n;
     var s = "";
@@ -6602,7 +6627,7 @@ fn arity_str_cg(n: Int) -> String {
 // duplicated rather than shared (flat cross-module function namespace, `_cg` suffix convention
 // this file already uses elsewhere for that reason). Builds the full-signature half of an extern
 // method's registry key -- see the `key`/`sig_key` pair right above this fn's own call site.
-fn join_type_names_cg(names: Vec<String>) -> String {
+pub fn join_type_names_cg(names: Vec<String>) -> String {
     var out = "";
     var i = 0;
     while i < names.length() {
@@ -6644,12 +6669,12 @@ extern class JLongCg = "java/lang/Long" {
 // Array types are represented as the plain string `"[ElemType]"` -- same convention (and same
 // duplicated-helper pattern, `_cg` suffix here only to dodge the flat cross-module function
 // namespace) as `Checker.hotc`'s own `is_array_type_name`/`array_elem_type_name`.
-fn is_array_type_name_cg(name: String) -> Bool {
+pub fn is_array_type_name_cg(name: String) -> Bool {
     if name.length() < 2 { return false; }
     return name.codePointAt(0) == 91 && name.codePointAt(name.length() - 1) == 93; // '[' / ']'
 }
 
-fn array_elem_type_name_cg(name: String) -> String {
+pub fn array_elem_type_name_cg(name: String) -> String {
     return name.substring(1, name.length() - 1);
 }
 
@@ -6658,12 +6683,12 @@ fn array_elem_type_name_cg(name: String) -> String {
 // `gen_stmt`'s `If` arm applies, independently of `Checker.hotc`'s `self.vars` -- a still-suffixed
 // var_types entry would make `gen_expr`'s own method/extern dispatch (keyed by exact type name)
 // fail to find a real declaration even for a call the checker already approved after narrowing.
-fn is_nullable_type_name_cg(name: String) -> Bool {
+pub fn is_nullable_type_name_cg(name: String) -> Bool {
     if name.length() < 2 { return false; }
     return name.codePointAt(name.length() - 1) == 63; // '?'
 }
 
-fn strip_nullable_cg(name: String) -> String {
+pub fn strip_nullable_cg(name: String) -> String {
     return name.substring(0, name.length() - 1);
 }
 
@@ -6673,7 +6698,7 @@ fn strip_nullable_cg(name: String) -> String {
 // stage) and `PhoenixFunction` (every `.then(...)` stage after it) -- see `finish_method_call`'s
 // own header, right where this is called, for why the capture-safety check is gated on this SET
 // of interface names rather than a hardcoded (receiver, method-name) pair.
-fn is_phoenix_background_iface_cg(name: String) -> Bool {
+pub fn is_phoenix_background_iface_cg(name: String) -> Bool {
     return name == "PhoenixCallable" || name == "PhoenixSupplier" || name == "PhoenixFunction";
 }
 
@@ -6684,7 +6709,7 @@ fn is_phoenix_background_iface_cg(name: String) -> Bool {
 // `Ast.hc`'s own `Program.sendable_struct_names`) -- the author's own assertion that every field
 // is safe to hand across a thread boundary, NOT verified field-by-field this pass (same "declared
 // type is truth" honesty `extern class` already gets elsewhere in this checker).
-fn is_sendable_type_cg(ty: String, sendable_structs: &Registry<Bool>) -> Bool {
+pub fn is_sendable_type_cg(ty: String, sendable_structs: &Registry<Bool>) -> Bool {
     if is_numeric_ty_name_cg(ty) { return true; }
     if ty == "String" { return true; }
     if ty == "?" { return true; }
@@ -6693,7 +6718,7 @@ fn is_sendable_type_cg(ty: String, sendable_structs: &Registry<Bool>) -> Bool {
     return false;
 }
 
-fn is_numeric_ty_name_cg(name: String) -> Bool {
+pub fn is_numeric_ty_name_cg(name: String) -> Bool {
     return name == "Int" || name == "Long" || name == "Float" || name == "Double" || name == "Char" || name == "Byte";
 }
 
@@ -6701,7 +6726,7 @@ fn is_numeric_ty_name_cg(name: String) -> Bool {
 // the real gap this closes and the exact rule (same one here). `CodeGen.gen_widen_numeric_pair`
 // (a real METHOD, unlike this free fn, since it needs `&mut self` to emit the actual widening
 // bytecode) is what actually applies this.
-fn numeric_widen_result_cg(lt: String, rt: String) -> String {
+pub fn numeric_widen_result_cg(lt: String, rt: String) -> String {
     if !is_numeric_ty_name_cg(lt) || !is_numeric_ty_name_cg(rt) { return ""; }
     if lt == rt { return lt; }
     if lt == "Double" || rt == "Double" { return "Double"; }
@@ -6711,7 +6736,7 @@ fn numeric_widen_result_cg(lt: String, rt: String) -> String {
 
 // Mirrors `Checker.hotc`'s own identical `operator_method_name` -- see that fn's own header for
 // the full design and naming convention.
-fn operator_method_name_cg(op: String) -> String {
+pub fn operator_method_name_cg(op: String) -> String {
     if op == "+" { return "add"; }
     if op == "-" { return "sub"; }
     if op == "*" { return "mul"; }
@@ -6724,22 +6749,22 @@ fn operator_method_name_cg(op: String) -> String {
 
 // `"dyn Name"` -- see `Parser.hotc`'s own `type_name_ref` header for why a `&dyn Name` type shows
 // up as this plain, space-containing type-name string rather than a new `Ty`/AST shape.
-fn is_dyn_type_name_cg(name: String) -> Bool {
+pub fn is_dyn_type_name_cg(name: String) -> Bool {
     if name.length() < 4 { return false; }
     return name.substring(0, 4) == "dyn ";
 }
 
-fn dyn_interface_name_cg(name: String) -> String {
+pub fn dyn_interface_name_cg(name: String) -> String {
     return name.substring(4, name.length());
 }
 
 // `"arena Name"` -- see `Ast.hc`'s own `ArenaNew` header.
-fn is_arena_type_name_cg(name: String) -> Bool {
+pub fn is_arena_type_name_cg(name: String) -> Bool {
     if name.length() < 6 { return false; }
     return name.substring(0, 6) == "arena ";
 }
 
-fn arena_struct_name_cg(name: String) -> String {
+pub fn arena_struct_name_cg(name: String) -> String {
     return name.substring(6, name.length());
 }
 
@@ -6753,7 +6778,7 @@ fn arena_struct_name_cg(name: String) -> String {
 // template, real for a flat two-param one like `"Pair$K$V"`). Same fix here: split flat on every
 // `"$"` and check each segment independently, instead of recursing into "the rest" as if it were
 // always exactly one more nested type application.
-fn substitute_field_type_cg(ftype: String, type_param: String, arg: String) -> String {
+pub fn substitute_field_type_cg(ftype: String, type_param: String, arg: String) -> String {
     if is_array_type_name_cg(ftype) {
         let elem = array_elem_type_name_cg(ftype);
         return "[" + substitute_field_type_cg(elem, type_param, arg) + "]";
@@ -6790,12 +6815,12 @@ fn substitute_field_type_cg(ftype: String, type_param: String, arg: String) -> S
     return result;
 }
 
-fn empty_expr_vec_cg() -> Vec<Expr> {
+pub fn empty_expr_vec_cg() -> Vec<Expr> {
     var v = vec_of(IntLit { value: 0 });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_matcharm_vec_cg() -> Vec<MatchArm> {
+pub fn empty_matcharm_vec_cg() -> Vec<MatchArm> {
     var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec4(), bind_names: empty_str_vec4(), body: empty_stmt_vec2(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
     return Vec { data: v.data, len: 0 };
 }
@@ -6808,7 +6833,7 @@ fn empty_matcharm_vec_cg() -> Vec<MatchArm> {
 // constructs/calls the real concrete instantiation (`"Vec$Int"`) instead of the still-abstract
 // template name (`"Vec$T"`, which would emit `NEW`/`ANEWARRAY` against a class that was never
 // compiled). See `Checker.hotc`'s own header for why this pass exists at all.
-fn subst_expr_cg(e: &Expr, type_param: String, arg: String) -> Expr {
+pub fn subst_expr_cg(e: &Expr, type_param: String, arg: String) -> Expr {
     match e {
         IntLit { value } => { return IntLit { value: value }; }
         FloatLit { text } => { return FloatLit { text: text }; }
@@ -6862,7 +6887,7 @@ fn subst_expr_cg(e: &Expr, type_param: String, arg: String) -> Expr {
     }
 }
 
-fn subst_expr_list_cg(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Expr> {
+pub fn subst_expr_list_cg(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Expr> {
     var out = empty_expr_vec_cg();
     var i = 0;
     while i < es.length() {
@@ -6872,7 +6897,7 @@ fn subst_expr_list_cg(es: Vec<Expr>, type_param: String, arg: String) -> Vec<Exp
     return out;
 }
 
-fn subst_stmt_cg(s: Stmt, type_param: String, arg: String) -> Stmt {
+pub fn subst_stmt_cg(s: Stmt, type_param: String, arg: String) -> Stmt {
     match s {
         Let { name, mutable, init, declared_type, line } => { return Let { name: name, mutable: mutable, init: subst_expr_cg(init, type_param, arg), declared_type: declared_type, line: line }; }
         ExprStmt { expr, line } => { return ExprStmt { expr: subst_expr_cg(expr, type_param, arg), line: line }; }
@@ -6900,7 +6925,7 @@ fn subst_stmt_cg(s: Stmt, type_param: String, arg: String) -> Stmt {
     }
 }
 
-fn subst_stmt_list_cg(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stmt> {
+pub fn subst_stmt_list_cg(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stmt> {
     var out = empty_stmt_vec2();
     var i = 0;
     while i < ss.length() {
@@ -6910,7 +6935,7 @@ fn subst_stmt_list_cg(ss: Vec<Stmt>, type_param: String, arg: String) -> Vec<Stm
     return out;
 }
 
-fn subst_catches_cg(cs: Vec<CatchClause>, type_param: String, arg: String) -> Vec<CatchClause> {
+pub fn subst_catches_cg(cs: Vec<CatchClause>, type_param: String, arg: String) -> Vec<CatchClause> {
     var out = empty_catchclause_vec_cg();
     var i = 0;
     while i < cs.length() {
@@ -6921,12 +6946,12 @@ fn subst_catches_cg(cs: Vec<CatchClause>, type_param: String, arg: String) -> Ve
     return out;
 }
 
-fn empty_catchclause_vec_cg() -> Vec<CatchClause> {
+pub fn empty_catchclause_vec_cg() -> Vec<CatchClause> {
     var v = vec_of(CatchClause { catch_var: "_", catch_type: "_", catch_block: empty_stmt_vec2() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn subst_arm_list_cg(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<MatchArm> {
+pub fn subst_arm_list_cg(arms: Vec<MatchArm>, type_param: String, arg: String) -> Vec<MatchArm> {
     var out = empty_matcharm_vec_cg();
     var i = 0;
     while i < arms.length() {
@@ -6937,19 +6962,19 @@ fn subst_arm_list_cg(arms: Vec<MatchArm>, type_param: String, arg: String) -> Ve
     return out;
 }
 
-fn none_expr_cg() -> Option<Expr> {
+pub fn none_expr_cg() -> Option<Expr> {
     return None;
 }
 
-fn some_expr_cg(e: Expr) -> Option<Expr> {
+pub fn some_expr_cg(e: Expr) -> Option<Expr> {
     return Some { value: e };
 }
 
-fn none_stmt_list_cg() -> Option<Vec<Stmt>> {
+pub fn none_stmt_list_cg() -> Option<Vec<Stmt>> {
     return None;
 }
 
-fn some_stmt_list_cg(ss: Vec<Stmt>) -> Option<Vec<Stmt>> {
+pub fn some_stmt_list_cg(ss: Vec<Stmt>) -> Option<Vec<Stmt>> {
     return Some { value: ss };
 }
 
@@ -6957,7 +6982,7 @@ fn some_stmt_list_cg(ss: Vec<Stmt>) -> Option<Vec<Stmt>> {
 // the generic struct `base`'s own `impl` block -- searched fresh each call (same "redo the search,
 // simplicity over caching" convention `monomorphized_fields`/`monomorphized_fn_params_cg` already
 // use), a sentinel empty `FnDecl` if nothing matches.
-fn find_template_method_cg(impls: &Vec<ImplDecl>, base: String, method: String) -> FnDecl {
+pub fn find_template_method_cg(impls: &Vec<ImplDecl>, base: String, method: String) -> FnDecl {
     var i = 0;
     while i < impls.length() {
         let im = impls.get(i);
@@ -6980,7 +7005,7 @@ fn find_template_method_cg(impls: &Vec<ImplDecl>, base: String, method: String) 
 // if `base` isn't found or isn't generic -- `Codegen.hotc` doesn't share `Checker.hotc`'s own
 // `generic_templates` registry, so this is derived fresh from the plain `structs: Vec<StructDecl>`
 // every caller already has, same pattern the rest of this file's mono helpers use.
-fn struct_type_param_cg(structs: &Vec<StructDecl>, base: String) -> String {
+pub fn struct_type_param_cg(structs: &Vec<StructDecl>, base: String) -> String {
     var i = 0;
     while i < structs.length() {
         let sd = structs.get(i);
@@ -6996,7 +7021,7 @@ fn struct_type_param_cg(structs: &Vec<StructDecl>, base: String) -> String {
 
 // The `type_param2`-shaped sibling of `struct_type_param_cg` above -- `""` when `base` isn't
 // found or has only one type param, see `Ast.hc`'s own `StructDecl.type_param2` header.
-fn struct_type_param2_cg(structs: &Vec<StructDecl>, base: String) -> String {
+pub fn struct_type_param2_cg(structs: &Vec<StructDecl>, base: String) -> String {
     var i = 0;
     while i < structs.length() {
         let sd = structs.get(i);
@@ -7016,7 +7041,7 @@ fn struct_type_param2_cg(structs: &Vec<StructDecl>, base: String) -> String {
 // declared `T` (the OWNING STRUCT's own type parameter, found via `struct_type_param_cg` -- NOT
 // the method's own `type_param`, which is always `None`; a method isn't independently generic, it
 // just uses its struct's `T`) for `mono_arg_cg(owner)`.
-fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Param> {
+pub fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Param> {
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
     let found_tp = struct_type_param_cg(&structs, base);
@@ -7046,7 +7071,7 @@ fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDec
     return out;
 }
 
-fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> String {
+pub fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> String {
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
     let found_tp = struct_type_param_cg(&structs, base);
@@ -7067,7 +7092,7 @@ fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl
     return subbed_ret;
 }
 
-fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Stmt> {
+pub fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Stmt> {
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
     let found_tp = struct_type_param_cg(&structs, base);
@@ -7090,7 +7115,7 @@ fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>
 // The full substituted `FnDecl` for one mono method instantiation, ready to hand to `gen_method`
 // exactly like a real, non-generic method's own declaration -- `gen_struct`'s own method-emission
 // loop needs no changes at all once it's handed one of these (see this file's own header).
-fn monomorphized_method_decl_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> FnDecl {
+pub fn monomorphized_method_decl_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> FnDecl {
     let params = monomorphized_method_params_cg(&impls, &structs, owner, method);
     let ret = monomorphized_method_retty_cg(&impls, &structs, owner, method);
     let body = monomorphized_method_body_cg(&impls, &structs, owner, method);
@@ -7103,7 +7128,7 @@ fn monomorphized_method_decl_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>
 // (`mono_name`, e.g. `"Box$Int"`) -- `gen_struct`'s own mono-instantiation call site passes this
 // as its `methods` argument instead of the empty `Vec` it used before this phase (see `Codegen.hc`'s
 // own header for why generic struct instance methods needed this whole new pathway).
-fn monomorphized_methods_for_struct_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, method_mono_names: &Vec<String>, mono_name: String) -> Vec<FnDecl> {
+pub fn monomorphized_methods_for_struct_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, method_mono_names: &Vec<String>, mono_name: String) -> Vec<FnDecl> {
     var out = empty_fn_decl_vec2();
     var i = 0;
     while i < method_mono_names.length() {
@@ -7130,7 +7155,7 @@ fn monomorphized_methods_for_struct_cg(impls: &Vec<ImplDecl>, structs: &Vec<Stru
 // name is `module_names`/`module_values`-qualified instead, see `CodeGen.qualify`'s own header --
 // the SAME lookup, just plumbed here as parallel arrays since this is a free function with no
 // `CodeGen` receiver to hang a `Registry` off of).
-fn descriptor_of_type(name0: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>, module_names: &Vec<String>, module_values: &Vec<String>) -> String {
+pub fn descriptor_of_type(name0: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>, module_names: &Vec<String>, module_values: &Vec<String>) -> String {
     // See `resolve_descriptor`'s own identical header, right above -- same reasoning, duplicated
     // here since this is the free-function twin with no `CodeGen` receiver to share it through.
     var name = name0;
@@ -7182,7 +7207,7 @@ fn descriptor_of_type(name0: String, alias_names: &Vec<String>, alias_binaries: 
 // Free-function, parallel-array-driven twin of `CodeGen.qualify` -- used by `descriptor_of_type`,
 // which (unlike most of this file's other codegen) has no `CodeGen` receiver to read
 // `self.module_of` off of.
-fn qualify_names_cg(name: String, module_names: &Vec<String>, module_values: &Vec<String>) -> String {
+pub fn qualify_names_cg(name: String, module_names: &Vec<String>, module_values: &Vec<String>) -> String {
     var base = name;
     if is_mono_name_cg(name) { base = mono_base_cg(name); }
     var i = 0;
@@ -7195,7 +7220,7 @@ fn qualify_names_cg(name: String, module_names: &Vec<String>, module_values: &Ve
     return name;
 }
 
-fn extern_alias_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
+pub fn extern_alias_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < externs.length() {
@@ -7205,7 +7230,7 @@ fn extern_alias_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
     return out;
 }
 
-fn extern_binary_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
+pub fn extern_binary_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < externs.length() {
@@ -7226,7 +7251,7 @@ fn extern_binary_list(externs: &Vec<ExternClassDecl>) -> Vec<String> {
 // here: it only decides whether to take the "resolve the callee's real param types before
 // evaluating any arg" slower path, not whether an arg's own eventual `gen_expr`/`gen_method_ref`
 // dispatch is correct.
-fn args_has_lambda_cg(args: &Vec<Expr>) -> Bool {
+pub fn args_has_lambda_cg(args: &Vec<Expr>) -> Bool {
     var i = 0;
     while i < args.length() {
         match args.get(i) {
@@ -7245,7 +7270,7 @@ fn args_has_lambda_cg(args: &Vec<Expr>) -> Bool {
 // exact same `Lambda { params: [mref_p0, ...], body: StaticCall { type_name, method, args:
 // [idents] } }` the checker's own version builds, then hands it to `gen_lambda` unchanged -- no
 // separate emission path, no new bytecode shape.
-fn synth_method_ref_lambda_params_cg(count: Int) -> Vec<String> {
+pub fn synth_method_ref_lambda_params_cg(count: Int) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < count {
@@ -7255,7 +7280,7 @@ fn synth_method_ref_lambda_params_cg(count: Int) -> Vec<String> {
     return out;
 }
 
-fn synth_method_ref_args_cg(params: &Vec<String>) -> Vec<Expr> {
+pub fn synth_method_ref_args_cg(params: &Vec<String>) -> Vec<Expr> {
     var out = empty_expr_vec_cg();
     var i = 0;
     while i < params.length() {
@@ -7267,7 +7292,7 @@ fn synth_method_ref_args_cg(params: &Vec<String>) -> Vec<Expr> {
 
 // Does `v` already contain `s`? A plain linear scan -- `Vec<String>`'s own small, expected size
 // here (a lambda literal's own free-variable count) doesn't earn a `Registry`.
-fn str_vec_contains_cg(v: &Vec<String>, s: String) -> Bool {
+pub fn str_vec_contains_cg(v: &Vec<String>, s: String) -> Bool {
     var i = 0;
     while i < v.length() {
         if v.get(i) == s { return true; }
@@ -7279,16 +7304,16 @@ fn str_vec_contains_cg(v: &Vec<String>, s: String) -> Bool {
 // Monomorphized generic instantiations are named `"Base$Arg"` -- same convention (and same
 // duplicated-helper-with-`_cg`-suffix pattern) as `Checker.hotc`'s own `is_mono_name`/
 // `mono_base`/`mono_arg`.
-fn is_mono_name_cg(name: String) -> Bool {
+pub fn is_mono_name_cg(name: String) -> Bool {
     return name.indexOf("$") >= 0;
 }
 
-fn mono_base_cg(name: String) -> String {
+pub fn mono_base_cg(name: String) -> String {
     let idx = name.indexOf("$");
     return name.substring(0, idx);
 }
 
-fn mono_arg_cg(name: String) -> String {
+pub fn mono_arg_cg(name: String) -> String {
     let idx = name.indexOf("$");
     return name.substring(idx + 1, name.length());
 }
@@ -7299,7 +7324,7 @@ fn mono_arg_cg(name: String) -> String {
 // `ensure_instantiated` already performed once to decide this instantiation was needed at all,
 // redone here on the codegen side since `Checker.hotc`'s own `GenericTemplate` isn't exposed
 // (only the plain `structs: Vec<StructDecl>` this file already has).
-fn monomorphized_fields(structs: &Vec<StructDecl>, mono_name: String) -> Vec<Param> {
+pub fn monomorphized_fields(structs: &Vec<StructDecl>, mono_name: String) -> Vec<Param> {
     let base = mono_base_cg(mono_name);
     let arg = mono_arg_cg(mono_name);
     var i = 0;
@@ -7346,7 +7371,7 @@ fn monomorphized_fields(structs: &Vec<StructDecl>, mono_name: String) -> Vec<Par
 // (enums). `fns` here is the WHOLE program's fn list (including generic templates, which never
 // made it into `fn_names`/`fn_descs_list` -- see `build_program_info`'s own header), searched
 // linearly for the one whose name matches `mono_name`'s base and whose `type_param` is `Some`.
-fn monomorphized_fn_params_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Param> {
+pub fn monomorphized_fn_params_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Param> {
     let base = mono_base_cg(mono_name);
     let arg = mono_arg_cg(mono_name);
     var i = 0;
@@ -7388,7 +7413,7 @@ fn monomorphized_fn_params_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Param
 
 // The return-type-shaped sibling of `monomorphized_fn_params_cg` above -- same linear search,
 // substituting the template's own declared return type instead of its params.
-fn monomorphized_fn_retty_cg(fns: &Vec<FnDecl>, mono_name: String) -> String {
+pub fn monomorphized_fn_retty_cg(fns: &Vec<FnDecl>, mono_name: String) -> String {
     let base = mono_base_cg(mono_name);
     let arg = mono_arg_cg(mono_name);
     var i = 0;
@@ -7423,7 +7448,7 @@ fn monomorphized_fn_retty_cg(fns: &Vec<FnDecl>, mono_name: String) -> String {
 // (`subst_stmt_list_cg`, fixing up any nested generic construction site inside the body that
 // referenced the fn's own still-abstract `T` -- see `Checker.hotc`'s own `ensure_fn_instantiated`
 // header for why this substitution has to happen, not just on params/return types).
-fn fn_body_of_generic_template_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Stmt> {
+pub fn fn_body_of_generic_template_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<Stmt> {
     let base = mono_base_cg(mono_name);
     let arg = mono_arg_cg(mono_name);
     var i = 0;
@@ -7453,7 +7478,7 @@ fn fn_body_of_generic_template_cg(fns: &Vec<FnDecl>, mono_name: String) -> Vec<S
     return empty_stmt_vec2();
 }
 
-fn empty_variant_vec_cg() -> Vec<EnumVariant> {
+pub fn empty_variant_vec_cg() -> Vec<EnumVariant> {
     var v = vec_of(EnumVariant { name: "_", fields: empty_param_vec2() });
     return Vec { data: v.data, len: 0 };
 }
@@ -7463,7 +7488,7 @@ fn empty_variant_vec_cg() -> Vec<EnumVariant> {
 // `monomorphized_fields` above. Returns an empty `Vec` if `mono_name`'s base isn't a generic enum
 // at all (the caller falls back to `monomorphized_fields`/`gen_struct` in that case -- see
 // `compile_program`'s own mono-instantiation loop).
-fn monomorphized_enum_variants(enums: &Vec<EnumDecl>, mono_name: String) -> Vec<EnumVariant> {
+pub fn monomorphized_enum_variants(enums: &Vec<EnumDecl>, mono_name: String) -> Vec<EnumVariant> {
     let base = mono_base_cg(mono_name);
     let arg = mono_arg_cg(mono_name);
     var i = 0;
@@ -7514,13 +7539,13 @@ fn monomorphized_enum_variants(enums: &Vec<EnumDecl>, mono_name: String) -> Vec<
 }
 
 // See `monomorphized_enum_variants`'s own header.
-fn mono_arg1_of2_cg(name: String) -> String {
+pub fn mono_arg1_of2_cg(name: String) -> String {
     let idx1 = name.indexOf("$");
     let rest = name.substring(idx1 + 1, name.length());
     let idx2 = rest.indexOf("$");
     return rest.substring(0, idx2);
 }
-fn mono_arg2_of2_cg(name: String) -> String {
+pub fn mono_arg2_of2_cg(name: String) -> String {
     let idx1 = name.indexOf("$");
     let rest = name.substring(idx1 + 1, name.length());
     let idx2 = rest.indexOf("$");
@@ -7531,7 +7556,7 @@ fn mono_arg2_of2_cg(name: String) -> String {
 // decides whether `compile_program`'s mono-instantiation loop and `build_program_info` route a
 // given `"Base$Arg"` name through the enum-shaped path (`monomorphized_enum_variants`/`gen_enum`)
 // or the struct-shaped one (`monomorphized_fields`/`gen_struct`).
-fn is_generic_enum_mono(enums: &Vec<EnumDecl>, mono_name: String) -> Bool {
+pub fn is_generic_enum_mono(enums: &Vec<EnumDecl>, mono_name: String) -> Bool {
     let base = mono_base_cg(mono_name);
     var i = 0;
     while i < enums.length() {
@@ -7544,7 +7569,7 @@ fn is_generic_enum_mono(enums: &Vec<EnumDecl>, mono_name: String) -> Bool {
     return false;
 }
 
-fn fn_descriptor(param_type_names: Vec<String>, ret_type_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>, module_names: &Vec<String>, module_values: &Vec<String>) -> String {
+pub fn fn_descriptor(param_type_names: Vec<String>, ret_type_name: String, alias_names: &Vec<String>, alias_binaries: &Vec<String>, module_names: &Vec<String>, module_values: &Vec<String>) -> String {
     var d = "(";
     var i = 0;
     while i < param_type_names.length() {
@@ -7577,7 +7602,7 @@ pub fn emit_and_write(fn_name: String, param_names: Vec<String>, body: Vec<Stmt>
     var self_only_rettys = vec_of("Int");
     var int_types = all_int_types(param_count);
     let info = ProgramInfo { target: 17, fn_names: self_only_names, fn_descs_list: self_only_descs, fn_rettys_list: self_only_rettys, fn_param_types_list: vec_of(empty_str_vec4()), fn_param_names_list: vec_of(empty_str_vec4()), static_names: empty_str_vec4(), static_type_names: empty_str_vec4(), generic_fn_names: empty_str_vec4(), generic_fn_infer_idx: empty_int_vec(), generic_fn_infer_unwrap: empty_int_vec(), generic_fn_infer_idx2: empty_int_vec(), generic_fn_infer_unwrap2: empty_int_vec(), generic_struct_infer_names: empty_str_vec4(), generic_struct_infer_fields: empty_str_vec4(), generic_enum_infer_variant_names: empty_str_vec4(), generic_enum_infer_owner_names: empty_str_vec4(), generic_enum_infer_field_names: empty_str_vec4(), enum_names: empty_str_vec4(), struct_names: empty_str_vec4(), struct_field_names_list: empty_str_vec_vec(), struct_field_types_list: empty_str_vec_vec(), method_keys: empty_str_vec4(), method_descs_list: empty_str_vec4(), method_rettys_list: empty_str_vec4(), method_param_types_list: empty_str_vec_vec(), variant_owner_names: empty_str_vec4(), variant_owner_enums: empty_str_vec4(), variant_tag_keys: empty_str_vec4(), variant_tag_list: empty_int_vec(), extern_alias_names: empty_str_vec4(), extern_binary_names: empty_str_vec4(), extern_alias_is_interface: empty_int_vec(), extern_method_keys: empty_str_vec4(), extern_method_descs_list: empty_str_vec4(), extern_method_rettys_list: empty_str_vec4(), extern_method_static_list: empty_int_vec(), extern_method_ctor_list: empty_int_vec(), extern_method_param_types_list: empty_str_vec_vec(), extern_field_keys: empty_str_vec4(), extern_field_descs_list: empty_str_vec4(), extern_field_type_names_list: empty_str_vec4(), extern_field_static_list: empty_int_vec(), struct_extends_names: empty_str_vec4(), struct_extends_targets: empty_str_vec4(), variant_field_keys: empty_str_vec4(), variant_field_names_list: empty_str_vec_vec(), variant_field_types_list: empty_str_vec_vec(), module_names: empty_str_vec4(), module_values: empty_str_vec4(), interfaces_raw: empty_interface_vec_cg(), sendable_struct_names: empty_str_vec4() };
-    gen_fn(&mut cw, binary_name, fn_name, param_names, int_types, "Int", body, info, none_annotation2());
+    gen_fn(&mut cw, binary_name, fn_name, param_names, int_types, "Int", body, info, none_annotation2(), 9); // ACC_PUBLIC | ACC_STATIC -- synthetic probe entry, always public
 
     let main_mv = CodegenShim::visitMethodNoSig(&mut cw, 9, "main", "([Ljava/lang/String;)V", ["x"; 0]);
     main_mv.visitCode();
@@ -7617,7 +7642,7 @@ pub fn emit_and_write(fn_name: String, param_names: Vec<String>, body: Vec<Stmt>
 // interface's own default -- the more specific, deliberately-chosen behavior wins; the "already
 // present" check in `materialize_default_methods` naturally skips a name this pass already filled
 // in, no extra coordination needed.
-fn materialize_delegated_methods(impls: Vec<ImplDecl>, interfaces: &Vec<InterfaceDecl>) -> Vec<ImplDecl> {
+pub fn materialize_delegated_methods(impls: Vec<ImplDecl>, interfaces: &Vec<InterfaceDecl>) -> Vec<ImplDecl> {
     var out = empty_impl_decl_vec();
     var i = 0;
     while i < impls.length() {
@@ -7685,7 +7710,7 @@ fn materialize_delegated_methods(impls: Vec<ImplDecl>, interfaces: &Vec<Interfac
     return out;
 }
 
-fn materialize_default_methods(impls: Vec<ImplDecl>, interfaces: &Vec<InterfaceDecl>) -> Vec<ImplDecl> {
+pub fn materialize_default_methods(impls: Vec<ImplDecl>, interfaces: &Vec<InterfaceDecl>) -> Vec<ImplDecl> {
     var out = empty_impl_decl_vec();
     var i = 0;
     while i < impls.length() {
@@ -7753,7 +7778,7 @@ fn materialize_default_methods(impls: Vec<ImplDecl>, interfaces: &Vec<InterfaceD
 // that's neither (or a non-open interface) is a real, loud compile error -- `open` exists
 // specifically so an interface author opts in; extending a non-open one is exactly the mistake this
 // guards against.
-fn merge_fn_decl_vec_cg(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
+pub fn merge_fn_decl_vec_cg(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -7763,7 +7788,7 @@ fn merge_fn_decl_vec_cg(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
     return out;
 }
 
-fn materialize_extend_fns(extend_decls: Vec<ExtendDecl>, structs: &Vec<StructDecl>, interfaces: &Vec<InterfaceDecl>) -> Vec<FnDecl> {
+pub fn materialize_extend_fns(extend_decls: Vec<ExtendDecl>, structs: &Vec<StructDecl>, interfaces: &Vec<InterfaceDecl>) -> Vec<FnDecl> {
     var out = empty_fn_decl_vec2();
     var i = 0;
     while i < extend_decls.length() {
@@ -7830,7 +7855,7 @@ fn materialize_extend_fns(extend_decls: Vec<ExtendDecl>, structs: &Vec<StructDec
 // only primitives and OTHER plain structs (recursively) are supported -- a component field of some
 // other shape (an array, a generic, an extern type) throws a real, named `CodegenError` rather
 // than silently producing broken code.
-fn zero_value_expr_ecs(type_name: String, structs: &Vec<StructDecl>) -> Expr {
+pub fn zero_value_expr_ecs(type_name: String, structs: &Vec<StructDecl>) -> Expr {
     if type_name == "Int" { return IntLit { value: 0 }; }
     if type_name == "Bool" { return BoolLit { value: false }; }
     if type_name == "String" { return StringLit { value: "" }; }
@@ -7864,7 +7889,7 @@ fn zero_value_expr_ecs(type_name: String, structs: &Vec<StructDecl>) -> Expr {
 // compiler already uses -- see this fn's own callers) for an ARBITRARY component/field type `t`,
 // built as source-level `Expr` rather than requiring a real value to already exist -- exactly what
 // an archetype's own initial (pre-any-`spawn`) storage needs.
-fn empty_vec_expr_ecs(t: String, structs: &Vec<StructDecl>) -> Expr {
+pub fn empty_vec_expr_ecs(t: String, structs: &Vec<StructDecl>) -> Expr {
     let seed = zero_value_expr_ecs(t, structs);
     var fnames = vec_of("data");
     fnames.push("len");
@@ -7892,7 +7917,7 @@ fn empty_vec_expr_ecs(t: String, structs: &Vec<StructDecl>) -> Expr {
 // `finish_method_call` (the `World#spawn` codegen) is the only reader of either. Named
 // deterministically from the signature itself (`Archetype$C1$C2`/`__archetype_C1_C2`) so the SAME
 // signature always resolves to the SAME struct/static, however many `spawn` call sites share it.
-fn archetype_struct_name_ecs(sig: &Vec<String>) -> String {
+pub fn archetype_struct_name_ecs(sig: &Vec<String>) -> String {
     var n = "Archetype";
     var i = 0;
     while i < sig.length() {
@@ -7902,7 +7927,7 @@ fn archetype_struct_name_ecs(sig: &Vec<String>) -> String {
     return n;
 }
 
-fn archetype_static_name_ecs(sig: &Vec<String>) -> String {
+pub fn archetype_static_name_ecs(sig: &Vec<String>) -> String {
     var n = "__archetype";
     var i = 0;
     while i < sig.length() {
@@ -7914,7 +7939,7 @@ fn archetype_static_name_ecs(sig: &Vec<String>) -> String {
 
 // The synthesized archetype struct's own component field NAMES, in signature order -- `c0`, `c1`,
 // ... -- shared by both the struct-synthesis and the `World#spawn` codegen so they always agree.
-fn archetype_field_name_ecs(idx: Int) -> String {
+pub fn archetype_field_name_ecs(idx: Int) -> String {
     return "c" + JString::valueOf(idx);
 }
 
@@ -7923,7 +7948,7 @@ fn archetype_field_name_ecs(idx: Int) -> String {
 // ...). `true` at index `i` means "component `c{idx}` at row `i` was written (or the row was
 // freshly created/moved-into) since the start of the CURRENT `world.run_all()` call" -- see
 // `build_run_all_body_ecs`'s own header for the full reset-and-mark protocol this backs.
-fn archetype_field_changed_name_ecs(idx: Int) -> String {
+pub fn archetype_field_changed_name_ecs(idx: Int) -> String {
     return archetype_field_name_ecs(idx) + "_changed";
 }
 
@@ -7935,7 +7960,7 @@ fn archetype_field_changed_name_ecs(idx: Int) -> String {
 // real component field -- nothing else in this file assumes fields end there, but keeping it
 // out of the way of `entities`/`c0`/`c1`/...'s own fixed positional convention (`archetype_
 // field_name_ecs`) costs nothing and avoids ever having to ask.
-fn synthesize_archetype_struct_ecs(sig: Vec<String>) -> StructDecl {
+pub fn synthesize_archetype_struct_ecs(sig: Vec<String>) -> StructDecl {
     var fields = empty_param_vec2();
     fields.push(Param { name: "entities", type_name: "Vec$Int", is_ref: false, is_mut_ref: false });
     var i = 0;
@@ -7949,7 +7974,7 @@ fn synthesize_archetype_struct_ecs(sig: Vec<String>) -> StructDecl {
     return StructDecl { name: archetype_struct_name_ecs(&sig), type_param: none_string2(), fields: fields, is_arena: false, module_name: none_string2(), super_class: none_string2(), type_param2: none_string2() };
 }
 
-fn synthesize_archetype_static_ecs(sig: Vec<String>, structs: &Vec<StructDecl>, id: Int) -> StaticDecl {
+pub fn synthesize_archetype_static_ecs(sig: Vec<String>, structs: &Vec<StructDecl>, id: Int) -> StaticDecl {
     let struct_name = archetype_struct_name_ecs(&sig);
     var fnames = vec_of("entities");
     var fvals = vec_of(empty_vec_expr_ecs("Int", structs));
@@ -7977,7 +8002,7 @@ fn synthesize_archetype_static_ecs(sig: Vec<String>, structs: &Vec<StructDecl>, 
 // bytecode branch to ever be touched; a `Call`/`MethodCall`/`For` tree needs none at all.
 
 // The first index of `s` in `v`, or `-1` if absent -- `sig_has_all_ecs`'s own building block.
-fn str_vec_index_of_ecs(v: &Vec<String>, s: String) -> Int {
+pub fn str_vec_index_of_ecs(v: &Vec<String>, s: String) -> Int {
     var i = 0;
     while i < v.length() {
         if v.get(i) == s { return i; }
@@ -7998,7 +8023,7 @@ fn str_vec_index_of_ecs(v: &Vec<String>, s: String) -> Int {
 // and in what order" -- rather than a full dependency-graph dump; the ALREADY-existing per-
 // conflict warning (right above this flag's own check) is what explains WHY two systems didn't
 // land in the same group, so this report doesn't need to repeat that reasoning.
-fn print_schedule_report_ecs(groups: &Vec<Vec<String>>) {
+pub fn print_schedule_report_ecs(groups: &Vec<Vec<String>>) {
     print("schedule (" + JString::valueOf(groups.length()) + " group(s), in run order):");
     var gi = 0;
     while gi < groups.length() {
@@ -8018,7 +8043,7 @@ fn print_schedule_report_ecs(groups: &Vec<Vec<String>>) {
     }
 }
 
-fn sig_has_all_ecs(sig: &Vec<String>, needed: &Vec<String>) -> Bool {
+pub fn sig_has_all_ecs(sig: &Vec<String>, needed: &Vec<String>) -> Bool {
     var i = 0;
     while i < needed.length() {
         if str_vec_index_of_ecs(sig, needed.get(i)) == -1 { return false; }
@@ -8030,7 +8055,7 @@ fn sig_has_all_ecs(sig: &Vec<String>, needed: &Vec<String>) -> Bool {
 // `sig_has_all_ecs`'s negated sibling for `Without<T>` -- does `sig` contain ANY of `excluded`?
 // Used to drop an archetype from a system's own matching set entirely the moment it has even
 // one of the components that system's own `Without<...>` params name.
-fn sig_has_any_ecs(sig: &Vec<String>, excluded: &Vec<String>) -> Bool {
+pub fn sig_has_any_ecs(sig: &Vec<String>, excluded: &Vec<String>) -> Bool {
     var i = 0;
     while i < excluded.length() {
         if str_vec_index_of_ecs(sig, excluded.get(i)) != -1 { return true; }
@@ -8041,7 +8066,7 @@ fn sig_has_any_ecs(sig: &Vec<String>, excluded: &Vec<String>) -> Bool {
 
 // Deterministic, collision-proof name for the real top-level fn a `system`'s own `run` block
 // becomes -- shared by the synthesis below and the call-site builder right after it.
-fn system_fn_name_ecs(sys_name: String) -> String {
+pub fn system_fn_name_ecs(sys_name: String) -> String {
     return "__system_" + sys_name + "_run";
 }
 
@@ -8050,7 +8075,7 @@ fn system_fn_name_ecs(sys_name: String) -> String {
 // archetypes it needs to visit here). Includes query-filter pseudo-params too -- callers that
 // need those excluded use `required_components_of_system_ecs` instead; this one is kept as-is
 // since nothing outside the filter feature reads it.
-fn component_names_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
+pub fn component_names_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < run_params.length() {
@@ -8063,7 +8088,7 @@ fn component_names_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
 // `Without<Component>` -- a query filter, not a component borrow (see `Checker.hotc`'s own
 // `check_systems` header). Rides the existing generic type-name mono-name convention
 // (`"Without$Transform"`), same as `Vec<Int>` -> `"Vec$Int"` -- no new AST/parser work needed.
-fn is_without_filter_ecs(type_name: String) -> Bool {
+pub fn is_without_filter_ecs(type_name: String) -> Bool {
     return is_mono_name_cg(type_name) && mono_base_cg(type_name) == "Without";
 }
 
@@ -8072,11 +8097,11 @@ fn is_without_filter_ecs(type_name: String) -> Bool {
 // `Checker.hotc`'s own `check_systems` currently rejects any real USE of it with a clear "not
 // implemented yet" error before a program using one ever reaches this file at all (see that
 // error's own header for why: real change-tracking runtime state doesn't exist yet).
-fn is_changed_filter_ecs(type_name: String) -> Bool {
+pub fn is_changed_filter_ecs(type_name: String) -> Bool {
     return is_mono_name_cg(type_name) && mono_base_cg(type_name) == "Changed";
 }
 
-fn is_query_filter_param_ecs(type_name: String) -> Bool {
+pub fn is_query_filter_param_ecs(type_name: String) -> Bool {
     return is_without_filter_ecs(type_name) || is_changed_filter_ecs(type_name);
 }
 
@@ -8085,7 +8110,7 @@ fn is_query_filter_param_ecs(type_name: String) -> Bool {
 // either one). Used for the synthesized `run` fn's own signature (`synthesize_system_fn_ecs`)
 // and for building its call-site arguments (`synthesize_system_call_stmt_ecs`) -- both need the
 // filters gone, or codegen would try to resolve a nonexistent archetype field for one.
-fn real_run_params_ecs(run_params: &Vec<Param>) -> Vec<Param> {
+pub fn real_run_params_ecs(run_params: &Vec<Param>) -> Vec<Param> {
     var out = empty_param_vec2();
     var i = 0;
     while i < run_params.length() {
@@ -8112,7 +8137,7 @@ fn real_run_params_ecs(run_params: &Vec<Param>) -> Vec<Param> {
 // certainly not what a pure-resource ("global") system wants. Not a real, reachable shape yet
 // (every system built so far pairs a resource with at least one real component), so left
 // unguarded rather than designed around speculatively.
-fn required_components_of_system_ecs(run_params: &Vec<Param>, resource_names: &Vec<String>) -> Vec<String> {
+pub fn required_components_of_system_ecs(run_params: &Vec<Param>, resource_names: &Vec<String>) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < run_params.length() {
@@ -8135,7 +8160,7 @@ fn required_components_of_system_ecs(run_params: &Vec<Param>, resource_names: &V
 // containing ANY of these is skipped entirely for this system, regardless of whether it also
 // satisfies `required_components_of_system_ecs` (see `sig_has_any_ecs`, right below `sig_has_
 // all_ecs`).
-fn excluded_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
+pub fn excluded_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < run_params.length() {
@@ -8151,7 +8176,7 @@ fn excluded_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
 // Every component named by a `Changed<T>` filter param on this system -- a matching archetype's
 // own per-row loop (`synthesize_system_call_stmts_ecs`) skips calling `run` for any row where
 // even ONE of these components' own change-flag reads `false` this tick.
-fn changed_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
+pub fn changed_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < run_params.length() {
@@ -8173,7 +8198,7 @@ fn changed_components_of_system_ecs(run_params: &Vec<Param>) -> Vec<String> {
 // becomes a real fn signature -- neither binds a real value (there's no archetype field backing
 // a filter), so keeping one in the ACTUAL synthesized fn's param list would ask codegen to
 // declare a JVM param of a type ("Without$Transform") that doesn't exist as a real class at all.
-fn synthesize_system_fn_ecs(sysd: SystemDecl) -> FnDecl {
+pub fn synthesize_system_fn_ecs(sysd: SystemDecl) -> FnDecl {
     return FnDecl { name: system_fn_name_ecs(sysd.name), params: real_run_params_ecs(&sysd.run_params), ret_type: none_string2(), body: sysd.run_body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
@@ -8182,7 +8207,7 @@ fn synthesize_system_fn_ecs(sysd: SystemDecl) -> FnDecl {
 // `__world_pool` already use. Declared once per distinct resource TYPE actually named by any
 // system's `run` params (`compile_program`'s own resource-field-declaration loop), regardless of
 // how many systems read/write it -- there's only ever one value per resource type, program-wide.
-fn resource_field_name_ecs(resource_name: String) -> String {
+pub fn resource_field_name_ecs(resource_name: String) -> String {
     return "__resource_" + resource_name;
 }
 
@@ -8201,7 +8226,7 @@ fn resource_field_name_ecs(resource_name: String) -> String {
 // all, see `required_components_of_system_ecs`'s own header), so `idx` -- looked up fresh per
 // component param since two different archetypes matching the same system can place its
 // components at different positions -- always resolves for those.
-fn synthesize_system_call_stmts_ecs(sysd: &SystemDecl, sig: &Vec<String>, static_name: String, loop_var: String, resource_names: &Vec<String>) -> Vec<Stmt> {
+pub fn synthesize_system_call_stmts_ecs(sysd: &SystemDecl, sig: &Vec<String>, static_name: String, loop_var: String, resource_names: &Vec<String>) -> Vec<Stmt> {
     var call_args = empty_expr_vec_cg();
     let real_params = real_run_params_ecs(&sysd.run_params);
     var mark_stmts = empty_stmt_vec2();
@@ -8238,7 +8263,7 @@ fn synthesize_system_call_stmts_ecs(sysd: &SystemDecl, sig: &Vec<String>, static
 // where even one such flag reads `false` this tick is skipped entirely, never even calling
 // `run`. `loop_idx` only exists to keep every such loop's own induction variable name distinct
 // within the one, flat (never nested) `__world_run_all` body.
-fn synthesize_archetype_loop_stmt_ecs(sysd: &SystemDecl, sig: &Vec<String>, loop_idx: Int, resource_names: &Vec<String>) -> Stmt {
+pub fn synthesize_archetype_loop_stmt_ecs(sysd: &SystemDecl, sig: &Vec<String>, loop_idx: Int, resource_names: &Vec<String>) -> Stmt {
     let static_name = archetype_static_name_ecs(sig);
     let loop_var = "__ecs_row" + JString::valueOf(loop_idx);
     let n_expr = MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: "entities" }, method: "length", args: empty_expr_vec_cg() };
@@ -8280,7 +8305,7 @@ fn synthesize_archetype_loop_stmt_ecs(sysd: &SystemDecl, sig: &Vec<String>, loop
 // no block-expr support), so there's nowhere to fit a "record start, call, record end, print" a
 // SEQUENCE outside the dispatch fn itself; inside it, that's just an ordinary multi-statement
 // `Vec<Stmt>` body, ordinary for either call shape.
-fn any_system_profiled_ecs(systems: &Vec<SystemDecl>) -> Bool {
+pub fn any_system_profiled_ecs(systems: &Vec<SystemDecl>) -> Bool {
     var i = 0;
     while i < systems.length() {
         if systems.get(i).has_profile { return true; }
@@ -8293,7 +8318,7 @@ fn any_system_profiled_ecs(systems: &Vec<SystemDecl>) -> Bool {
 // SIZE -- 1 means it runs directly (Phase A shape); >1 means it's real Phoenix-Flight-backed
 // parallel dispatch (Phase B). Falls back to `1` if somehow not found (never happens for a real
 // system name -- `check_systems` places every one of them into exactly one group).
-fn group_size_for_system_ecs(groups: &Vec<Vec<String>>, name: String) -> Int {
+pub fn group_size_for_system_ecs(groups: &Vec<Vec<String>>, name: String) -> Int {
     var gi = 0;
     while gi < groups.length() {
         let g = groups.get(gi);
@@ -8308,14 +8333,14 @@ fn group_size_for_system_ecs(groups: &Vec<Vec<String>>, name: String) -> Int {
 // extern the user's own program might separately declare. Only ever synthesized into a program
 // that actually has at least one `@profile`-marked system (`any_system_profiled_ecs`'s own
 // caller in `compile_program`) -- a program with none never pays for it at all.
-fn synthesize_profile_clock_extern_ecs() -> ExternClassDecl {
+pub fn synthesize_profile_clock_extern_ecs() -> ExternClassDecl {
     let m = ExternMethod { name: "nanoTime", params: empty_param_vec2(), ret_type: "Long", is_static: true, is_ctor: false };
     var fields = vec_of(ExternField { name: "_", type_name: "_", is_static: false });
     fields = Vec { data: fields.data, len: 0 };
     return ExternClassDecl { name: "__ProfileClock", binary_name: "java.lang.System", methods: vec_of(m), fields: fields, is_interface: false };
 }
 
-fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> Vec<Stmt> {
+pub fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> Vec<Stmt> {
     // Everything this dispatch fn does for a REAL tick (the profiling clock, every archetype
     // loop, the profiling print) builds up in `inner_body` first -- `@run_if(condition_fn)` (see
     // `Ast.hc`'s own `SystemDecl.run_if` header) then decides whether `inner_body` runs AT ALL
@@ -8368,7 +8393,7 @@ fn build_system_dispatch_body_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<
     return body;
 }
 
-fn system_dispatch_fn_name_ecs(sys_name: String) -> String {
+pub fn system_dispatch_fn_name_ecs(sys_name: String) -> String {
     return "__system_" + sys_name + "_dispatch";
 }
 
@@ -8378,7 +8403,7 @@ fn system_dispatch_fn_name_ecs(sys_name: String) -> String {
 // as PhoenixObject)` (a real reference value to cast, mirroring `stdlib/phoenix.hotc`'s own
 // documented `"{...}" as PhoenixObject` idiom) without needing a second wrapper fn just to
 // manufacture one.
-fn synthesize_system_dispatch_fn_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> FnDecl {
+pub fn synthesize_system_dispatch_fn_ecs(sysd: &SystemDecl, archetype_signatures: &Vec<Vec<String>>, profiled: Bool, group_size: Int, resource_names: &Vec<String>) -> FnDecl {
     return FnDecl { name: system_dispatch_fn_name_ecs(sysd.name), params: empty_param_vec2(), ret_type: some_string2("String"), body: build_system_dispatch_body_ecs(sysd, archetype_signatures, profiled, group_size, resource_names), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
@@ -8431,7 +8456,7 @@ fn synthesize_system_dispatch_fn_ecs(sysd: &SystemDecl, archetype_signatures: &V
 // an earlier-SCHEDULED `&mut`-taking system this same tick." See `Checker.hotc`'s own `check_
 // systems` "Changed<Component>" branch for the full, disclosed tick-boundary consequence this
 // establishes.
-fn build_reset_changed_stmts_ecs(archetype_signatures: &Vec<Vec<String>>) -> Vec<Stmt> {
+pub fn build_reset_changed_stmts_ecs(archetype_signatures: &Vec<Vec<String>>) -> Vec<Stmt> {
     var stmts = empty_stmt_vec2();
     var ai = 0;
     while ai < archetype_signatures.length() {
@@ -8453,7 +8478,7 @@ fn build_reset_changed_stmts_ecs(archetype_signatures: &Vec<Vec<String>>) -> Vec
     return stmts;
 }
 
-fn build_run_all_body_ecs(groups: &Vec<Vec<String>>) -> Vec<Stmt> {
+pub fn build_run_all_body_ecs(groups: &Vec<Vec<String>>) -> Vec<Stmt> {
     var body = empty_stmt_vec2();
     var gi = 0;
     while gi < groups.length() {
@@ -8490,7 +8515,7 @@ fn build_run_all_body_ecs(groups: &Vec<Vec<String>>) -> Vec<Stmt> {
 // -- an empty body, a genuine no-op, otherwise. Whether `__world_pool` exists at all is a
 // COMPILE-TIME fact (a static field either got declared on the class or it didn't), so this
 // decision has to be made here, at SYNTHESIS time, not as a runtime branch inside the fn body.
-fn build_world_shutdown_body_ecs(pool_size: Int) -> Vec<Stmt> {
+pub fn build_world_shutdown_body_ecs(pool_size: Int) -> Vec<Stmt> {
     var body = empty_stmt_vec2();
     if pool_size > 1 {
         body.push(ExprStmt { expr: MethodCall { recv: Ident { name: "__world_pool" }, method: "shutdown", args: empty_expr_vec_cg() }, line: 0 });
@@ -8501,7 +8526,7 @@ fn build_world_shutdown_body_ecs(pool_size: Int) -> Vec<Stmt> {
 // The most parallel work any single group ever asks for -- `__world_pool`'s own real thread
 // count, synthesized to be exactly wide enough for the widest batch (no wasted idle
 // threads, no batch that has to queue and wait for a slot inside itself).
-fn max_group_size_ecs(groups: &Vec<Vec<String>>) -> Int {
+pub fn max_group_size_ecs(groups: &Vec<Vec<String>>) -> Int {
     var m = 0;
     var i = 0;
     while i < groups.length() {
@@ -8531,7 +8556,7 @@ fn max_group_size_ecs(groups: &Vec<Vec<String>>) -> Int {
 // Exact, order-sensitive `Vec<String>` equality -- `Checker.hotc`'s own `str_vec_eq_ecs` has an
 // identical twin; duplicated independently here for the same reason every other `_ecs`/`_cg`-
 // suffixed helper in this file already is (`Codegen.hotc` doesn't share Checker's registries).
-fn str_vec_eq_ecs2(a: &Vec<String>, b: &Vec<String>) -> Bool {
+pub fn str_vec_eq_ecs2(a: &Vec<String>, b: &Vec<String>) -> Bool {
     if a.length() != b.length() { return false; }
     var i = 0;
     while i < a.length() {
@@ -8542,7 +8567,7 @@ fn str_vec_eq_ecs2(a: &Vec<String>, b: &Vec<String>) -> Bool {
 }
 
 // The first index of a signature matching `sig` (exact, order-sensitive) in `list`, or `-1`.
-fn sig_list_index_of_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Int {
+pub fn sig_list_index_of_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Int {
     var i = 0;
     while i < list.length() {
         let e = list.get(i);
@@ -8552,7 +8577,7 @@ fn sig_list_index_of_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Int {
     return -1;
 }
 
-fn sig_list_contains_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Bool {
+pub fn sig_list_contains_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Bool {
     return sig_list_index_of_ecs(list, sig) != -1;
 }
 
@@ -8560,7 +8585,7 @@ fn sig_list_contains_ecs(list: &Vec<Vec<String>>, sig: &Vec<String>) -> Bool {
 // a real, disclosed convention: an entity that reaches the same target component SET via a
 // DIFFERENT add order still lands in a DIFFERENT archetype, same imprecision `world.spawn(...)`'s
 // own signature-is-order-sensitive design already accepts).
-fn str_vec_with_ecs(v: &Vec<String>, s: String) -> Vec<String> {
+pub fn str_vec_with_ecs(v: &Vec<String>, s: String) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < v.length() {
@@ -8573,7 +8598,7 @@ fn str_vec_with_ecs(v: &Vec<String>, s: String) -> Vec<String> {
 
 // `v` with every occurrence of `s` removed, order otherwise preserved -- the "remove a
 // component" target signature.
-fn str_vec_without_ecs(v: &Vec<String>, s: String) -> Vec<String> {
+pub fn str_vec_without_ecs(v: &Vec<String>, s: String) -> Vec<String> {
     var out = empty_str_vec4();
     var i = 0;
     while i < v.length() {
@@ -8584,7 +8609,7 @@ fn str_vec_without_ecs(v: &Vec<String>, s: String) -> Vec<String> {
     return out;
 }
 
-fn archetype_closure_ecs(base: &Vec<Vec<String>>, add_types: &Vec<String>, remove_types: &Vec<String>) -> Vec<Vec<String>> {
+pub fn archetype_closure_ecs(base: &Vec<Vec<String>>, add_types: &Vec<String>, remove_types: &Vec<String>) -> Vec<Vec<String>> {
     var out = empty_str_vec_vec();
     var bi = 0;
     while bi < base.length() {
@@ -8630,7 +8655,7 @@ fn archetype_closure_ecs(base: &Vec<Vec<String>>, add_types: &Vec<String>, remov
 
 // The REAL mover -- internal-only (see "Queued archetype transitions", right above `compile_
 // program`, for why `world.add`/`world.remove` no longer call this directly).
-fn apply_fn_name_ecs(comp_type: String, is_add: Bool) -> String {
+pub fn apply_fn_name_ecs(comp_type: String, is_add: Bool) -> String {
     if is_add { return "__world_apply_add_" + comp_type; }
     return "__world_apply_remove_" + comp_type;
 }
@@ -8639,20 +8664,20 @@ fn apply_fn_name_ecs(comp_type: String, is_add: Bool) -> String {
 // existed (`Codegen.hotc`'s own `finish_method_call` branches construct this exact string), but
 // now points at a QUEUEING fn (`synthesize_queue_add_fn_ecs`/`synthesize_queue_remove_fn_ecs`)
 // instead of the mover directly.
-fn queue_fn_name_ecs(comp_type: String, is_add: Bool) -> String {
+pub fn queue_fn_name_ecs(comp_type: String, is_add: Bool) -> String {
     if is_add { return "__world_add_" + comp_type; }
     return "__world_remove_" + comp_type;
 }
 
-fn pending_add_entities_name_ecs(comp_type: String) -> String {
+pub fn pending_add_entities_name_ecs(comp_type: String) -> String {
     return "__pending_add_" + comp_type + "_entities";
 }
 
-fn pending_add_values_name_ecs(comp_type: String) -> String {
+pub fn pending_add_values_name_ecs(comp_type: String) -> String {
     return "__pending_add_" + comp_type + "_values";
 }
 
-fn pending_remove_entities_name_ecs(comp_type: String) -> String {
+pub fn pending_remove_entities_name_ecs(comp_type: String) -> String {
     return "__pending_remove_" + comp_type + "_entities";
 }
 
@@ -8663,7 +8688,7 @@ fn pending_remove_entities_name_ecs(comp_type: String) -> String {
 // `is_add`). Building blocks are plain `Vec$<T>` method calls (`.get`/`.set`/`.pop`/`.push`/
 // `.length`) -- ordinary generic calls the ORDINARY check/codegen pipeline already knows how to
 // monomorphize, nothing bespoke needed here at all.
-fn build_move_stmts_ecs(src_sig: &Vec<String>, dst_sig: &Vec<String>, src_id: Int, dst_id: Int, is_add: Bool) -> Vec<Stmt> {
+pub fn build_move_stmts_ecs(src_sig: &Vec<String>, dst_sig: &Vec<String>, src_id: Int, dst_id: Int, is_add: Bool) -> Vec<Stmt> {
     let src_static = archetype_static_name_ecs(src_sig);
     let dst_static = archetype_static_name_ecs(dst_sig);
     var stmts = empty_stmt_vec2();
@@ -8748,7 +8773,7 @@ fn build_move_stmts_ecs(src_sig: &Vec<String>, dst_sig: &Vec<String>, src_id: In
 // call site's entity is in at COMPILE time in general) via one `If` per compatible source
 // archetype in `closed_sigs`. Called only by the flush logic now, never directly by `world.add`/
 // `world.remove` (see this section's own header just above).
-fn synthesize_transition_fn_ecs(comp_type: String, is_add: Bool, closed_sigs: &Vec<Vec<String>>) -> FnDecl {
+pub fn synthesize_transition_fn_ecs(comp_type: String, is_add: Bool, closed_sigs: &Vec<Vec<String>>) -> FnDecl {
     var params = empty_param_vec2();
     params.push(Param { name: "__entity", type_name: "Int", is_ref: false, is_mut_ref: false });
     if is_add {
@@ -8784,14 +8809,14 @@ fn synthesize_transition_fn_ecs(comp_type: String, is_add: Bool, closed_sigs: &V
 // type (once per registration call PLUS once for the real `FnDecl`, since `param_types_of`/
 // `param_names_of`/`param_is_ref_of`/`param_is_mut_ref_of` all take `Vec<Param>` BY VALUE, same
 // "fresh copy per use" requirement every other synthesized param list in this file already has).
-fn queue_add_params_ecs(comp_type: String) -> Vec<Param> {
+pub fn queue_add_params_ecs(comp_type: String) -> Vec<Param> {
     var params = empty_param_vec2();
     params.push(Param { name: "__entity", type_name: "Int", is_ref: false, is_mut_ref: false });
     params.push(Param { name: "__value", type_name: comp_type, is_ref: false, is_mut_ref: false });
     return params;
 }
 
-fn synthesize_queue_add_fn_ecs(comp_type: String) -> FnDecl {
+pub fn synthesize_queue_add_fn_ecs(comp_type: String) -> FnDecl {
     var params = queue_add_params_ecs(comp_type);
     var body = empty_stmt_vec2();
     body.push(ExprStmt { expr: MethodCall { recv: Ident { name: pending_add_entities_name_ecs(comp_type) }, method: "push", args: vec_of(Ident { name: "__entity" }) }, line: 0 });
@@ -8801,13 +8826,13 @@ fn synthesize_queue_add_fn_ecs(comp_type: String) -> FnDecl {
 
 // `world.remove(entity, Value)`'s own real forward target -- the `synthesize_queue_add_fn_ecs`
 // sibling, minus a value to carry (there's nothing to push but the entity id).
-fn queue_remove_params_ecs() -> Vec<Param> {
+pub fn queue_remove_params_ecs() -> Vec<Param> {
     var params = empty_param_vec2();
     params.push(Param { name: "__entity", type_name: "Int", is_ref: false, is_mut_ref: false });
     return params;
 }
 
-fn synthesize_queue_remove_fn_ecs(comp_type: String) -> FnDecl {
+pub fn synthesize_queue_remove_fn_ecs(comp_type: String) -> FnDecl {
     var params = queue_remove_params_ecs();
     var body = empty_stmt_vec2();
     body.push(ExprStmt { expr: MethodCall { recv: Ident { name: pending_remove_entities_name_ecs(comp_type) }, method: "push", args: vec_of(Ident { name: "__entity" }) }, line: 0 });
@@ -8823,7 +8848,7 @@ fn synthesize_queue_remove_fn_ecs(comp_type: String) -> FnDecl {
 // field assignment's receiver as mutable when it's a `var` local, an `&mut`-borrowed param, or
 // `&mut self` -- never a top-level `pub static`, even though calling a real `&mut self` METHOD
 // on one, like `.push()`/`.pop()` already do throughout this whole feature, works fine).
-fn build_flush_transitions_stmts_ecs(add_types: &Vec<String>, remove_types: &Vec<String>) -> Vec<Stmt> {
+pub fn build_flush_transitions_stmts_ecs(add_types: &Vec<String>, remove_types: &Vec<String>) -> Vec<Stmt> {
     var body = empty_stmt_vec2();
     var loop_idx = 0;
     var ai = 0;
@@ -8858,7 +8883,7 @@ fn build_flush_transitions_stmts_ecs(add_types: &Vec<String>, remove_types: &Vec
     return body;
 }
 
-pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool, classpath: Vec<String>, resources: Vec<ComponentDecl>, quiet_schedule: Bool) -> Vec<String> {
+pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<ImplDecl>, enums: Vec<EnumDecl>, externs: Vec<ExternClassDecl>, statics: Vec<StaticDecl>, interfaces: Vec<InterfaceDecl>, binary_name: String, entry_name: String, entry_args: Vec<Int>, out_path: String, struct_annotation_names: Vec<String>, struct_annotation_data: Vec<Annotation>, fn_annotation_names: Vec<String>, fn_annotation_data: Vec<Annotation>, extend_decls: Vec<ExtendDecl>, must_use_fn_names: Vec<String>, struct_doc_names: Vec<String>, struct_doc_data: Vec<DocComment>, fn_doc_names: Vec<String>, fn_doc_data: Vec<DocComment>, sendable_struct_names: Vec<String>, components: Vec<ComponentDecl>, systems: Vec<SystemDecl>, target: Int, explain_schedule: Bool, classpath: Vec<String>, resources: Vec<ComponentDecl>, quiet_schedule: Bool, pub_struct_names: Vec<String>, pub_enum_names: Vec<String>, pub_interface_names: Vec<String>, pub_fn_names: Vec<String>, pub_static_names: Vec<String>) -> Vec<String> {
     // `arena struct` -- see README's own "Off-heap data" section: built on `java.lang.foreign`,
     // stable only since JDK 22 (still preview at 21). Gated at `25` -- the only discrete
     // `--target` level this compiler actually has (17/21/25, no "22") that's genuinely >= 22 --
@@ -9497,7 +9522,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         // no class to emit for it at all, same as a generic struct TEMPLATE right above.
         if !is_generic && !sd2.is_arena {
             let sd2_ann = find_annotation_cg(&struct_annotation_names, &struct_annotation_data, sd2.name);
-            gen_struct(target, sd2.name, sd2.fields, methods_for_struct(&impls, sd2.name), static_methods_for_struct(&impls, sd2.name), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, sd2.super_class, sd2_ann, &sendable_struct_names);
+            gen_struct(target, sd2.name, sd2.fields, methods_for_struct(&impls, sd2.name), static_methods_for_struct(&impls, sd2.name), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, sd2.super_class, sd2_ann, &sendable_struct_names, &pub_struct_names);
         }
         si1 = si1 + 1;
     }
@@ -9510,10 +9535,10 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         let mono_name = checker.mono_needed.get(mi2);
         if is_generic_enum_mono(&enums, mono_name) {
             let mono_variants = monomorphized_enum_variants(&enums, mono_name);
-            gen_enum(target, mono_name, mono_variants, find_enum_module_cg(mono_name, &enums), &structs, &enums);
+            gen_enum(target, mono_name, mono_variants, find_enum_module_cg(mono_name, &enums), &structs, &enums, &pub_enum_names);
         } else {
             let mono_fields = monomorphized_fields(&structs, mono_name);
-            gen_struct(target, mono_name, mono_fields, monomorphized_methods_for_struct_cg(&impls, &structs, &checker.method_mono_needed, mono_name), empty_fn_decl_vec2(), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, none_string2(), none_annotation2(), &sendable_struct_names);
+            gen_struct(target, mono_name, mono_fields, monomorphized_methods_for_struct_cg(&impls, &structs, &checker.method_mono_needed, mono_name), empty_fn_decl_vec2(), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, none_string2(), none_annotation2(), &sendable_struct_names, &pub_struct_names);
         }
         mi2 = mi2 + 1;
     }
@@ -9523,7 +9548,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         var ed1_is_generic = false;
         if let Some { value: etp1 } = ed1.type_param { ed1_is_generic = true; }
         if !ed1_is_generic {
-            gen_enum(target, ed1.name, ed1.variants, ed1.module_name, &structs, &enums);
+            gen_enum(target, ed1.name, ed1.variants, ed1.module_name, &structs, &enums, &pub_enum_names);
         }
         ei1 = ei1 + 1;
     }
@@ -9536,7 +9561,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         var has_extern_binary = false;
         if let Some { value: ebn } = ifd1.extern_binary_name { has_extern_binary = true; }
         if !has_extern_binary {
-            gen_interface(target, ifd1.name, ifd1.methods, ifd1.parents, ifd1.module_name, &interfaces);
+            gen_interface(target, ifd1.name, ifd1.methods, ifd1.parents, ifd1.module_name, &interfaces, &pub_interface_names);
         }
         ifi1 = ifi1 + 1;
     }
@@ -9589,7 +9614,12 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
     var sti = 0;
     while sti < statics.length() {
         let sd3 = statics.get(sti);
-        CodegenShim::visitInstanceField(&mut cw, 9, sd3.name, descriptor_of_type(sd3.type_name, &static_alias_names, &static_alias_binaries, &static_module_names, &static_module_values)); // ACC_PUBLIC | ACC_STATIC
+        // `pub static NAME: Type = ...;` -- see `Ast.hc`'s own `Program.pub_static_names` header
+        // for the real fix this is (`pub` used to be discarded unconditionally, every top-level
+        // static field always `ACC_PUBLIC` regardless).
+        var static_access = 8; // ACC_STATIC
+        if str_vec_contains_cg(&pub_static_names, sd3.name) { static_access = 9; } // + ACC_PUBLIC
+        CodegenShim::visitInstanceField(&mut cw, static_access, sd3.name, descriptor_of_type(sd3.type_name, &static_alias_names, &static_alias_binaries, &static_module_names, &static_module_values));
         sti = sti + 1;
     }
     // `$stdin` -- backs the `read_line` intrinsic (see `gen_expr`'s own `Call` codegen header),
@@ -9617,7 +9647,11 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         if !f_is_generic {
             let info = build_program_info(target, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, &sendable_struct_names); // fresh every iteration, see build_program_info's own header
             let f_ann = find_annotation_cg(&fn_annotation_names, &fn_annotation_data, f.name);
-            gen_fn(&mut cw, binary_name, f.name, param_names_of(f.params), param_type_names_of(f2.params), opt_string_or(f.ret_type, "Unit"), f.body, info, f_ann);
+            // `pub fn name(...) { ... }` -- see `Ast.hc`'s own `Program.pub_fn_names` header for
+            // the real fix this is.
+            var f_access = 8; // ACC_STATIC
+            if str_vec_contains_cg(&pub_fn_names, f.name) { f_access = 9; } // + ACC_PUBLIC
+            gen_fn(&mut cw, binary_name, f.name, param_names_of(f.params), param_type_names_of(f2.params), opt_string_or(f.ret_type, "Unit"), f.body, info, f_ann, f_access);
         }
         k = k + 1;
     }
@@ -9629,7 +9663,13 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         let mono_ret = monomorphized_fn_retty_cg(&fns, fmono_name);
         let mono_body = fn_body_of_generic_template_cg(&fns, fmono_name);
         let info2 = build_program_info(target, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, &sendable_struct_names); // fresh every iteration
-        gen_fn(&mut cw, binary_name, fmono_name, param_names_of(mono_params), param_type_names_of(mono_params2), mono_ret, mono_body, info2, none_annotation2());
+        // `fmono_name` is a monomorphized instantiation (`"identity$Int"`) -- check against its
+        // own TEMPLATE's declared name, same as every other generic-instantiation lookup.
+        var fmono_base = fmono_name;
+        if is_mono_name_cg(fmono_name) { fmono_base = mono_base_cg(fmono_name); }
+        var fmono_access = 8; // ACC_STATIC
+        if str_vec_contains_cg(&pub_fn_names, fmono_base) { fmono_access = 9; } // + ACC_PUBLIC
+        gen_fn(&mut cw, binary_name, fmono_name, param_names_of(mono_params), param_type_names_of(mono_params2), mono_ret, mono_body, info2, none_annotation2(), fmono_access);
         fmk = fmk + 1;
     }
 
@@ -9709,7 +9749,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
 // -- not a compile error, a real `AbstractMethodError` at runtime the first time something called
 // through the missing method (direct OR `&dyn` dispatch alike, since the method genuinely isn't
 // on the class file either way).
-fn methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<FnDecl> {
+pub fn methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<FnDecl> {
     var out = empty_fn_decl_vec2();
     var i = 0;
     while i < impls.length() {
@@ -9726,7 +9766,7 @@ fn methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<FnDecl>
     return out;
 }
 
-fn static_methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<FnDecl> {
+pub fn static_methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<FnDecl> {
     var out = empty_fn_decl_vec2();
     var i = 0;
     while i < impls.length() {
@@ -9743,25 +9783,25 @@ fn static_methods_for_struct(impls: &Vec<ImplDecl>, struct_name: String) -> Vec<
     return out;
 }
 
-fn empty_fn_decl_vec2() -> Vec<FnDecl> {
+pub fn empty_fn_decl_vec2() -> Vec<FnDecl> {
     var v = vec_of(FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_param_vec2() -> Vec<Param> {
+pub fn empty_param_vec2() -> Vec<Param> {
     var v = vec_of(Param { name: "_", type_name: "_", is_ref: false, is_mut_ref: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn none_string2() -> Option<String> {
+pub fn none_string2() -> Option<String> {
     return None;
 }
 
-fn some_string2(s: String) -> Option<String> {
+pub fn some_string2(s: String) -> Option<String> {
     return Some { value: s };
 }
 
-fn empty_stmt_vec2() -> Vec<Stmt> {
+pub fn empty_stmt_vec2() -> Vec<Stmt> {
     var v = vec_of(ExprStmt { expr: IntLit { value: 0 }, line: 0 });
     return Vec { data: v.data, len: 0 };
 }
@@ -9769,7 +9809,7 @@ fn empty_stmt_vec2() -> Vec<Stmt> {
 // `param_types_of` -- now shared with `Checker.hotc` via `Types.hotc` (used to be a near-
 // duplicate copy here; harmless under the flat bootstrap namespace, but genuine duplication).
 
-fn all_int_types(count: Int) -> Vec<String> {
+pub fn all_int_types(count: Int) -> Vec<String> {
     var out = vec_of("__init__");
     var real = Vec { data: out.data, len: 0 };
     var i = 0;
@@ -9780,7 +9820,7 @@ fn all_int_types(count: Int) -> Vec<String> {
     return real;
 }
 
-fn param_type_names_of(params: &Vec<Param>) -> Vec<String> {
+pub fn param_type_names_of(params: &Vec<Param>) -> Vec<String> {
     var out = vec_of("__init__");
     var real = Vec { data: out.data, len: 0 };
     var i = 0;
@@ -9791,7 +9831,7 @@ fn param_type_names_of(params: &Vec<Param>) -> Vec<String> {
     return real;
 }
 
-fn param_names_of(params: &Vec<Param>) -> Vec<String> {
+pub fn param_names_of(params: &Vec<Param>) -> Vec<String> {
     var out = vec_of("__init__");
     var real = Vec { data: out.data, len: 0 };
     var i = 0;
@@ -9802,14 +9842,14 @@ fn param_names_of(params: &Vec<Param>) -> Vec<String> {
     return real;
 }
 
-fn opt_string_or(o: Option<String>, default_val: String) -> String {
+pub fn opt_string_or(o: Option<String>, default_val: String) -> String {
     if let Some { value: v } = o {
         return v;
     }
     return default_val;
 }
 
-fn has_real_errors(errs: Vec<String>) -> Bool {
+pub fn has_real_errors(errs: Vec<String>) -> Bool {
     var i = 0;
     while i < errs.length() {
         if errs.get(i) != "" {

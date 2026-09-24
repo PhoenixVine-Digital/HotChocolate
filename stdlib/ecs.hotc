@@ -8,7 +8,7 @@
 // `spawn` a single fixed signature (it takes an arbitrary set of DIFFERENT component types per
 // call site), so both are recognized and compiled specially by `Checker.hotc`/`Codegen.hotc`, the
 // same way `PhoenixPool::spawn` (see `stdlib/phoenix.hotc`) is.
-struct World {
+pub struct World {
     _unused: Int,
 }
 

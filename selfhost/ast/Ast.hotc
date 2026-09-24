@@ -595,7 +595,7 @@ pub fn flatten_interface_methods(interfaces: &Vec<InterfaceDecl>, name: String) 
     return flatten_interface_methods_depth(&interfaces, name, 0);
 }
 
-fn flatten_interface_methods_depth(interfaces: &Vec<InterfaceDecl>, name: String, depth: Int) -> Vec<InterfaceMethod> {
+pub fn flatten_interface_methods_depth(interfaces: &Vec<InterfaceDecl>, name: String, depth: Int) -> Vec<InterfaceMethod> {
     var out = empty_interface_method_vec();
     // Guarding the WHOLE body in one `if depth <= 20 { ... }` (rather than an early `return out;`
     // right at the top for the `depth > 20` case) is deliberate, not just style -- this subset's
@@ -635,7 +635,7 @@ fn flatten_interface_methods_depth(interfaces: &Vec<InterfaceDecl>, name: String
     return out;
 }
 
-fn remove_interface_method_named(methods: Vec<InterfaceMethod>, name: String) -> Vec<InterfaceMethod> {
+pub fn remove_interface_method_named(methods: Vec<InterfaceMethod>, name: String) -> Vec<InterfaceMethod> {
     var out = empty_interface_method_vec();
     var i = 0;
     while i < methods.length() {
@@ -684,7 +684,7 @@ pub fn transitive_supertraits(interfaces: &Vec<InterfaceDecl>, name: String, dep
     return out;
 }
 
-fn push_str_if_absent(v: Vec<String>, s: String) -> Vec<String> {
+pub fn push_str_if_absent(v: Vec<String>, s: String) -> Vec<String> {
     var out = v;
     var i = 0;
     var found = false;
@@ -978,6 +978,22 @@ pub struct Program {
     // from afterward, which is exactly why this can't be a `Checker.hotc` pass on the merged
     // `Program` the way most other checks are).
     private_type_names: Vec<String>,
+    // `pub struct`/`pub enum`/`pub interface`/`pub fn`/`pub static` -- the DECLARED name of every
+    // top-level declaration marked `pub`, one flat list per kind (separate lists because these
+    // are separate namespaces, same reason the checker itself keeps separate struct/enum/
+    // interface/fn/static registries). Real fix, 2026-09-23, for a genuine regression: `pub` was
+    // parsed and unconditionally discarded (`self.match_kind(PUB)`, no data captured anywhere) --
+    // see `ARCHITECTURE.md`'s own "Modules" section corrections for the full story. `Codegen.hotc`
+    // is the only reader: a struct/interface/enum NOT in its own list here gets a package-private
+    // JVM class (`ACC_PUBLIC` omitted) instead of the unconditional `ACC_PUBLIC` every class used
+    // to get regardless; a top-level fn/static NOT in its own list gets a package-private member
+    // on its holder class the same way. Same bare-directive side-channel shape `dev_fn_names`/
+    // `private_type_names` above already use, for the identical reason.
+    pub_struct_names: Vec<String>,
+    pub_enum_names: Vec<String>,
+    pub_interface_names: Vec<String>,
+    pub_fn_names: Vec<String>,
+    pub_static_names: Vec<String>,
 }
 
 // `/// text` lines immediately before a `struct`/`fn`, parsed into structured sections rather than

@@ -4,7 +4,7 @@
 // isn't supported for a two-type-parameter type this phase, see `Ast.hc`'s own
 // `EnumDecl.type_param2` header for why.
 
-enum Result<T, E> {
+pub enum Result<T, E> {
     Ok { value: T },
     Err { error: E },
 }

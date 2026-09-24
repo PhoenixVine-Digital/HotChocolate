@@ -43,7 +43,7 @@ extern class GLFWMouse = "org.lwjgl.glfw.GLFW" {
 // genuinely empty -- `Vec<T>::push`'s own backing array always needs a real first element to exist
 // at all (see `vec.hotc`'s own `vec_of`), and no real GLFW key constant is ever negative, so the
 // sentinel can never accidentally match a real `just_pressed` lookup.
-struct KeyEdge {
+pub struct KeyEdge {
     code: Int,
     was_down: Bool,
 }
@@ -52,7 +52,7 @@ struct KeyEdge {
 // not a poll -- `glfwGetCursorPos`/`glfwGetMouseButton`'s own simple "ask right now" shape doesn't
 // extend to it directly). A future pass wiring up `glfwSetScrollCallback` is its own, separately-
 // scoped follow-up once something actually needs it.
-struct Input {
+pub struct Input {
     keys: Vec<KeyEdge>,
     mouse_x: Float,
     mouse_y: Float,

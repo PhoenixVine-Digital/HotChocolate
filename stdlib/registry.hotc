@@ -2,16 +2,16 @@
 // own `entries` field, and reuses `vec_of`) and `option` (`get`'s own return type) -- `use
 // registry;` alone pulls both in automatically, see `Driver.hotc`'s own `resolve_stdlib_modules`.
 
-struct RegistryEntry<T> {
+pub struct RegistryEntry<T> {
     key: String,
     value: T,
 }
 
-struct Registry<T> {
+pub struct Registry<T> {
     entries: Vec<RegistryEntry<T>>,
 }
 
-fn registry_new<T>(firstKey: String, firstValue: T) -> Registry<T> {
+pub fn registry_new<T>(firstKey: String, firstValue: T) -> Registry<T> {
     return Registry<T> { entries: vec_of(RegistryEntry<T> { key: firstKey, value: firstValue }) };
 }
 

@@ -152,7 +152,7 @@ pub struct Token {
     line: Int,
 }
 
-fn build_keywords() -> Registry<TokType> {
+pub fn build_keywords() -> Registry<TokType> {
     var kw = registry_new("fn", FN);
     kw.register("struct", STRUCT);
     kw.register("let", LET);
@@ -592,7 +592,7 @@ impl Lexer {
     }
 }
 
-fn empty_str_vec_lex() -> Vec<String> {
+pub fn empty_str_vec_lex() -> Vec<String> {
     var v = vec_of("__init__");
     return Vec { data: v.data, len: 0 };
 }

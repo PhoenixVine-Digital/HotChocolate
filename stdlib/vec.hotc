@@ -1,7 +1,7 @@
 // `Vec<T>` -- see README's own "Standard library modules" section. No dependencies on any other
 // stdlib topic.
 
-struct Vec<T> {
+pub struct Vec<T> {
     data: [T],
     len: Int,
 }
@@ -57,6 +57,6 @@ impl Vec<T> {
     }
 }
 
-fn vec_of<T>(first: T) -> Vec<T> {
+pub fn vec_of<T>(first: T) -> Vec<T> {
     return Vec<T> { data: [first; 4], len: 1 };
 }

@@ -2618,6 +2618,11 @@ impl Parser {
         var uses = empty_str_vec();
         var sendable_struct_names = empty_str_vec();
         var private_type_names = empty_str_vec();
+        var pub_struct_names = empty_str_vec();
+        var pub_enum_names = empty_str_vec();
+        var pub_interface_names = empty_str_vec();
+        var pub_fn_names = empty_str_vec();
+        var pub_static_names = empty_str_vec();
         var components = empty_component_decl_vec();
         var systems = empty_system_decl_vec();
         var resources = empty_component_decl_vec();
@@ -2810,7 +2815,12 @@ impl Parser {
             // compiles one file at a time (no cross-module resolution to gate), so `pub` is
             // parsed purely so real HC source that uses it doesn't fail to parse; consumed and
             // otherwise ignored.
-            self.match_kind(PUB);
+            // **Fixed 2026-09-23**: `pub`'s own real effect was previously discarded entirely
+            // right here -- see `ARCHITECTURE.md`'s own "Modules" section corrections for the
+            // full story. Captured now, pushed into the matching `pub_*_names` list once the
+            // actual declaration kind is known (each branch below), same shape `is_priv` right
+            // below already establishes.
+            let is_pub_decl = self.match_kind(PUB);
             // `priv struct Foo { ... }` / `priv enum` / `priv interface` -- see IDEAS.md's own "A
             // minimal import/visibility system" entry. Only meaningful on a top-level TYPE
             // declaration (real, disclosed v1 scope: not `fn`/`static` -- the actual motivating
@@ -2882,6 +2892,9 @@ impl Parser {
                 if is_priv {
                     private_type_names.push(sd.name);
                 }
+                if is_pub_decl {
+                    pub_struct_names.push(sd.name);
+                }
                 if pending_derive.length() > 0 {
                     let synth = self.derive_impls(&sd, &pending_derive);
                     var dsi = 0;
@@ -2939,6 +2952,9 @@ impl Parser {
                 if is_priv {
                     private_type_names.push(ed.name);
                 }
+                if is_pub_decl {
+                    pub_enum_names.push(ed.name);
+                }
                 enums.push(ed);
             } else if self.check(EXTERN) && self.tokens.get(self.pos + 1).kind == INTERFACE {
                 if has_pending_annotation {
@@ -2973,6 +2989,9 @@ impl Parser {
                     throw ParseError::new("doc comments aren't supported on top-level 'static' declarations");
                 }
                 let sdecl = self.static_decl();
+                if is_pub_decl {
+                    pub_static_names.push(sdecl.name);
+                }
                 if pending_tunable {
                     if sdecl.type_name != "Float" {
                         throw ParseError::new("'@tunable' currently only supports 'Float' statics, got '" + sdecl.name + ": " + sdecl.type_name + "'");
@@ -2993,6 +3012,9 @@ impl Parser {
                 let ifd = self.interface_decl();
                 if is_priv {
                     private_type_names.push(ifd.name);
+                }
+                if is_pub_decl {
+                    pub_interface_names.push(ifd.name);
                 }
                 interfaces.push(ifd);
             } else if self.check(EXTEND) {
@@ -3098,6 +3120,9 @@ impl Parser {
                 self.on_decl();
             } else {
                 var fd = self.fn_decl();
+                if is_pub_decl {
+                    pub_fn_names.push(fd.name);
+                }
                 if has_pending_annotation {
                     if let Some { value: ann2 } = pending_annotation {
                         fn_annotation_names.push(fd.name);
@@ -3223,7 +3248,7 @@ impl Parser {
             fns.push(build_event_emit_fn(ev_name, &ev_fields, &ev_handlers));
             evi = evi + 1;
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources, private_type_names: private_type_names };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources, private_type_names: private_type_names, pub_struct_names: pub_struct_names, pub_enum_names: pub_enum_names, pub_interface_names: pub_interface_names, pub_fn_names: pub_fn_names, pub_static_names: pub_static_names };
     }
 
     // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field
@@ -3382,7 +3407,7 @@ impl Parser {
 // returning fn that falls off the end of its body with no explicit `return` at all is likewise
 // unchecked (there's no `Return` node to intercept there either) -- `@ensures` only ever fires on
 // an EXPLICIT `return expr;`, not on every possible exit path.
-fn build_contract_check_stmt(cond: &Expr, msg: String) -> Stmt {
+pub fn build_contract_check_stmt(cond: &Expr, msg: String) -> Stmt {
     var throw_args = empty_expr_vec();
     throw_args.push(StringLit { value: msg });
     var inner_body = empty_stmt_vec();
@@ -3397,7 +3422,7 @@ fn build_contract_check_stmt(cond: &Expr, msg: String) -> Stmt {
 // shadowing every `Stmt` variant's OWN `cond` field (`If`/`While`) inside this fn's own `match`
 // arms below -- a real, easy-to-miss naming trap this fn's own recursion would otherwise walk
 // straight into.
-fn rewrite_ensures_returns(ss: Vec<Stmt>, ens_cond: &Expr, fn_name: String) -> Vec<Stmt> {
+pub fn rewrite_ensures_returns(ss: Vec<Stmt>, ens_cond: &Expr, fn_name: String) -> Vec<Stmt> {
     var out = empty_stmt_vec();
     var i = 0;
     while i < ss.length() {
@@ -3450,7 +3475,7 @@ fn rewrite_ensures_returns(ss: Vec<Stmt>, ens_cond: &Expr, fn_name: String) -> V
 
 // The single entry point `parse_program`'s own plain-`fn` dispatch branch calls once a `fn` had
 // `@requires`/`@ensures` -- see `build_contract_check_stmt`'s own header for the full design.
-fn apply_contract(fd: FnDecl, has_req: Bool, req: Option<Expr>, has_ens: Bool, ens: Option<Expr>) -> FnDecl {
+pub fn apply_contract(fd: FnDecl, has_req: Bool, req: Option<Expr>, has_ens: Bool, ens: Option<Expr>) -> FnDecl {
     var body = fd.body;
     if has_req {
         if let Some { value: rc } = req {
@@ -3475,7 +3500,7 @@ fn apply_contract(fd: FnDecl, has_req: Bool, req: Option<Expr>, has_ens: Bool, e
 // `typestate_decl`'s own small "have I seen this state name before" check -- a local, narrow
 // helper (not a reusable general-purpose one) rather than depending on `Driver.hotc`'s own
 // similarly-named `str_vec_contains`, since that lives in a different phase file.
-fn str_vec_contains_ts(v: &Vec<String>, target: String) -> Bool {
+pub fn str_vec_contains_ts(v: &Vec<String>, target: String) -> Bool {
     var i = 0;
     while i < v.length() {
         if v.get(i) == target { return true; }
@@ -3492,7 +3517,7 @@ fn str_vec_contains_ts(v: &Vec<String>, target: String) -> Bool {
 // header for why those are flat rather than a real `Vec<Vec<Param>>` field) -- the RETURN value
 // here is a plain, single-level `Vec<Param>` (no nesting at all), so this itself hits no
 // monomorphization gap; only a doubly-nested generic STORED AS A FIELD does.
-fn event_params_for(names: &Vec<String>, field_counts: &Vec<Int>, field_names: &Vec<String>, field_types: &Vec<String>, target: String) -> Vec<Param> {
+pub fn event_params_for(names: &Vec<String>, field_counts: &Vec<Int>, field_names: &Vec<String>, field_types: &Vec<String>, target: String) -> Vec<Param> {
     var offset = 0;
     var i = 0;
     while i < names.length() {
@@ -3515,7 +3540,7 @@ fn event_params_for(names: &Vec<String>, field_counts: &Vec<Int>, field_names: &
 // `parse_program`'s own tail -- every handler `fn` name registered for `target`, in the SAME
 // declaration order `on_decl` recorded them (`handler_event_names`/`handler_fn_names` are a flat
 // pair spanning EVERY event in the file, not just `target`'s own).
-fn handlers_for_event(handler_event_names: &Vec<String>, handler_fn_names: &Vec<String>, target: String) -> Vec<String> {
+pub fn handlers_for_event(handler_event_names: &Vec<String>, handler_fn_names: &Vec<String>, target: String) -> Vec<String> {
     var out = empty_str_vec2();
     var i = 0;
     while i < handler_event_names.length() {
@@ -3531,7 +3556,7 @@ fn handlers_for_event(handler_event_names: &Vec<String>, handler_fn_names: &Vec<
 // event (generated even for zero handlers -- firing an event nobody's listening to yet is a
 // normal no-op, not an error), calling every one of its own handlers, forwarding the same
 // arguments, in declaration order.
-fn build_event_emit_fn(name: String, fields: &Vec<Param>, handler_names: &Vec<String>) -> FnDecl {
+pub fn build_event_emit_fn(name: String, fields: &Vec<Param>, handler_names: &Vec<String>) -> FnDecl {
     var params = empty_param_vec();
     var fwd_args = empty_expr_vec();
     var fi = 0;
@@ -3555,7 +3580,7 @@ fn build_event_emit_fn(name: String, fields: &Vec<Param>, handler_names: &Vec<St
 // parameter) so `parse_program`'s own tail can generate ONE call shape (`fn_name(dt)`) per
 // dispatcher regardless of which specific fns it's calling -- no per-fn signature introspection
 // needed at CALL-SITE-GENERATION time, only here, once, right when each fn is first parsed.
-fn check_lifecycle_dt_param(fd: &FnDecl, directive_text: String) {
+pub fn check_lifecycle_dt_param(fd: &FnDecl, directive_text: String) {
     if fd.params.length() != 1 || fd.params.get(0).type_name != "Float" {
         throw ParseError::new("'" + directive_text + "' fn '" + fd.name + "' must take exactly one 'Float' parameter (the delta time)");
     }
@@ -3574,7 +3599,7 @@ fn check_lifecycle_dt_param(fd: &FnDecl, directive_text: String) {
 // here spins up an actual loop/timer/frame-pump. A host application (a hand-written `while true {
 // ... }`, or a future HC-owned game-loop runtime) calls `run_update(dt)`/etc. itself, on whatever
 // cadence it already has.
-fn build_lifecycle_dispatcher_fn(dispatcher_name: String, names: &Vec<String>, has_dt_param: Bool) -> FnDecl {
+pub fn build_lifecycle_dispatcher_fn(dispatcher_name: String, names: &Vec<String>, has_dt_param: Bool) -> FnDecl {
     var params = empty_param_vec();
     if has_dt_param {
         params.push(Param { name: "dt", type_name: "Float", is_ref: false, is_mut_ref: false });
@@ -3597,7 +3622,7 @@ fn build_lifecycle_dispatcher_fn(dispatcher_name: String, names: &Vec<String>, h
 // compare directly with `==` for equality (already exact for every one of them). `String` is
 // deliberately NOT in this list -- it shares the `==` equality path but needs a different,
 // dedicated hashing path (`hash_string_hc`, not a cast).
-fn is_derive_numeric_type_hc(ty: String) -> Bool {
+pub fn is_derive_numeric_type_hc(ty: String) -> Bool {
     if ty == "Int" { return true; }
     if ty == "Bool" { return true; }
     if ty == "Char" { return true; }
@@ -3611,7 +3636,7 @@ fn is_derive_numeric_type_hc(ty: String) -> Bool {
 // One field's own `self.field == other.field` (numeric/`String`) or `self.field.equals(other.
 // field)` (anything else -- a nested struct/enum, dispatching to ITS OWN `Eq` impl) -- see
 // `derive_impls`'s own header for the full field-type-dispatch design.
-fn derive_field_eq_expr(f: &Param) -> Expr {
+pub fn derive_field_eq_expr(f: &Param) -> Expr {
     let lhs = FieldAccess { obj: Ident { name: "self" }, field: f.name };
     let rhs = FieldAccess { obj: Ident { name: "other" }, field: f.name };
     if is_derive_numeric_type_hc(f.type_name) || f.type_name == "String" {
@@ -3626,7 +3651,7 @@ fn derive_field_eq_expr(f: &Param) -> Expr {
 // primitives, `hash_string_hc(self.field)` for `String` (`stdlib/collections.hotc`'s own hand-
 // rolled polynomial hash), or `self.field.hash_key()` for anything else (a nested struct/enum,
 // dispatching to ITS OWN `Hashable` impl) -- see `derive_impls`'s own header.
-fn derive_field_hash_expr(f: &Param) -> Expr {
+pub fn derive_field_hash_expr(f: &Param) -> Expr {
     let lhs = FieldAccess { obj: Ident { name: "self" }, field: f.name };
     if is_derive_numeric_type_hc(f.type_name) {
         return Cast { expr: lhs, target_type: "Int" };
@@ -3642,7 +3667,7 @@ fn derive_field_hash_expr(f: &Param) -> Expr {
 // `unit_decl`'s own `add`/`sub` -- `fn add(&self, other: &Ticks) -> Ticks { return Ticks { value:
 // self.value + other.value }; }`. `op` is `"+"`/`"-"`, `method_name` the operator-overload
 // method name it dispatches through (`Checker.hotc`'s own `operator_method_name`).
-fn unit_binop_fn(method_name: String, op: String, unit_name: String) -> FnDecl {
+pub fn unit_binop_fn(method_name: String, op: String, unit_name: String) -> FnDecl {
     var params = empty_param_vec();
     params.push(Param { name: "other", type_name: unit_name, is_ref: true, is_mut_ref: false });
     let combined = Binary { op: op, left: FieldAccess { obj: Ident { name: "self" }, field: "value" }, right: FieldAccess { obj: Ident { name: "other" }, field: "value" } };
@@ -3659,7 +3684,7 @@ fn unit_binop_fn(method_name: String, op: String, unit_name: String) -> FnDecl {
 // return Ticks { value: self.value * factor }; }`), not unit-times-unit (a units-of-units
 // product, e.g. `Ticks * Ticks -> TicksSquared`, isn't a coherent single-declaration concept and
 // isn't attempted this pass).
-fn unit_scale_fn(method_name: String, op: String, unit_name: String, base: String) -> FnDecl {
+pub fn unit_scale_fn(method_name: String, op: String, unit_name: String, base: String) -> FnDecl {
     var params = empty_param_vec();
     params.push(Param { name: "factor", type_name: base, is_ref: false, is_mut_ref: false });
     let combined = Binary { op: op, left: FieldAccess { obj: Ident { name: "self" }, field: "value" }, right: Ident { name: "factor" } };
@@ -3675,7 +3700,7 @@ fn unit_scale_fn(method_name: String, op: String, unit_name: String, base: Strin
 // `unit_decl`'s own `eq` -- `Checker.hotc`'s own operator-overload dispatch always returns `Bool`
 // for `==`/`!=` regardless of this method's own declared return type (see `check_binary`'s own
 // header), so this returning `Bool` here is just honest, not load-bearing for that part.
-fn unit_eq_fn(unit_name: String) -> FnDecl {
+pub fn unit_eq_fn(unit_name: String) -> FnDecl {
     var params = empty_param_vec();
     params.push(Param { name: "other", type_name: unit_name, is_ref: true, is_mut_ref: false });
     let cmp = Binary { op: "==", left: FieldAccess { obj: Ident { name: "self" }, field: "value" }, right: FieldAccess { obj: Ident { name: "other" }, field: "value" } };
@@ -3706,7 +3731,7 @@ fn unit_eq_fn(unit_name: String) -> FnDecl {
 // boxing header on `PhoenixTask::join()`'s similar `Object`-erasure cost). An unknown name passed
 // to `tunable_get` returns `0.0f` silently (no exception) -- `tunable_names()` is the intended
 // way for a caller to know what's actually valid, rather than probing with unknown strings.
-fn build_tunable_get_fn(names: &Vec<String>) -> FnDecl {
+pub fn build_tunable_get_fn(names: &Vec<String>) -> FnDecl {
     var params = empty_param_vec();
     params.push(Param { name: "name", type_name: "String", is_ref: false, is_mut_ref: false });
     var body = empty_stmt_vec();
@@ -3724,7 +3749,7 @@ fn build_tunable_get_fn(names: &Vec<String>) -> FnDecl {
 
 // `build_tunable_get_fn`'s own write-side twin -- `NAME = value;` (`Assign`) is the exact same
 // real `PUTSTATIC` fallback that fn's own header explains, just used to WRITE instead of read.
-fn build_tunable_set_fn(names: &Vec<String>) -> FnDecl {
+pub fn build_tunable_set_fn(names: &Vec<String>) -> FnDecl {
     var params = empty_param_vec();
     params.push(Param { name: "name", type_name: "String", is_ref: false, is_mut_ref: false });
     params.push(Param { name: "value", type_name: "Float", is_ref: false, is_mut_ref: false });
@@ -3745,7 +3770,7 @@ fn build_tunable_set_fn(names: &Vec<String>) -> FnDecl {
 // what's actually valid to pass to `tunable_get`/`tunable_set` instead of guessing names. `names`
 // is never empty when this is called (`parse_program`'s own tail only synthesizes all three
 // tunable fns together, gated on `self.tunable_names.length() > 0`).
-fn build_tunable_names_fn(names: &Vec<String>) -> FnDecl {
+pub fn build_tunable_names_fn(names: &Vec<String>) -> FnDecl {
     var body = empty_stmt_vec();
     var first_args = empty_expr_vec();
     first_args.push(StringLit { value: names.get(0) });
@@ -3764,7 +3789,7 @@ fn build_tunable_names_fn(names: &Vec<String>) -> FnDecl {
 // `String` has no built-in `startsWith` in this compiler's own intrinsic set (`length`/
 // `substring`/`indexOf`/etc only, see `Checker.hotc`'s own matching `extern class` declaration) --
 // built from those instead. Used by `doc_comment_block`'s own tag dispatch.
-fn str_starts_with(s: String, prefix: String) -> Bool {
+pub fn str_starts_with(s: String, prefix: String) -> Bool {
     if s.length() < prefix.length() { return false; }
     return s.substring(0, prefix.length()) == prefix;
 }
@@ -3772,7 +3797,7 @@ fn str_starts_with(s: String, prefix: String) -> Bool {
 // The text after `prefix`, with exactly one leading space (if any) also stripped -- `"@param x
 // the thing"` stripped of `"@param"` is `" x the thing"`, and every doc-comment tag line has
 // that one separating space before its own real content.
-fn str_after_prefix(s: String, prefix: String) -> String {
+pub fn str_after_prefix(s: String, prefix: String) -> String {
     var rest = s.substring(prefix.length(), s.length());
     if rest.length() > 0 && rest.substring(0, 1) == " " {
         rest = rest.substring(1, rest.length());
@@ -3780,42 +3805,42 @@ fn str_after_prefix(s: String, prefix: String) -> String {
     return rest;
 }
 
-fn empty_doc_comment_vec() -> Vec<DocComment> {
+pub fn empty_doc_comment_vec() -> Vec<DocComment> {
     var v = vec_of(DocComment { summary: "_", param_names: empty_str_vec(), param_texts: empty_str_vec(), returns_text: "", example_text: "", warning_text: "", see_targets: empty_str_vec(), deprecated_text: "", has_deprecated: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_annotation_vec() -> Vec<Annotation> {
+pub fn empty_annotation_vec() -> Vec<Annotation> {
     var v = vec_of(Annotation { binary_name: "_", args: empty_annotation_arg_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_annotation_arg_vec() -> Vec<AnnotationArg> {
+pub fn empty_annotation_arg_vec() -> Vec<AnnotationArg> {
     var v = vec_of(AnnotationArg { name: "_", value: AnnStr { value: "_" } });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_annvalue_vec() -> Vec<AnnValue> {
+pub fn empty_annvalue_vec() -> Vec<AnnValue> {
     var v = vec_of(AnnStr { value: "_" });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_fn_decl_vec() -> Vec<FnDecl> {
+pub fn empty_fn_decl_vec() -> Vec<FnDecl> {
     var v = vec_of(FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_struct_decl_vec() -> Vec<StructDecl> {
+pub fn empty_struct_decl_vec() -> Vec<StructDecl> {
     var v = vec_of(StructDecl { name: "_", type_param: none_string(), fields: empty_param_vec(), is_arena: false, module_name: none_string(), super_class: none_string(), type_param2: none_string() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_component_decl_vec() -> Vec<ComponentDecl> {
+pub fn empty_component_decl_vec() -> Vec<ComponentDecl> {
     var v = vec_of(ComponentDecl { name: "_", fields: empty_param_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_system_decl_vec() -> Vec<SystemDecl> {
+pub fn empty_system_decl_vec() -> Vec<SystemDecl> {
     var v = vec_of(SystemDecl { name: "_", run_params: empty_param_vec(), run_body: empty_stmt_vec(), after: empty_str_vec2(), before: empty_str_vec2(), has_profile: false, has_main_thread: false, run_if: "" });
     return Vec { data: v.data, len: 0 };
 }
@@ -3826,7 +3851,7 @@ pub fn empty_impl_decl_vec() -> Vec<ImplDecl> {
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_extend_decl_vec() -> Vec<ExtendDecl> {
+pub fn empty_extend_decl_vec() -> Vec<ExtendDecl> {
     var v = vec_of(ExtendDecl { target: "_", methods: empty_fn_decl_vec() });
     return Vec { data: v.data, len: 0 };
 }
@@ -3838,7 +3863,7 @@ pub fn empty_interface_method_vec() -> Vec<InterfaceMethod> {
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_interface_decl_vec() -> Vec<InterfaceDecl> {
+pub fn empty_interface_decl_vec() -> Vec<InterfaceDecl> {
     var v = vec_of(InterfaceDecl { name: "_", methods: empty_interface_method_vec(), is_sealed: false, parents: empty_str_vec(), extern_binary_name: none_string(), module_name: none_string(), is_open: false });
     return Vec { data: v.data, len: 0 };
 }
@@ -3850,42 +3875,42 @@ pub fn empty_str_vec() -> Vec<String> {
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_variant_vec() -> Vec<EnumVariant> {
+pub fn empty_variant_vec() -> Vec<EnumVariant> {
     var v = vec_of(EnumVariant { name: "_", fields: empty_param_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_enum_decl_vec() -> Vec<EnumDecl> {
+pub fn empty_enum_decl_vec() -> Vec<EnumDecl> {
     var v = vec_of(EnumDecl { name: "_", variants: empty_variant_vec(), type_param: none_string(), module_name: none_string(), type_param2: none_string() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_catchclause_vec() -> Vec<CatchClause> {
+pub fn empty_catchclause_vec() -> Vec<CatchClause> {
     var v = vec_of(CatchClause { catch_var: "_", catch_type: "_", catch_block: empty_stmt_vec() });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_matcharm_vec() -> Vec<MatchArm> {
+pub fn empty_matcharm_vec() -> Vec<MatchArm> {
     var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec(), bind_names: empty_str_vec(), body: empty_stmt_vec(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_extern_method_vec() -> Vec<ExternMethod> {
+pub fn empty_extern_method_vec() -> Vec<ExternMethod> {
     var v = vec_of(ExternMethod { name: "_", params: empty_param_vec(), ret_type: "Unit", is_static: false, is_ctor: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_extern_field_vec() -> Vec<ExternField> {
+pub fn empty_extern_field_vec() -> Vec<ExternField> {
     var v = vec_of(ExternField { name: "_", type_name: "Unit", is_static: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_extern_class_vec() -> Vec<ExternClassDecl> {
+pub fn empty_extern_class_vec() -> Vec<ExternClassDecl> {
     var v = vec_of(ExternClassDecl { name: "_", binary_name: "_", methods: empty_extern_method_vec(), fields: empty_extern_field_vec(), is_interface: false });
     return Vec { data: v.data, len: 0 };
 }
 
-fn empty_static_decl_vec() -> Vec<StaticDecl> {
+pub fn empty_static_decl_vec() -> Vec<StaticDecl> {
     var v = vec_of(StaticDecl { name: "_", type_name: "_", value: IntLit { value: 0 } });
     return Vec { data: v.data, len: 0 };
 }
@@ -3895,29 +3920,29 @@ fn empty_static_decl_vec() -> Vec<StaticDecl> {
 // an empty starting `Vec` needs its element pushed onto a throwaway one instead. `Option<T>`'s
 // `Some`/`None` constructors need `T` inferrable the same way -- these fns just give the checker
 // a call site with a concrete `T` already on hand.
-fn empty_expr_vec() -> Vec<Expr> {
+pub fn empty_expr_vec() -> Vec<Expr> {
     var v = vec_of(IntLit { value: 0 });
     return Vec { data: v.data, len: 0 };
 }
-fn empty_stmt_vec() -> Vec<Stmt> {
+pub fn empty_stmt_vec() -> Vec<Stmt> {
     var v = vec_of(ExprStmt { expr: IntLit { value: 0 }, line: 0 });
     return Vec { data: v.data, len: 0 };
 }
-fn empty_param_vec() -> Vec<Param> {
+pub fn empty_param_vec() -> Vec<Param> {
     var v = vec_of(Param { name: "_", type_name: "_", is_ref: false, is_mut_ref: false });
     return Vec { data: v.data, len: 0 };
 }
 // `event_field_counts`'s own empty seed -- same "seed via a real value, then reset `len` to 0"
 // convention every other `empty_*_vec` helper here already uses.
-fn empty_int_vec_ev() -> Vec<Int> {
+pub fn empty_int_vec_ev() -> Vec<Int> {
     var seed = vec_of(0);
     return Vec { data: seed.data, len: 0 };
 }
-fn none_expr() -> Option<Expr> {
+pub fn none_expr() -> Option<Expr> {
     var v = vec_of(Some { value: IntLit { value: 0 } });
     return None;
 }
-fn some_expr(e: Expr) -> Option<Expr> {
+pub fn some_expr(e: Expr) -> Option<Expr> {
     return Some { value: e };
 }
 // `pub`: `Checker.hotc`'s own `checker_new` seed and `Ast.hc`'s `InterfaceMethod` construction
@@ -3930,28 +3955,28 @@ pub fn none_stmt_vec() -> Option<Vec<Stmt>> {
 pub fn some_stmt_vec(v: Vec<Stmt>) -> Option<Vec<Stmt>> {
     return Some { value: v };
 }
-fn none_string() -> Option<String> {
+pub fn none_string() -> Option<String> {
     return None;
 }
-fn none_annotation() -> Option<Annotation> {
+pub fn none_annotation() -> Option<Annotation> {
     return None;
 }
-fn some_annotation(a: Annotation) -> Option<Annotation> {
+pub fn some_annotation(a: Annotation) -> Option<Annotation> {
     return Some { value: a };
 }
-fn none_doc_comment() -> Option<DocComment> {
+pub fn none_doc_comment() -> Option<DocComment> {
     return None;
 }
-fn some_doc_comment(d: DocComment) -> Option<DocComment> {
+pub fn some_doc_comment(d: DocComment) -> Option<DocComment> {
     return Some { value: d };
 }
-fn some_string(s: String) -> Option<String> {
+pub fn some_string(s: String) -> Option<String> {
     return Some { value: s };
 }
 
 extern class JInt = "java.lang.Integer" {
     static fn parseInt(s: String) -> Int;
 }
-fn parse_int(s: String) -> Int {
+pub fn parse_int(s: String) -> Int {
     return JInt::parseInt(s);
 }

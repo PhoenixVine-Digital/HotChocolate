@@ -26,7 +26,7 @@ extern class JFiles2 = "java.nio.file.Files" {
     static fn readString(p: JPath) -> String;
 }
 
-fn read_source_file(path: String) -> String {
+pub fn read_source_file(path: String) -> String {
     let p = JPaths::get(path, ["x"; 0]);
     return JFiles2::readString(p);
 }
@@ -49,7 +49,7 @@ extern class JFileWriter = "java.io.FileWriter" {
     fn close(&self);
 }
 
-fn write_text_file(path: String, content: String) {
+pub fn write_text_file(path: String, content: String) {
     let cs = JCharset::forName("UTF-8");
     var w = JFileWriter::new(path, cs);
     w.write(content);
@@ -115,7 +115,7 @@ extern class JFilePathSepCli = "java.io.File" {
 // avoidance elsewhere). Real, disclosed simplification: single-codepoint separators only, which
 // is all either a real OS path-separator or any other reasonable `--classpath`-style delimiter
 // ever needs.
-fn split_on_char(s: String, sep: Int) -> Vec<String> {
+pub fn split_on_char(s: String, sep: Int) -> Vec<String> {
     var parts = empty_str_vec4();
     var start = 0;
     var i = 0;
@@ -148,11 +148,11 @@ extern class JProcessCli = "java.lang.Process" {
 // sentinel) instead of a real path, surfacing many steps later as a confusing
 // `NoSuchFileException: __init__` with no obvious connection to "wrong extension". Both
 // extensions are accepted now, matching single-file mode's own already-permissive behavior.
-fn ends_with_hotc(name: String) -> Bool {
+pub fn ends_with_hotc(name: String) -> Bool {
     return ends_with_suffix(name, ".hotc") || ends_with_suffix(name, ".hc");
 }
 
-fn ends_with_suffix(name: String, suffix: String) -> Bool {
+pub fn ends_with_suffix(name: String, suffix: String) -> Bool {
     let nlen = name.length();
     let slen = suffix.length();
     if nlen < slen { return false; }
@@ -163,7 +163,7 @@ fn ends_with_suffix(name: String, suffix: String) -> Bool {
 // `Checker.hotc`'s own `check_binary`) -- a plain codepoint-by-codepoint comparison via
 // `codePointAt` is both simpler than porting a real collation and sufficient here, since this only
 // needs to match the real compiler's own plain-path-string `sortedBy` (not real locale collation).
-fn str_less_than(a: String, b: String) -> Bool {
+pub fn str_less_than(a: String, b: String) -> Bool {
     var i = 0;
     let alen = a.length();
     let blen = b.length();
@@ -177,7 +177,7 @@ fn str_less_than(a: String, b: String) -> Bool {
     return alen < blen;
 }
 
-fn sort_str_vec(v: Vec<String>) -> Vec<String> {
+pub fn sort_str_vec(v: Vec<String>) -> Vec<String> {
     var out = v;
     var i = 1;
     while i < out.length() {
@@ -199,7 +199,7 @@ fn sort_str_vec(v: Vec<String>) -> Vec<String> {
     return out;
 }
 
-fn collect_hotc_files(dir_path: String) -> Vec<String> {
+pub fn collect_hotc_files(dir_path: String) -> Vec<String> {
     var out = empty_str_vec2();
     let dir = JFileCli::new(dir_path);
     let entries = dir.listFiles();
@@ -221,7 +221,7 @@ fn collect_hotc_files(dir_path: String) -> Vec<String> {
     return out;
 }
 
-fn last_index_of_char(s: String, cp: Int) -> Int {
+pub fn last_index_of_char(s: String, cp: Int) -> Int {
     var idx = -1;
     var i = 0;
     while i < s.length() {
@@ -236,7 +236,7 @@ fn last_index_of_char(s: String, cp: Int) -> Int {
 // characters that aren't already valid in a Java identifier (matching this whole codebase's
 // existing "trust the input, don't guess" convention), just enough to name the output class for a
 // normal project/file path.
-fn base_name_no_ext(path: String) -> String {
+pub fn base_name_no_ext(path: String) -> String {
     // A real gap found running this compiler on a Windows ABSOLUTE path
     // (`C:\Users\...\CategoryDefinition.hotc`, real usage piloting Minecraft-modding on top of
     // this compiler): `CP_SLASH` alone finds nothing in a backslash-separated path, so `name`
@@ -272,7 +272,7 @@ fn base_name_no_ext(path: String) -> String {
 // Player`) that silently corrupted the compiled output before this check existed: `gen_struct`
 // would overwrite the SAME "Player.class" the entry holder needed, with no `main` at all left in
 // it. See `run_cli`'s own header for the fix (mangling the entry class name, never the struct's).
-fn name_collides_with_decl(name: String, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>) -> Bool {
+pub fn name_collides_with_decl(name: String, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>) -> Bool {
     var i = 0;
     while i < structs.length() {
         if structs.get(i).name == name {
@@ -298,7 +298,7 @@ fn name_collides_with_decl(name: String, structs: &Vec<StructDecl>, enums: &Vec<
 // module` for that ONE file, then compares it against the module a DIRECTORY-derived name would
 // suggest. A mismatch prints a warning (never a hard error -- "surface it," not "block the
 // build," matching how `check_systems`'s own per-conflict warning already behaves).
-fn check_module_dirs(dir_path: String) {
+pub fn check_module_dirs(dir_path: String) {
     let files = collect_hotc_files(dir_path);
     var i = 0;
     while i < files.length() {
@@ -324,7 +324,7 @@ fn check_module_dirs(dir_path: String) {
 // path convention this codebase already uses (`"examples/battle"`, `stdlib_topic_path`, ...)
 // assumes forward slashes -- replacing backslash with forward slash here means this check
 // behaves identically regardless of which platform actually produced the path.
-fn normalize_path_seps_hc(s: String) -> String {
+pub fn normalize_path_seps_hc(s: String) -> String {
     var out = "";
     var i = 0;
     while i < s.length() {
@@ -335,7 +335,7 @@ fn normalize_path_seps_hc(s: String) -> String {
     return out;
 }
 
-fn replace_slashes_with_dots_hc(s: String) -> String {
+pub fn replace_slashes_with_dots_hc(s: String) -> String {
     var out = "";
     var i = 0;
     while i < s.length() {
@@ -351,7 +351,7 @@ fn replace_slashes_with_dots_hc(s: String) -> String {
 // `dir_path` plus some real subpath (`collect_hotc_files`'s own recursion only ever descends
 // FROM `dir_path`), so stripping that prefix, then the trailing filename, then replacing every
 // remaining "/" with "." gives the expected dot-joined module string directly.
-fn expected_module_for_path(dir_path: String, file_path: String) -> String {
+pub fn expected_module_for_path(dir_path: String, file_path: String) -> String {
     var dp = normalize_path_seps_hc(dir_path);
     if dp.length() > 0 && dp.codePointAt(dp.length() - 1) == CP_SLASH {
         dp = dp.substring(0, dp.length() - 1);
@@ -375,7 +375,7 @@ fn expected_module_for_path(dir_path: String, file_path: String) -> String {
     return replace_slashes_with_dots_hc(dir_part);
 }
 
-fn parse_directory(dir_path: String) -> Program {
+pub fn parse_directory(dir_path: String) -> Program {
     var files = collect_hotc_files(dir_path);
     files = sort_str_vec(files);
     // `check_private_visibility` needs each file's own identity, which is impossible to recover
@@ -416,7 +416,7 @@ fn parse_directory(dir_path: String) -> Program {
 // `run_doc_cli`'s own `compile_program` call, right below, same as `build`/`run`), so rendering
 // only ever happens once every `@see` in the program is already known-valid -- there's no
 // "unresolved" case left by the time this runs at all.
-fn render_doc_section(title: String, names: Vec<String>, docs: Vec<DocComment>) -> String {
+pub fn render_doc_section(title: String, names: Vec<String>, docs: Vec<DocComment>) -> String {
     let nl = codepoint_to_string(CP_NEWLINE);
     var out = "";
     if names.length() == 0 { return out; }
@@ -469,7 +469,7 @@ fn render_doc_section(title: String, names: Vec<String>, docs: Vec<DocComment>) 
     return out;
 }
 
-fn render_doc_markdown(struct_names: Vec<String>, struct_docs: Vec<DocComment>, fn_names: Vec<String>, fn_docs: Vec<DocComment>) -> String {
+pub fn render_doc_markdown(struct_names: Vec<String>, struct_docs: Vec<DocComment>, fn_names: Vec<String>, fn_docs: Vec<DocComment>) -> String {
     let nl = codepoint_to_string(CP_NEWLINE);
     var out = "# API Documentation" + nl + nl;
     out = out + render_doc_section("Structs", struct_names, struct_docs);
@@ -486,7 +486,7 @@ fn render_doc_markdown(struct_names: Vec<String>, struct_docs: Vec<DocComment>, 
 // `off` -- how many leading argv slots `run_cli`'s own `--target` handling already consumed (0
 // if it wasn't present) -- every OTHERWISE-fixed-position `args[N]` access here shifts by it,
 // since `[String]` has no slicing operation to hand this fn a shorter view instead.
-fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, quiet_schedule: Bool, classpath: Vec<String>, dev_mode: Bool) {
+pub fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, quiet_schedule: Bool, classpath: Vec<String>, dev_mode: Bool) {
     let doc_path = args[off + 1];
     var doc_out = "api.md";
     if args.length > off + 2 { doc_out = args[off + 2]; }
@@ -513,6 +513,7 @@ fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool, qu
         dprog.extend_decls, dprog.must_use_fn_names,
         dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data, dprog.sendable_struct_names,
         dprog.components, dprog.systems, target, explain_schedule, classpath, dprog.resources, quiet_schedule,
+        dprog.pub_struct_names, dprog.pub_enum_names, dprog.pub_interface_names, dprog.pub_fn_names, dprog.pub_static_names,
     );
     if report_errors(derrors) {
         let md = render_doc_markdown(dprog.struct_doc_names, dprog.struct_doc_data, dprog.fn_doc_names, dprog.fn_doc_data);
@@ -684,6 +685,7 @@ pub fn run_cli(args: [String]) {
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
         prog.components, prog.systems, target, explain_schedule, classpath, prog.resources, quiet_schedule,
+        prog.pub_struct_names, prog.pub_enum_names, prog.pub_interface_names, prog.pub_fn_names, prog.pub_static_names,
     );
     if report_errors(errors) {
         print("wrote " + out_path);
@@ -715,7 +717,7 @@ pub fn run_cli(args: [String]) {
     }
 }
 
-fn cli_entry_source() -> String {
+pub fn cli_entry_source() -> String {
     let nl = codepoint_to_string(CP_NEWLINE);
     return "pub fn main(args: [String]) \{" + nl + "run_cli(args);" + nl + "\}" + nl;
 }
@@ -751,6 +753,7 @@ pub fn run_selfcompile_cli_prep() {
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
         prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath/--quiet-schedule never wanted here
+        prog.pub_struct_names, prog.pub_enum_names, prog.pub_interface_names, prog.pub_fn_names, prog.pub_static_names,
     );
     if report_errors(errors2) {
         print("wrote SelfhostCLI.class -- run it standalone with a real target path to compile any .hotc file or project directory.");
@@ -786,7 +789,7 @@ pub fn run_selfcompile_cli_prep() {
 // them could have written a `use` statement at all. See `resolve_stdlib_modules`'s own header,
 // right below `merge_program`, for the actual resolution logic, and README's own "Standard
 // library modules" section for the full design.
-fn merge_fns(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
+pub fn merge_fns(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -796,7 +799,7 @@ fn merge_fns(a: Vec<FnDecl>, b: Vec<FnDecl>) -> Vec<FnDecl> {
     return out;
 }
 
-fn merge_structs(a: Vec<StructDecl>, b: Vec<StructDecl>) -> Vec<StructDecl> {
+pub fn merge_structs(a: Vec<StructDecl>, b: Vec<StructDecl>) -> Vec<StructDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -806,7 +809,7 @@ fn merge_structs(a: Vec<StructDecl>, b: Vec<StructDecl>) -> Vec<StructDecl> {
     return out;
 }
 
-fn merge_impls(a: Vec<ImplDecl>, b: Vec<ImplDecl>) -> Vec<ImplDecl> {
+pub fn merge_impls(a: Vec<ImplDecl>, b: Vec<ImplDecl>) -> Vec<ImplDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -816,7 +819,7 @@ fn merge_impls(a: Vec<ImplDecl>, b: Vec<ImplDecl>) -> Vec<ImplDecl> {
     return out;
 }
 
-fn merge_component_decl_vec(a: Vec<ComponentDecl>, b: Vec<ComponentDecl>) -> Vec<ComponentDecl> {
+pub fn merge_component_decl_vec(a: Vec<ComponentDecl>, b: Vec<ComponentDecl>) -> Vec<ComponentDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -826,7 +829,7 @@ fn merge_component_decl_vec(a: Vec<ComponentDecl>, b: Vec<ComponentDecl>) -> Vec
     return out;
 }
 
-fn merge_system_decl_vec(a: Vec<SystemDecl>, b: Vec<SystemDecl>) -> Vec<SystemDecl> {
+pub fn merge_system_decl_vec(a: Vec<SystemDecl>, b: Vec<SystemDecl>) -> Vec<SystemDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -836,7 +839,7 @@ fn merge_system_decl_vec(a: Vec<SystemDecl>, b: Vec<SystemDecl>) -> Vec<SystemDe
     return out;
 }
 
-fn merge_enums(a: Vec<EnumDecl>, b: Vec<EnumDecl>) -> Vec<EnumDecl> {
+pub fn merge_enums(a: Vec<EnumDecl>, b: Vec<EnumDecl>) -> Vec<EnumDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -846,7 +849,7 @@ fn merge_enums(a: Vec<EnumDecl>, b: Vec<EnumDecl>) -> Vec<EnumDecl> {
     return out;
 }
 
-fn merge_externs(a: Vec<ExternClassDecl>, b: Vec<ExternClassDecl>) -> Vec<ExternClassDecl> {
+pub fn merge_externs(a: Vec<ExternClassDecl>, b: Vec<ExternClassDecl>) -> Vec<ExternClassDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -856,7 +859,7 @@ fn merge_externs(a: Vec<ExternClassDecl>, b: Vec<ExternClassDecl>) -> Vec<Extern
     return out;
 }
 
-fn merge_statics(a: Vec<StaticDecl>, b: Vec<StaticDecl>) -> Vec<StaticDecl> {
+pub fn merge_statics(a: Vec<StaticDecl>, b: Vec<StaticDecl>) -> Vec<StaticDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -902,7 +905,7 @@ pub fn run_bootstrap_demo(path: String) {
 
     var args = vec_of(3);
     args.push(4);
-    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, prog_interfaces, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class", prog_struct_ann_names, prog_struct_ann_data, prog_fn_ann_names, prog_fn_ann_data, prog_extend_decls, prog_must_use_fn_names, prog_struct_doc_names, prog_struct_doc_data, prog_fn_doc_names, prog_fn_doc_data, merge_str_vec(prelude_prog.sendable_struct_names, real_prog.sendable_struct_names), merge_component_decl_vec(prelude_prog.components, real_prog.components), merge_system_decl_vec(prelude_prog.systems, real_prog.systems), 17, false, empty_str_vec4(), merge_component_decl_vec(prelude_prog.resources, real_prog.resources), false); // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath/--quiet-schedule never wanted here
+    let errors = compile_program(prog_fns, prog_structs, prog_impls, prog_enums, prog_externs, prog_statics, prog_interfaces, "SelfhostDemoProgram", "combo", args, "SelfhostDemoProgram.class", prog_struct_ann_names, prog_struct_ann_data, prog_fn_ann_names, prog_fn_ann_data, prog_extend_decls, prog_must_use_fn_names, prog_struct_doc_names, prog_struct_doc_data, prog_fn_doc_names, prog_fn_doc_data, merge_str_vec(prelude_prog.sendable_struct_names, real_prog.sendable_struct_names), merge_component_decl_vec(prelude_prog.components, real_prog.components), merge_system_decl_vec(prelude_prog.systems, real_prog.systems), 17, false, empty_str_vec4(), merge_component_decl_vec(prelude_prog.resources, real_prog.resources), false, merge_str_vec(prelude_prog.pub_struct_names, real_prog.pub_struct_names), merge_str_vec(prelude_prog.pub_enum_names, real_prog.pub_enum_names), merge_str_vec(prelude_prog.pub_interface_names, real_prog.pub_interface_names), merge_str_vec(prelude_prog.pub_fn_names, real_prog.pub_fn_names), merge_str_vec(prelude_prog.pub_static_names, real_prog.pub_static_names)); // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath/--quiet-schedule never wanted here
     if report_errors(errors) {
         print("wrote SelfhostDemoProgram.class (combo(3, 4) should print 18 when run)");
     }
@@ -912,7 +915,7 @@ pub fn run_bootstrap_demo(path: String) {
 // covering both "does anything need reporting" and "print it," since `errs` is move-only and a
 // separate check-then-print pair (like `TestDriver.hotc`'s own `print_errors`) would need it read
 // twice.
-fn report_errors(errs: Vec<String>) -> Bool {
+pub fn report_errors(errs: Vec<String>) -> Bool {
     var i = 0;
     var clean = true;
     while i < errs.length() {
@@ -945,7 +948,7 @@ extern class JString4 = "java.lang.String" {
 // merging every `.hotc` file in a directory into one program) -- so the fix here is the same idea,
 // built from the merge helpers already sitting right above (`merge_fns`/`merge_structs`/etc.,
 // used so far only to merge the PRELUDE in) generalized to merge all SIX real files together too.
-fn parse_source_file(path: String) -> Program {
+pub fn parse_source_file(path: String) -> Program {
     let src = read_source_file(path);
     var lex = lexer_new(src);
     let toks = lex.tokenize();
@@ -953,7 +956,7 @@ fn parse_source_file(path: String) -> Program {
     return p.parse_program();
 }
 
-fn parse_source_string(src: String) -> Program {
+pub fn parse_source_string(src: String) -> Program {
     var lex = lexer_new(src);
     let toks = lex.tokenize();
     var p = parser_new(toks);
@@ -969,11 +972,11 @@ fn parse_source_string(src: String) -> Program {
 // construction through a real `return` inside a small helper (matching every other bare-`Vec{}`
 // site already proven working across `Checker.hotc`/`Codegen.hotc`/`Parser.hotc`/`Types.hotc`,
 // e.g. their own pervasive `return Vec { data: v.data, len: 0 };`) fixes it.
-fn driver_empty_int_vec() -> Vec<Int> {
+pub fn driver_empty_int_vec() -> Vec<Int> {
     return Vec { data: [0; 1], len: 0 };
 }
 
-fn merge_interfaces(a: Vec<InterfaceDecl>, b: Vec<InterfaceDecl>) -> Vec<InterfaceDecl> {
+pub fn merge_interfaces(a: Vec<InterfaceDecl>, b: Vec<InterfaceDecl>) -> Vec<InterfaceDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -983,7 +986,7 @@ fn merge_interfaces(a: Vec<InterfaceDecl>, b: Vec<InterfaceDecl>) -> Vec<Interfa
     return out;
 }
 
-fn merge_str_vec(a: Vec<String>, b: Vec<String>) -> Vec<String> {
+pub fn merge_str_vec(a: Vec<String>, b: Vec<String>) -> Vec<String> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -993,7 +996,7 @@ fn merge_str_vec(a: Vec<String>, b: Vec<String>) -> Vec<String> {
     return out;
 }
 
-fn merge_annotation_vec(a: Vec<Annotation>, b: Vec<Annotation>) -> Vec<Annotation> {
+pub fn merge_annotation_vec(a: Vec<Annotation>, b: Vec<Annotation>) -> Vec<Annotation> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -1003,7 +1006,7 @@ fn merge_annotation_vec(a: Vec<Annotation>, b: Vec<Annotation>) -> Vec<Annotatio
     return out;
 }
 
-fn merge_extend_decl_vec(a: Vec<ExtendDecl>, b: Vec<ExtendDecl>) -> Vec<ExtendDecl> {
+pub fn merge_extend_decl_vec(a: Vec<ExtendDecl>, b: Vec<ExtendDecl>) -> Vec<ExtendDecl> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -1013,7 +1016,7 @@ fn merge_extend_decl_vec(a: Vec<ExtendDecl>, b: Vec<ExtendDecl>) -> Vec<ExtendDe
     return out;
 }
 
-fn merge_doc_comment_vec(a: Vec<DocComment>, b: Vec<DocComment>) -> Vec<DocComment> {
+pub fn merge_doc_comment_vec(a: Vec<DocComment>, b: Vec<DocComment>) -> Vec<DocComment> {
     var out = a;
     var i = 0;
     while i < b.length() {
@@ -1023,7 +1026,7 @@ fn merge_doc_comment_vec(a: Vec<DocComment>, b: Vec<DocComment>) -> Vec<DocComme
     return out;
 }
 
-fn merge_program(a: Program, b: Program) -> Program {
+pub fn merge_program(a: Program, b: Program) -> Program {
     return Program {
         fns: merge_fns(a.fns, b.fns),
         structs: merge_structs(a.structs, b.structs),
@@ -1050,6 +1053,11 @@ fn merge_program(a: Program, b: Program) -> Program {
         systems: merge_system_decl_vec(a.systems, b.systems),
         resources: merge_component_decl_vec(a.resources, b.resources),
         private_type_names: merge_str_vec(a.private_type_names, b.private_type_names),
+        pub_struct_names: merge_str_vec(a.pub_struct_names, b.pub_struct_names),
+        pub_enum_names: merge_str_vec(a.pub_enum_names, b.pub_enum_names),
+        pub_interface_names: merge_str_vec(a.pub_interface_names, b.pub_interface_names),
+        pub_fn_names: merge_str_vec(a.pub_fn_names, b.pub_fn_names),
+        pub_static_names: merge_str_vec(a.pub_static_names, b.pub_static_names),
     };
 }
 
@@ -1066,7 +1074,7 @@ fn merge_program(a: Program, b: Program) -> Program {
 // branch at all, just unconditional inclusion); in a release build, drops the whole block,
 // `else_body` included (this feature's own real, disclosed v1 scope: `if dev { ... }` alone, no
 // `else` clause is a supported shape to begin with).
-fn strip_dev_blocks_list(ss: Vec<Stmt>, dev_mode: Bool) -> Vec<Stmt> {
+pub fn strip_dev_blocks_list(ss: Vec<Stmt>, dev_mode: Bool) -> Vec<Stmt> {
     var out = empty_stmt_vec2();
     var i = 0;
     while i < ss.length() {
@@ -1123,7 +1131,7 @@ fn strip_dev_blocks_list(ss: Vec<Stmt>, dev_mode: Bool) -> Vec<Stmt> {
     return out;
 }
 
-fn strip_dev_fn_decl_vec(fns: Vec<FnDecl>, dev_names: &Vec<String>, dev_mode: Bool) -> Vec<FnDecl> {
+pub fn strip_dev_fn_decl_vec(fns: Vec<FnDecl>, dev_names: &Vec<String>, dev_mode: Bool) -> Vec<FnDecl> {
     var out = empty_fn_decl_vec2();
     var i = 0;
     while i < fns.length() {
@@ -1143,7 +1151,7 @@ fn strip_dev_fn_decl_vec(fns: Vec<FnDecl>, dev_names: &Vec<String>, dev_mode: Bo
 // `impl`'s own `methods`/`static_methods` (rewritten only -- `@dev` on a METHOD isn't in this v1's
 // own scope, a real, disclosed narrower cut than the top-level-fn case), and every `system`'s own
 // `run_body`.
-fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
+pub fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
     var new_fns = strip_dev_fn_decl_vec(prog.fns, &prog.dev_fn_names, dev_mode);
     var new_impls = empty_impl_decl_vec();
     var ii = 0;
@@ -1161,7 +1169,7 @@ fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
         new_systems.push(SystemDecl { name: sysd.name, run_params: sysd.run_params, run_body: strip_dev_blocks_list(sysd.run_body, dev_mode), after: sysd.after, before: sysd.before, has_profile: sysd.has_profile, has_main_thread: sysd.has_main_thread, run_if: sysd.run_if });
         si = si + 1;
     }
-    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources, private_type_names: prog.private_type_names };
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names };
 }
 
 // `asset("textures/player.png")` -- see `IDEAS.md`'s own "Compile-time asset existence checks"
@@ -1172,7 +1180,7 @@ fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
 // motivating shape (`let texture = asset("textures/player.png");`) without needing a second,
 // parallel general expression walker just for this one diagnostic. A no-op entirely when
 // `assets_dir` is `""` (the flag's own default -- opt-in, not forced on every compile).
-fn check_assets(prog: &Program, assets_dir: String) {
+pub fn check_assets(prog: &Program, assets_dir: String) {
     if assets_dir == "" { return; }
     var fi = 0;
     while fi < prog.fns.length() {
@@ -1201,7 +1209,7 @@ fn check_assets(prog: &Program, assets_dir: String) {
     }
 }
 
-fn check_one_asset_expr(e: &Expr, assets_dir: String) {
+pub fn check_one_asset_expr(e: &Expr, assets_dir: String) {
     match e {
         Call { callee, args } => {
             if callee == "asset" && args.length() == 1 {
@@ -1221,7 +1229,7 @@ fn check_one_asset_expr(e: &Expr, assets_dir: String) {
     }
 }
 
-fn check_assets_in_stmts(ss: &Vec<Stmt>, assets_dir: String) {
+pub fn check_assets_in_stmts(ss: &Vec<Stmt>, assets_dir: String) {
     var i = 0;
     while i < ss.length() {
         match ss.get(i) {
@@ -1271,14 +1279,14 @@ fn check_assets_in_stmts(ss: &Vec<Stmt>, assets_dir: String) {
 // own shallower top-level-only scan) -- calling an ORDINARY, un-annotated helper fn that itself
 // happens to call `random_new` internally is NOT caught, since that would need tracking which
 // PLAIN fns are transitively non-deterministic too, a real, larger analysis not attempted here.
-fn is_nondeterministic_name(name: String) -> Bool {
+pub fn is_nondeterministic_name(name: String) -> Bool {
     if name == "random_new" { return true; }
     if name == "nanoTime" { return true; }
     if name == "currentTimeMillis" { return true; }
     return false;
 }
 
-fn check_deterministic_fns(prog: &Program) {
+pub fn check_deterministic_fns(prog: &Program) {
     var i = 0;
     while i < prog.fns.length() {
         let f = prog.fns.get(i);
@@ -1289,7 +1297,7 @@ fn check_deterministic_fns(prog: &Program) {
     }
 }
 
-fn check_deterministic_stmts(ss: &Vec<Stmt>, fn_name: String) {
+pub fn check_deterministic_stmts(ss: &Vec<Stmt>, fn_name: String) {
     var i = 0;
     while i < ss.length() {
         match ss.get(i) {
@@ -1335,7 +1343,7 @@ fn check_deterministic_stmts(ss: &Vec<Stmt>, fn_name: String) {
     }
 }
 
-fn check_deterministic_expr_list(es: &Vec<Expr>, fn_name: String) {
+pub fn check_deterministic_expr_list(es: &Vec<Expr>, fn_name: String) {
     var i = 0;
     while i < es.length() {
         check_deterministic_expr(&es.get(i), fn_name);
@@ -1343,7 +1351,7 @@ fn check_deterministic_expr_list(es: &Vec<Expr>, fn_name: String) {
     }
 }
 
-fn check_deterministic_expr(e: &Expr, fn_name: String) {
+pub fn check_deterministic_expr(e: &Expr, fn_name: String) {
     match e {
         Call { callee, args } => {
             if is_nondeterministic_name(callee) {
@@ -1424,7 +1432,7 @@ fn check_deterministic_expr(e: &Expr, fn_name: String) {
 // real parser for every one of this AST's several decorated-type-string shapes -- pushing "Vec"
 // AND "Foo" both for `"Vec<Foo>"` is exactly the point (either one could be the private name being
 // checked for).
-fn is_type_str_sep(c: Int) -> Bool {
+pub fn is_type_str_sep(c: Int) -> Bool {
     if c == CP_AMP { return true; }
     if c == CP_QUESTION { return true; }
     if c == CP_LT { return true; }
@@ -1436,7 +1444,7 @@ fn is_type_str_sep(c: Int) -> Bool {
     return false;
 }
 
-fn push_type_name_words(s: String, out: &mut Vec<String>) {
+pub fn push_type_name_words(s: String, out: &mut Vec<String>) {
     var i = 0;
     var cur = "";
     while i < s.length() {
@@ -1452,14 +1460,14 @@ fn push_type_name_words(s: String, out: &mut Vec<String>) {
     if cur != "" { out.push(cur); }
 }
 
-fn push_opt_type_name_words(o: Option<String>, out: &mut Vec<String>) {
+pub fn push_opt_type_name_words(o: Option<String>, out: &mut Vec<String>) {
     match o {
         Some { value: s } => { push_type_name_words(s, out); }
         None => {}
     }
 }
 
-fn collect_private_refs_params(params: &Vec<Param>, out: &mut Vec<String>) {
+pub fn collect_private_refs_params(params: &Vec<Param>, out: &mut Vec<String>) {
     var i = 0;
     while i < params.length() {
         push_type_name_words(params.get(i).type_name, out);
@@ -1467,13 +1475,13 @@ fn collect_private_refs_params(params: &Vec<Param>, out: &mut Vec<String>) {
     }
 }
 
-fn collect_private_refs_fn(f: &FnDecl, out: &mut Vec<String>) {
+pub fn collect_private_refs_fn(f: &FnDecl, out: &mut Vec<String>) {
     push_opt_type_name_words(f.ret_type, out);
     collect_private_refs_params(&f.params, out);
     collect_private_refs_stmts(&f.body, out);
 }
 
-fn collect_private_refs_fns(fns: &Vec<FnDecl>, out: &mut Vec<String>) {
+pub fn collect_private_refs_fns(fns: &Vec<FnDecl>, out: &mut Vec<String>) {
     var i = 0;
     while i < fns.length() {
         collect_private_refs_fn(&fns.get(i), out);
@@ -1486,7 +1494,7 @@ fn collect_private_refs_fns(fns: &Vec<FnDecl>, out: &mut Vec<String>) {
 // only (struct-literal/static-call/cast/`is`/arena-constructor targets, plus every field/param/
 // return type string, plus `extends`/`impl ... for`/`extend` target names), never bare value/call
 // references.
-fn collect_type_refs_in_program(prog: &Program, out: &mut Vec<String>) {
+pub fn collect_type_refs_in_program(prog: &Program, out: &mut Vec<String>) {
     var si = 0;
     while si < prog.structs.length() {
         let sd = prog.structs.get(si);
@@ -1544,7 +1552,7 @@ fn collect_type_refs_in_program(prog: &Program, out: &mut Vec<String>) {
     collect_private_refs_fns(&prog.fns, out);
 }
 
-fn collect_private_refs_stmts(ss: &Vec<Stmt>, out: &mut Vec<String>) {
+pub fn collect_private_refs_stmts(ss: &Vec<Stmt>, out: &mut Vec<String>) {
     var i = 0;
     while i < ss.length() {
         match ss.get(i) {
@@ -1601,7 +1609,7 @@ fn collect_private_refs_stmts(ss: &Vec<Stmt>, out: &mut Vec<String>) {
     }
 }
 
-fn collect_private_refs_expr_list(es: &Vec<Expr>, out: &mut Vec<String>) {
+pub fn collect_private_refs_expr_list(es: &Vec<Expr>, out: &mut Vec<String>) {
     var i = 0;
     while i < es.length() {
         collect_private_refs_expr(&es.get(i), out);
@@ -1609,7 +1617,7 @@ fn collect_private_refs_expr_list(es: &Vec<Expr>, out: &mut Vec<String>) {
     }
 }
 
-fn collect_private_refs_expr(e: &Expr, out: &mut Vec<String>) {
+pub fn collect_private_refs_expr(e: &Expr, out: &mut Vec<String>) {
     match e {
         Call { callee, args } => { collect_private_refs_expr_list(&args, out); }
         MethodCall { recv, method, args } => {
@@ -1684,7 +1692,7 @@ fn collect_private_refs_expr(e: &Expr, out: &mut Vec<String>) {
 // shallower and on a much bigger struct) -- re-parsing sidesteps it entirely by never
 // constructing that Vec at all. Not perf-critical either way (matching `check_module_dirs`'s own
 // header): real project sizes here are dozens of files, not thousands.
-fn check_private_visibility(files: &Vec<String>) {
+pub fn check_private_visibility(files: &Vec<String>) {
     // Pass 1: parse every file once just to collect its own `priv` type names -- `all_names`/
     // `all_owners` is a flat parallel pair (one entry per `priv` declaration anywhere in the
     // whole directory, its own declaring file alongside it), same convention `event_names`/
@@ -1726,11 +1734,11 @@ fn check_private_visibility(files: &Vec<String>) {
     }
 }
 
-fn stdlib_topic_path(topic: String) -> String {
+pub fn stdlib_topic_path(topic: String) -> String {
     return "stdlib/" + topic + ".hotc";
 }
 
-fn str_vec_contains(v: &Vec<String>, s: String) -> Bool {
+pub fn str_vec_contains(v: &Vec<String>, s: String) -> Bool {
     var i = 0;
     while i < v.length() {
         if v.get(i) == s { return true; }
@@ -1755,14 +1763,14 @@ fn str_vec_contains(v: &Vec<String>, s: String) -> Bool {
 // topic (a virtual-thread `PhoenixPool` variant for Marshmallow/MC 1.21.1, say -- see the
 // compiler's own JDK-target design) to have exactly one place to declare its own minimum,
 // without touching the gating mechanism itself.
-fn min_target_for_topic(topic: String) -> Int {
+pub fn min_target_for_topic(topic: String) -> Int {
     if topic == "phoenix_virtual" {
         return 21;
     }
     return 17;
 }
 
-fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) -> Vec<String> {
+pub fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) -> Vec<String> {
     if str_vec_contains(&wanted, topic) {
         return wanted;
     }
@@ -1873,7 +1881,7 @@ fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int) ->
 // anywhere -- the 100%-backward-compatible "inject everything" default every pre-existing program
 // already relies on; a non-empty list means real opt-in, resolved (with transitive deps) via
 // `add_stdlib_topic_and_deps` above.
-fn resolve_stdlib_modules(requested: Vec<String>, target: Int) -> Program {
+pub fn resolve_stdlib_modules(requested: Vec<String>, target: Int) -> Program {
     if requested.length() == 0 {
         // No `use` anywhere -- the always-portable default set, unconditionally injected
         // regardless of `target` (every one of these is plain JDK-17-compatible code, and this
@@ -1907,7 +1915,7 @@ fn resolve_stdlib_modules(requested: Vec<String>, target: Int) -> Program {
 // none of the six real files declare a zero-arg `Int`-returning top-level fn of their own (they're
 // pure library code with no entry point at all), and this probe cares only about whether
 // CHECKING + CODEGEN succeed for the whole merged compiler, not about running anything meaningful.
-fn probe_entry_source() -> String {
+pub fn probe_entry_source() -> String {
     let nl = codepoint_to_string(CP_NEWLINE);
     return "fn __selfcompile_probe_entry() -> Int \{" + nl + "return 42;" + nl + "\}" + nl;
 }
@@ -1939,6 +1947,7 @@ pub fn run_selfcompile_probe() {
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
         prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath/--quiet-schedule never wanted here
+        prog.pub_struct_names, prog.pub_enum_names, prog.pub_interface_names, prog.pub_fn_names, prog.pub_static_names,
     );
     if report_errors(errors) {
         print("SELF-HOSTING MILESTONE: the self-hosted compiler successfully checked+compiled its own full source (ast+types+lexer+parser+checker+codegen)!");
@@ -1959,7 +1968,7 @@ pub fn run_selfcompile_probe() {
 // (`read_source_file`/`prelude_source`/`merge_*`/`run_bootstrap_demo`/`report_errors`) is real,
 // working `.hotc` source already, so it goes through the exact same self-hosted-compile step as
 // everything else, landing INSIDE the same produced class as compiled methods it can then call.
-fn stage2_entry_source() -> String {
+pub fn stage2_entry_source() -> String {
     let nl = codepoint_to_string(CP_NEWLINE);
     return "pub fn main(args: [String]) \{" + nl + "run_bootstrap_demo(args[0]);" + nl + "\}" + nl;
 }
@@ -1999,6 +2008,7 @@ pub fn run_selfcompile_stage2() {
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
         prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath/--quiet-schedule never wanted here
+        prog.pub_struct_names, prog.pub_enum_names, prog.pub_interface_names, prog.pub_fn_names, prog.pub_static_names,
     );
     if report_errors(errors) {
         print("wrote SelfhostStage2Compiler.class -- run it with a real target .hotc/.hcsrc path as argv[0] to test the true fixed point.");
@@ -2031,7 +2041,7 @@ pub fn run_selfcompile_stage2() {
 // replicator can regenerate an identical copy of itself, the stage-2 compiler, AND the CLI, then
 // this ONE checked-in class file is a permanent, sufficient bootstrap seed -- see
 // `selfhost/bootstrap/README.md` for what that actually means for retiring the Kotlin compiler.
-fn stage3_entry_source() -> String {
+pub fn stage3_entry_source() -> String {
     let nl = codepoint_to_string(CP_NEWLINE);
     return "pub fn main(args: [String]) \{" + nl + "run_selfcompile_stage2();" + nl + "run_selfcompile_stage3_prep();" + nl + "run_selfcompile_cli_prep();" + nl + "\}" + nl;
 }
@@ -2069,13 +2079,14 @@ pub fn run_selfcompile_stage3_prep() {
         prog.extend_decls, prog.must_use_fn_names,
         prog.struct_doc_names, prog.struct_doc_data, prog.fn_doc_names, prog.fn_doc_data, prog.sendable_struct_names,
         prog.components, prog.systems, 17, false, empty_str_vec4(), prog.resources, false, // internal bootstrap probe -- always compiles at the baseline target, --explain-schedule/--classpath/--quiet-schedule never wanted here
+        prog.pub_struct_names, prog.pub_enum_names, prog.pub_interface_names, prog.pub_fn_names, prog.pub_static_names,
     );
     if report_errors(errors) {
         print("wrote SelfhostSelfReplicator.class -- run it standalone (no args) to rebuild SelfhostStage2Compiler.class with zero Kotlin involved.");
     }
 }
 
-fn cpprobe_bool_str(b: Bool) -> String {
+pub fn cpprobe_bool_str(b: Bool) -> String {
     if b { return "true"; }
     return "false";
 }
@@ -2087,7 +2098,7 @@ fn cpprobe_bool_str(b: Bool) -> String {
 // bootstrap otherwise relies on everywhere, but fails at class-LOAD time with a genuine
 // `IllegalAccessError`, since the real JVM access check runs on the generated class file, not the
 // source).
-fn cpprobe_empty_str_vec() -> Vec<String> {
+pub fn cpprobe_empty_str_vec() -> Vec<String> {
     var v = vec_of("__init__");
     return Vec { data: v.data, len: 0 };
 }

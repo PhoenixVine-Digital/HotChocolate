@@ -3950,21 +3950,43 @@ fn main() {
   compiles to a package-private class, so cross-module code that
   shouldn't reach it can't even link against it, `IllegalAccessError` at
   load time if something tries. (See `examples/modules/`.)
-  **Correction, 2026-09-23: this describes the original (retired
-  Kotlin) compiler's design, not `selfhost/`'s actual current
-  behavior.** `Parser.hotc`'s own top-level parse loop just calls
-  `self.match_kind(PUB)` and discards the result — no field anywhere
-  records it, and `Codegen.hotc`'s own `gen_struct`/`gen_interface`/
-  `gen_enum` unconditionally emit `ACC_PUBLIC` on every class
-  regardless (`class_access = 33` in `gen_struct`, `1537` in
-  `gen_interface`, ...) — there is no package-private codegen path at
-  all in the self-hosted port. `InternalConfig` in this section's own
-  first example is NOT actually invisible outside its module today,
-  despite what its comment claims. Found while building the real,
-  differently-scoped `priv` visibility check below (`priv` marks a
-  TYPE invisible to other FILES in a directory-mode compile — a
-  compile-time, name-based check, not JVM access control at all —
-  distinct from what this bullet describes and not a fix for it).
+  **Regression found AND fixed, both 2026-09-23.** `Parser.hotc`'s own
+  top-level parse loop used to call `self.match_kind(PUB)` and discard
+  the result — no field anywhere recorded it, and `Codegen.hotc`'s own
+  `gen_struct`/`gen_interface`/`gen_enum` unconditionally emitted
+  `ACC_PUBLIC` on every class regardless — there was no package-private
+  codegen path at all in the self-hosted port, and `InternalConfig` in
+  this section's own first example was NOT actually invisible outside
+  its module despite what its comment claimed. Real fix, same day: `pub`
+  is now captured (`Program.pub_struct_names`/`pub_enum_names`/
+  `pub_interface_names`/`pub_fn_names`/`pub_static_names`, the same
+  side-channel shape `dev_fn_names`/`private_type_names` already use),
+  and `Codegen.hotc` now defaults every struct/interface/enum class and
+  every top-level fn/static class MEMBER to package-private, adding
+  `ACC_PUBLIC` back only for a name actually in its own list — a real
+  default-behavior FLIP, not just an addition. **Real, sweeping fallout
+  found immediately**: NOT ONE declaration anywhere in `stdlib/*.hotc`
+  used `pub` (nobody had a reason to, since it was a no-op) — every
+  stdlib type/fn (`Option`, `Result`, `Vec`, `Registry`, `HashMap`, ...)
+  would have gone package-private in the default package, breaking
+  every consumer that ALSO declares a real `module` line (i.e. every
+  real Forge/Fabric mod — exactly the intended, motivating use case for
+  `module` at all). The self-hosted compiler's OWN 6 source files hit
+  the identical problem cross-FILE (each declares its own `module
+  hc.selfhost.*`, and plenty of small cross-file helper fns had never
+  been marked `pub` either, having never needed to be before). Fixed
+  both the same way: every top-level `struct`/`enum`/`interface`/`fn`/
+  `static` in `stdlib/*.hotc` AND across all 6 `selfhost/*.hotc` files
+  now has `pub` (mechanical, low-risk — adding `pub` only ever WIDENS
+  access, never narrows it, so this could only fix breakage, never
+  cause new breakage). Verified with a real `javap` run this time
+  (`InternalConfig` now genuinely `class minecraft.machine.
+  InternalConfig` — no `public` — vs. `Furnace`'s `public class`).
+  Full example regression suite: zero new failures. Self-hosting
+  verified to a true fixed point. `priv` (below) remains a separate,
+  differently-scoped mechanism — a compile-time, name-based check for
+  TYPES across FILES in a directory-mode compile, not JVM access
+  control — this fix doesn't replace it.
 - **`open interface X`** — marks a trait as allowed to receive new
   methods from `extend` blocks in other modules. Orthogonal to `sealed`:
   `sealed` is about the closed set of *implementers* (what `match`
@@ -4001,14 +4023,18 @@ its top-level `pub fn`/`pub static` land as ordinary static members
 directly on *that file's own first* declared struct's class — a real
 name Java code can reference by writing it, not a hidden one. Only a
 file with no struct at all falls back to an internal `$Fns` holder.
-**Same correction as the `pub` bullet above applies here too**: nothing
-in `FnDecl`/`StaticDecl` (or anywhere else in `Ast.hc`) actually
-records whether a `pub` was written at all — `Parser.hotc` discards it
-unconditionally for these too, the same as for struct/interface/enum —
-so there is no data left by the time `Codegen.hotc` places a fn/static
-on its holder class to distinguish a `pub` one from a private one in
-the first place. This whole paragraph describes the original compiler's
-design, not `selfhost/`'s current, real behavior.
+**Same regression, same fix, both 2026-09-23** (see the `pub` bullet
+above for the full story): a top-level fn/static's own `pub`-ness is
+now real too (`Program.pub_fn_names`/`pub_static_names`), and a name
+not in its own list lands on its holder class as a package-private
+member (`ACC_STATIC` alone) instead of the unconditional `ACC_PUBLIC |
+ACC_STATIC` every one used to get regardless — gated at the exact call
+sites `gen_fn`'s own new `access: Int` param and the top-level static-
+field-emission loop check against. Scoped to genuinely TOP-LEVEL fns/
+statics only, matching this whole paragraph's own framing — impl/
+`extend` methods (dispatched by receiver type, not referenced by a
+qualified holder-class name the way a top-level fn is) aren't gated by
+`pub` at all, unchanged.
 
 ```
 module defs;
@@ -4061,12 +4087,12 @@ being renamed to the directory's own basename).
 See `examples/modules/` for a working two-module example (`extend`
 reaching across module boundaries, a private struct genuinely
 inaccessible cross-module — verified with `javap`, not just by reading
-the source). **This `javap` verification, like the `pub` corrections
-above, predates the self-hosted migration** — almost certainly run
-against the original Kotlin compiler, never re-run against `selfhost/`
-(which, per those corrections, emits every struct class `ACC_PUBLIC`
-unconditionally today; a fresh `javap` run against `selfhost/`'s own
-output would show this).
+the source). **Re-verified with a fresh `javap` run, 2026-09-23**,
+after the regression-and-fix described in the `pub` bullet above:
+`javap minecraft/machine/InternalConfig.class` now genuinely prints
+`class minecraft.machine.InternalConfig` (no `public`), vs. `Furnace`'s
+`public class minecraft.machine.Furnace` — real, current confirmation,
+not a stale claim inherited from the original Kotlin compiler.
 
 ### `priv` — a minimal cross-file visibility check (directory-mode compiles only)
 

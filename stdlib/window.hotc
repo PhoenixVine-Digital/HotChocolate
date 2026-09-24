@@ -147,7 +147,7 @@ extern class GL11 = "org.lwjgl.opengl.GL11" {
 // `open` -- `open` is a real reserved keyword in this language (`pub open module ...`
 // visibility), found the hard way: `Window::open(...)` failed with a real parse error
 // ("unexpected token 'open'") since `open` never lexes as an `IDENT` after `::` at all.
-struct Window {
+pub struct Window {
     handle: Long,
 }
 

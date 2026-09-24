@@ -34,7 +34,7 @@ extern class PhoenixVirtualExecutors = "java.util.concurrent.Executors" {
     static fn newVirtualThreadPerTaskExecutor() -> PhoenixExecutorService;
 }
 
-struct PhoenixVirtualPool {
+pub struct PhoenixVirtualPool {
     exec: PhoenixExecutorService,
 }
 
