@@ -813,6 +813,43 @@ check" is a defensible, much simpler first cut than full range-interval
 analysis). Worth revisiting once there's a concrete real program hitting
 enough of these bugs to justify it — not a first-pick item.
 
+**Status (2026-09-24): the "defensible, much simpler first cut" shipped, narrower still than
+even that.** `let x: Int<lo..hi>` (exclusive) / `Int<lo..=hi>` (inclusive), literal, non-negative
+bounds only:
+
+```
+let health: Int<0..=100> = 70;          // literal in range -- compiles, zero runtime cost
+let x: Int<0..=100> = 150;              // literal OUT of range -- real compile-time error
+let clamped: Int<0..=100> = compute();  // not provable statically -- real runtime bounds check
+```
+
+Exactly the decision procedure this entry's own header proposed: a literal `let`/`var` init is
+checked at COMPILE time (`Checker.hotc`'s own `check_stmt` `Let` arm, a real, named error for an
+out-of-range literal, no bytecode generated at all); anything else (a variable, a computed
+expression, a fn call's return value) gets a real RUNTIME bounds check inserted instead
+(`Codegen.hotc`'s own mirrored `Let` arm emits real `IF_ICMPLT`/`IF_ICMPGT`/`IF_ICMPGE` comparisons
+against the bounds, throwing a real `RuntimeException` on violation) — unconditionally, even for a
+literal init the checker already proved safe, real deliberate defense-in-depth rather than the two
+passes trusting a flag one set for the other. Real, disclosed scope cut, considerably narrower
+than this entry's own original framing:
+- **Only a `let`/`var`'s own declared type** — no struct fields, no fn params/return types. A
+  ranged `Int` is registered as plain `"Int"` the instant the check passes, and behaves as an
+  ordinary `Int` everywhere else from that point on.
+- **No resulting-range propagation through arithmetic at all** — `Int<0..=100> + Int<0..=100>`
+  isn't tracked as anything beyond plain `Int`; this entry's own "genuinely new machinery" (range-
+  interval analysis, resulting-range computation per operator) is NOT attempted. The range is
+  enforced only at the ONE declaration/assignment boundary, never followed through computation.
+- **Only non-negative literal bounds** (`Int<0..100>`, not `Int<-10..10>`) — `Parser.hotc`'s own
+  `type_name_ref` reads the bounds via a direct `self.expect(INT)`, not through `unary()`'s own
+  leading-`-` handling, matching Ada's own `Natural`-style motivating example this entry's header
+  already pointed to.
+
+`"Int<0..100>"`/`"Int<0..=100>"` is encoded as the LITERAL surface syntax itself (not the
+`"Base$Arg"` mono-name convention generics use) — it never goes through `ensure_instantiated`/
+monomorphization at all; the only two readers are `Checker.hotc`'s and `Codegen.hotc`'s own
+mirrored `Let` arms, each independently parsing the bounds back out via plain `substring`/
+`indexOf`. See `examples/numeric_range_bounds.hotc`.
+
 ### `@deterministic` + built-in state replay/rewind
 
 **Status, 2026-09-23 (real, disclosed SUBSET shipped -- a name blocklist, not the whole-program

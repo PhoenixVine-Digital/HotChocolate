@@ -1,0 +1,35 @@
+// Numeric range bounds -- see IDEAS.md's own "Numeric range bounds" entry. `let x: Int<lo..hi>`
+// (exclusive) / `Int<lo..=hi>` (inclusive) checks a literal init at COMPILE time (a real, named
+// error, no bytecode generated) and inserts a real RUNTIME bounds check (throwing) for anything
+// else -- "only literal-vs-literal arithmetic gets proven statically, everything else gets a
+// runtime check", the defensible simpler first cut that entry's own header explicitly suggests.
+// Real, disclosed scope: only a `let`/`var`'s own declared type, not struct fields/fn params/
+// returns, and no resulting-range propagation through arithmetic -- a ranged Int is an ordinary
+// Int everywhere else once the check passes.
+
+fn clamp(x: Int, lo: Int, hi: Int) -> Int {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+fn main() {
+    // A literal init -- proven in range at COMPILE time, zero runtime cost.
+    let health: Int<0..=100> = 70;
+    print(health);
+
+    // A computed value -- the compiler can't prove this statically, so a real runtime check runs
+    // (and passes here, since clamp's own result is always within [0, 100]).
+    let clamped: Int<0..=100> = clamp(999, 0, 100);
+    print(clamped);
+
+    // Exclusive upper bound: 0 and 99 are valid, 100 is not.
+    let a: Int<0..100> = clamp(0, 0, 99);
+    print(a);
+
+    print("done");
+}

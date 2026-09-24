@@ -4754,6 +4754,45 @@ impl TyChecker {
                         // Move-check: `let x = y;` moves `y` (a bare, non-Copy local) into `x` --
                         // see this file's own move-checking header (`TyChecker.moved`).
                         self.move_check_consumed(&init, gn);
+                        // `let x: Int<0..=100> = 150;` -- a real, disclosed narrower scope than
+                        // `IDEAS.md`'s own "Numeric range bounds" entry (see `Parser.hotc`'s own
+                        // `type_name_ref` header): only a `let`/`var`'s own declared type, no
+                        // struct fields/fn params/returns, and no resulting-range propagation
+                        // through arithmetic -- a ranged `Int` is registered as plain `"Int"`
+                        // below and behaves as an ordinary `Int` everywhere else from this point
+                        // on. What IS real: a LITERAL init out of range is a compile-time error
+                        // right here (the "only literal-vs-literal gets proven statically" cut
+                        // that entry's own header explicitly suggests as "a defensible, much
+                        // simpler first cut"); anything else (a variable, a computed expression)
+                        // gets a REAL runtime bounds check instead, inserted unconditionally by
+                        // `Codegen.hotc`'s own mirrored `gen_stmt` `Let` arm (which independently
+                        // re-checks `dt_str`/`init`'s own shape rather than this pass threading a
+                        // new AST field through -- both passes read the exact same already-
+                        // existing `declared_type` string and `init` node, so there's nothing new
+                        // for `Codegen.hotc` to trust from THIS pass beyond "it didn't error").
+                        if has_dt && is_ranged_int_type_chk(dt_str) {
+                            if gn != "?" && gn != "Int" {
+                                self.error("cannot assign " + gn + " to '" + name + "' of declared type " + dt_str);
+                            } else {
+                                match init {
+                                    IntLit { value } => {
+                                        let rlo = ranged_int_lo_chk(dt_str);
+                                        let rhi = ranged_int_hi_chk(dt_str);
+                                        let rincl = ranged_int_inclusive_chk(dt_str);
+                                        var rout = value < rlo;
+                                        if rincl {
+                                            if value > rhi { rout = true; }
+                                        } else {
+                                            if value >= rhi { rout = true; }
+                                        }
+                                        if rout {
+                                            self.error("'" + name + "' = " + JString::valueOf(value) + " is out of the declared range " + dt_str);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         var final_ty = ty_from_name(gn);
                         if has_dt && is_dyn_type_name_chk(dt_str) {
                             if gn != "?" && self.is_arg_type_mismatch(dt_str, gn) {
@@ -5835,6 +5874,40 @@ pub fn dyn_interface_name_chk(name: String) -> String {
 pub fn is_arena_type_name_chk(name: String) -> Bool {
     if name.length() < 6 { return false; }
     return name.substring(0, 6) == "arena ";
+}
+
+extern class JIntegerChk = "java.lang.Integer" {
+    static fn parseInt(s: String) -> Int;
+}
+
+// `"Int<0..100>"` / `"Int<0..=100>"` -- numeric range bounds, see `Parser.hotc`'s own `type_
+// name_ref` header for the full design and `IDEAS.md`'s own "Numeric range bounds" entry.
+// `_chk`-suffixed for the same reason `is_dyn_type_name_chk` right above is: `Codegen.hotc` needs
+// its own identical mirror (`_cg`-suffixed) and this subset's flat top-level namespace would
+// otherwise collide the two.
+pub fn is_ranged_int_type_chk(name: String) -> Bool {
+    if name.length() < 5 { return false; }
+    return name.substring(0, 4) == "Int<";
+}
+
+pub fn ranged_int_lo_chk(name: String) -> Int {
+    let inner = name.substring(4, name.length() - 1);
+    let dd = inner.indexOf("..");
+    return JIntegerChk::parseInt(inner.substring(0, dd));
+}
+
+pub fn ranged_int_hi_chk(name: String) -> Int {
+    let inner = name.substring(4, name.length() - 1);
+    let dd = inner.indexOf("..");
+    var hi_start = dd + 2;
+    if inner.substring(dd + 2, dd + 3) == "=" { hi_start = dd + 3; }
+    return JIntegerChk::parseInt(inner.substring(hi_start, inner.length()));
+}
+
+pub fn ranged_int_inclusive_chk(name: String) -> Bool {
+    let inner = name.substring(4, name.length() - 1);
+    let dd = inner.indexOf("..");
+    return inner.substring(dd + 2, dd + 3) == "=";
 }
 
 pub fn arena_struct_name_chk(name: String) -> String {

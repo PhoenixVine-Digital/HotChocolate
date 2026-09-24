@@ -4617,6 +4617,50 @@ bootstrap sync" trap (a `NoClassDefFoundError` on the freshly-synced bootstrap, 
 `fn_decl` fix) -- recovered with the usual `git checkout --` restore of the exact modified
 bootstrap files, then a clean rebuild-sync-reverify. See `examples/macros.hotc`.
 
+## Numeric range bounds (`let x: Int<lo..hi>` / `Int<lo..=hi>`)
+
+**Shipped, 2026-09-24.** See `IDEAS.md`'s own "Numeric range bounds" entry for the full design and
+the real scope cuts made versus that entry's own original framing (a genuinely bigger refinement-
+type system with resulting-range propagation through arithmetic, explicitly NOT attempted here).
+The short version:
+
+```
+let health: Int<0..=100> = 70;          // literal in range -- compiles, zero runtime cost
+let x: Int<0..=100> = 150;              // literal OUT of range -- real compile-time error
+let clamped: Int<0..=100> = compute();  // not provable statically -- real runtime bounds check
+```
+
+Touches all three phases, the first macro-era feature this session to need real `Checker.hotc`/
+`Codegen.hotc` changes rather than a pure `Parser.hotc` desugar:
+- **`Parser.hotc`'s own `type_name_ref`** recognizes `LT INT (DOTDOT|DOTDOTEQ) INT GT` right after
+  an `Int` base type (`looks_like_int_range`, a bounded, non-consuming lookahead in the same family
+  as `looks_like_generic_lit`, checked BEFORE the ordinary generic-type-argument branch so the two
+  never conflict) and encodes the bounds as the literal surface syntax itself (`"Int<0..100>"`) --
+  not the `"Base$Arg"` mono-name convention generics use, since this never goes through `ensure_
+  instantiated`/monomorphization at all.
+- **`Checker.hotc`'s own `check_stmt`'s `Let` arm** (the same wildcard branch `world.get`'s own
+  ambient-hint mechanism already uses) checks `is_ranged_int_type_chk(dt_str)`: a bare `IntLit`
+  init out of range is a real, named compile error; anything else is trusted (the runtime check
+  covers it) and the variable is registered as plain `"Int"` either way -- a ranged Int behaves as
+  an ordinary Int for every purpose beyond this one check, no propagation.
+- **`Codegen.hotc`'s own `gen_stmt`'s `Let` arm** calls a new `emit_ranged_int_check`
+  UNCONDITIONALLY whenever `dt_str` is ranged (even for a literal the checker already proved safe
+  -- real, deliberate defense-in-depth: the two passes independently re-derive "is this ranged"
+  from the identical already-existing `declared_type` string rather than one trusting a flag the
+  other set). Real bytecode: `DUP`, push the lo bound (reusing `IntLit`'s own existing codegen via
+  `gen_expr`, not hand-rolled), `IF_ICMPLT` to a fail label; `DUP` again, push the hi bound,
+  `IF_ICMPGT`/`IF_ICMPGE` (inclusive/exclusive) to the same fail label; the fail label constructs
+  and throws a real `java.lang.RuntimeException` (same ASM idiom the `Throw` statement's own
+  codegen already uses for a `String` message) -- verified directly: a literal 150 against
+  `Int<0..=100>` is rejected at compile time with zero bytecode; a computed 500 against the same
+  bounds compiles fine and throws at the exact line when actually run; the exclusive/inclusive
+  boundary (`Int<0..100>` accepting 0 and 99 but rejecting 100) is verified both ways.
+
+Real, disclosed scope cut, considerably narrower than the doc's own original framing: only a
+`let`/`var`'s own declared type (no struct fields, fn params/returns); no resulting-range
+propagation through arithmetic; only non-negative literal bounds (`self.expect(INT)` directly, not
+routed through `unary()`'s own leading-`-` handling). See `examples/numeric_range_bounds.hotc`.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/

@@ -4093,6 +4093,44 @@ impl CodeGen {
         return result_ty;
     }
 
+    // Real bounds check for `let x: Int<lo..hi>/<lo..=hi> = init;` (see `Parser.hotc`'s own
+    // `type_name_ref` header for the full design) -- called from `gen_stmt`'s own `Let` arm right
+    // after `init`'s value is pushed (stack: `[value]`, an `Int`), unconditionally whenever
+    // `dt_str` is a ranged-Int type, REGARDLESS of whether `init` was a literal `Checker.hotc`
+    // already proved in range at check time -- a real, deliberate bit of defense-in-depth (this
+    // fn and `Checker.hotc`'s own `check_stmt` independently re-derive "is this ranged" from the
+    // exact same `declared_type` string rather than one pass trusting a flag the other set, so
+    // there's no way for the two to silently disagree) rather than a correctness requirement,
+    // since a literal's own compile-time check already ran. Leaves `[value]` back on the stack
+    // exactly as it was found (the DUP'd copies used for each comparison are fully consumed by
+    // their own `IF_ICMPxx`), so `gen_stmt`'s own subsequent `ISTORE` sees the identical value.
+    fn emit_ranged_int_check(&mut self, dt_str: String, var_name: String) {
+        let rlo = ranged_int_lo_cg(dt_str);
+        let rhi = ranged_int_hi_cg(dt_str);
+        let rincl = ranged_int_inclusive_cg(dt_str);
+        var fail_label = Label::new();
+        var ok_label = Label::new();
+        self.mv.visitInsn(89); // DUP
+        self.gen_expr(IntLit { value: rlo });
+        self.mv.visitJumpInsn(161, &fail_label); // IF_ICMPLT -- value < lo -> fail
+        self.mv.visitInsn(89); // DUP
+        self.gen_expr(IntLit { value: rhi });
+        if rincl {
+            self.mv.visitJumpInsn(163, &fail_label); // IF_ICMPGT -- value > hi -> fail
+        } else {
+            self.mv.visitJumpInsn(162, &fail_label); // IF_ICMPGE -- value >= hi -> fail
+        }
+        self.mv.visitJumpInsn(167, &ok_label); // GOTO ok
+        self.mv.visitLabel(&fail_label);
+        self.mv.visitTypeInsn(187, "java/lang/RuntimeException"); // NEW
+        self.mv.visitInsn(89); // DUP
+        let msg = "range check failed: '" + var_name + "' must be within declared type " + dt_str;
+        self.mv.visitLdcInsn(msg as JObject4);
+        self.mv.visitMethodInsn(183, "java/lang/RuntimeException", "<init>", "(Ljava/lang/String;)V", false); // INVOKESPECIAL
+        self.mv.visitInsn(191); // ATHROW
+        self.mv.visitLabel(&ok_label);
+    }
+
     fn gen_stmt(&mut self, s: Stmt) {
         match s {
             Let { name, mutable, init, declared_type, line } => {
@@ -4165,6 +4203,11 @@ impl CodeGen {
                             ty = dt_str;
                         }
                     }
+                }
+                // See `emit_ranged_int_check`'s own header -- unconditional whenever `dt_str` is
+                // a ranged-Int type, regardless of whether `init` was a literal.
+                if has_dt && is_ranged_int_type_name_cg(dt_str) {
+                    self.emit_ranged_int_check(dt_str, name);
                 }
                 let slot = self.alloc_slot(name, ty);
                 self.var_types.register(name, ty);
@@ -6663,6 +6706,9 @@ pub fn join_type_names_cg(names: Vec<String>) -> String {
 // object (see `IntLit`'s own header for why this is needed at all).
 extern class JIntegerCg = "java/lang/Integer" {
     static fn valueOf(v: Int) -> JIntegerCg;
+    // `ranged_int_lo_cg`/`ranged_int_hi_cg`'s own reader -- see `is_ranged_int_type_name_cg`'s
+    // own header.
+    static fn parseInt(s: String) -> Int;
 }
 
 // `FloatLit`/`DoubleLit`'s own host-side boxing call -- see `JIntegerCg`'s own header, same
@@ -6780,6 +6826,34 @@ pub fn dyn_interface_name_cg(name: String) -> String {
 pub fn is_arena_type_name_cg(name: String) -> Bool {
     if name.length() < 6 { return false; }
     return name.substring(0, 6) == "arena ";
+}
+
+// `"Int<0..100>"` / `"Int<0..=100>"` -- mirrors `Checker.hotc`'s own `is_ranged_int_type_chk`/
+// `ranged_int_lo_chk`/etc. exactly (see `Parser.hotc`'s own `type_name_ref` header for the full
+// design); `_cg`-suffixed for the same flat-namespace reason `is_dyn_type_name_cg` already is.
+pub fn is_ranged_int_type_name_cg(name: String) -> Bool {
+    if name.length() < 5 { return false; }
+    return name.substring(0, 4) == "Int<";
+}
+
+pub fn ranged_int_lo_cg(name: String) -> Int {
+    let inner = name.substring(4, name.length() - 1);
+    let dd = inner.indexOf("..");
+    return JIntegerCg::parseInt(inner.substring(0, dd));
+}
+
+pub fn ranged_int_hi_cg(name: String) -> Int {
+    let inner = name.substring(4, name.length() - 1);
+    let dd = inner.indexOf("..");
+    var hi_start = dd + 2;
+    if inner.substring(dd + 2, dd + 3) == "=" { hi_start = dd + 3; }
+    return JIntegerCg::parseInt(inner.substring(hi_start, inner.length()));
+}
+
+pub fn ranged_int_inclusive_cg(name: String) -> Bool {
+    let inner = name.substring(4, name.length() - 1);
+    let dd = inner.indexOf("..");
+    return inner.substring(dd + 2, dd + 3) == "=";
 }
 
 pub fn arena_struct_name_cg(name: String) -> String {

@@ -194,6 +194,21 @@ impl Parser {
         return self.tokens.get(self.pos);
     }
 
+    // Non-consuming 4-token lookahead from the current `LT` -- see `type_name_ref`'s own header
+    // on numeric range bounds (`Int<0..100>`/`Int<0..=100>`) for why this is checked before the
+    // ordinary generic-type-argument branch. `LT INT (DOTDOT|DOTDOTEQ) INT GT`.
+    fn looks_like_int_range(&self) -> Bool {
+        if self.pos + 4 >= self.tokens.length() { return false; }
+        let t1 = self.tokens.get(self.pos + 1);
+        if t1.kind != INT { return false; }
+        let t2 = self.tokens.get(self.pos + 2);
+        if t2.kind != DOTDOT && t2.kind != DOTDOTEQ { return false; }
+        let t3 = self.tokens.get(self.pos + 3);
+        if t3.kind != INT { return false; }
+        let t4 = self.tokens.get(self.pos + 4);
+        return t4.kind == GT;
+    }
+
     // Non-consuming 3-token lookahead from the current `LT` -- see `primary`'s own use of it for
     // why this stays a bounded peek rather than real backtracking.
     fn looks_like_generic_lit(&self) -> Bool {
@@ -2557,6 +2572,42 @@ impl Parser {
         }
         let base = self.expect(IDENT).text;
         var result = base;
+        // `Int<0..100>` / `Int<0..=100>` -- numeric range bounds, see `IDEAS.md`'s own "Numeric
+        // range bounds" entry. Checked BEFORE the ordinary generic-type-argument branch right
+        // below (which expects an `IDENT` type argument via a recursive `type_name_ref()` call,
+        // and would otherwise choke on the leading `INT` token here) via a non-consuming lookahead
+        // (`looks_like_int_range`, bounded exactly like `looks_like_generic_lit`'s own family of
+        // checks elsewhere in this file) so the two forms never conflict: this ONLY fires for
+        // `LT INT (DOTDOT|DOTDOTEQ) INT GT`, never for a real generic argument. Encodes the ENTIRE
+        // constraint directly as the literal surface syntax (`"Int<0..100>"`/`"Int<0..=100>"`) --
+        // not the `"Base$Arg"` mono-name convention the generic branch uses, since this never goes
+        // through `ensure_instantiated`/monomorphization at all; `Checker.hotc`'s own `is_ranged_
+        // int_type_chk`/`ranged_int_lo_chk`/etc. and `Codegen.hotc`'s own mirrors parse it back
+        // via plain substring/indexOf, and the ONLY reader of either is `check_stmt`'s/`gen_stmt`'s
+        // own `Let` arm (see those headers) -- a real, disclosed scope cut narrower than the doc's
+        // own original framing (struct fields, fn params/returns, and arithmetic-through
+        // propagation aren't attempted this pass, only a `let`/`var`'s own declared type is).
+        // Real, disclosed cut: only non-negative literal bounds are supported (`self.expect(INT)`
+        // directly, not routed through `unary()`'s own leading-`-` handling), matching Ada's own
+        // `Natural`-style motivating example in that doc entry.
+        if self.check(LT) && base == "Int" && self.looks_like_int_range() {
+            self.advance(); // LT
+            let lo_tok = self.expect(INT).text;
+            var inclusive_rng = false;
+            if self.check(DOTDOTEQ) {
+                self.advance();
+                inclusive_rng = true;
+            } else {
+                self.expect(DOTDOT);
+            }
+            let hi_tok = self.expect(INT).text;
+            self.expect(GT);
+            if inclusive_rng {
+                return "Int<" + lo_tok + "..=" + hi_tok + ">";
+            } else {
+                return "Int<" + lo_tok + ".." + hi_tok + ">";
+            }
+        }
         if self.check(LT) {
             self.advance();
             let arg = self.type_name_ref();
