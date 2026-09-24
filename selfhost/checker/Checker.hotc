@@ -3869,7 +3869,15 @@ impl TyChecker {
                 }
                 self.check_borrow_rules(borrow_names, borrow_is_mut, borrow_present, "call to '" + callee + "'");
             }
-            return sig.ret_type;
+            // `fn compute() -> Int<0..=100> { ... }` -- the CALL EXPRESSION's own resulting type
+            // is normalized back to plain `"Int"` here, same "behaves as an ordinary Int
+            // everywhere else" promise `find_field_type`/the param-registration fixes already
+            // keep for struct fields and params (see `Codegen.hotc`'s own matching `Call` arm
+            // header) -- `let x = compute();` needs `x` typed as ordinary `Int`, not the ranged
+            // annotation string, for its own later arithmetic/argument-passing to type-check.
+            let call_rt_name = ty_name(sig.ret_type);
+            if is_ranged_int_type_chk(call_rt_name) { return TyInt; }
+            return ty_from_name(call_rt_name);
         } else {
             let gtmpl_found = self.generic_fn_templates.get(callee);
             if let Some { value: gtmpl } = gtmpl_found {
@@ -4955,8 +4963,36 @@ impl TyChecker {
             Return { value, line } => {
                 if let Some { value: v } = value {
                     let rt = self.check_expr(&v);
+                    // `ty_name` consumed exactly once here (a `Ty` isn't `Copy` -- see this
+                    // file's own established convention) into a plain `String`, safe to reuse
+                    // for both the move-check right below AND the new ranged-Int return check.
+                    let rt_name = ty_name(rt);
                     // Move-check: `return y;` moves `y` out to the caller, same as `let x = y;`.
-                    self.move_check_consumed(&v, ty_name(rt));
+                    self.move_check_consumed(&v, rt_name);
+                    // `fn compute() -> Int<0..=100> { return x; }` -- see `Codegen.hotc`'s own
+                    // matching `Return` header. Same literal-vs-runtime split as every other
+                    // ranged-Int enforcement point: a literal return value out of range is a
+                    // real compile-time error; anything else is trusted here (the runtime check
+                    // covers it).
+                    if is_ranged_int_type_chk(self.cur_ret_ty) && rt_name == "Int" {
+                        match v {
+                            IntLit { value: rv } => {
+                                let rlo2 = ranged_int_lo_chk(self.cur_ret_ty);
+                                let rhi2 = ranged_int_hi_chk(self.cur_ret_ty);
+                                let rincl2 = ranged_int_inclusive_chk(self.cur_ret_ty);
+                                var rout2 = rv < rlo2;
+                                if rincl2 {
+                                    if rv > rhi2 { rout2 = true; }
+                                } else {
+                                    if rv >= rhi2 { rout2 = true; }
+                                }
+                                if rout2 {
+                                    self.error("return value " + JString::valueOf(rv) + " is out of the declared range " + self.cur_ret_ty);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {

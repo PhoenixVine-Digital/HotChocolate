@@ -2611,6 +2611,9 @@ impl CodeGen {
                 self.mv.visitMethodInsn(184, self.owner, target, desc, false); // INVOKESTATIC
                 let rt_found = self.fn_ret_tys.get(target);
                 if let Some { value: rt } = rt_found {
+                    // See `Checker.hotc`'s own matching `check_call` header -- the call
+                    // EXPRESSION's own resulting type is normalized back to plain `"Int"` here.
+                    if is_ranged_int_type_name_cg(rt) { return "Int"; }
                     return rt;
                 }
                 return "Int";
@@ -4281,6 +4284,14 @@ impl CodeGen {
                 self.mark_line(line);
                 if let Some { value: v } = value {
                     self.gen_expr(v);
+                    // `fn compute() -> Int<0..=100> { return x; }` -- see `Checker.hotc`'s own
+                    // matching `Return` header. `is_ref_type` already treats a ranged-Int
+                    // `self.ret_ty` as a plain primitive (picks `IRETURN` below, correctly), so
+                    // this only needs the extra bounds check itself, inserted before whichever
+                    // return opcode actually runs.
+                    if is_ranged_int_type_name_cg(self.ret_ty) {
+                        self.emit_ranged_int_check(self.ret_ty, "return value");
+                    }
                     if self.ret_ty == "Long" { self.mv.visitInsn(173); } // LRETURN
                     else if self.ret_ty == "Float" { self.mv.visitInsn(174); } // FRETURN
                     else if self.ret_ty == "Double" { self.mv.visitInsn(175); } // DRETURN

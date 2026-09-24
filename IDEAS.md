@@ -880,8 +880,18 @@ vars` registration in `check_fn`/`check_method`) and `Codegen.hotc` (the matchin
 registration in `gen_fn`/`gen_method`) — the SAME normalization now needed at four spots, not
 just `find_field_type`'s one. See `examples/numeric_range_bounds.hotc`.
 
-Still open: fn RETURN types, assignment to an existing struct field, enum variant fields, and
-negative bounds.
+**Extended once more the same day to fn RETURN types** (`fn compute() -> Int<0..=100> { return
+x; }`), checked at each `return` statement — same literal-vs-runtime split. Unlike params/fields,
+there was NO existing "return value vs declared return type" checking machinery at all to extend
+(`check_stmt`'s own `Return` arm previously just checked the returned expression's own type and
+move-checked it, never comparing it against the enclosing fn's declared return type) — this is
+the first of the four extensions that had to add the check from scratch rather than piggyback on
+an existing comparison. The CALL EXPRESSION's own resulting type (`Checker.hotc`'s `check_call`'s
+own `return sig.ret_type;`, and `Codegen.hotc`'s matching `Call` arm reading `self.fn_ret_tys`)
+both needed the same plain-`"Int"` normalization on read-back that struct fields/params already
+needed, so `let x = compute();` types `x` as ordinary `Int`, not the ranged annotation string.
+
+Still open: assignment to an existing struct field, enum variant fields, and negative bounds.
 
 ### `@deterministic` + built-in state replay/rewind
 

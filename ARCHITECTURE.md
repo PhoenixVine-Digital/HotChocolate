@@ -4719,9 +4719,22 @@ normalization needs to happen at every point a ranged-Int value crosses from "a 
 annotation" to "an ordinary local binding used inside a body," not just the one `find_field_type`
 choke point struct fields happened to have. See `examples/numeric_range_bounds.hotc`.
 
-Still open: fn RETURN types (no existing "check return value against declared return type"
-machinery to hook into at all, unlike params/fields, which both already had SOME type-checking to
-extend), field assignment, enum variant fields, negative bounds.
+**Extended once more the same day to fn RETURN types** (`fn compute() -> Int<0..=100> { return
+x; }`), checked at each `return` statement with the same literal-vs-runtime split:
+- **`Checker.hotc`'s own `check_stmt`'s `Return` arm** previously had NO "compare the returned
+  value's type against the declared return type" check at all -- unlike params/fields, this had
+  to be added from scratch rather than piggyback on an existing comparison. Checks a literal
+  return value against `self.cur_ret_ty` (the enclosing fn's own already-tracked declared return
+  type) directly.
+- **`Codegen.hotc`'s own `Return` stmt codegen** calls `emit_ranged_int_check` right after the
+  value is generated and before whichever return opcode runs (`is_ref_type` already correctly
+  picks `IRETURN` for a ranged-Int `self.ret_ty`, no fix needed there).
+- **The CALL EXPRESSION's own resulting type** needed the same plain-`"Int"` normalization on
+  read-back struct fields/params already needed -- `check_call`'s own `return sig.ret_type;` and
+  the `Call` arm's own `self.fn_ret_tys` read, both fixed, so `let x = compute();` types `x` as
+  ordinary `Int`.
+
+Still open: assignment to an existing struct field, enum variant fields, negative bounds.
 
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 

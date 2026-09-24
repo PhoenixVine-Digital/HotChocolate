@@ -4,11 +4,11 @@
 // else -- "only literal-vs-literal arithmetic gets proven statically, everything else gets a
 // runtime check", the defensible simpler first cut that entry's own header explicitly suggests.
 // Also works as a STRUCT FIELD type (`health: Int<0..=100>` -- this entry's own original
-// motivating example) and a plain top-level fn's PARAM type, both checked the same way at their
-// own construction/call boundary. Real, disclosed scope: no fn return types yet, and no
-// resulting-range propagation through arithmetic -- a ranged Int is an ordinary Int everywhere
-// else once the check passes (reading a struct field back or a param inside its own fn body,
-// arithmetic, comparisons, ...).
+// motivating example), a plain top-level fn's PARAM type, and its RETURN type, all checked the
+// same way at their own construction/call/return boundary. Real, disclosed scope: no resulting-
+// range propagation through arithmetic -- a ranged Int is an ordinary Int everywhere else once
+// the check passes (reading a struct field, a param, or a call's own result back, arithmetic,
+// comparisons, ...).
 
 fn clamp(x: Int, lo: Int, hi: Int) -> Int {
     if x < lo {
@@ -30,6 +30,16 @@ struct Player {
 // body's own type-checking, matching the "behaves as an ordinary Int everywhere else" promise).
 fn take_damage(current: Int, amount: Int<0..=100>) -> Int {
     return current - amount;
+}
+
+// A ranged-Int RETURN type -- checked the same way at each `return` statement. `computed_health`'s
+// own returned value is `clamp`'s result, not provable statically, so it gets a real runtime
+// check; `fixed_health`'s literal `80` is proven in range at compile time.
+fn fixed_health() -> Int<0..=100> {
+    return 80;
+}
+fn computed_health(raw: Int) -> Int<0..=100> {
+    return clamp(raw, 0, 100);
 }
 
 fn main() {
@@ -60,6 +70,11 @@ fn main() {
     // result) gets a real runtime check instead, same split as everywhere else in this file.
     print(take_damage(p.health, 30));
     print(take_damage(p.health, clamp(999, 0, 100)));
+
+    // A fn returning a ranged-Int type -- the result reads back as an ordinary Int too.
+    let h1 = fixed_health();
+    let h2 = computed_health(999);
+    print(h1 + h2);
 
     print("done");
 }
