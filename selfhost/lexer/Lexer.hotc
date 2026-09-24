@@ -135,6 +135,11 @@ pub enum TokType {
     // "Bounded compile-time evaluation (`const fn`)" entry. `Driver.hotc`'s own `eval_const_expr`/
     // `fold_consts` are the only readers.
     CONST,
+    // `macro name(p1, p2, ...) { expr }`, invoked `name!(arg1, arg2)` -- see `IDEAS.md`'s own
+    // "Macros" entry. `Parser.hotc`'s own `macro_decl`/`expand_macro` are the only readers;
+    // checked for a self-hosting collision (grepped all 6 selfhost/*.hotc files for a bare
+    // `macro` identifier) before reserving it, same discipline `on`'s own header describes.
+    MACRO,
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
@@ -209,6 +214,7 @@ pub fn build_keywords() -> Registry<TokType> {
     kw.register("event", EVENT);
     kw.register("handle", HANDLE);
     kw.register("const", CONST);
+    kw.register("macro", MACRO);
     return kw;
 }
 

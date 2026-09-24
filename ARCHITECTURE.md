@@ -4535,6 +4535,32 @@ code, which uses bare `on`/`on0` as real local variable names; reusing it here w
 same self-hosting hazard, and `IDENT ARROW IDENT SEMI` is already unambiguous inside a dedicated
 `StateName { ... }` block without any leading keyword. See `examples/state_machine.hotc`.
 
+## Basic macros (`macro name(...) { expr }`)
+
+**Shipped, 2026-09-24.** See `IDEAS.md`'s own "Macros" entry for the full design and the real
+scope cuts made versus the fuller "hygienic AST-level macro" framing that entry originally called
+for. The short version:
+
+```
+macro min3(a, b, c) { JMath::min(JMath::min(a, b), c) }
+print(min3!(p1.x, p2.x, 5));
+```
+
+Entirely a `Parser.hotc`-level feature: `macro_decl` parses and stores each macro's own param
+names and single-expression body (`self.macro_names`/`macro_param_counts`/`macro_param_names`/
+`macro_bodies`, flattened Vecs mirroring `event_decl`'s own established convention); `primary()`
+detects `IDENT BANG LPAREN` and calls `expand_macro`, which looks the name up (declared-before-use
+only -- no forward references), validates the argument count, and returns `subst_macro_expr`'s
+result: the macro's own body `Expr` with every bare `Ident` naming a param replaced by the
+caller's already-parsed argument `Expr` (structurally mirrors `Driver.hotc`'s own `fold_const_expr`
+almost exactly, substituting VALUES via a names/values pair instead of `fold_const_expr`'s constant-
+folding rule). The result splices into the call site as ordinary syntax and flows through
+`Checker.hotc`/`Codegen.hotc` completely normally -- no separate macro-aware code in either file.
+Real, disclosed scope cut that sidesteps macro hygiene rather than solving it: a macro body is
+exactly ONE expression, never a statement list, so a macro can never introduce a new binding that
+could capture or collide with a call-site name -- there's nothing bound to capture in the first
+place. See `examples/macros.hotc`.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/

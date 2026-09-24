@@ -137,10 +137,22 @@ pub struct Parser {
     handler_event_names: Vec<String>,
     handler_fn_names: Vec<String>,
     pending_event_fns: Vec<FnDecl>,
+    // `macro name(p1, p2, ...) { expr }` -- see `macro_decl`'s own header for the full design.
+    // `macro_names`/`macro_param_counts` are parallel Vecs (declaration order, index-aligned),
+    // and `macro_param_names` is FLATTENED across every macro's own params (same "avoid a
+    // `Vec<Vec<String>>` struct field" convention `event_field_names` already established, for
+    // the identical real monomorphization-gap reason disclosed on that field) -- `expand_macro`
+    // computes each macro's own slice offset by summing every EARLIER macro's `macro_param_
+    // counts` entry. `macro_bodies` is index-aligned with `macro_names` (one `Expr` per macro,
+    // since v1 macros are expression-only -- see this file's own `macro_decl` header).
+    macro_names: Vec<String>,
+    macro_param_counts: Vec<Int>,
+    macro_param_names: Vec<String>,
+    macro_bodies: Vec<Expr>,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false, event_names: empty_str_vec2(), event_field_counts: empty_int_vec_ev(), event_field_names: empty_str_vec2(), event_field_types: empty_str_vec2(), event_handler_counter: 0, handler_event_names: empty_str_vec2(), handler_fn_names: empty_str_vec2(), pending_event_fns: empty_fn_decl_vec() };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false, event_names: empty_str_vec2(), event_field_counts: empty_int_vec_ev(), event_field_names: empty_str_vec2(), event_field_types: empty_str_vec2(), event_handler_counter: 0, handler_event_names: empty_str_vec2(), handler_fn_names: empty_str_vec2(), pending_event_fns: empty_fn_decl_vec(), macro_names: empty_str_vec2(), macro_param_counts: empty_int_vec_ev(), macro_param_names: empty_str_vec2(), macro_bodies: empty_expr_vec() };
 }
 
 impl Parser {
@@ -892,6 +904,18 @@ impl Parser {
                 }
                 return ExternStaticFieldGet { type_name: t.text, field: method };
             }
+            // `name!(arg1, arg2)` -- a macro invocation, see `macro_decl`'s own header for the
+            // full design. Gated on `BANG` immediately followed by `LPAREN` (not just `BANG`
+            // alone) so this can't misfire: `BANG` right after a bare `IDENT` has no other valid
+            // meaning in this grammar (`!x` negation is only ever a PREFIX operator, parsed in
+            // `unary()` before a primary expression even starts), so the lookahead is purely a
+            // belt-and-suspenders check, not disambiguating two real, otherwise-legal shapes.
+            if self.check(BANG) && self.pos + 1 < self.tokens.length() && self.tokens.get(self.pos + 1).kind == LPAREN {
+                self.advance(); // BANG
+                self.advance(); // LPAREN
+                let margs = self.arg_list();
+                return self.expand_macro(t.text, margs);
+            }
             return Ident { name: t.text };
         }
         if self.check(LBRACKET) {
@@ -1516,6 +1540,106 @@ impl Parser {
         let transition_fn = FnDecl { name: machine_name + "_transition", params: params, ret_type: some_string(machine_name), body: fn_body, type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
 
         return StateMachineResult { state_enum: state_enum, event_enum: event_enum, transition_fn: transition_fn };
+    }
+
+    // `macro name(p1, p2, ...) { expr }`, invoked `name!(arg1, arg2)` -- see `IDEAS.md`'s own
+    // "Macros" entry for the full design discussion. Real, disclosed scope, tight on purpose
+    // (that entry's own header explicitly warns this is "real design work needed... not a small
+    // addition"):
+    //
+    // - **Expression-only.** A macro's body is exactly ONE expression (parsed via `self.
+    //   expression()`, same as any other expr), not a statement list -- no macro-introduced
+    //   `let` bindings are possible, which sidesteps the classic macro-hygiene "does a macro-
+    //   introduced name accidentally capture/collide with a call-site name" problem entirely,
+    //   rather than solving it: a macro with an expression-only body introduces NO new bindings
+    //   at all, so there's nothing that could capture anything. `IDEAS.md`'s own header calls
+    //   hygiene "probably harder than anything the move/borrow checker already does" -- this is
+    //   the scope cut that makes it a non-issue for v1, at the real cost of not covering a
+    //   statement-list-shaped macro (no `macro_rules!`-style repetition, no multi-statement
+    //   bodies).
+    // - **AST-level substitution, not textual.** `expand_macro` splices each CALLER-supplied,
+    //   already-PARSED argument `Expr` in for every bare `Ident` in the macro's own pre-parsed
+    //   body that names one of its declared params (see `subst_macro_expr`'s own header) --
+    //   never re-tokenizes/re-parses text. The resulting `Expr` tree is spliced directly into
+    //   the call site and flows through `Checker.hotc`/`Codegen.hotc` completely normally, same
+    //   as if the caller had hand-written the expanded form -- satisfies `IDEAS.md`'s own "must
+    //   generate real AST nodes the checker still runs over normally" requirement, not a
+    //   preprocessor bypassing it.
+    // - **Untyped params.** A macro's own params have no declared types (just bare names) --
+    //   they're placeholders in an AST tree, not real typed function parameters; whatever type
+    //   each argument expression actually has is discovered when the EXPANDED call site is
+    //   checked, same as it would be for hand-written code.
+    // - **Declared-before-use, single file.** Expansion happens at PARSE time (`expand_macro` is
+    //   called the moment `primary()` sees `name!(`), so a macro must be declared textually
+    //   earlier in the SAME file than any call site -- no forward references, no cross-file
+    //   visibility of any kind yet (real, disclosed narrower scope than `pub`/`priv`'s own
+    //   real cross-file visibility rules). A macro invoking ANOTHER macro (or itself) inside its
+    //   own body is naturally rejected by this same rule: the callee wouldn't be in `self.
+    //   macro_names` yet while THIS macro's own body is being parsed (or, for self-recursion,
+    //   ever) -- `expand_macro`'s own "no macro named ..." error covers it for free, no separate
+    //   check needed.
+    fn macro_decl(&mut self) {
+        self.expect(MACRO);
+        let name = self.expect(IDENT).text;
+        if str_vec_contains_ts(&self.macro_names, name) {
+            throw ParseError::new("macro '" + name + "' is declared more than once");
+        }
+        self.expect(LPAREN);
+        var params = empty_str_vec();
+        if !self.check(RPAREN) {
+            params.push(self.expect(IDENT).text);
+            while self.match_kind(COMMA) {
+                params.push(self.expect(IDENT).text);
+            }
+        }
+        self.expect(RPAREN);
+        self.expect(LBRACE);
+        let body = self.expression();
+        self.expect(RBRACE);
+        self.macro_names.push(name);
+        self.macro_param_counts.push(params.length());
+        var pi = 0;
+        while pi < params.length() {
+            self.macro_param_names.push(params.get(pi));
+            pi = pi + 1;
+        }
+        self.macro_bodies.push(body);
+    }
+
+    // Expands `name!(args)` -- looks `name` up in `self.macro_names` (declared-before-use, see
+    // `macro_decl`'s own header), validates the argument count, and returns the macro's own body
+    // `Expr` with every bare-`Ident` reference to one of its params replaced by the matching
+    // caller-supplied argument expression (`subst_macro_expr`). Called the instant `primary()`
+    // sees `IDENT BANG LPAREN` -- there is no separate "macro invocation" AST node at all; by the
+    // time this returns, the call site already looks exactly like the expanded code.
+    fn expand_macro(&mut self, name: String, args: Vec<Expr>) -> Expr {
+        var idx = -1;
+        var i = 0;
+        while i < self.macro_names.length() {
+            if self.macro_names.get(i) == name { idx = i; }
+            i = i + 1;
+        }
+        if idx == -1 {
+            throw ParseError::new("no macro named '" + name + "' (macros must be declared earlier in the same file)");
+        }
+        var offset = 0;
+        var oi = 0;
+        while oi < idx {
+            offset = offset + self.macro_param_counts.get(oi);
+            oi = oi + 1;
+        }
+        let pcount = self.macro_param_counts.get(idx);
+        if args.length() != pcount {
+            throw ParseError::new("macro '" + name + "' expects " + JString3::valueOf(pcount) + " argument(s), got " + JString3::valueOf(args.length()));
+        }
+        var pnames = empty_str_vec();
+        var pj = 0;
+        while pj < pcount {
+            pnames.push(self.macro_param_names.get(offset + pj));
+            pj = pj + 1;
+        }
+        let body = self.macro_bodies.get(idx);
+        return subst_macro_expr(body, &pnames, &args);
     }
 
     // `event PlayerDied(player: Entity, cause: String);` -- events/signals, compile-time-wired
@@ -3004,7 +3128,7 @@ impl Parser {
             // scattered per-branch rejects below). Positive check (IS it one of the other
             // declaration-kind keywords the loop right below this one dispatches on?) rather than
             // a long negation -- easier to keep in sync with that chain's own real member list.
-            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE) || self.check(CONST) || self.check(STATE);
+            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE) || self.check(CONST) || self.check(STATE) || self.check(MACRO);
             if is_priv && !(self.check(STRUCT) || self.check(ENUM) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN)) {
                 throw ParseError::new("'priv' is only supported on top-level 'struct'/'enum'/'interface' declarations");
             }
@@ -3312,6 +3436,17 @@ impl Parser {
                 enums.push(smr.state_enum);
                 enums.push(smr.event_enum);
                 fns.push(smr.transition_fn);
+            } else if self.check(MACRO) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'macro' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'macro' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'macro' declarations");
+                }
+                self.macro_decl();
             } else {
                 var fd = self.fn_decl();
                 if is_pub_decl {
@@ -4117,6 +4252,81 @@ pub fn empty_static_decl_vec() -> Vec<StaticDecl> {
 pub fn empty_expr_vec() -> Vec<Expr> {
     var v = vec_of(IntLit { value: 0 });
     return Vec { data: v.data, len: 0 };
+}
+
+// Substitutes every bare `Ident` in `e` naming one of `pnames` with the matching entry of
+// `pargs` (same index) -- the whole mechanism behind `macro_decl`/`expand_macro`'s expansion
+// (see `macro_decl`'s own header). Structurally mirrors `Checker.hotc`'s own `subst_expr` (the
+// generic-monomorphization substitution walker) almost exactly, variant for variant, but the
+// substitution RULE is different: that one replaces TYPE NAME STRINGS wherever a generic type
+// parameter appears (`substitute_field_type`), for a fixed ONE-name-to-one-string mapping; this
+// one replaces bare `Ident` EXPRESSIONS wherever one of potentially several PARAM names appears,
+// with a full caller-supplied Expr spliced in each time -- so every struct/enum/static-call NAME
+// string here (`StructLit.name`, `StaticCall.type_name`, `Cast`/`IsCheck.target_type`, ...) is
+// left completely untouched (macro substitution is about VALUES, never types), unlike that fn's
+// own matching branches.
+pub fn subst_macro_expr(e: Expr, pnames: &Vec<String>, pargs: &Vec<Expr>) -> Expr {
+    match e {
+        IntLit { value } => { return IntLit { value: value }; }
+        FloatLit { text } => { return FloatLit { text: text }; }
+        DoubleLit { text } => { return DoubleLit { text: text }; }
+        LongLit { text } => { return LongLit { text: text }; }
+        CharLit { value } => { return CharLit { value: value }; }
+        StringLit { value } => { return StringLit { value: value }; }
+        StringInterp { literals, exprs } => { return StringInterp { literals: literals, exprs: subst_macro_expr_list(exprs, pnames, pargs) }; }
+        BoolLit { value } => { return BoolLit { value: value }; }
+        Ident { name } => {
+            var vi = 0;
+            while vi < pnames.length() {
+                if pnames.get(vi) == name { return pargs.get(vi); }
+                vi = vi + 1;
+            }
+            return Ident { name: name };
+        }
+        Binary { op, left, right } => { return Binary { op: op, left: subst_macro_expr(left, pnames, pargs), right: subst_macro_expr(right, pnames, pargs) }; }
+        Unary { op, expr } => { return Unary { op: op, expr: subst_macro_expr(expr, pnames, pargs) }; }
+        Call { callee, args } => { return Call { callee: callee, args: subst_macro_expr_list(args, pnames, pargs) }; }
+        FieldAccess { obj, field } => { return FieldAccess { obj: subst_macro_expr(obj, pnames, pargs), field: field }; }
+        MethodCall { recv, method, args } => { return MethodCall { recv: subst_macro_expr(recv, pnames, pargs), method: method, args: subst_macro_expr_list(args, pnames, pargs) }; }
+        Assign { name, value } => { return Assign { name: name, value: subst_macro_expr(value, pnames, pargs) }; }
+        FieldAssign { obj, field, value } => { return FieldAssign { obj: subst_macro_expr(obj, pnames, pargs), field: field, value: subst_macro_expr(value, pnames, pargs) }; }
+        StructLit { name, field_names, field_values, generic_base } => { return StructLit { name: name, field_names: field_names, field_values: subst_macro_expr_list(field_values, pnames, pargs), generic_base: generic_base }; }
+        ArrayLit { elements } => { return ArrayLit { elements: subst_macro_expr_list(elements, pnames, pargs) }; }
+        ArrayRepeat { value, count } => { return ArrayRepeat { value: subst_macro_expr(value, pnames, pargs), count: subst_macro_expr(count, pnames, pargs) }; }
+        ArenaNew { struct_name, count } => { return ArenaNew { struct_name: struct_name, count: subst_macro_expr(count, pnames, pargs) }; }
+        Index { arr, index } => { return Index { arr: subst_macro_expr(arr, pnames, pargs), index: subst_macro_expr(index, pnames, pargs) }; }
+        IndexAssign { arr, index, value } => { return IndexAssign { arr: subst_macro_expr(arr, pnames, pargs), index: subst_macro_expr(index, pnames, pargs), value: subst_macro_expr(value, pnames, pargs) }; }
+        Slice { arr, start, end, inclusive } => { return Slice { arr: subst_macro_expr(arr, pnames, pargs), start: subst_macro_expr(start, pnames, pargs), end: subst_macro_expr(end, pnames, pargs), inclusive: inclusive }; }
+        IndexFieldGet { arr_name, index, field } => { return IndexFieldGet { arr_name: arr_name, index: subst_macro_expr(index, pnames, pargs), field: field }; }
+        IndexFieldSet { arr_name, index, field, value } => { return IndexFieldSet { arr_name: arr_name, index: subst_macro_expr(index, pnames, pargs), field: field, value: subst_macro_expr(value, pnames, pargs) }; }
+        StaticCall { type_name, method, args } => { return StaticCall { type_name: type_name, method: method, args: subst_macro_expr_list(args, pnames, pargs) }; }
+        ExternStaticFieldGet { type_name, field } => { return ExternStaticFieldGet { type_name: type_name, field: field }; }
+        ExternStaticFieldSet { type_name, field, value } => { return ExternStaticFieldSet { type_name: type_name, field: field, value: subst_macro_expr(value, pnames, pargs) }; }
+        Cast { expr, target_type } => { return Cast { expr: subst_macro_expr(expr, pnames, pargs), target_type: target_type }; }
+        IsCheck { expr, target_type } => { return IsCheck { expr: subst_macro_expr(expr, pnames, pargs), target_type: target_type }; }
+        Lambda { params, body } => { return Lambda { params: params, body: subst_macro_expr(body, pnames, pargs) }; }
+        TryOp { expr } => { return TryOp { expr: subst_macro_expr(expr, pnames, pargs) }; }
+        NamedArg { name, value } => { return NamedArg { name: name, value: subst_macro_expr(value, pnames, pargs) }; }
+        NullLit => { return NullLit; }
+        SafeCall { recv, method, args } => { return SafeCall { recv: subst_macro_expr(recv, pnames, pargs), method: method, args: subst_macro_expr_list(args, pnames, pargs) }; }
+        SafeFieldAccess { recv, field } => { return SafeFieldAccess { recv: subst_macro_expr(recv, pnames, pargs), field: field }; }
+        Elvis { left, right } => { return Elvis { left: subst_macro_expr(left, pnames, pargs), right: subst_macro_expr(right, pnames, pargs) }; }
+        Comprehension { result_expr, var_name, iter_expr, cond } => {
+            var new_cond = none_expr();
+            if let Some { value: c } = cond { new_cond = some_expr(subst_macro_expr(c, pnames, pargs)); }
+            return Comprehension { result_expr: subst_macro_expr(result_expr, pnames, pargs), var_name: var_name, iter_expr: subst_macro_expr(iter_expr, pnames, pargs), cond: new_cond };
+        }
+    }
+}
+
+pub fn subst_macro_expr_list(es: Vec<Expr>, pnames: &Vec<String>, pargs: &Vec<Expr>) -> Vec<Expr> {
+    var out = empty_expr_vec();
+    var i = 0;
+    while i < es.length() {
+        out.push(subst_macro_expr(es.get(i), pnames, pargs));
+        i = i + 1;
+    }
+    return out;
 }
 pub fn empty_stmt_vec() -> Vec<Stmt> {
     var v = vec_of(ExprStmt { expr: IntLit { value: 0 }, line: 0 });

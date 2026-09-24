@@ -1,0 +1,42 @@
+// Basic macros -- see IDEAS.md's own "Macros" entry. `macro name(p1, p2, ...) { expr }`,
+// invoked `name!(arg1, arg2)`. Real, disclosed scope cuts: expression-only body (no macro-
+// introduced bindings, so no hygiene problem to solve), AST-level substitution (not textual --
+// the expanded expression flows through the checker completely normally), untyped params,
+// declared-before-use in the same file only. See ARCHITECTURE.md for the full design writeup.
+
+extern class JMath = "java.lang.Math" {
+    static fn min(a: Int, b: Int) -> Int;
+    static fn max(a: Int, b: Int) -> Int;
+}
+
+// The exact motivating repetition IDEAS.md's own "Macros" entry calls out: a min-of-three
+// pattern, hand-duplicated across X/Y/Z components in real project code.
+macro min3(a, b, c) {
+    JMath::min(JMath::min(a, b), c)
+}
+
+macro max3(a, b, c) {
+    JMath::max(JMath::max(a, b), c)
+}
+
+// A macro's argument can be an arbitrary expression, not just a bare variable -- substitution
+// splices the whole caller-supplied Expr tree in, unevaluated, everywhere the param appears.
+macro square(x) {
+    x * x
+}
+
+struct Point { x: Int, y: Int, z: Int }
+
+fn main() {
+    let p1 = Point { x: 3, y: 8, z: 1 };
+    let p2 = Point { x: 7, y: 2, z: 9 };
+
+    print(min3!(p1.x, p2.x, 5));
+    print(max3!(p1.y, p2.y, 5));
+
+    // `square(2 + 3)` expands to `(2 + 3) * (2 + 3)`, not `2 + 3 * 2 + 3` -- confirms the
+    // substituted argument expression is spliced in as one unit, not re-tokenized.
+    print(square!(2 + 3));
+
+    print("done");
+}

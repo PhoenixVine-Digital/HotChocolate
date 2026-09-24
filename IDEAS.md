@@ -1480,6 +1480,48 @@ real `min`/`max`-over-a-struct helper only needs bounded generics, which
 already work correctly, not a macro) — before sinking design time into
 this specifically.
 
+**Status (2026-09-24): a basic v1 built**, deliberately far narrower than the
+"hygienic, AST-level macro" framing above — expression-only, not the general
+`macro_rules!`/`derive` shape:
+
+```
+macro min3(a, b, c) { JMath::min(JMath::min(a, b), c) }
+print(min3!(p1.x, p2.x, 5));
+```
+
+`macro name(p1, p2, ...) { expr }`, invoked `name!(arg1, arg2)`. Real, disclosed
+scope, picked specifically to make this entry's own two hardest open questions
+either moot or trivial rather than actually solving them:
+- **Hygiene is sidestepped, not solved.** A macro body is exactly ONE
+  expression — no `let`, no statement list — so a macro can never introduce a
+  new binding that could capture or collide with anything at the call site.
+  This entry's own header calls hygiene "probably harder than anything the
+  move/borrow checker already does"; the honest answer here is that v1 never
+  faces that problem because it never generates a binding at all, not that it
+  solved it.
+- **Where it plugs into the pipeline: parse time, before the checker ever
+  runs, via real AST substitution — not textual.** `Parser.hotc`'s own
+  `expand_macro` splices the caller's already-PARSED argument `Expr` trees in
+  for every occurrence of the matching param name inside the macro's own
+  pre-parsed body `Expr`, and the result is spliced into the call site as
+  ordinary syntax — indistinguishable to `Checker.hotc`/`Codegen.hotc` from
+  hand-written code. Still not a C-preprocessor: nothing is re-tokenized, so
+  `square!(2 + 3)` expands to `(2 + 3) * (2 + 3)`, never `2 + 3 * 2 + 3`.
+- **Untyped params, declared-before-use, single file.** A macro's params are
+  bare names with no declared type (placeholders in an AST tree, not real
+  function params); a macro must be declared textually earlier in the SAME
+  file than any call site (expansion happens the instant the parser sees
+  `name!(`, so there's no forward-reference pass) — no cross-file visibility
+  yet. A macro can't invoke another macro (or itself) in its own body: the
+  callee wouldn't be registered yet at that point, so it's rejected for free
+  by the same "declared before use" rule, no separate check needed.
+- **Not attempted this pass** (real gaps vs. the fuller design above, not
+  bugs): no `macro_rules!`-style repetition (`$()*`), no statement-list-
+  shaped macro bodies, no macro that generates a `StructDecl`/`FnDecl`/
+  `extern class` block (the doc's own third bullet, "a macro that generates
+  an extern class block", still needs its own registration-ordering design).
+  See `examples/macros.hotc`.
+
 ### Mixins (patching an existing compiled class's bytecode)
 
 Bytecode-level mixin support (in the SpongePowered/Mixin sense — injecting
