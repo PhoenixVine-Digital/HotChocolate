@@ -832,13 +832,15 @@ against the bounds, throwing a real `RuntimeException` on violation) — uncondi
 literal init the checker already proved safe, real deliberate defense-in-depth rather than the two
 passes trusting a flag one set for the other. Real, disclosed scope cut, considerably narrower
 than this entry's own original framing:
-- **Only a `let`/`var`'s own declared type** — no struct fields, no fn params/return types. A
-  ranged `Int` is registered as plain `"Int"` the instant the check passes, and behaves as an
-  ordinary `Int` everywhere else from that point on.
+- **Only a `let`/`var`'s own declared type, or a struct field's** — no fn params/return types
+  yet. A ranged `Int` is registered/read back as plain `"Int"` the instant the check passes, and
+  behaves as an ordinary `Int` everywhere else from that point on (arithmetic, comparisons,
+  reading a struct field back — verified directly).
 - **No resulting-range propagation through arithmetic at all** — `Int<0..=100> + Int<0..=100>`
   isn't tracked as anything beyond plain `Int`; this entry's own "genuinely new machinery" (range-
   interval analysis, resulting-range computation per operator) is NOT attempted. The range is
-  enforced only at the ONE declaration/assignment boundary, never followed through computation.
+  enforced only at the declaration/assignment/construction boundary, never followed through
+  computation.
 - **Only non-negative literal bounds** (`Int<0..100>`, not `Int<-10..10>`) — `Parser.hotc`'s own
   `type_name_ref` reads the bounds via a direct `self.expect(INT)`, not through `unary()`'s own
   leading-`-` handling, matching Ada's own `Natural`-style motivating example this entry's header
@@ -846,9 +848,24 @@ than this entry's own original framing:
 
 `"Int<0..100>"`/`"Int<0..=100>"` is encoded as the LITERAL surface syntax itself (not the
 `"Base$Arg"` mono-name convention generics use) — it never goes through `ensure_instantiated`/
-monomorphization at all; the only two readers are `Checker.hotc`'s and `Codegen.hotc`'s own
-mirrored `Let` arms, each independently parsing the bounds back out via plain `substring`/
-`indexOf`. See `examples/numeric_range_bounds.hotc`.
+monomorphization at all.
+
+**Extended the same day to struct fields** (`health: Int<0..=100>` — this entry's own original
+motivating example), checked the same way at STRUCT-LITERAL construction time. Scoped to PLAIN
+structs only, not enum variant fields (`gen_variant_construct`'s own separate codegen path isn't
+touched); real, disclosed gap left open — assigning to an existing field after construction
+(`obj.health = 150;`) is NOT checked at all, only the original `StructName { field: value }`
+literal. Two real, previously-hit-shaped bugs surfaced building this (both caught by the self-
+hosting rebuild discipline, not by hand-testing alone): a `VerifyError` ("Bad local variable
+type") from `Codegen.hotc`'s own `is_ref_type` catch-all not recognizing the ranged-Int type
+string as a primitive (the generated constructor's own body tried to `ALOAD` a param the
+descriptor already correctly declared as `I`), and a genuine "check never actually ran" bug
+where `check_struct_lit`'s own `expected` was read through the SAME normalizing lookup this
+extension needed to add — meaning the ranged annotation was already stripped by the time the
+range-check tried to detect it, so it silently accepted every literal, in or out of range,
+letting only the (unaffected) runtime half catch violations. Fixed with a second, raw
+(un-normalized) lookup used only by the construction check. See `examples/numeric_range_bounds.
+hotc`.
 
 ### `@deterministic` + built-in state replay/rewind
 

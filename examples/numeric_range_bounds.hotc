@@ -3,9 +3,11 @@
 // error, no bytecode generated) and inserts a real RUNTIME bounds check (throwing) for anything
 // else -- "only literal-vs-literal arithmetic gets proven statically, everything else gets a
 // runtime check", the defensible simpler first cut that entry's own header explicitly suggests.
-// Real, disclosed scope: only a `let`/`var`'s own declared type, not struct fields/fn params/
-// returns, and no resulting-range propagation through arithmetic -- a ranged Int is an ordinary
-// Int everywhere else once the check passes.
+// Also works as a STRUCT FIELD type (`health: Int<0..=100>` -- this entry's own original
+// motivating example), checked the same way at struct-literal construction time. Real, disclosed
+// scope: only a `let`/`var`/struct field, not fn params/return types, and no resulting-range
+// propagation through arithmetic -- a ranged Int is an ordinary Int everywhere else once the
+// check passes (reading a struct field back, arithmetic, comparisons, ...).
 
 fn clamp(x: Int, lo: Int, hi: Int) -> Int {
     if x < lo {
@@ -15,6 +17,11 @@ fn clamp(x: Int, lo: Int, hi: Int) -> Int {
         return hi;
     }
     return x;
+}
+
+struct Player {
+    name: String,
+    health: Int<0..=100>,
 }
 
 fn main() {
@@ -30,6 +37,16 @@ fn main() {
     // Exclusive upper bound: 0 and 99 are valid, 100 is not.
     let a: Int<0..100> = clamp(0, 0, 99);
     print(a);
+
+    // A struct field with a ranged-Int type -- checked the same way at construction (a literal
+    // in range here, so zero runtime cost).
+    let p = Player { name: "Ada", health: 70 };
+    print(p.health);
+
+    // Reading the field back behaves as an ordinary Int -- no propagation, but arithmetic and
+    // comparisons against it work exactly like any other Int.
+    let total = p.health + health;
+    print(total);
 
     print("done");
 }

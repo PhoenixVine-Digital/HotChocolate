@@ -448,7 +448,41 @@ pub fn opt_string_or2(o: Option<String>, default_val: String) -> String {
 // Linear scan for a field's declared type name, "?" if the struct has no such field -- mirrors
 // `Ty`'s own "?" sentinel for "unknown, don't error on it" so callers can reuse the same
 // `!= "?"` guard pattern already established throughout this file.
+// The ONE central place a struct/enum-variant field's own declared type gets read back for
+// EVERY caller (a plain field access, a match arm's own bind-name lookup, ...) -- a ranged-Int
+// field (`"Int<0..=100>"`, see `Parser.hotc`'s own `type_name_ref` header) is normalized back to
+// plain `"Int"` right here, the single spot that makes "a ranged Int behaves as an ordinary Int
+// everywhere else once the check passes" (the same promise this feature's own `Let`-statement
+// version already keeps) hold for struct fields too, without needing every ordinary consumer of
+// a field's type (arithmetic, comparisons, argument passing, ...) to separately learn to treat
+// the ranged string as compatible with plain `Int`. The range is enforced ONLY at the one
+// WRITE/construction boundary (`check_struct_lit`'s own matching branch) -- reading the field
+// back never re-checks it (same "not tracked through computation" scope cut the `Let` version
+// already discloses).
 pub fn find_field_type(info: StructInfo, field: String) -> String {
+    var i = 0;
+    while i < info.field_names.length() {
+        if info.field_names.get(i) == field {
+            let ft = info.field_types.get(i);
+            if is_ranged_int_type_chk(ft) { return "Int"; }
+            return ft;
+        }
+        i = i + 1;
+    }
+    return "?";
+}
+
+// The RAW (un-normalized) twin of `find_field_type`, right above -- `check_struct_lit`'s own
+// per-field construction loop is the ONE caller that needs the ranged-Int annotation still
+// intact (to run its own compile-time literal check against the real declared bounds); every
+// OTHER caller wants the normalized `"Int"` `find_field_type` itself already returns. A real bug
+// found running a real struct-field example: `check_struct_lit` originally called the NORMALIZING
+// `find_field_type` for its own `expected` and tried to detect "is this ranged" from THAT
+// already-stripped string, which is always false by construction -- silently skipping the
+// compile-time check entirely (the runtime check, unaffected since it reads the raw type
+// straight from `Codegen.hotc`'s own separate `struct_ftypes` registry, still caught it, but only
+// at runtime, defeating the whole point of the compile-time half).
+pub fn find_field_type_raw(info: StructInfo, field: String) -> String {
     var i = 0;
     while i < info.field_names.length() {
         if info.field_names.get(i) == field {
@@ -2148,7 +2182,14 @@ impl TyChecker {
                 // own `array_lit` header) can be special-cased against it directly -- `check_expr`
                 // alone has nothing to infer an empty array's element type FROM (no elements),
                 // but the struct's own declared field type already says exactly what's needed.
-                let expected = find_field_type(field_info, fname);
+                // Fetched RAW (un-normalized) once via `find_field_type_raw` -- calling BOTH that
+                // and the normalizing `find_field_type` on the same owned `field_info` would move
+                // it twice (a real "use of moved value" caught building this exact fix); `expected`
+                // is derived from `expected_raw` by the same one-line rule `find_field_type` itself
+                // applies, rather than a second lookup call.
+                let expected_raw = find_field_type_raw(field_info, fname);
+                var expected = expected_raw;
+                if is_ranged_int_type_chk(expected_raw) { expected = "Int"; }
                 var fty = TyUnknown;
                 var handled_empty_array = false;
                 if expected != "?" && is_array_type_name(expected) {
@@ -2214,8 +2255,37 @@ impl TyChecker {
                 // perfectly safe under this language's actual reference semantics (nothing here
                 // is EVER really "consumed" at runtime), and real construction code leans on that
                 // constantly. See README's own "Compile-time safety roadmap" section.
+                // `health: Int<0..=100>` as a STRUCT FIELD -- see `IDEAS.md`'s own "Numeric range
+                // bounds" entry and `Parser.hotc`'s own `type_name_ref` header. A ranged-Int
+                // field's OWN declared type string (`expected`, e.g. `"Int<0..=100>"`) never
+                // equals a plain value's checked type (`fn_`, always `"Int"`), so this needs its
+                // own branch BEFORE the ordinary mismatch check right below would otherwise
+                // reject every correct assignment to one. Same "literal gets proven statically,
+                // anything else gets a real runtime check" split the `Let`-statement version of
+                // this feature already established (`Codegen.hotc`'s own mirrored struct-literal
+                // codegen inserts the runtime half) -- scoped to PLAIN structs only this pass, not
+                // enum variant fields (`gen_variant_construct`'s own separate `PUTFIELD` codegen
+                // path isn't touched).
                 if expected == "?" {
                     self.error("'" + name + "' has no field '" + fname + "'");
+                } else if is_ranged_int_type_chk(expected_raw) && fn_ == "Int" {
+                    match field_values.get(i) {
+                        IntLit { value } => {
+                            let flo = ranged_int_lo_chk(expected_raw);
+                            let fhi = ranged_int_hi_chk(expected_raw);
+                            let fincl = ranged_int_inclusive_chk(expected_raw);
+                            var fout = value < flo;
+                            if fincl {
+                                if value > fhi { fout = true; }
+                            } else {
+                                if value >= fhi { fout = true; }
+                            }
+                            if fout {
+                                self.error("field '" + fname + "' of '" + name + "' = " + JString::valueOf(value) + " is out of the declared range " + expected_raw);
+                            }
+                        }
+                        _ => {}
+                    }
                 } else if fn_ != "?" && expected != fn_ {
                     self.error("field '" + fname + "' of '" + name + "' expects " + expected + ", got " + fn_);
                 }

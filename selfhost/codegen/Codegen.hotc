@@ -605,6 +605,11 @@ impl CodeGen {
         self.mv.visitLineNumber(line, &label);
     }
 
+    // See `Checker.hotc`'s own identical `find_field_type` header -- a ranged-Int field's own
+    // RESULT type (as opposed to `resolve_descriptor`'s own separate, still-`"I"` JVM descriptor
+    // for the underlying `GETFIELD`) is normalized back to plain `"Int"` here, so reading a
+    // ranged-Int field back behaves as an ordinary `Int` for every purpose beyond this one read
+    // (choosing `ISTORE` over `ASTORE` for a `let` that reads it, further arithmetic, ...).
     fn field_type_of(&mut self, struct_name: String, field: String) -> String {
         let names_found = self.struct_fields.get(struct_name);
         let types_found = self.struct_ftypes.get(struct_name);
@@ -613,7 +618,9 @@ impl CodeGen {
                 var i = 0;
                 while i < names.length() {
                     if names.get(i) == field {
-                        return types.get(i);
+                        let ft = types.get(i);
+                        if is_ranged_int_type_name_cg(ft) { return "Int"; }
+                        return ft;
                     }
                     i = i + 1;
                 }
@@ -1616,6 +1623,14 @@ impl CodeGen {
         if name == "String" { return "Ljava/lang/String;"; }
         if name == "Unit" { return "V"; }
         if name == "Int" { return "I"; }
+        // `"Int<0..100>"`/`"Int<0..=100>"` -- a ranged-Int STRUCT FIELD's own declared type is
+        // the literal range-annotated string itself (see `Parser.hotc`'s own `type_name_ref`
+        // header), which still needs the exact same real JVM descriptor an ordinary `Int` field
+        // gets -- a ranged Int is genuinely still a plain `int` at the bytecode level, the range
+        // is enforced entirely at construction time (`emit_ranged_int_check`), never carried as
+        // its own real type. Checked before the "unknown name -> treat as a class reference"
+        // fallback below would otherwise wrongly emit a reference descriptor for it.
+        if is_ranged_int_type_name_cg(name) { return "I"; }
         // Bool intentionally maps to "I", not real "Z": mapping it to "Z" here causes a struct's
         // field declaration (gen_struct, via descriptor_of_type below) and a StructLit ctor call
         // site (gen_expr, via this function) to disagree on the SAME field's descriptor even in a
@@ -2867,6 +2882,15 @@ impl CodeGen {
                             self.ret_ty = ftype;
                             self.gen_expr(field_values.get(found_idx));
                             self.ret_ty = saved_ret_ty_for_field;
+                            // `health: Int<0..=100>` as a STRUCT FIELD -- see `Checker.hotc`'s own
+                            // matching `check_struct_lit` header. Safe to insert here, between
+                            // accumulating constructor ARGUMENTS on the stack (`emit_ranged_int_
+                            // check` only DUPs/consumes the single value it was just handed,
+                            // leaving it back in the exact same stack position, never touching any
+                            // earlier field's own already-pushed value beneath it).
+                            if is_ranged_int_type_name_cg(ftype) {
+                                self.emit_ranged_int_check(ftype, fname);
+                            }
                         }
                         i = i + 1;
                     }
@@ -4742,8 +4766,15 @@ pub fn ref_cmp_opcode(op: String) -> Int {
 
 // Anything that isn't a plain JVM int (or other primitive) on the operand stack (`Int`/`Bool`/
 // `Long`/`Float`/`Double`) is a reference type -- `String` and every struct instance alike -- and
-// needs `ALOAD`/`ASTORE` instead of `ILOAD`/`ISTORE`/`LLOAD`/`FLOAD`/`DLOAD`/etc.
+// needs `ALOAD`/`ASTORE` instead of `ILOAD`/`ISTORE`/`LLOAD`/`FLOAD`/`DLOAD`/etc. A ranged-Int
+// type string (`"Int<0..=100>"`, see `Parser.hotc`'s own `type_name_ref` header) is still a real
+// primitive `int` at the bytecode level -- a real `VerifyError` ("Bad local variable type")
+// found running a real struct-field example the FIRST time this check went unfixed: `gen_struct`'s
+// own generated constructor body reads a `Vec<Param>`'s raw `type_name` directly (not through
+// `field_type_of`'s own already-normalizing lookup, see that fn's header), so this catch-all
+// needs its own explicit ranged-Int exception too.
 pub fn is_ref_type(name: String) -> Bool {
+    if is_ranged_int_type_name_cg(name) { return false; }
     return name != "Int" && name != "Bool" && name != "Long" && name != "Float" && name != "Double" && name != "Char" && name != "Byte";
 }
 
@@ -7255,6 +7286,9 @@ pub fn descriptor_of_type(name0: String, alias_names: &Vec<String>, alias_binari
     if name == "String" { return "Ljava/lang/String;"; }
     if name == "Unit" { return "V"; }
     if name == "Int" { return "I"; }
+    // See `resolve_descriptor`'s own identical header, right above, for why a ranged-Int type
+    // string still needs the plain `Int` descriptor.
+    if is_ranged_int_type_name_cg(name) { return "I"; }
     // See resolve_descriptor's own comment: Bool -> "Z" here causes a reproducible field-vs-ctor
     // descriptor mismatch across the self-host bootstrap. Keep as "I" until root-caused.
     if name == "Bool" { return "I"; }

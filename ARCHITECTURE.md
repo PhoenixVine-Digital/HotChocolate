@@ -4657,9 +4657,45 @@ Touches all three phases, the first macro-era feature this session to need real 
   boundary (`Int<0..100>` accepting 0 and 99 but rejecting 100) is verified both ways.
 
 Real, disclosed scope cut, considerably narrower than the doc's own original framing: only a
-`let`/`var`'s own declared type (no struct fields, fn params/returns); no resulting-range
+`let`/`var`'s own declared type or a struct field's (no fn params/returns yet); no resulting-range
 propagation through arithmetic; only non-negative literal bounds (`self.expect(INT)` directly, not
-routed through `unary()`'s own leading-`-` handling). See `examples/numeric_range_bounds.hotc`.
+routed through `unary()`'s own leading-`-` handling).
+
+**Extended the same day to struct fields** (`health: Int<0..=100>` as a field, this feature's own
+original motivating example), reusing the exact same literal-vs-runtime split at struct-literal
+CONSTRUCTION time:
+- **`Checker.hotc`'s own `check_struct_lit`** gets a matching branch (right where its per-field
+  loop already compares `expected` against the checked value's type) plus a new `find_field_type_
+  raw` (the un-normalized twin of `find_field_type`, which itself now normalizes a ranged-Int
+  field's type back to plain `"Int"` for every OTHER caller -- field access, match-arm bind-name
+  lookups, field assignment -- so a ranged struct field behaves as an ordinary Int everywhere else
+  the same way the `Let` version already does for locals).
+- **`Codegen.hotc`'s own struct-literal construction path** calls `emit_ranged_int_check` right
+  after each field value is pushed for the constructor call (safe between accumulating multiple
+  constructor arguments -- the check only touches the single value it was just handed). `resolve_
+  descriptor`/`descriptor_of_type`/`field_type_of` all learned to treat a ranged-Int type string as
+  plain `Int` for descriptor/type-tracking purposes.
+
+Two real mistakes surfaced building this, both caught by the self-hosting rebuild discipline:
+- A `VerifyError` ("Bad local variable type") the first time a real struct-field example ran: the
+  generated constructor's own body tried to `ALOAD` a ranged-Int param whose descriptor was
+  already correctly `I` -- `is_ref_type`'s own catch-all didn't yet know a ranged-Int string is
+  still a primitive `int`, so `load_opcode`/`store_opcode` (both routed through it) picked the
+  wrong instruction family. Fixed by adding the same one-line exception `resolve_descriptor`
+  already had.
+- A genuine "the compile-time check never actually runs" bug, found ONLY by testing a real
+  out-of-range literal field and seeing it compile clean (only the runtime half caught it):
+  `check_struct_lit`'s own `expected` was fetched through the SAME normalizing `find_field_type`
+  this extension needed to add for every OTHER caller -- by the time the new branch tried to
+  detect "is this ranged", the annotation was already stripped, so the condition was always false.
+  Fixed by adding `find_field_type_raw`, read once, with `expected` itself derived from it locally
+  (calling both the raw and the normalizing lookup on the same owned `StructInfo` moved it twice,
+  a real "use of moved value" hit fixing this the first way).
+
+Real, disclosed gap left open: only construction (`StructName { field: value }`) is checked --
+assigning to an existing field afterward (`obj.health = 150;`) isn't, and enum variant fields
+(`gen_variant_construct`'s own separate codegen) aren't touched either. See `examples/numeric_
+range_bounds.hotc`.
 
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
