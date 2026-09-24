@@ -4734,7 +4734,25 @@ x; }`), checked at each `return` statement with the same literal-vs-runtime spli
   the `Call` arm's own `self.fn_ret_tys` read, both fixed, so `let x = compute();` types `x` as
   ordinary `Int`.
 
-Still open: assignment to an existing struct field, enum variant fields, negative bounds.
+**Extended once more the same day to negative bounds** (`Int<-10..10>`), closing the last of this
+feature's own originally-disclosed scope cuts:
+- **`Parser.hotc`'s own `looks_like_int_range`** became a variable-length scan (a moving index)
+  instead of fixed token offsets, since an optional leading `MINUS` before either bound shifts
+  everything after it by one token; `type_name_ref`'s own parsing branch consumes that `MINUS`
+  directly as a TYPE-position token (never through `unary()`'s own general handling) and prefixes
+  it onto the encoded surface-syntax string.
+- **Every extraction helper needed ZERO changes** -- `ranged_int_lo_chk`/`_hi_chk`/`_inclusive_
+  chk` (and their `_cg` mirrors) already handle an embedded `-` on either side of `..`/`..=`
+  correctly, since `String.indexOf`/`Integer.parseInt` both do the right thing with no
+  special-casing for a sign character.
+
+Real, disclosed nuance found testing this: a directly-negated literal init (`let x: Int<-10..10>
+= -20;`) parses as `Unary { op: "-", ... }`, not a bare `IntLit`, so `Checker.hotc`'s own
+`IntLit`-only pattern match skips the compile-time check for it specifically -- confirmed the
+runtime check still catches it regardless (it runs unconditionally, independent of literal-ness),
+just without the compile-time optimization a plain positive literal gets.
+
+Still open: assignment to an existing struct field, enum variant fields.
 
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 

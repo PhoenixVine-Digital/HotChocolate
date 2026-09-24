@@ -5,10 +5,16 @@
 // runtime check", the defensible simpler first cut that entry's own header explicitly suggests.
 // Also works as a STRUCT FIELD type (`health: Int<0..=100>` -- this entry's own original
 // motivating example), a plain top-level fn's PARAM type, and its RETURN type, all checked the
-// same way at their own construction/call/return boundary. Real, disclosed scope: no resulting-
-// range propagation through arithmetic -- a ranged Int is an ordinary Int everywhere else once
-// the check passes (reading a struct field, a param, or a call's own result back, arithmetic,
-// comparisons, ...).
+// same way at their own construction/call/return boundary. Bounds may be negative (`Int<-10..
+// 10>`) -- a leading `-` on either bound is a real TYPE-position token, not routed through
+// `unary()`. Real, disclosed scope: no resulting-range propagation through arithmetic -- a
+// ranged Int is an ordinary Int everywhere else once the check passes (reading a struct field, a
+// param, or a call's own result back, arithmetic, comparisons, ...). Real, disclosed nuance: a
+// DIRECTLY-NEGATED literal init (`let x: Int<-10..10> = -20;`) parses as `Unary { op: "-", ... }`,
+// not a bare `IntLit`, so it skips the compile-time literal check specifically -- still fully
+// enforced (the runtime check always runs regardless), just not proven statically the way a
+// literal `20` or `-20` written as a single token (impossible in this language either way) would
+// be.
 
 fn clamp(x: Int, lo: Int, hi: Int) -> Int {
     if x < lo {
@@ -75,6 +81,13 @@ fn main() {
     let h1 = fixed_health();
     let h2 = computed_health(999);
     print(h1 + h2);
+
+    // Negative bounds. `-5` is a Unary negation (not a bare IntLit), so this specific assignment
+    // gets the runtime check rather than the compile-time one -- see this file's own header.
+    let temp: Int<-10..=10> = -5;
+    print(temp);
+    let delta: Int<-10..10> = clamp(-999, -10, 9);
+    print(delta);
 
     print("done");
 }

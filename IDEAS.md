@@ -891,7 +891,24 @@ own `return sig.ret_type;`, and `Codegen.hotc`'s matching `Call` arm reading `se
 both needed the same plain-`"Int"` normalization on read-back that struct fields/params already
 needed, so `let x = compute();` types `x` as ordinary `Int`, not the ranged annotation string.
 
-Still open: assignment to an existing struct field, enum variant fields, and negative bounds.
+**Extended once more the same day to negative bounds** (`Int<-10..10>`) — the last of this
+entry's own originally-disclosed scope cuts. `Parser.hotc`'s own `type_name_ref` accepts an
+optional leading `-` on either bound directly (a real TYPE-position token, not routed through
+`unary()`'s own general leading-`-` handling — this is a type annotation, not an expression),
+simply prefixed onto the encoded surface-syntax string (`"Int<-10..10>"`). Needed ZERO changes to
+any of the `ranged_int_lo_*`/`ranged_int_hi_*`/`ranged_int_inclusive_*` extraction helpers in
+either `Checker.hotc` or `Codegen.hotc` — `String.indexOf("..")` and `Integer.parseInt` both
+already handle an embedded `-` on either side of the separator correctly with no special-casing,
+so only `looks_like_int_range`'s own lookahead (now a variable-length scan rather than fixed
+token offsets, since either bound's optional `-` shifts everything after it) and the actual
+bound-parsing needed touching. Real, disclosed nuance found testing this: a directly-negated
+literal init (`let x: Int<-10..10> = -20;`) parses as `Unary { op: "-", ... }`, not a bare
+`IntLit`, so it skips the compile-time literal check specifically — confirmed it's still fully
+enforced (the runtime check runs unconditionally regardless of literal-ness, unaffected), just
+not proven statically the way `Checker.hotc`'s existing `IntLit`-only pattern match would need to
+recognize a negated-literal shape too (not attempted this pass).
+
+Still open: assignment to an existing struct field, enum variant fields.
 
 ### `@deterministic` + built-in state replay/rewind
 
