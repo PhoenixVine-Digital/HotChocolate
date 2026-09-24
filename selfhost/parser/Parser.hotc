@@ -167,10 +167,21 @@ pub struct Parser {
     macro_stmt_counts: Vec<Int>,
     macro_stmt_bodies: Vec<Stmt>,
     macro_expansion_counter: Int,
+    // `macro name(...) { fn item_name(...) { body } }` -- an ITEM macro, the third body shape
+    // (see `macro_decl`'s own header). `macro_item_kind` is index-aligned with `macro_names`
+    // ("" for an expression/statement macro, "fn" for this shape); `macro_item_fns` is likewise
+    // index-aligned, holding the macro's own pre-parsed template `FnDecl` (a meaningless
+    // placeholder whenever `macro_item_kind.get(i) != "fn"`, never read). `macro_item_name_param`
+    // holds the ONE declared param whose CALLER-SUPPLIED argument becomes the generated fn's own
+    // real top-level name (see `expand_item_macro`'s own header on why exactly one is required,
+    // not optional).
+    macro_item_kind: Vec<String>,
+    macro_item_fns: Vec<FnDecl>,
+    macro_item_name_param: Vec<String>,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false, event_names: empty_str_vec2(), event_field_counts: empty_int_vec_ev(), event_field_names: empty_str_vec2(), event_field_types: empty_str_vec2(), event_handler_counter: 0, handler_event_names: empty_str_vec2(), handler_fn_names: empty_str_vec2(), pending_event_fns: empty_fn_decl_vec(), macro_names: empty_str_vec2(), macro_param_counts: empty_int_vec_ev(), macro_param_names: empty_str_vec2(), macro_bodies: empty_expr_vec(), macro_is_stmt: empty_bool_vec_macro(), macro_stmt_counts: empty_int_vec_ev(), macro_stmt_bodies: empty_stmt_vec(), macro_expansion_counter: 0 };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false, event_names: empty_str_vec2(), event_field_counts: empty_int_vec_ev(), event_field_names: empty_str_vec2(), event_field_types: empty_str_vec2(), event_handler_counter: 0, handler_event_names: empty_str_vec2(), handler_fn_names: empty_str_vec2(), pending_event_fns: empty_fn_decl_vec(), macro_names: empty_str_vec2(), macro_param_counts: empty_int_vec_ev(), macro_param_names: empty_str_vec2(), macro_bodies: empty_expr_vec(), macro_is_stmt: empty_bool_vec_macro(), macro_stmt_counts: empty_int_vec_ev(), macro_stmt_bodies: empty_stmt_vec(), macro_expansion_counter: 0, macro_item_kind: empty_str_vec2(), macro_item_fns: empty_fn_decl_vec(), macro_item_name_param: empty_str_vec2() };
 }
 
 pub fn empty_bool_vec_macro() -> Vec<Bool> {
@@ -1568,7 +1579,8 @@ impl Parser {
     // `macro name(p1, p2, ...) { ... }`, invoked `name!(arg1, arg2)` -- see `IDEAS.md`'s own
     // "Macros" entry for the full design discussion. Real, disclosed scope, tight on purpose
     // (that entry's own header explicitly warns this is "real design work needed... not a small
-    // addition"). Two body shapes, told apart by `macro_body_is_stmt_list` (see its own header):
+    // addition"). Three body shapes, told apart by `macro_body_is_stmt_list` (see its own header)
+    // and a leading `FN` token check:
     //
     // - **Expression macros** (`macro name(...) { expr }`, body is exactly ONE expression) --
     //   invoked ANYWHERE an expression is legal (`primary()`'s own `IDENT BANG LPAREN` check).
@@ -1582,8 +1594,22 @@ impl Parser {
     //   for`/`sequence` already splice their own desugared statements there). A statement body
     //   CAN introduce `let`/`var` bindings, so THIS shape does need real hygiene -- see
     //   `expand_stmt_macro`'s own header for exactly how much (and how little) it does.
+    // - **Item macros** (`macro name(...) { fn item_name(...) { body } }`, body is a single `fn`
+    //   declaration) -- invoked ONLY at TOP LEVEL (`name!(args);`, `is_item_macro_ahead`), and
+    //   generates a real top-level `fn` spliced into this file's own `fns` list. Genuinely
+    //   different substitution shape from the other two: `item_name` must be one of the macro's
+    //   OWN declared params (checked in `macro_decl` itself), and the CALLER's argument in that
+    //   position must be a bare `Ident` -- its `.name` becomes the generated fn's real name (see
+    //   `expand_item_macro`'s own header). This is what actually makes item macros useful for
+    //   generating several DIFFERENTLY-named fns from one template, e.g. `make_adder!(add5, 5);
+    //   make_adder!(add10, 10);`. Real, disclosed scope cut: only the fn's NAME and its BODY vary
+    //   per call site -- its param list and return type are written once, literally, in the
+    //   macro's own body, and identical across every expansion. No `struct`/`enum`/`impl`/`extern
+    //   class` item-macro shape yet (the entry's own third bullet, "a macro that generates an
+    //   extern class block", still needs its own registration-ordering design).
     //
-    // Both shapes share the same underlying mechanism: **AST-level substitution, not textual.**
+    // All three shapes share the same underlying mechanism: **AST-level substitution, not
+    // textual.**
     // `expand_macro`/`expand_stmt_macro` splice each CALLER-supplied, already-PARSED argument
     // `Expr` in for every bare `Ident` in the macro's own pre-parsed body that names one of its
     // declared params (`subst_macro_expr`/`subst_macro_stmt`) -- never re-tokenizes/re-parses
@@ -1640,6 +1666,28 @@ impl Parser {
             self.macro_is_stmt.push(true);
             self.macro_bodies.push(IntLit { value: 0 });
             self.macro_stmt_counts.push(0);
+            self.macro_item_kind.push("");
+            self.macro_item_fns.push(placeholder_fn_decl());
+            self.macro_item_name_param.push("");
+            return;
+        }
+        if self.check(FN) {
+            // `macro name(...) { fn item_name(...) { body } }` -- an ITEM macro (see this fn's
+            // own header for the full 3-shape design). `item_name` must be one of THIS macro's
+            // own declared params (checked right below) -- an item-fn macro is always "named by
+            // the caller", since the whole point is generating a DIFFERENTLY-named top-level fn
+            // at each call site; a fixed literal name would collide with itself on a second call.
+            let template = self.fn_decl();
+            self.expect(RBRACE);
+            if !str_vec_contains_ts(&params, template.name) {
+                throw ParseError::new("item macro '" + name + "': its own fn's name ('" + template.name + "') must be one of its declared params, so each call site ('" + name + "!(my_name, ...)') can give the generated fn its own real name");
+            }
+            self.macro_is_stmt.push(false);
+            self.macro_bodies.push(IntLit { value: 0 });
+            self.macro_stmt_counts.push(0);
+            self.macro_item_kind.push("fn");
+            self.macro_item_fns.push(template);
+            self.macro_item_name_param.push(template.name);
             return;
         }
         if self.macro_body_is_stmt_list() {
@@ -1656,12 +1704,18 @@ impl Parser {
                 self.macro_stmt_bodies.push(body_stmts.get(si));
                 si = si + 1;
             }
+            self.macro_item_kind.push("");
+            self.macro_item_fns.push(placeholder_fn_decl());
+            self.macro_item_name_param.push("");
         } else {
             let body = self.expression();
             self.expect(RBRACE);
             self.macro_is_stmt.push(false);
             self.macro_bodies.push(body);
             self.macro_stmt_counts.push(0);
+            self.macro_item_kind.push("");
+            self.macro_item_fns.push(placeholder_fn_decl());
+            self.macro_item_name_param.push("");
         }
     }
 
@@ -1726,6 +1780,21 @@ impl Parser {
         return self.macro_is_stmt.get(idx);
     }
 
+    // Non-consuming lookahead used by `parse_program`'s own top-level dispatch: true iff the
+    // current position is `IDENT BANG LPAREN` AND `IDENT` names an already-declared ITEM macro
+    // (see `macro_decl`'s own header on this third body shape). An item macro is ONLY ever
+    // callable at top level, never inside a fn body -- there's no nested top-level-fn-declaration
+    // concept in this subset for it to splice into either way.
+    fn is_item_macro_ahead(&self) -> Bool {
+        if !self.check(IDENT) { return false; }
+        if self.pos + 2 >= self.tokens.length() { return false; }
+        if self.tokens.get(self.pos + 1).kind != BANG { return false; }
+        if self.tokens.get(self.pos + 2).kind != LPAREN { return false; }
+        let idx = self.find_macro_index(self.peek().text);
+        if idx == -1 { return false; }
+        return self.macro_item_kind.get(idx) != "";
+    }
+
     // Expands `name!(args)` for an EXPRESSION macro -- looks `name` up (declared-before-use),
     // validates the argument count, and returns the macro's own body `Expr` with every bare-
     // `Ident` reference to one of its params replaced by the matching caller-supplied argument
@@ -1743,6 +1812,9 @@ impl Parser {
         }
         if self.macro_is_stmt.get(idx) {
             throw ParseError::new("macro '" + name + "' is a statement macro (its body is a statement list, not one expression) -- it can only be called at statement position, 'name!(args);', not used as a value");
+        }
+        if self.macro_item_kind.get(idx) != "" {
+            throw ParseError::new("macro '" + name + "' is an item macro (its body declares a top-level fn) -- it can only be called at top level, 'name!(args);', not used as a value or a statement inside a fn body");
         }
         var offset = 0;
         var oi = 0;
@@ -1842,6 +1914,60 @@ impl Parser {
             ti = ti + 1;
         }
         return subst_macro_stmt_list(body_stmts, &pnames, &args, &rnames, &rvals);
+    }
+
+    // Expands `name!(args);` for an ITEM macro, called from `parse_program`'s own top-level
+    // dispatch (`is_item_macro_ahead`). Returns a real `FnDecl` for the caller to push directly
+    // into this file's own `fns` list. `args`' entry at `macro_item_name_param`'s own position
+    // must be a bare `Ident` -- its `.name` becomes the generated fn's REAL top-level name (this
+    // is the ONE place a macro param feeds a NAME rather than a spliced VALUE; see `macro_decl`'s
+    // own header on why the name-param is required, not optional, for this shape). Every OTHER
+    // param is substituted into the fn's own BODY exactly like a statement macro's params are
+    // (`subst_macro_stmt_list`) -- the generated fn's OWN param list/return type are never
+    // substituted at all; they're written literally in the macro's body and identical across
+    // every call site (a real, disclosed scope cut: only the NAME and the BODY vary per call).
+    fn expand_item_macro(&mut self, name: String, args: Vec<Expr>) -> FnDecl {
+        let idx = self.find_macro_index(name);
+        if idx == -1 {
+            throw ParseError::new("no macro named '" + name + "' (macros must be declared earlier in the same file)");
+        }
+        if self.macro_item_kind.get(idx) != "fn" {
+            throw ParseError::new("macro '" + name + "' isn't an item macro -- it can't be called at top level to generate a declaration");
+        }
+        var poffset = 0;
+        var oi = 0;
+        while oi < idx {
+            poffset = poffset + self.macro_param_counts.get(oi);
+            oi = oi + 1;
+        }
+        let pcount = self.macro_param_counts.get(idx);
+        if args.length() != pcount {
+            throw ParseError::new("macro '" + name + "' expects " + JString3::valueOf(pcount) + " argument(s), got " + JString3::valueOf(args.length()));
+        }
+        var pnames = empty_str_vec();
+        var pj = 0;
+        while pj < pcount {
+            pnames.push(self.macro_param_names.get(poffset + pj));
+            pj = pj + 1;
+        }
+        let name_param = self.macro_item_name_param.get(idx);
+        var npi = -1;
+        var nk = 0;
+        while nk < pnames.length() {
+            if pnames.get(nk) == name_param { npi = nk; }
+            nk = nk + 1;
+        }
+        let name_arg = args.get(npi);
+        var real_name = "";
+        match name_arg {
+            Ident { name: an } => { real_name = an; }
+            _ => {
+                throw ParseError::new("macro '" + name + "'s name parameter ('" + name_param + "') needs a bare identifier argument, e.g. '" + name + "!(my_name, ...)', not an arbitrary expression");
+            }
+        }
+        let template = self.macro_item_fns.get(idx);
+        let subst_body = subst_macro_stmt_list(template.body, &pnames, &args, &empty_str_vec(), &empty_str_vec());
+        return FnDecl { name: real_name, params: template.params, ret_type: template.ret_type, body: subst_body, type_param: template.type_param, type_bounds: template.type_bounds, self_is_mut: template.self_is_mut, type_param2: template.type_param2, type_bounds2: template.type_bounds2 };
     }
 
     // `event PlayerDied(player: Entity, cause: String);` -- events/signals, compile-time-wired
@@ -3668,6 +3794,29 @@ impl Parser {
                     throw ParseError::new("doc comments aren't supported on 'macro' declarations");
                 }
                 self.macro_decl();
+            } else if self.is_item_macro_ahead() {
+                // `name!(args);` at TOP LEVEL, where `name` is an ITEM macro (see `macro_decl`'s
+                // own header on this third body shape) -- generates a real top-level `fn`,
+                // spliced straight into this file's own `fns` list. Rejects the same pending
+                // modifiers STATE/CONST/etc. already reject at this position; a real item-macro
+                // call simply doesn't carry any of them.
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on an item-macro call");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on an item-macro call");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on an item-macro call");
+                }
+                let imname = self.peek().text;
+                self.advance(); // IDENT
+                self.advance(); // BANG
+                self.advance(); // LPAREN
+                let imargs = self.arg_list();
+                self.expect(SEMI);
+                let generated_fn = self.expand_item_macro(imname, imargs);
+                fns.push(generated_fn);
             } else {
                 var fd = self.fn_decl();
                 if is_pub_decl {
@@ -4378,6 +4527,16 @@ pub fn empty_annvalue_vec() -> Vec<AnnValue> {
 pub fn empty_fn_decl_vec() -> Vec<FnDecl> {
     var v = vec_of(FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() });
     return Vec { data: v.data, len: 0 };
+}
+
+// A meaningless placeholder `FnDecl`, pushed into `macro_item_fns` for every macro that ISN'T an
+// item macro (`macro_item_kind.get(i) == ""`) -- keeps that Vec index-aligned with `macro_names`
+// without needing an `Option<FnDecl>` (a real, previously-hit monomorphization gap for OTHER
+// `Option<T>` instantiations this session -- see `IDEAS.md`'s own "const fn" entry -- so this
+// compiler's own established workaround is to just never construct the risky generic shape at
+// all, using an always-safe placeholder value instead).
+pub fn placeholder_fn_decl() -> FnDecl {
+    return FnDecl { name: "_", params: empty_param_vec(), ret_type: none_string(), body: empty_stmt_vec(), type_param: none_string(), type_bounds: empty_str_vec(), self_is_mut: false, type_param2: none_string(), type_bounds2: empty_str_vec() };
 }
 
 pub fn empty_struct_decl_vec() -> Vec<StructDecl> {

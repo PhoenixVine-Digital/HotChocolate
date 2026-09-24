@@ -1522,28 +1522,52 @@ the closing `}` means a statement list; none means a single expression):
   own uses affected too — avoidable by not reusing a top-level macro-local's
   name for an unrelated nested binding in the same body.
 
-Both shapes share the same underlying mechanism — **AST-level substitution,
-not textual.** `Parser.hotc`'s own `expand_macro`/`expand_stmt_macro` splice
-the caller's already-PARSED argument `Expr` trees in for every occurrence of
-the matching param name inside the macro's own pre-parsed body, and the
-result is spliced into the call site as ordinary syntax — indistinguishable
-to `Checker.hotc`/`Codegen.hotc` from hand-written code. Still not a
-C-preprocessor: nothing is re-tokenized, so `square!(2 + 3)` expands to
-`(2 + 3) * (2 + 3)`, never `2 + 3 * 2 + 3`. Untyped params, declared-before-
-use, single file (no cross-file visibility yet): a macro must be declared
-textually earlier in the SAME file than any call site. Self-recursion is
-rejected for free by that same rule (a macro's own name is never registered
-yet while its own body is being parsed) — but calling an EARLIER-declared,
-DIFFERENT macro from inside a later one's body works and composes correctly,
-precisely because expansion is eager and happens once, at the outer macro's
-own declaration (`double_it!(double_it!(y))` inside `quad_it`'s own body
-becomes `quad_it`'s literal stored body `(y * 2) * 2`, substituting only
-`quad_it`'s own `y` at each of ITS OWN call sites).
+**Extended again the same day with a third shape: item macros** —
+`macro name(...) { fn item_name(...) { body } }`, invoked ONLY at TOP LEVEL
+(`name!(args);`), generating a real top-level `fn` per call site:
+
+```
+macro make_adder(name, amount) {
+    fn name(x: Int) -> Int { return x + amount; }
+}
+make_adder!(add5, 5);
+make_adder!(add10, 10);
+```
+
+This closes the doc's own third bullet ("a macro that generates an extern
+class block") for the `fn` case specifically — `struct`/`enum`/`impl`/`extern
+class` item shapes are still open. The substitution rule here is genuinely
+different from the other two shapes: `item_name` (the fn's own name, written
+inside the macro's body) must be one of the macro's own declared params, and
+the CALLER's argument in that position must be a bare identifier — its name
+becomes the generated fn's real top-level name. That's what actually makes
+item macros useful for producing several DIFFERENTLY-named fns from one
+template, rather than every call site colliding on the same literal name.
+Real, disclosed scope cut: only the name and the body vary per call; the
+generated fn's own param list and return type are written once, literally,
+in the macro's body, and identical across every expansion.
+
+All three shapes share the same underlying mechanism — **AST-level
+substitution, not textual.** `Parser.hotc`'s own `expand_macro`/`expand_stmt_
+macro`/`expand_item_macro` splice the caller's already-PARSED argument `Expr`
+trees in for every occurrence of the matching param name inside the macro's
+own pre-parsed body, and the result is spliced into the call site as ordinary
+syntax — indistinguishable to `Checker.hotc`/`Codegen.hotc` from hand-written
+code. Still not a C-preprocessor: nothing is re-tokenized, so `square!(2 + 3)`
+expands to `(2 + 3) * (2 + 3)`, never `2 + 3 * 2 + 3`. Untyped params,
+declared-before-use, single file (no cross-file visibility yet): a macro must
+be declared textually earlier in the SAME file than any call site.
+Self-recursion is rejected for free by that same rule (a macro's own name is
+never registered yet while its own body is being parsed) — but calling an
+EARLIER-declared, DIFFERENT macro from inside a later one's body works and
+composes correctly, precisely because expansion is eager and happens once, at
+the outer macro's own declaration (`double_it!(double_it!(y))` inside `quad_
+it`'s own body becomes `quad_it`'s literal stored body `(y * 2) * 2`,
+substituting only `quad_it`'s own `y` at each of ITS OWN call sites).
 
 **Not attempted** (real gaps vs. the fuller design above, not bugs): no
-`macro_rules!`-style repetition (`$()*`), no macro that generates a
-`StructDecl`/`FnDecl`/`extern class` block (the doc's own third bullet still
-needs its own registration-ordering design). See `examples/macros.hotc`.
+`macro_rules!`-style repetition (`$()*`), no `struct`/`enum`/`impl`/`extern
+class` item-macro shape. See `examples/macros.hotc`.
 
 ### Mixins (patching an existing compiled class's bytecode)
 

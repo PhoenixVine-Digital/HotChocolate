@@ -4537,10 +4537,10 @@ same self-hosting hazard, and `IDENT ARROW IDENT SEMI` is already unambiguous in
 
 ## Basic macros (`macro name(...) { ... }`)
 
-**Shipped, 2026-09-24** (expression macros), **extended the same day** (statement macros +
-hygiene). See `IDEAS.md`'s own "Macros" entry for the full design and the real scope cuts made
-versus the fuller "hygienic AST-level macro" framing that entry originally called for -- the
-guiding stance stayed "reduce boilerplate, but not good for everything," not a general
+**Shipped, 2026-09-24** (expression macros), **extended the same day twice** (statement macros +
+hygiene, then item macros). See `IDEAS.md`'s own "Macros" entry for the full design and the real
+scope cuts made versus the fuller "hygienic AST-level macro" framing that entry originally called
+for -- the guiding stance stayed "reduce boilerplate, but not good for everything," not a general
 `macro_rules!`/`derive` system. The short version:
 
 ```
@@ -4553,15 +4553,22 @@ macro report_clamped(label, x, lo, hi) {
     print(clamped);
 }
 report_clamped!("first", 999, 0, 10);
+
+macro make_adder(name, amount) {
+    fn name(x: Int) -> Int { return x + amount; }
+}
+make_adder!(add5, 5);
 ```
 
 Entirely a `Parser.hotc`-level feature. `macro_decl` parses and stores each macro's own param
 names (`self.macro_names`/`macro_param_counts`/`macro_param_names`, flattened Vecs mirroring
-`event_decl`'s own established convention) plus its body, in one of two shapes told apart by
-`macro_body_is_stmt_list` -- a bracket-depth-aware, non-consuming token scan (same idiom `looks_
-like_index_field_access` already established) that returns true the moment a bare `;` appears at
-depth 0 before the matching closing `}` (conclusive, not a heuristic: a single expression can
-never contain a top-level `;`):
+`event_decl`'s own established convention) plus its body, in one of three shapes: a leading `FN`
+token means an item macro (checked first, unambiguous -- `fn` can't start a bare expression or
+ordinary statement either); otherwise `macro_body_is_stmt_list` -- a bracket-depth-aware,
+non-consuming token scan (same idiom `looks_like_index_field_access` already established) that
+returns true the moment a bare `;` appears at depth 0 before the matching closing `}` (conclusive,
+not a heuristic: a single expression can never contain a top-level `;`) -- picks statement vs.
+expression:
 
 - **Expression macros** (body is one `Expr`, stored in `macro_bodies`) -- `primary()` detects
   `IDENT BANG LPAREN` anywhere an expression is legal and calls `expand_macro`, which looks the
@@ -4583,13 +4590,32 @@ never contain a top-level `;`):
   outside it. Verified directly: a macro-local named the same as an unrelated caller-scope
   variable survives the macro call untouched, and calling the same statement macro twice in one
   block doesn't collide.
+- **Item macros** (body is a single `FnDecl`, stored in `macro_item_fns`, alongside `macro_item_
+  kind`/`macro_item_name_param` -- all three index-aligned with `macro_names`, a placeholder
+  `FnDecl` in the unused slot for the OTHER two shapes, same "never construct the risky `Option
+  <T>` shape, use an always-safe placeholder instead" workaround this session's own `const fn`
+  work already established for a DIFFERENT `Option<T>` monomorphization gap) -- invoked ONLY at
+  TOP LEVEL, spliced as a real `fn` directly into the file's own `fns` list by `parse_program`'s
+  own dispatch (`is_item_macro_ahead`/`expand_item_macro`). A genuinely different substitution
+  rule from the other two shapes: the fn's own name (written inside the macro's body) must be one
+  of the macro's own declared params, and the CALLER's argument there must be a bare identifier --
+  its name becomes the generated fn's real top-level name (verified: `make_adder!(add5, 5)` and
+  `make_adder!(add10, 10)` from one template correctly produce two independently-callable fns).
+  Only the name and the body vary per call; the generated fn's own param list/return type are
+  written once, literally, in the macro's body.
 
-Both shapes flow through `Checker.hotc`/`Codegen.hotc` completely normally after expansion -- no
-separate macro-aware code in either file. An earlier-declared, DIFFERENT macro can be called from
-inside a later macro's own body, and composes correctly, because expansion is eager and happens
-once, at the outer macro's own declaration (verified: `double_it!(double_it!(y))` inside `quad_
-it`'s body becomes `quad_it`'s literal stored body `(y * 2) * 2`). Self-recursion is rejected for
-free by the same declared-before-use rule. See `examples/macros.hotc`.
+All three shapes flow through `Checker.hotc`/`Codegen.hotc` completely normally after expansion --
+no separate macro-aware code in either file. An earlier-declared, DIFFERENT macro can be called
+from inside a later macro's own body, and composes correctly, because expansion is eager and
+happens once, at the outer macro's own declaration (verified: `double_it!(double_it!(y))` inside
+`quad_it`'s body becomes `quad_it`'s literal stored body `(y * 2) * 2`). Self-recursion is rejected
+for free by the same declared-before-use rule. Two real mistakes hit building item macros: the
+item-macro branch of `macro_decl` originally called `self.fn_decl()` but forgot to consume the
+macro's own OUTER closing `}` afterward (caught immediately running a real example -- "unexpected
+token '}'"), and separately, the very next sync-and-re-verify cycle hit the established "bad
+bootstrap sync" trap (a `NoClassDefFoundError` on the freshly-synced bootstrap, unrelated to the
+`fn_decl` fix) -- recovered with the usual `git checkout --` restore of the exact modified
+bootstrap files, then a clean rebuild-sync-reverify. See `examples/macros.hotc`.
 
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
