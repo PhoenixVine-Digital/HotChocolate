@@ -2623,6 +2623,10 @@ impl Parser {
         var pub_interface_names = empty_str_vec();
         var pub_fn_names = empty_str_vec();
         var pub_static_names = empty_str_vec();
+        var const_fns = empty_fn_decl_vec();
+        var const_names = empty_str_vec();
+        var const_types = empty_str_vec();
+        var const_inits = empty_expr_vec();
         var components = empty_component_decl_vec();
         var systems = empty_system_decl_vec();
         var resources = empty_component_decl_vec();
@@ -2853,7 +2857,7 @@ impl Parser {
             // scattered per-branch rejects below). Positive check (IS it one of the other
             // declaration-kind keywords the loop right below this one dispatches on?) rather than
             // a long negation -- easier to keep in sync with that chain's own real member list.
-            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE);
+            var next_is_other_decl_kind = self.check(STRUCT) || self.check(ARENA) || self.check(IMPL) || self.check(ENUM) || self.check(EXTERN) || self.check(STATIC) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) || self.check(EXTEND) || self.check(COMPONENT) || self.check(RESOURCE) || self.check(SYSTEM) || self.check(UNIT) || self.check(TYPESTATE) || self.check(EVENT) || self.check(HANDLE) || self.check(CONST);
             if is_priv && !(self.check(STRUCT) || self.check(ENUM) || self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN)) {
                 throw ParseError::new("'priv' is only supported on top-level 'struct'/'enum'/'interface' declarations");
             }
@@ -2999,6 +3003,35 @@ impl Parser {
                     self.tunable_names.push(sdecl.name);
                 }
                 statics.push(sdecl);
+            } else if self.check(CONST) {
+                if has_pending_annotation {
+                    throw ParseError::new("annotations aren't supported on 'const' declarations");
+                }
+                if pending_must_use {
+                    throw ParseError::new("'@must_use' isn't supported on 'const' declarations");
+                }
+                if has_pending_doc {
+                    throw ParseError::new("doc comments aren't supported on 'const' declarations");
+                }
+                // `const fn name(...) -> Ret { body }` vs. `const NAME: Type = expr;` --
+                // distinguished by whether `FN` follows `CONST` (one token of lookahead), same
+                // "peek the very next token to pick a branch" approach `event_decl`/`on_decl`'s
+                // own dispatch already uses.
+                if self.tokens.get(self.pos + 1).kind == FN {
+                    self.advance(); // CONST
+                    const_fns.push(self.fn_decl());
+                } else {
+                    self.advance(); // CONST
+                    let cname = self.expect(IDENT).text;
+                    self.expect(COLON);
+                    let ctype = self.type_name_ref();
+                    self.expect(EQ);
+                    let cinit = self.expression();
+                    self.expect(SEMI);
+                    const_names.push(cname);
+                    const_types.push(ctype);
+                    const_inits.push(cinit);
+                }
             } else if self.check(INTERFACE) || self.check(SEALED) || self.check(OPEN) {
                 if has_pending_annotation {
                     throw ParseError::new("annotations aren't supported on 'interface' declarations");
@@ -3248,7 +3281,7 @@ impl Parser {
             fns.push(build_event_emit_fn(ev_name, &ev_fields, &ev_handlers));
             evi = evi + 1;
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources, private_type_names: private_type_names, pub_struct_names: pub_struct_names, pub_enum_names: pub_enum_names, pub_interface_names: pub_interface_names, pub_fn_names: pub_fn_names, pub_static_names: pub_static_names };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources, private_type_names: private_type_names, pub_struct_names: pub_struct_names, pub_enum_names: pub_enum_names, pub_interface_names: pub_interface_names, pub_fn_names: pub_fn_names, pub_static_names: pub_static_names, const_fns: const_fns, const_names: const_names, const_types: const_types, const_inits: const_inits };
     }
 
     // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field

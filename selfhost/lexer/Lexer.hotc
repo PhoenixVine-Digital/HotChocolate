@@ -131,6 +131,10 @@ pub enum TokType {
     // as a real, pervasive local/param name throughout their own field-access-type-resolution
     // logic, found the hard way: reserving `on` broke this compiler's own self-compile).
     EVENT, HANDLE,
+    // `const fn name(...) -> Ret { body }` / `const NAME: Type = expr;` -- see `IDEAS.md`'s own
+    // "Bounded compile-time evaluation (`const fn`)" entry. `Driver.hotc`'s own `eval_const_expr`/
+    // `fold_consts` are the only readers.
+    CONST,
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
@@ -204,6 +208,7 @@ pub fn build_keywords() -> Registry<TokType> {
     kw.register("state", STATE);
     kw.register("event", EVENT);
     kw.register("handle", HANDLE);
+    kw.register("const", CONST);
     return kw;
 }
 

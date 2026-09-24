@@ -926,6 +926,44 @@ where the interpreter/evaluator lives — a second execution mode inside
 the compiler itself, separate from real codegen, is genuinely new
 infrastructure this compiler doesn't have any version of today.
 
+**Status, 2026-09-24 (real, disclosed SUBSET shipped)**: an EXPLICIT `const fn` qualifier, matching
+Rust's own actual design, not inferred purity — the "any sufficiently-pure fn" question above is
+deliberately NOT attempted; only a fn literally written `const fn` is ever evaluated at compile
+time, and only from inside another `const fn` or a `const NAME: Type = expr;` initializer.
+`Driver.hotc`'s own `eval_const_expr`/`eval_const_stmts` are the interpreter (a genuinely new,
+separate execution mode, exactly as this entry's own header anticipated — no `Checker.hotc`/
+`Codegen.hotc` change needed at all, since a `const fn` never reaches either: it's parsed into its
+own `Program.const_fns` list, never merged into the ordinary `fns`). Real, disclosed LEGAL SUBSET,
+answering this entry's own open question directly: literals, arithmetic/comparison/logical
+operators (operand types must match exactly — no implicit numeric promotion, same restriction this
+language's own real operators already have), `let`/`if`/`return`, and a call to ANOTHER `const fn`
+(recursively, depth-guarded). **No loops, no `struct`/array construction, no `match`, no calls to
+an ordinary fn, no `extern` reach at all** — each a real, named compile error, not silently
+accepted or ignored. A `const`'s own value is substituted as a literal everywhere it's referenced
+in ordinary fn/method/`extend` bodies (`Driver.hotc`'s own `fold_consts`, mirroring `Checker.hotc`'s
+own `subst_expr`/`subst_stmt` generic-substitution walkers almost exactly, just swapping the
+substitution rule) — genuinely zero runtime cost: no `static` field, no `<clinit>` entry, nothing;
+a `const` is indistinguishable from having hand-written the literal at every use site by the time
+`Checker.hotc`/`Codegen.hotc` ever see the program. A later `const` can reference an earlier one in
+its own initializer (folded in declaration order before evaluation). Real, disclosed scope cut
+beyond the legal-subset restriction itself: a `const fn` body can only reference its OWN params and
+call other `const fn`s — it can NOT reference a top-level `const`'s own value (that would need
+threading the const-substitution table into the interpreter's own env, not attempted this pass).
+Two real, previously-latent `Vec<T>`/`Option<T>` monomorphization gaps found building this (the
+same broader class of gap this whole backlog has hit repeatedly): a `ConstValue` enum (this
+feature's own internal value representation) crashes `NoClassDefFoundError`/`ClassNotFoundException`
+the moment it's wrapped in EITHER `Vec<ConstValue>` (the evaluation environment) or
+`Option<ConstValue>` (a `const fn` body's own return value) and that class is actually loaded, even
+though it compiles fine as source either way — fixed by storing env values and return values as
+`Vec<Expr>`/`Option<Expr>` instead (already-proven-safe generic arguments elsewhere in this AST,
+e.g. `Return.value` is a real `Option<Expr>` already), converting to/from `ConstValue` only at the
+point of use, never inside a `Vec`/`Option` wrapper. Verified against `examples/const_fn.hotc`: a
+`const fn` calling another `const fn`, a later `const` referencing an earlier one, `Int`
+arithmetic, and `String` concatenation, all producing the exact expected values; a negative test
+(a `while` loop inside a `const fn`) correctly rejected with the named error instead of silently
+accepted or crashing. Full example regression suite: zero new failures. Self-hosting verified to a
+true fixed point.
+
 ### `@gpu` — GPU compute functions
 
 ```

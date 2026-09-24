@@ -1,0 +1,42 @@
+// Bounded compile-time evaluation -- see IDEAS.md's own "Bounded compile-time evaluation
+// (`const fn`)" entry. `const fn`s are evaluated by the COMPILER itself; a `const NAME: Type =
+// expr;` is replaced by its own literal value everywhere it's referenced -- by the time this
+// program actually runs, LEVEL_COUNT/CLAMPED/GREETING are indistinguishable from having
+// hand-written "5"/"10"/"hi, world" directly. No runtime cost, no static field, no <clinit>.
+const fn clamp(x: Int, lo: Int, hi: Int) -> Int {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+const fn double_it(x: Int) -> Int {
+    return x * 2;
+}
+
+const fn compute_level_count(raw: Int) -> Int {
+    // A real const fn calling ANOTHER const fn -- recursion through the call graph, not just a
+    // single flat expression.
+    return double_it(raw) + 1;
+}
+
+const LEVEL_COUNT: Int = compute_level_count(2);   // double_it(2) + 1 = 5
+const CLAMPED: Int = clamp(999, 0, 10);              // 10
+const GREETING: String = "hi, " + "world";           // const fns/inits can use string ops too
+// A LATER const referencing an EARLIER one directly in its own init -- resolved entirely at
+// compile time too (`Driver.hotc`'s own `fold_consts` folds LEVEL_COUNT's literal in before this
+// one is ever evaluated).
+const DOUBLE_LEVEL_COUNT: Int = LEVEL_COUNT * 2;     // 10
+
+fn main() {
+    print(LEVEL_COUNT);
+    print(CLAMPED);
+    print(GREETING);
+    print(DOUBLE_LEVEL_COUNT);
+    print(LEVEL_COUNT + CLAMPED);
+
+    print("done");
+}

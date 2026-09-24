@@ -994,6 +994,25 @@ pub struct Program {
     pub_interface_names: Vec<String>,
     pub_fn_names: Vec<String>,
     pub_static_names: Vec<String>,
+    // `const fn name(params) -> Ret { body }` -- see IDEAS.md's own "Bounded compile-time
+    // evaluation (`const fn`)" entry. A `const fn` never reaches `Codegen.hotc` as a real,
+    // compiled method at all -- it exists ONLY to be evaluated by `Driver.hotc`'s own tree-
+    // walking interpreter (`eval_const_expr`/`eval_const_stmts`), which is why these live in
+    // their own separate list, not merged into the ordinary `fns` above. Real, disclosed scope
+    // cut versus this compiler's real runtime fns: no loops, no `struct`/array construction, no
+    // calls to anything but ANOTHER `const fn` -- see `eval_const_expr`'s own header for the
+    // exact legal subset.
+    const_fns: Vec<FnDecl>,
+    // `const NAME: Type = expr;` -- a top-level value the COMPILER evaluates once, at compile
+    // time, then substitutes as a literal everywhere `NAME` is referenced (see `Driver.hotc`'s
+    // own `fold_consts` header) -- unlike `static`, this never becomes a real JVM field at all;
+    // by the time `Codegen.hotc` ever sees the program, every reference has already been rewritten
+    // to a plain literal and these three lists are empty. Three parallel Vecs (name/declared type/
+    // init expression), same flat-and-index-aligned convention `event_names`/`event_field_types`
+    // already establish in `Parser.hotc` for the identical reason (no `Vec<Vec<T>>` shape).
+    const_names: Vec<String>,
+    const_types: Vec<String>,
+    const_inits: Vec<Expr>,
 }
 
 // `/// text` lines immediately before a `struct`/`fn`, parsed into structured sections rather than

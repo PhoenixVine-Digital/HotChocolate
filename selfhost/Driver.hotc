@@ -99,6 +99,36 @@ extern class JInteger = "java.lang.Integer" {
     static fn parseInt(s: String) -> Int;
 }
 
+// `const fn`'s own literal-to-value evaluation (`eval_const_expr`'s own `IntLit`/`LongLit`/
+// `FloatLit`/`DoubleLit` arms) -- `Lexer.hotc`'s own `number()` already strips every literal
+// suffix (`L`/`f`/`F`) before storing `text`, so plain `parseX(text)` is always safe here, same
+// "host `parseX(String)` on already-suffix-stripped text" mechanism `Codegen.hotc`'s own
+// `JLongCg`/`JFloatCg`/`JDoubleCg` bindings already rely on for the identical literal shapes.
+extern class JLongConst = "java.lang.Long" {
+    static fn parseLong(s: String, radix: Int) -> Long;
+}
+extern class JFloatConst = "java.lang.Float" {
+    static fn parseFloat(s: String) -> Float;
+}
+extern class JDoubleConst = "java.lang.Double" {
+    static fn parseDouble(s: String) -> Double;
+}
+// `const_value_to_expr`'s own reverse direction (a real evaluated `Long`/`Float`/`Double` back to
+// LITERAL SOURCE TEXT, so `IntLit`'s siblings can re-carry it unchanged) -- `JString4` right below
+// only ever declared the `Int` overload it originally needed, and this language resolves an
+// `extern class`'s own method purely by its DECLARED signature, not real overload resolution
+// across aliases -- so each numeric-to-string `java.lang.String.valueOf` overload this needs gets
+// its own separate alias to the SAME real class instead.
+extern class JStringValueOfLong = "java.lang.String" {
+    static fn valueOf(v: Long) -> String;
+}
+extern class JStringValueOfFloat = "java.lang.String" {
+    static fn valueOf(v: Float) -> String;
+}
+extern class JStringValueOfDouble = "java.lang.String" {
+    static fn valueOf(v: Double) -> String;
+}
+
 // `java.io.File.pathSeparator` -- the real, platform-correct separator (`;` on Windows, `:`
 // elsewhere) a `--classpath` argument's own multiple entries are joined with, matching exactly
 // what `FileCollection.getAsPath()` already produces on the Gradle-plugin side (`hc-gradle-
@@ -499,6 +529,7 @@ pub fn run_doc_cli(args: [String], off: Int, target: Int, explain_schedule: Bool
     }
     dprog = merge_program(resolve_stdlib_modules(dprog.uses, target), dprog);
     dprog = strip_dev_code(dprog, dev_mode);
+    dprog = fold_consts(dprog);
     let dname0 = base_name_no_ext(doc_path);
     var dname = dname0;
     if name_collides_with_decl(dname0, &dprog.structs, &dprog.enums) {
@@ -654,6 +685,10 @@ pub fn run_cli(args: [String]) {
     }
     prog = merge_program(resolve_stdlib_modules(prog.uses, target), prog);
     prog = strip_dev_code(prog, dev_mode);
+    // Runs AFTER `strip_dev_code` too, same reasoning -- a `const`'s own init referencing
+    // something an `if dev { ... }` block dropped should already be gone by the time evaluation
+    // runs, not fail with a confusing "unknown const fn" error over dead code.
+    prog = fold_consts(prog);
     // Runs AFTER `strip_dev_code`, deliberately -- an `asset(...)` call inside an `if dev { ... }`
     // block that a release build already dropped should never be checked at all (it will never
     // actually compile in), not flagged as a false positive.
@@ -996,6 +1031,16 @@ pub fn merge_str_vec(a: Vec<String>, b: Vec<String>) -> Vec<String> {
     return out;
 }
 
+pub fn merge_expr_vec_driver(a: Vec<Expr>, b: Vec<Expr>) -> Vec<Expr> {
+    var out = a;
+    var i = 0;
+    while i < b.length() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
 pub fn merge_annotation_vec(a: Vec<Annotation>, b: Vec<Annotation>) -> Vec<Annotation> {
     var out = a;
     var i = 0;
@@ -1058,6 +1103,10 @@ pub fn merge_program(a: Program, b: Program) -> Program {
         pub_interface_names: merge_str_vec(a.pub_interface_names, b.pub_interface_names),
         pub_fn_names: merge_str_vec(a.pub_fn_names, b.pub_fn_names),
         pub_static_names: merge_str_vec(a.pub_static_names, b.pub_static_names),
+        const_fns: merge_fns(a.const_fns, b.const_fns),
+        const_names: merge_str_vec(a.const_names, b.const_names),
+        const_types: merge_str_vec(a.const_types, b.const_types),
+        const_inits: merge_expr_vec_driver(a.const_inits, b.const_inits),
     };
 }
 
@@ -1169,7 +1218,7 @@ pub fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
         new_systems.push(SystemDecl { name: sysd.name, run_params: sysd.run_params, run_body: strip_dev_blocks_list(sysd.run_body, dev_mode), after: sysd.after, before: sysd.before, has_profile: sysd.has_profile, has_main_thread: sysd.has_main_thread, run_if: sysd.run_if });
         si = si + 1;
     }
-    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names };
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names, const_fns: prog.const_fns, const_names: prog.const_names, const_types: prog.const_types, const_inits: prog.const_inits };
 }
 
 // `asset("textures/player.png")` -- see `IDEAS.md`'s own "Compile-time asset existence checks"
@@ -1732,6 +1781,607 @@ pub fn check_private_visibility(files: &Vec<String>) {
         }
         gi = gi + 1;
     }
+}
+
+// === Bounded compile-time evaluation (`const fn`) -- see IDEAS.md's own "Bounded compile-time
+// evaluation" entry for the full design and disclosed scope. ===
+//
+// The COMPILER's own internal representation of a `const`-evaluated value -- deliberately NOT a
+// `Ty`/`Expr` reuse: this only ever needs to hold the small, fixed set of primitive VALUES this
+// subset's evaluator can actually produce, never a real AST shape.
+pub enum ConstValue {
+    CVInt { v: Int },
+    CVLong { v: Long },
+    CVFloat { v: Float },
+    CVDouble { v: Double },
+    CVBool { v: Bool },
+    CVString { v: String },
+}
+
+fn const_value_type_name(v: &ConstValue) -> String {
+    match v {
+        CVInt { v } => { return "Int"; }
+        CVLong { v } => { return "Long"; }
+        CVFloat { v } => { return "Float"; }
+        CVDouble { v } => { return "Double"; }
+        CVBool { v } => { return "Bool"; }
+        CVString { v } => { return "String"; }
+    }
+}
+
+// Converts an evaluated `ConstValue` BACK into a real literal `Expr` -- the actual payoff of
+// `const`-evaluation: every REFERENCE to a `const`'s own name gets rewritten to this literal node
+// directly (see `fold_consts`'s own header), so by the time `Checker.hotc`/`Codegen.hotc` ever see
+// the program, a `const` is indistinguishable from having hand-written the literal at every use
+// site -- genuinely zero runtime cost, no `static` field, no `<clinit>` entry, nothing.
+fn const_value_to_expr(v: ConstValue) -> Expr {
+    match v {
+        CVInt { v } => { return IntLit { value: v }; }
+        CVLong { v } => { return LongLit { text: JStringValueOfLong::valueOf(v) }; }
+        CVFloat { v } => { return FloatLit { text: JStringValueOfFloat::valueOf(v) }; }
+        CVDouble { v } => { return DoubleLit { text: JStringValueOfDouble::valueOf(v) }; }
+        CVBool { v } => { return BoolLit { value: v }; }
+        CVString { v } => { return StringLit { value: v }; }
+    }
+}
+
+// Env values are stored as already-proven `Vec<Expr>` (a real literal `Expr` node -- `IntLit`/
+// `LongLit`/etc), NOT `Vec<ConstValue>` -- a real, previously-hit `Vec<T>` monomorphization gap
+// found the hard way: `Vec<ConstValue>` compiles fine as source but crashes `NoClassDefFoundError:
+// Vec$ConstValue` the moment the compiled class actually loads, the exact same broader class of
+// gap this session already found for `Vec<Vec<T>>`/`Vec<Program>`. `ConstValue` itself (never
+// wrapped in a `Vec`) is fine -- `expr_to_const_value`/`const_value_to_expr` convert at the point
+// of use instead.
+fn const_env_get(env_names: &Vec<String>, env_values: &Vec<Expr>, name: String) -> Option<Expr> {
+    var i = 0;
+    while i < env_names.length() {
+        if env_names.get(i) == name { return Some { value: env_values.get(i) }; }
+        i = i + 1;
+    }
+    return None;
+}
+
+fn expr_to_const_value(e: &Expr) -> ConstValue {
+    match e {
+        IntLit { value } => { return CVInt { v: value }; }
+        LongLit { text } => { return CVLong { v: JLongConst::parseLong(text, 10) }; }
+        FloatLit { text } => { return CVFloat { v: JFloatConst::parseFloat(text) }; }
+        DoubleLit { text } => { return CVDouble { v: JDoubleConst::parseDouble(text) }; }
+        BoolLit { value } => { return CVBool { v: value }; }
+        StringLit { value } => { return CVString { v: value }; }
+        _ => { throw ParseError::new("internal error: a 'const fn' env held a non-literal expression"); }
+    }
+}
+
+// Every `const fn` this compiler ever needs to find by name lives in one flat, small
+// `Vec<FnDecl>` (`Program.const_fns`) -- a hand-rolled linear scan rather than a `Registry<T>`,
+// same "no stdlib dependency available to this bootstrap-merged file" reason `Parser.hotc`'s own
+// `event_params_for` already documents for the identical shape.
+fn find_const_fn(const_fns: &Vec<FnDecl>, name: String) -> Option<FnDecl> {
+    var i = 0;
+    while i < const_fns.length() {
+        let f = const_fns.get(i);
+        if f.name == name { return Some { value: f }; }
+        i = i + 1;
+    }
+    return None;
+}
+
+// The real, disclosed LEGAL SUBSET inside a `const fn` body (or a `const NAME: Type = expr;`
+// init) -- see this whole section's own header. Deliberately narrow, matching this compiler's own
+// established "ship the useful subset, disclose the cut" discipline: literals, arithmetic/
+// comparison/logical `Binary`/`Unary` ops (operand types must MATCH exactly, same restriction
+// this language's own real `+`/`-`/`*`/`/` already have -- no implicit numeric promotion), a
+// bound local/param `Ident`, and a `Call` to ANOTHER `const fn` (recursive, depth-guarded against
+// runaway/infinite recursion). Everything else -- loops, `struct`/array construction, method
+// calls, calls to an ordinary (non-`const`) fn, any `extern` reach at all -- is a real, named
+// compile error: there is no attempt at inferring a bigger "provably pure" subset automatically,
+// matching Rust's own actual `const fn` design (an explicit qualifier, not inferred purity) rather
+// than the open-ended whole-program effect-tracking this doc's own header calls out as a
+// materially bigger, unattempted feature.
+fn eval_const_expr(e: &Expr, env_names: &Vec<String>, env_values: &Vec<Expr>, const_fns: &Vec<FnDecl>, depth: Int) -> ConstValue {
+    match e {
+        IntLit { value } => { return CVInt { v: value }; }
+        LongLit { text } => { return CVLong { v: JLongConst::parseLong(text, 10) }; }
+        FloatLit { text } => { return CVFloat { v: JFloatConst::parseFloat(text) }; }
+        DoubleLit { text } => { return CVDouble { v: JDoubleConst::parseDouble(text) }; }
+        BoolLit { value } => { return CVBool { v: value }; }
+        StringLit { value } => { return CVString { v: value }; }
+        Ident { name } => {
+            let found = const_env_get(env_names, env_values, name);
+            if let Some { value: v } = found { return expr_to_const_value(&v); }
+            throw ParseError::new("'" + name + "' isn't a known local/param inside this 'const fn' (only literals, arithmetic, and calls to other 'const fn's are legal here)");
+        }
+        Unary { op, expr } => {
+            let v = eval_const_expr(&expr, env_names, env_values, const_fns, depth);
+            if op == "-" {
+                match v {
+                    CVInt { v } => { return CVInt { v: 0 - v }; }
+                    CVLong { v } => { return CVLong { v: (0 as Long) - v }; }
+                    CVFloat { v } => { return CVFloat { v: 0.0f - v }; }
+                    CVDouble { v } => { return CVDouble { v: 0.0 - v }; }
+                    _ => { throw ParseError::new("'-' inside a 'const fn' needs a numeric operand, got " + const_value_type_name(&v)); }
+                }
+            }
+            if op == "!" {
+                match v {
+                    CVBool { v } => { return CVBool { v: !v }; }
+                    _ => { throw ParseError::new("'!' inside a 'const fn' needs a Bool operand, got " + const_value_type_name(&v)); }
+                }
+            }
+            throw ParseError::new("'" + op + "' isn't a legal unary operator inside a 'const fn'");
+        }
+        Binary { op, left, right } => {
+            let lv = eval_const_expr(&left, env_names, env_values, const_fns, depth);
+            let rv = eval_const_expr(&right, env_names, env_values, const_fns, depth);
+            return eval_const_binary(op, lv, rv);
+        }
+        Call { callee, args } => {
+            let target_found = find_const_fn(const_fns, callee);
+            var target = FnDecl { name: "", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
+            var target_known = false;
+            if let Some { value: t } = target_found { target = t; target_known = true; }
+            if !target_known {
+                throw ParseError::new("'" + callee + "(...)' isn't a known 'const fn' -- only calls to another 'const fn' are legal inside a 'const fn' or a 'const' initializer");
+            }
+            if depth > 500 {
+                throw ParseError::new("'const fn' call depth exceeded 500 levels evaluating '" + callee + "(...)' -- likely infinite recursion");
+            }
+            if args.length() != target.params.length() {
+                throw ParseError::new("'" + callee + "(...)' expects " + JString4::valueOf(target.params.length()) + " argument(s), got " + JString4::valueOf(args.length()));
+            }
+            var call_env_names = empty_str_vec2();
+            var call_env_values = empty_expr_vec_cg();
+            var ai = 0;
+            while ai < args.length() {
+                let av = eval_const_expr(&args.get(ai), env_names, env_values, const_fns, depth);
+                call_env_names.push(target.params.get(ai).name);
+                call_env_values.push(const_value_to_expr(av));
+                ai = ai + 1;
+            }
+            let result = eval_const_stmts(&target.body, &mut call_env_names, &mut call_env_values, const_fns, depth + 1);
+            if let Some { value: rv2 } = result { return expr_to_const_value(&rv2); }
+            throw ParseError::new("'const fn " + callee + "(...)' body never reaches a 'return' -- every path must return a value");
+        }
+        _ => {
+            throw ParseError::new("this expression isn't legal inside a 'const fn' or a 'const' initializer -- only literals, arithmetic, a local/param name, and calls to another 'const fn' are");
+        }
+    }
+}
+
+fn eval_const_binary(op: String, lv: ConstValue, rv: ConstValue) -> ConstValue {
+    let ltn = const_value_type_name(&lv);
+    let rtn = const_value_type_name(&rv);
+    if op == "==" || op == "!=" {
+        // Structural equality over the small, fixed `ConstValue` shape -- mismatched operand
+        // types are always simply unequal (matching this language's own real `==` semantics,
+        // never a type error), never an error, same reasoning `is_arg_type_mismatch`-adjacent
+        // real-language comparisons already use.
+        var eq = false;
+        if ltn == rtn {
+            match lv {
+                CVInt { v: lvv } => { match rv { CVInt { v: rvv } => { eq = lvv == rvv; } _ => {} } }
+                CVLong { v: lvv } => { match rv { CVLong { v: rvv } => { eq = lvv == rvv; } _ => {} } }
+                CVFloat { v: lvv } => { match rv { CVFloat { v: rvv } => { eq = lvv == rvv; } _ => {} } }
+                CVDouble { v: lvv } => { match rv { CVDouble { v: rvv } => { eq = lvv == rvv; } _ => {} } }
+                CVBool { v: lvv } => { match rv { CVBool { v: rvv } => { eq = lvv == rvv; } _ => {} } }
+                CVString { v: lvv } => { match rv { CVString { v: rvv } => { eq = lvv == rvv; } _ => {} } }
+            }
+        }
+        if op == "==" { return CVBool { v: eq }; }
+        return CVBool { v: !eq };
+    }
+    if ltn != rtn {
+        throw ParseError::new("'" + op + "' inside a 'const fn' needs matching operand types, got " + ltn + " and " + rtn);
+    }
+    if op == "+" && ltn == "String" {
+        var lstr = "";
+        match lv { CVString { v } => { lstr = v; } _ => {} }
+        var rstr = "";
+        match rv { CVString { v } => { rstr = v; } _ => {} }
+        return CVString { v: lstr + rstr };
+    }
+    if op == "&&" || op == "||" {
+        var lb = false;
+        match lv { CVBool { v } => { lb = v; } _ => { throw ParseError::new("'" + op + "' inside a 'const fn' needs Bool operands, got " + ltn); } }
+        var rb = false;
+        match rv { CVBool { v } => { rb = v; } _ => {} }
+        if op == "&&" { return CVBool { v: lb && rb }; }
+        return CVBool { v: lb || rb };
+    }
+    // Real arithmetic/comparison, one arm per numeric `ConstValue` shape -- `+`/`-`/`*`/`/`/`%`
+    // and `<`/`<=`/`>`/`>=` all real, matching this language's own real operator set for these
+    // four primitive types exactly (see `IDEAS.md`'s own header: no implicit promotion, an
+    // `Int`+`Float` mix is already rejected by the type-match gate right above).
+    match lv {
+        CVInt { v: lvv } => {
+            var rvv = 0;
+            match rv { CVInt { v } => { rvv = v; } _ => {} }
+            return eval_const_arith_int(op, lvv, rvv);
+        }
+        CVLong { v: lvv } => {
+            var rvv = 0 as Long;
+            match rv { CVLong { v } => { rvv = v; } _ => {} }
+            return eval_const_arith_long(op, lvv, rvv);
+        }
+        CVFloat { v: lvv } => {
+            var rvv = 0.0f;
+            match rv { CVFloat { v } => { rvv = v; } _ => {} }
+            return eval_const_arith_float(op, lvv, rvv);
+        }
+        CVDouble { v: lvv } => {
+            var rvv = 0.0;
+            match rv { CVDouble { v } => { rvv = v; } _ => {} }
+            return eval_const_arith_double(op, lvv, rvv);
+        }
+        _ => {
+            throw ParseError::new("'" + op + "' isn't a legal operator inside a 'const fn' for " + ltn + " operands");
+        }
+    }
+}
+
+fn eval_const_arith_int(op: String, l: Int, r: Int) -> ConstValue {
+    if op == "+" { return CVInt { v: l + r }; }
+    if op == "-" { return CVInt { v: l - r }; }
+    if op == "*" { return CVInt { v: l * r }; }
+    if op == "/" { return CVInt { v: l / r }; }
+    if op == "%" { return CVInt { v: l % r }; }
+    if op == "<" { return CVBool { v: l < r }; }
+    if op == "<=" { return CVBool { v: l <= r }; }
+    if op == ">" { return CVBool { v: l > r }; }
+    if op == ">=" { return CVBool { v: l >= r }; }
+    throw ParseError::new("'" + op + "' isn't a legal operator inside a 'const fn' for Int operands");
+}
+
+fn eval_const_arith_long(op: String, l: Long, r: Long) -> ConstValue {
+    if op == "+" { return CVLong { v: l + r }; }
+    if op == "-" { return CVLong { v: l - r }; }
+    if op == "*" { return CVLong { v: l * r }; }
+    if op == "/" { return CVLong { v: l / r }; }
+    if op == "%" { return CVLong { v: l % r }; }
+    if op == "<" { return CVBool { v: l < r }; }
+    if op == "<=" { return CVBool { v: l <= r }; }
+    if op == ">" { return CVBool { v: l > r }; }
+    if op == ">=" { return CVBool { v: l >= r }; }
+    throw ParseError::new("'" + op + "' isn't a legal operator inside a 'const fn' for Long operands");
+}
+
+fn eval_const_arith_float(op: String, l: Float, r: Float) -> ConstValue {
+    if op == "+" { return CVFloat { v: l + r }; }
+    if op == "-" { return CVFloat { v: l - r }; }
+    if op == "*" { return CVFloat { v: l * r }; }
+    if op == "/" { return CVFloat { v: l / r }; }
+    if op == "%" { return CVFloat { v: l % r }; }
+    if op == "<" { return CVBool { v: l < r }; }
+    if op == "<=" { return CVBool { v: l <= r }; }
+    if op == ">" { return CVBool { v: l > r }; }
+    if op == ">=" { return CVBool { v: l >= r }; }
+    throw ParseError::new("'" + op + "' isn't a legal operator inside a 'const fn' for Float operands");
+}
+
+fn eval_const_arith_double(op: String, l: Double, r: Double) -> ConstValue {
+    if op == "+" { return CVDouble { v: l + r }; }
+    if op == "-" { return CVDouble { v: l - r }; }
+    if op == "*" { return CVDouble { v: l * r }; }
+    if op == "/" { return CVDouble { v: l / r }; }
+    if op == "%" { return CVDouble { v: l % r }; }
+    if op == "<" { return CVBool { v: l < r }; }
+    if op == "<=" { return CVBool { v: l <= r }; }
+    if op == ">" { return CVBool { v: l > r }; }
+    if op == ">=" { return CVBool { v: l >= r }; }
+    throw ParseError::new("'" + op + "' isn't a legal operator inside a 'const fn' for Double operands");
+}
+
+// Walks a `const fn`'s own body statement-by-statement, `Let`-bindings extending the SAME env a
+// `Call` seeded with its own arguments, `If` real-branching, stopping and returning `Some(value)`
+// the moment a `Return` is reached -- no loops at all this v1 (see this whole section's own
+// header for why), so `While`/`For`/`Match`/`Try`/`Break`/`Continue` are all real, named compile
+// errors instead of being silently skipped.
+// Returns `Option<Expr>`, NOT `Option<ConstValue>` -- same `Vec$ConstValue`-shaped monomorphization
+// gap this whole section's own header already found for `Vec<ConstValue>`, just for `Option<T>`
+// instead of `Vec<T>` this time (`Option$ConstValue` failed to load the identical way). `Expr` is
+// already a proven-safe generic argument everywhere else in this compiler (`Return.value` is a
+// real `Option<Expr>` in `Ast.hc` itself) -- callers convert back via `expr_to_const_value` at the
+// point of use, same as every other env-storage site in this file already does.
+fn eval_const_stmts(ss: &Vec<Stmt>, env_names: &mut Vec<String>, env_values: &mut Vec<Expr>, const_fns: &Vec<FnDecl>, depth: Int) -> Option<Expr> {
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Let { name, mutable, init, declared_type, line } => {
+                let v = eval_const_expr(&init, env_names, env_values, const_fns, depth);
+                env_names.push(name);
+                env_values.push(const_value_to_expr(v));
+            }
+            ExprStmt { expr, line } => {
+                eval_const_expr(&expr, env_names, env_values, const_fns, depth);
+            }
+            Return { value, line } => {
+                match value {
+                    Some { value: v } => { return Some { value: const_value_to_expr(eval_const_expr(&v, env_names, env_values, const_fns, depth)) }; }
+                    None => { throw ParseError::new("'return;' with no value isn't legal inside a 'const fn' -- every path must return a value"); }
+                }
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                let cv = eval_const_expr(&cond, env_names, env_values, const_fns, depth);
+                var cond_true = false;
+                match cv { CVBool { v } => { cond_true = v; } _ => { throw ParseError::new("'if' inside a 'const fn' needs a Bool condition, got " + const_value_type_name(&cv)); } }
+                if cond_true {
+                    let r = eval_const_stmts(&then_body, env_names, env_values, const_fns, depth);
+                    if let Some { value: rv } = r { return Some { value: rv }; }
+                } else {
+                    match else_body {
+                        Some { value: eb } => {
+                            let r2 = eval_const_stmts(&eb, env_names, env_values, const_fns, depth);
+                            if let Some { value: rv2 } = r2 { return Some { value: rv2 }; }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            _ => {
+                throw ParseError::new("this statement isn't legal inside a 'const fn' -- only 'let', 'if', and 'return' are (no loops, no 'match', no 'try')");
+            }
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+
+// Whole-program substitution: replaces every `Ident{name}` matching a `const`'s own declared name
+// with its already-evaluated literal value, everywhere in the program -- mirrors `Checker.hotc`'s
+// own `subst_expr`/`subst_stmt` (generic type-parameter substitution) SHAPE exactly, one arm per
+// real `Expr`/`Stmt` variant, just swapping the substitution rule itself (const name -> literal,
+// instead of type-param name -> concrete type argument).
+fn fold_const_expr(e: Expr, names: &Vec<String>, values: &Vec<Expr>) -> Expr {
+    match e {
+        IntLit { value } => { return IntLit { value: value }; }
+        FloatLit { text } => { return FloatLit { text: text }; }
+        DoubleLit { text } => { return DoubleLit { text: text }; }
+        LongLit { text } => { return LongLit { text: text }; }
+        CharLit { value } => { return CharLit { value: value }; }
+        StringLit { value } => { return StringLit { value: value }; }
+        StringInterp { literals, exprs } => { return StringInterp { literals: literals, exprs: fold_const_expr_list(exprs, names, values) }; }
+        BoolLit { value } => { return BoolLit { value: value }; }
+        Ident { name } => {
+            var i = 0;
+            while i < names.length() {
+                if names.get(i) == name { return values.get(i); }
+                i = i + 1;
+            }
+            return Ident { name: name };
+        }
+        Binary { op, left, right } => { return Binary { op: op, left: fold_const_expr(left, names, values), right: fold_const_expr(right, names, values) }; }
+        Unary { op, expr } => { return Unary { op: op, expr: fold_const_expr(expr, names, values) }; }
+        Call { callee, args } => { return Call { callee: callee, args: fold_const_expr_list(args, names, values) }; }
+        FieldAccess { obj, field } => { return FieldAccess { obj: fold_const_expr(obj, names, values), field: field }; }
+        MethodCall { recv, method, args } => { return MethodCall { recv: fold_const_expr(recv, names, values), method: method, args: fold_const_expr_list(args, names, values) }; }
+        Assign { name, value } => { return Assign { name: name, value: fold_const_expr(value, names, values) }; }
+        FieldAssign { obj, field, value } => { return FieldAssign { obj: fold_const_expr(obj, names, values), field: field, value: fold_const_expr(value, names, values) }; }
+        StructLit { name, field_names, field_values, generic_base } => { return StructLit { name: name, field_names: field_names, field_values: fold_const_expr_list(field_values, names, values), generic_base: generic_base }; }
+        ArrayLit { elements } => { return ArrayLit { elements: fold_const_expr_list(elements, names, values) }; }
+        ArrayRepeat { value, count } => { return ArrayRepeat { value: fold_const_expr(value, names, values), count: fold_const_expr(count, names, values) }; }
+        ArenaNew { struct_name, count } => { return ArenaNew { struct_name: struct_name, count: fold_const_expr(count, names, values) }; }
+        Index { arr, index } => { return Index { arr: fold_const_expr(arr, names, values), index: fold_const_expr(index, names, values) }; }
+        IndexAssign { arr, index, value } => { return IndexAssign { arr: fold_const_expr(arr, names, values), index: fold_const_expr(index, names, values), value: fold_const_expr(value, names, values) }; }
+        Slice { arr, start, end, inclusive } => { return Slice { arr: fold_const_expr(arr, names, values), start: fold_const_expr(start, names, values), end: fold_const_expr(end, names, values), inclusive: inclusive }; }
+        IndexFieldGet { arr_name, index, field } => { return IndexFieldGet { arr_name: arr_name, index: fold_const_expr(index, names, values), field: field }; }
+        IndexFieldSet { arr_name, index, field, value } => { return IndexFieldSet { arr_name: arr_name, index: fold_const_expr(index, names, values), field: field, value: fold_const_expr(value, names, values) }; }
+        StaticCall { type_name, method, args } => { return StaticCall { type_name: type_name, method: method, args: fold_const_expr_list(args, names, values) }; }
+        ExternStaticFieldGet { type_name, field } => { return ExternStaticFieldGet { type_name: type_name, field: field }; }
+        ExternStaticFieldSet { type_name, field, value } => { return ExternStaticFieldSet { type_name: type_name, field: field, value: fold_const_expr(value, names, values) }; }
+        Cast { expr, target_type } => { return Cast { expr: fold_const_expr(expr, names, values), target_type: target_type }; }
+        IsCheck { expr, target_type } => { return IsCheck { expr: fold_const_expr(expr, names, values), target_type: target_type }; }
+        Lambda { params, body } => { return Lambda { params: params, body: fold_const_expr(body, names, values) }; }
+        TryOp { expr } => { return TryOp { expr: fold_const_expr(expr, names, values) }; }
+        NamedArg { name, value } => { return NamedArg { name: name, value: fold_const_expr(value, names, values) }; }
+        NullLit => { return NullLit; }
+        SafeCall { recv, method, args } => { return SafeCall { recv: fold_const_expr(recv, names, values), method: method, args: fold_const_expr_list(args, names, values) }; }
+        SafeFieldAccess { recv, field } => { return SafeFieldAccess { recv: fold_const_expr(recv, names, values), field: field }; }
+        Elvis { left, right } => { return Elvis { left: fold_const_expr(left, names, values), right: fold_const_expr(right, names, values) }; }
+        Comprehension { result_expr, var_name, iter_expr, cond } => {
+            var new_cond = none_expr_cg();
+            match cond {
+                Some { value: c } => { new_cond = some_expr_cg(fold_const_expr(c, names, values)); }
+                None => {}
+            }
+            return Comprehension { result_expr: fold_const_expr(result_expr, names, values), var_name: var_name, iter_expr: fold_const_expr(iter_expr, names, values), cond: new_cond };
+        }
+    }
+}
+
+fn fold_const_expr_list(es: Vec<Expr>, names: &Vec<String>, values: &Vec<Expr>) -> Vec<Expr> {
+    var out = empty_expr_vec_cg();
+    var i = 0;
+    while i < es.length() {
+        out.push(fold_const_expr(es.get(i), names, values));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn fold_const_stmt(s: Stmt, names: &Vec<String>, values: &Vec<Expr>) -> Stmt {
+    match s {
+        Let { name, mutable, init, declared_type, line } => { return Let { name: name, mutable: mutable, init: fold_const_expr(init, names, values), declared_type: declared_type, line: line }; }
+        ExprStmt { expr, line } => { return ExprStmt { expr: fold_const_expr(expr, names, values), line: line }; }
+        Return { value, line } => {
+            var new_val = none_expr_cg();
+            match value {
+                Some { value: v } => { new_val = some_expr_cg(fold_const_expr(v, names, values)); }
+                None => {}
+            }
+            return Return { value: new_val, line: line };
+        }
+        If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+            var new_else = none_stmt_list_cg();
+            match else_body {
+                Some { value: eb } => { new_else = some_stmt_list_cg(fold_const_stmt_list(eb, names, values)); }
+                None => {}
+            }
+            return If { cond: fold_const_expr(cond, names, values), then_body: fold_const_stmt_list(then_body, names, values), else_body: new_else, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq };
+        }
+        While { cond, body, line } => { return While { cond: fold_const_expr(cond, names, values), body: fold_const_stmt_list(body, names, values), line: line }; }
+        For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+            return For { var_name: var_name, is_range: is_range, range_start: fold_const_expr(range_start, names, values), range_end: fold_const_expr(range_end, names, values), inclusive: inclusive, arr_expr: fold_const_expr(arr_expr, names, values), body: fold_const_stmt_list(body, names, values), line: line };
+        }
+        Match { subject, arms, line } => { return Match { subject: fold_const_expr(subject, names, values), arms: fold_const_arm_list(arms, names, values), line: line }; }
+        Throw { value, line } => { return Throw { value: fold_const_expr(value, names, values), line: line }; }
+        Break { line } => { return Break { line: line }; }
+        Continue { line } => { return Continue { line: line }; }
+        Try { try_block, catches, line } => { return Try { try_block: fold_const_stmt_list(try_block, names, values), catches: fold_const_catches(catches, names, values), line: line }; }
+    }
+}
+
+fn fold_const_stmt_list(ss: Vec<Stmt>, names: &Vec<String>, values: &Vec<Expr>) -> Vec<Stmt> {
+    var out = empty_stmt_vec2();
+    var i = 0;
+    while i < ss.length() {
+        out.push(fold_const_stmt(ss.get(i), names, values));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn fold_const_catches(cs: Vec<CatchClause>, names: &Vec<String>, values: &Vec<Expr>) -> Vec<CatchClause> {
+    var out = empty_catchclause_vec_driver();
+    var i = 0;
+    while i < cs.length() {
+        let c = cs.get(i);
+        out.push(CatchClause { catch_var: c.catch_var, catch_type: c.catch_type, catch_block: fold_const_stmt_list(c.catch_block, names, values) });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn empty_catchclause_vec_driver() -> Vec<CatchClause> {
+    var v = vec_of(CatchClause { catch_var: "_", catch_type: "_", catch_block: empty_stmt_vec2() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn fold_const_arm_list(arms: Vec<MatchArm>, names: &Vec<String>, values: &Vec<Expr>) -> Vec<MatchArm> {
+    var out = empty_matcharm_vec_driver();
+    var i = 0;
+    while i < arms.length() {
+        let a = arms.get(i);
+        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: fold_const_stmt_list(a.body, names, values), is_literal: a.is_literal, literal: fold_const_expr(a.literal, names, values), is_positional: a.is_positional });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn empty_matcharm_vec_driver() -> Vec<MatchArm> {
+    var v = vec_of(MatchArm { variant_name: "_", field_names: empty_str_vec2(), bind_names: empty_str_vec2(), body: empty_stmt_vec2(), is_literal: false, literal: IntLit { value: 0 }, is_positional: false });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn fold_const_fns(fns: Vec<FnDecl>, names: &Vec<String>, values: &Vec<Expr>) -> Vec<FnDecl> {
+    var out = empty_fn_decl_vec2();
+    var i = 0;
+    while i < fns.length() {
+        let f = fns.get(i);
+        out.push(FnDecl { name: f.name, params: f.params, ret_type: f.ret_type, body: fold_const_stmt_list(f.body, names, values), type_param: f.type_param, type_bounds: f.type_bounds, self_is_mut: f.self_is_mut, type_param2: f.type_param2, type_bounds2: f.type_bounds2 });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn fold_const_impls(impls: Vec<ImplDecl>, names: &Vec<String>, values: &Vec<Expr>) -> Vec<ImplDecl> {
+    var out = empty_impl_decl_vec_driver();
+    var i = 0;
+    while i < impls.length() {
+        let im = impls.get(i);
+        out.push(ImplDecl { struct_name: im.struct_name, methods: fold_const_fns(im.methods, names, values), static_methods: fold_const_fns(im.static_methods, names, values), interface_name: im.interface_name, delegate_field: im.delegate_field });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn empty_impl_decl_vec_driver() -> Vec<ImplDecl> {
+    var v = vec_of(ImplDecl { struct_name: "_", methods: empty_fn_decl_vec2(), static_methods: empty_fn_decl_vec2(), interface_name: none_string2(), delegate_field: none_string2() });
+    return Vec { data: v.data, len: 0 };
+}
+
+fn fold_const_extend_decls(ds: Vec<ExtendDecl>, names: &Vec<String>, values: &Vec<Expr>) -> Vec<ExtendDecl> {
+    var out = empty_extend_decl_vec_driver();
+    var i = 0;
+    while i < ds.length() {
+        let d = ds.get(i);
+        out.push(ExtendDecl { target: d.target, methods: fold_const_fns(d.methods, names, values) });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn empty_extend_decl_vec_driver() -> Vec<ExtendDecl> {
+    var v = vec_of(ExtendDecl { target: "_", methods: empty_fn_decl_vec2() });
+    return Vec { data: v.data, len: 0 };
+}
+
+// Evaluates every `const NAME: Type = expr;` once (`Driver.hotc`'s own `eval_const_expr`,
+// declaration order -- a LATER `const` can reference an EARLIER one, since each one's own
+// literal replacement already happened by the time the next one is evaluated), then rewrites the
+// WHOLE program (every top-level fn, every impl method/static method, every `extend` method --
+// everywhere a real fn BODY exists) so every reference to `NAME` becomes that literal directly.
+// Real, disclosed scope cut: a `const`'s own value can't be referenced from a STRUCT FIELD
+// DEFAULT, an array SIZE, or another `const`'s own DECLARED TYPE -- only from ordinary fn/method
+// BODY code, matching this whole feature's own "ship the useful subset" framing. `const_fns`/
+// `const_names`/`const_types`/`const_inits` are always empty by the time this returns -- neither
+// ever reaches `Checker.hotc`/`Codegen.hotc` at all.
+pub fn fold_consts(prog: Program) -> Program {
+    if prog.const_names.length() == 0 { return prog; }
+    var names = empty_str_vec2();
+    var values = empty_expr_vec_cg();
+    var i = 0;
+    while i < prog.const_names.length() {
+        // `fold_const_expr` first, so a LATER `const`'s own init referencing an EARLIER one
+        // (`const B: Int = A + 1;`) already has `Ident{"A"}` replaced by `A`'s own literal value
+        // before evaluation ever runs -- `eval_const_expr`'s own `env_names`/`env_values` here are
+        // therefore always empty: a top-level `const` init takes no params of its own, and by this
+        // point no reference to an EARLIER const remains unresolved either.
+        let init_folded = fold_const_expr(prog.const_inits.get(i), &names, &values);
+        var empty_env_names = empty_str_vec2();
+        var empty_env_values = empty_expr_vec_cg();
+        let cv = eval_const_expr(&init_folded, &empty_env_names, &empty_env_values, &prog.const_fns, 0);
+        names.push(prog.const_names.get(i));
+        values.push(const_value_to_expr(cv));
+        i = i + 1;
+    }
+    return Program {
+        fns: fold_const_fns(prog.fns, &names, &values),
+        structs: prog.structs,
+        impls: fold_const_impls(prog.impls, &names, &values),
+        enums: prog.enums,
+        externs: prog.externs,
+        statics: prog.statics,
+        interfaces: prog.interfaces,
+        struct_annotation_names: prog.struct_annotation_names,
+        struct_annotation_data: prog.struct_annotation_data,
+        fn_annotation_names: prog.fn_annotation_names,
+        fn_annotation_data: prog.fn_annotation_data,
+        extend_decls: fold_const_extend_decls(prog.extend_decls, &names, &values),
+        must_use_fn_names: prog.must_use_fn_names,
+        dev_fn_names: prog.dev_fn_names,
+        deterministic_fn_names: prog.deterministic_fn_names,
+        struct_doc_names: prog.struct_doc_names,
+        struct_doc_data: prog.struct_doc_data,
+        fn_doc_names: prog.fn_doc_names,
+        fn_doc_data: prog.fn_doc_data,
+        uses: prog.uses,
+        sendable_struct_names: prog.sendable_struct_names,
+        components: prog.components,
+        systems: prog.systems,
+        resources: prog.resources,
+        private_type_names: prog.private_type_names,
+        pub_struct_names: prog.pub_struct_names,
+        pub_enum_names: prog.pub_enum_names,
+        pub_interface_names: prog.pub_interface_names,
+        pub_fn_names: prog.pub_fn_names,
+        pub_static_names: prog.pub_static_names,
+        const_fns: empty_fn_decl_vec2(),
+        const_names: empty_str_vec2(),
+        const_types: empty_str_vec2(),
+        const_inits: empty_expr_vec_cg(),
+    };
 }
 
 pub fn stdlib_topic_path(topic: String) -> String {

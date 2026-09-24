@@ -4487,6 +4487,25 @@ internal application. Left alone, documented, not worth a third blind
 attempt at outguessing JitPack's own undocumented internal packaging
 heuristics for a cosmetic, non-fatal warning.
 
+## Bounded compile-time evaluation (`const fn`)
+
+**Shipped, 2026-09-24.** See `IDEAS.md`'s own "Bounded compile-time evaluation (`const fn`)" entry
+for the full design, disclosed scope, and the real `Vec<T>`/`Option<T>` monomorphization gap found
+building it. The short version:
+
+```
+const fn double_it(x: Int) -> Int { return x * 2; }
+const LEVEL_COUNT: Int = double_it(2) + 1;   // 5, computed by the COMPILER itself
+```
+
+A `const fn` is a genuinely SEPARATE execution mode inside `Driver.hotc` (`eval_const_expr`/
+`eval_const_stmts`, a small tree-walking interpreter over a deliberately narrow subset: literals,
+matching-type arithmetic, `let`/`if`/`return`, and calls to other `const fn`s only) — it never
+reaches `Checker.hotc`/`Codegen.hotc` as a real, compiled method at all. A `const NAME: Type =
+expr;` is evaluated once and substituted as a literal everywhere `NAME` is referenced in ordinary
+code (`fold_consts`, mirroring `Checker.hotc`'s own generic-substitution walkers) — no `static`
+field, no `<clinit>` entry, genuinely zero runtime cost. See `examples/const_fn.hotc`.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/
