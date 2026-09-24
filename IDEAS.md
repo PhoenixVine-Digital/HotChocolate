@@ -864,8 +864,24 @@ where `check_struct_lit`'s own `expected` was read through the SAME normalizing 
 extension needed to add — meaning the ranged annotation was already stripped by the time the
 range-check tried to detect it, so it silently accepted every literal, in or out of range,
 letting only the (unaffected) runtime half catch violations. Fixed with a second, raw
-(un-normalized) lookup used only by the construction check. See `examples/numeric_range_bounds.
-hotc`.
+(un-normalized) lookup used only by the construction check.
+
+**Extended again the same day to plain top-level fn PARAMS** (`fn take_damage(amount: Int<0..=
+100>)`), checked the same way at each CALL SITE — a literal argument in range at compile time,
+anything else gets a real runtime check inserted right after that argument's value is pushed for
+the call. `Checker.hotc`'s own `is_arg_type_mismatch` learned the same "ranged-Int is compatible
+with plain Int" rule `check_struct_lit` already needed, so this widened compatibility (though not
+yet the real enforcement) to method/static calls too, for free. Scoped to plain, non-generic
+top-level fn calls only. A real bug found running a real example: the param's own declared type
+string wasn't normalized back to plain `"Int"` for the FN'S OWN BODY (only for the checker's
+struct-field path) — `amount - 1` inside the body itself failed with a real type error ("'-' needs
+matching Int, ... operands, got Int and Int<0..=100>"), fixed in both `Checker.hotc` (the `self.
+vars` registration in `check_fn`/`check_method`) and `Codegen.hotc` (the matching `var_types`
+registration in `gen_fn`/`gen_method`) — the SAME normalization now needed at four spots, not
+just `find_field_type`'s one. See `examples/numeric_range_bounds.hotc`.
+
+Still open: fn RETURN types, assignment to an existing struct field, enum variant fields, and
+negative bounds.
 
 ### `@deterministic` + built-in state replay/rewind
 

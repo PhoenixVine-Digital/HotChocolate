@@ -2546,9 +2546,25 @@ impl CodeGen {
                         i = i + 1;
                     }
                 } else {
+                    // `take_damage(150)` -- see `Checker.hotc`'s own matching `check_call` header.
+                    // Scoped to a real, KNOWN, non-generic top-level fn call only (a generic call's
+                    // own params aren't concrete enough here to carry a fixed ranged-Int type at
+                    // all). Fetched once, outside the loop, rather than re-reading the registry
+                    // per argument.
+                    var call_param_types_r = empty_str_vec4();
+                    if known && !is_generic_call {
+                        let cpt_found_r = self.fn_param_types.get(callee);
+                        if let Some { value: cptv_r } = cpt_found_r { call_param_types_r = cptv_r; }
+                    }
                     var i = 0;
                     while i < argc {
                         let at = self.gen_expr(args.get(i));
+                        if i < call_param_types_r.length() {
+                            let pty_r = call_param_types_r.get(i);
+                            if is_ranged_int_type_name_cg(pty_r) {
+                                self.emit_ranged_int_check(pty_r, "argument " + JString::valueOf(i + 1) + " to '" + callee + "'");
+                            }
+                        }
                         if is_generic_call && i == infer_idx {
                             // `b: Box<T>` -- see `ProgramInfo`'s own header on
                             // `generic_fn_infer_unwrap`: `at` here is the ARG's own real mono name
@@ -5203,7 +5219,14 @@ pub fn gen_fn(cw: &mut ClassWriter2, owner: String, name: String, param_names: V
     var i = 0;
     while i < param_count {
         gen.alloc_slot(param_names.get(i), param_type_names.get(i));
-        gen.var_types.register(param_names.get(i), param_type_names.get(i));
+        // A ranged-Int param's own DECLARED type string still needs its real `alloc_slot`
+        // treatment above (already handled -- `is_ref_type` learned about it), but `var_types`
+        // is this fn body's own type-TRACKING registry for later reads (arithmetic, further
+        // calls, ...) -- normalized to plain `"Int"` here, same reasoning `Checker.hotc`'s own
+        // matching `check_fn`/`check_method` fix uses for `self.vars`.
+        var pty_g = param_type_names.get(i);
+        if is_ranged_int_type_name_cg(pty_g) { pty_g = "Int"; }
+        gen.var_types.register(param_names.get(i), pty_g);
         i = i + 1;
     }
     gen.mv.visitCode();
@@ -5283,7 +5306,11 @@ pub fn gen_method(cw: &mut ClassWriter2, binary_name: String, struct_name: Strin
     var i = 0;
     while i < param_names.length() {
         gen.alloc_slot(param_names.get(i), param_type_names.get(i));
-        gen.var_types.register(param_names.get(i), param_type_names.get(i));
+        // See `gen_fn`'s own identical fix, right above -- `var_types` tracks this method body's
+        // own local READS, normalized back to plain `"Int"` for a ranged param.
+        var pty_g2 = param_type_names.get(i);
+        if is_ranged_int_type_name_cg(pty_g2) { pty_g2 = "Int"; }
+        gen.var_types.register(param_names.get(i), pty_g2);
         i = i + 1;
     }
     gen.mv.visitCode();

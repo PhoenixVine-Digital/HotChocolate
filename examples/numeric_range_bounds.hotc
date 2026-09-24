@@ -4,10 +4,11 @@
 // else -- "only literal-vs-literal arithmetic gets proven statically, everything else gets a
 // runtime check", the defensible simpler first cut that entry's own header explicitly suggests.
 // Also works as a STRUCT FIELD type (`health: Int<0..=100>` -- this entry's own original
-// motivating example), checked the same way at struct-literal construction time. Real, disclosed
-// scope: only a `let`/`var`/struct field, not fn params/return types, and no resulting-range
-// propagation through arithmetic -- a ranged Int is an ordinary Int everywhere else once the
-// check passes (reading a struct field back, arithmetic, comparisons, ...).
+// motivating example) and a plain top-level fn's PARAM type, both checked the same way at their
+// own construction/call boundary. Real, disclosed scope: no fn return types yet, and no
+// resulting-range propagation through arithmetic -- a ranged Int is an ordinary Int everywhere
+// else once the check passes (reading a struct field back or a param inside its own fn body,
+// arithmetic, comparisons, ...).
 
 fn clamp(x: Int, lo: Int, hi: Int) -> Int {
     if x < lo {
@@ -22,6 +23,13 @@ fn clamp(x: Int, lo: Int, hi: Int) -> Int {
 struct Player {
     name: String,
     health: Int<0..=100>,
+}
+
+// A ranged-Int PARAM -- checked at each call site the same way. `amount - 1` inside the body
+// works exactly like plain Int arithmetic (the param is registered as ordinary Int for the
+// body's own type-checking, matching the "behaves as an ordinary Int everywhere else" promise).
+fn take_damage(current: Int, amount: Int<0..=100>) -> Int {
+    return current - amount;
 }
 
 fn main() {
@@ -47,6 +55,11 @@ fn main() {
     // comparisons against it work exactly like any other Int.
     let total = p.health + health;
     print(total);
+
+    // A literal argument -- proven in range at compile time. A computed one (clamp's own
+    // result) gets a real runtime check instead, same split as everywhere else in this file.
+    print(take_damage(p.health, 30));
+    print(take_damage(p.health, clamp(999, 0, 100)));
 
     print("done");
 }

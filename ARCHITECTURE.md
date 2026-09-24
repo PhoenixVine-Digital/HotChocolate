@@ -4694,8 +4694,34 @@ Two real mistakes surfaced building this, both caught by the self-hosting rebuil
 
 Real, disclosed gap left open: only construction (`StructName { field: value }`) is checked --
 assigning to an existing field afterward (`obj.health = 150;`) isn't, and enum variant fields
-(`gen_variant_construct`'s own separate codegen) aren't touched either. See `examples/numeric_
-range_bounds.hotc`.
+(`gen_variant_construct`'s own separate codegen) aren't touched either.
+
+**Extended again the same day to plain top-level fn PARAMS** (`fn take_damage(amount: Int<0..=
+100>)`), checked at each CALL SITE:
+- **`Checker.hotc`'s own `check_call`** gets a matching branch (mirroring `check_struct_lit`'s
+  own exactly) right where it already compares each argument's checked type against the declared
+  param type. `is_arg_type_mismatch` itself learned the "ranged-Int is compatible with plain Int"
+  rule too, which widens compatibility to method/static calls for free (though the real
+  enforcement below is scoped to plain, non-generic top-level fn calls only).
+- **`Codegen.hotc`'s own `Call` codegen** fetches the callee's own declared param types
+  (`self.fn_param_types`, already used for the existing lambda-arg case) and calls `emit_ranged_
+  int_check` right after each argument value is pushed, for whichever params are ranged.
+
+A real bug found running a real example, distinct from the struct-field one: the param's own
+declared type string wasn't normalized back to plain `"Int"` for the FN'S OWN BODY -- only
+`find_field_type` (the struct-field path) got that fix, not the param-registration code path at
+all. `amount - 1` inside `take_damage`'s own body failed with a real type error ("'-' needs
+matching Int, ... operands, got Int and Int<0..=100>"), since ordinary arithmetic type-checking
+compares exact type-name strings. Fixed at FOUR spots total, all needing the identical one-line
+rule: `Checker.hotc`'s own `check_fn`/`check_method` (the `self.vars` registration) and `Codegen.
+hotc`'s own `gen_fn`/`gen_method` (the matching `var_types` registration) -- confirming this
+normalization needs to happen at every point a ranged-Int value crosses from "a declared type
+annotation" to "an ordinary local binding used inside a body," not just the one `find_field_type`
+choke point struct fields happened to have. See `examples/numeric_range_bounds.hotc`.
+
+Still open: fn RETURN types (no existing "check return value against declared return type"
+machinery to hook into at all, unlike params/fields, which both already had SOME type-checking to
+extend), field assignment, enum variant fields, negative bounds.
 
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 

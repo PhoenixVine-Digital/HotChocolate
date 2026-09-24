@@ -3815,6 +3815,34 @@ impl TyChecker {
                     let gn = ty_name(got);
                     if en != "?" && gn != "?" && self.is_arg_type_mismatch(en, gn) {
                         self.error("argument " + JString::valueOf(i + 1) + " to '" + callee + "' expects " + en + ", got " + gn);
+                    } else if is_ranged_int_type_chk(en) && gn == "Int" {
+                        // `take_damage(150)` -- a literal argument against a ranged-Int param is
+                        // provable at COMPILE time (same split `check_struct_lit`'s own matching
+                        // branch already established); anything else (a variable, a computed
+                        // expression) is trusted here and gets a real RUNTIME check instead,
+                        // inserted by `Codegen.hotc`'s own mirrored call-argument codegen right
+                        // after each argument value is pushed for the call. Scoped to PLAIN
+                        // top-level fn calls only this pass -- method/static calls aren't wired
+                        // up with the runtime half yet, even though `is_arg_type_mismatch`'s own
+                        // widened compatibility rule (see its own header) already makes them
+                        // compile cleanly.
+                        match args.get(i) {
+                            IntLit { value } => {
+                                let alo = ranged_int_lo_chk(en);
+                                let ahi = ranged_int_hi_chk(en);
+                                let aincl = ranged_int_inclusive_chk(en);
+                                var aout = value < alo;
+                                if aincl {
+                                    if value > ahi { aout = true; }
+                                } else {
+                                    if value >= ahi { aout = true; }
+                                }
+                                if aout {
+                                    self.error("argument " + JString::valueOf(i + 1) + " to '" + callee + "' = " + JString::valueOf(value) + " is out of the declared range " + en);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     var arg_is_ref = true;
                     if i < is_ref_list.length() { arg_is_ref = is_ref_list.get(i); }
@@ -4060,6 +4088,17 @@ impl TyChecker {
     // subtype-to-supertype argument pass).
     fn is_arg_type_mismatch(&mut self, expected: String, got: String) -> Bool {
         if expected == got { return false; }
+        // `fn take_damage(amount: Int<0..=100>)` -- a ranged-Int param's own declared type string
+        // never exact-matches a plain argument's checked `"Int"`, so it needs the same "treat as
+        // compatible" rule `check_struct_lit`'s own matching branch already established for
+        // struct fields (see `IDEAS.md`'s own "Numeric range bounds" entry). Real bounds
+        // enforcement (a literal argument checked at compile time, anything else at runtime)
+        // happens in `check_call`/`Codegen.hotc`'s own mirrored call-argument codegen, NOT here --
+        // this fn only ever answers "is this a real type error", so it can't see the actual
+        // argument EXPRESSION to decide literal-vs-not. Widening this rule through here also
+        // (harmlessly) makes a ranged-Int param compatible for method/static calls too, even
+        // though this pass only wires up the real enforcement for plain top-level fn calls.
+        if is_ranged_int_type_chk(expected) && got == "Int" { return false; }
         // A non-null value where a nullable one is expected is real, legal widening (`Type` ->
         // `Type?`) -- the other direction (`Type?` -> `Type`) is still a mismatch, unchanged: a
         // still-nullable value needs narrowing first, not an implicit conversion here.
@@ -5697,7 +5736,16 @@ impl TyChecker {
         var i = 0;
         while i < f.params.length() {
             let p = f.params.get(i);
-            self.vars.register(p.name, ty_from_name(p.type_name));
+            // A ranged-Int param (`Int<0..=100>`, see `IDEAS.md`'s own "Numeric range bounds"
+            // entry) is registered as plain `"Int"` for the fn/method's OWN body -- same
+            // "behaves as an ordinary Int everywhere else once the check passes" promise `find_
+            // field_type` already keeps for struct fields (real bug found running a real
+            // example: without this, `amount - 1` inside the body itself failed with "'-' needs
+            // matching Int, ... operands, got Int and Int<0..=100>", since ordinary arithmetic
+            // type-checking compares exact type-name strings).
+            var pty = p.type_name;
+            if is_ranged_int_type_chk(pty) { pty = "Int"; }
+            self.vars.register(p.name, ty_from_name(pty));
             self.mark_mut_capable(p.name, p.is_mut_ref);
             i = i + 1;
         }
@@ -5711,7 +5759,16 @@ impl TyChecker {
         var i = 0;
         while i < f.params.length() {
             let p = f.params.get(i);
-            self.vars.register(p.name, ty_from_name(p.type_name));
+            // A ranged-Int param (`Int<0..=100>`, see `IDEAS.md`'s own "Numeric range bounds"
+            // entry) is registered as plain `"Int"` for the fn/method's OWN body -- same
+            // "behaves as an ordinary Int everywhere else once the check passes" promise `find_
+            // field_type` already keeps for struct fields (real bug found running a real
+            // example: without this, `amount - 1` inside the body itself failed with "'-' needs
+            // matching Int, ... operands, got Int and Int<0..=100>", since ordinary arithmetic
+            // type-checking compares exact type-name strings).
+            var pty = p.type_name;
+            if is_ranged_int_type_chk(pty) { pty = "Int"; }
+            self.vars.register(p.name, ty_from_name(pty));
             self.mark_mut_capable(p.name, p.is_mut_ref);
             i = i + 1;
         }
