@@ -1480,47 +1480,70 @@ real `min`/`max`-over-a-struct helper only needs bounded generics, which
 already work correctly, not a macro) — before sinking design time into
 this specifically.
 
-**Status (2026-09-24): a basic v1 built**, deliberately far narrower than the
-"hygienic, AST-level macro" framing above — expression-only, not the general
-`macro_rules!`/`derive` shape:
+**Status (2026-09-24): a basic v1 (expression macros), then extended the same
+day to also cover statement macros** — deliberately far narrower than the
+"hygienic, AST-level macro" framing above, and deliberately staying that way:
+the guiding stance is "reduce boilerplate, but not good for everything," not
+a general `macro_rules!`/`derive` system.
 
 ```
 macro min3(a, b, c) { JMath::min(JMath::min(a, b), c) }
 print(min3!(p1.x, p2.x, 5));
+
+macro report_clamped(label, x, lo, hi) {
+    let clamped = clamp!(x, lo, hi);
+    print(label);
+    print(clamped);
+}
+report_clamped!("first", 999, 0, 10);
 ```
 
-`macro name(p1, p2, ...) { expr }`, invoked `name!(arg1, arg2)`. Real, disclosed
-scope, picked specifically to make this entry's own two hardest open questions
-either moot or trivial rather than actually solving them:
-- **Hygiene is sidestepped, not solved.** A macro body is exactly ONE
-  expression — no `let`, no statement list — so a macro can never introduce a
-  new binding that could capture or collide with anything at the call site.
-  This entry's own header calls hygiene "probably harder than anything the
-  move/borrow checker already does"; the honest answer here is that v1 never
-  faces that problem because it never generates a binding at all, not that it
-  solved it.
-- **Where it plugs into the pipeline: parse time, before the checker ever
-  runs, via real AST substitution — not textual.** `Parser.hotc`'s own
-  `expand_macro` splices the caller's already-PARSED argument `Expr` trees in
-  for every occurrence of the matching param name inside the macro's own
-  pre-parsed body `Expr`, and the result is spliced into the call site as
-  ordinary syntax — indistinguishable to `Checker.hotc`/`Codegen.hotc` from
-  hand-written code. Still not a C-preprocessor: nothing is re-tokenized, so
-  `square!(2 + 3)` expands to `(2 + 3) * (2 + 3)`, never `2 + 3 * 2 + 3`.
-- **Untyped params, declared-before-use, single file.** A macro's params are
-  bare names with no declared type (placeholders in an AST tree, not real
-  function params); a macro must be declared textually earlier in the SAME
-  file than any call site (expansion happens the instant the parser sees
-  `name!(`, so there's no forward-reference pass) — no cross-file visibility
-  yet. A macro can't invoke another macro (or itself) in its own body: the
-  callee wouldn't be registered yet at that point, so it's rejected for free
-  by the same "declared before use" rule, no separate check needed.
-- **Not attempted this pass** (real gaps vs. the fuller design above, not
-  bugs): no `macro_rules!`-style repetition (`$()*`), no statement-list-
-  shaped macro bodies, no macro that generates a `StructDecl`/`FnDecl`/
-  `extern class` block (the doc's own third bullet, "a macro that generates
-  an extern class block", still needs its own registration-ordering design).
-  See `examples/macros.hotc`.
+Two body shapes, told apart by a pure token scan (a bare top-level `;` before
+the closing `}` means a statement list; none means a single expression):
+- **Expression macros** (`macro name(...) { expr }`) — invoked `name!(args)`
+  anywhere a value is expected. Hygiene is sidestepped, not solved: a macro
+  body is exactly one expression, so it can never introduce a binding that
+  could capture or collide with anything at the call site.
+- **Statement macros** (`macro name(...) { stmt1; stmt2; ... }`) — invoked
+  ONLY at statement position (`name!(args);`), spliced directly into the
+  caller's own enclosing block (mirroring how `parallel for`/`sequence`
+  already splice their own desugared statements there). These CAN introduce
+  `let`/`var` bindings, so this shape needed a real answer on hygiene, not
+  just a scope cut around it: every name declared via a TOP-LEVEL `let`/`var`
+  in the macro's own body gets renamed to a fresh gensym (`name +
+  "__mexp" + a per-expansion-site counter`) before splicing, so calling the
+  same statement macro twice in one scope — or a macro-local's name
+  colliding with an unrelated caller-scope local of the same name — doesn't
+  produce two real `let`s of the same name in the same flat scope. Real,
+  disclosed limitation: this is a NAME-based rename across the whole body
+  tree, not real lexical-scope analysis, so a nested `if`/`while`/`for`/`try`
+  inside the same macro body that happens to declare/bind something with the
+  exact same name as one of the macro's own top-level locals would have its
+  own uses affected too — avoidable by not reusing a top-level macro-local's
+  name for an unrelated nested binding in the same body.
+
+Both shapes share the same underlying mechanism — **AST-level substitution,
+not textual.** `Parser.hotc`'s own `expand_macro`/`expand_stmt_macro` splice
+the caller's already-PARSED argument `Expr` trees in for every occurrence of
+the matching param name inside the macro's own pre-parsed body, and the
+result is spliced into the call site as ordinary syntax — indistinguishable
+to `Checker.hotc`/`Codegen.hotc` from hand-written code. Still not a
+C-preprocessor: nothing is re-tokenized, so `square!(2 + 3)` expands to
+`(2 + 3) * (2 + 3)`, never `2 + 3 * 2 + 3`. Untyped params, declared-before-
+use, single file (no cross-file visibility yet): a macro must be declared
+textually earlier in the SAME file than any call site. Self-recursion is
+rejected for free by that same rule (a macro's own name is never registered
+yet while its own body is being parsed) — but calling an EARLIER-declared,
+DIFFERENT macro from inside a later one's body works and composes correctly,
+precisely because expansion is eager and happens once, at the outer macro's
+own declaration (`double_it!(double_it!(y))` inside `quad_it`'s own body
+becomes `quad_it`'s literal stored body `(y * 2) * 2`, substituting only
+`quad_it`'s own `y` at each of ITS OWN call sites).
+
+**Not attempted** (real gaps vs. the fuller design above, not bugs): no
+`macro_rules!`-style repetition (`$()*`), no macro that generates a
+`StructDecl`/`FnDecl`/`extern class` block (the doc's own third bullet still
+needs its own registration-ordering design). See `examples/macros.hotc`.
 
 ### Mixins (patching an existing compiled class's bytecode)
 

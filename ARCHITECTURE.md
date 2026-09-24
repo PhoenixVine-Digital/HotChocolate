@@ -4535,31 +4535,61 @@ code, which uses bare `on`/`on0` as real local variable names; reusing it here w
 same self-hosting hazard, and `IDENT ARROW IDENT SEMI` is already unambiguous inside a dedicated
 `StateName { ... }` block without any leading keyword. See `examples/state_machine.hotc`.
 
-## Basic macros (`macro name(...) { expr }`)
+## Basic macros (`macro name(...) { ... }`)
 
-**Shipped, 2026-09-24.** See `IDEAS.md`'s own "Macros" entry for the full design and the real
-scope cuts made versus the fuller "hygienic AST-level macro" framing that entry originally called
-for. The short version:
+**Shipped, 2026-09-24** (expression macros), **extended the same day** (statement macros +
+hygiene). See `IDEAS.md`'s own "Macros" entry for the full design and the real scope cuts made
+versus the fuller "hygienic AST-level macro" framing that entry originally called for -- the
+guiding stance stayed "reduce boilerplate, but not good for everything," not a general
+`macro_rules!`/`derive` system. The short version:
 
 ```
 macro min3(a, b, c) { JMath::min(JMath::min(a, b), c) }
 print(min3!(p1.x, p2.x, 5));
+
+macro report_clamped(label, x, lo, hi) {
+    let clamped = clamp!(x, lo, hi);
+    print(label);
+    print(clamped);
+}
+report_clamped!("first", 999, 0, 10);
 ```
 
-Entirely a `Parser.hotc`-level feature: `macro_decl` parses and stores each macro's own param
-names and single-expression body (`self.macro_names`/`macro_param_counts`/`macro_param_names`/
-`macro_bodies`, flattened Vecs mirroring `event_decl`'s own established convention); `primary()`
-detects `IDENT BANG LPAREN` and calls `expand_macro`, which looks the name up (declared-before-use
-only -- no forward references), validates the argument count, and returns `subst_macro_expr`'s
-result: the macro's own body `Expr` with every bare `Ident` naming a param replaced by the
-caller's already-parsed argument `Expr` (structurally mirrors `Driver.hotc`'s own `fold_const_expr`
-almost exactly, substituting VALUES via a names/values pair instead of `fold_const_expr`'s constant-
-folding rule). The result splices into the call site as ordinary syntax and flows through
-`Checker.hotc`/`Codegen.hotc` completely normally -- no separate macro-aware code in either file.
-Real, disclosed scope cut that sidesteps macro hygiene rather than solving it: a macro body is
-exactly ONE expression, never a statement list, so a macro can never introduce a new binding that
-could capture or collide with a call-site name -- there's nothing bound to capture in the first
-place. See `examples/macros.hotc`.
+Entirely a `Parser.hotc`-level feature. `macro_decl` parses and stores each macro's own param
+names (`self.macro_names`/`macro_param_counts`/`macro_param_names`, flattened Vecs mirroring
+`event_decl`'s own established convention) plus its body, in one of two shapes told apart by
+`macro_body_is_stmt_list` -- a bracket-depth-aware, non-consuming token scan (same idiom `looks_
+like_index_field_access` already established) that returns true the moment a bare `;` appears at
+depth 0 before the matching closing `}` (conclusive, not a heuristic: a single expression can
+never contain a top-level `;`):
+
+- **Expression macros** (body is one `Expr`, stored in `macro_bodies`) -- `primary()` detects
+  `IDENT BANG LPAREN` anywhere an expression is legal and calls `expand_macro`, which looks the
+  name up (declared-before-use only, via `find_macro_index`), validates the argument count, and
+  returns `subst_macro_expr`'s result: the macro's own body with every bare `Ident` naming a
+  param replaced by the caller's already-parsed argument `Expr` (structurally mirrors `Driver.
+  hotc`'s own `fold_const_expr` almost exactly, substituting VALUES via a names/values pair
+  instead of that fn's constant-folding rule).
+- **Statement macros** (body is `Vec<Stmt>`, stored flattened in `macro_stmt_bodies`/`macro_stmt_
+  counts`, same real "avoid a `Vec<Vec<Stmt>>` struct field" monomorphization-gap workaround
+  `event_field_names` already established) -- `block`'s own per-statement loop detects `IDENT
+  BANG LPAREN` naming an already-declared STATEMENT macro (`is_stmt_macro_ahead`) and calls
+  `expand_stmt_macro`, splicing the resulting `Vec<Stmt>` directly into its own growing list (same
+  shape `parallel_for_stmts`/`sequence_stmts` already use there). Real hygiene, not just a scope
+  cut around it this time: every name the body declares via a TOP-LEVEL `let`/`var` gets renamed
+  to a fresh gensym (`name + "__mexp" + a whole-file, per-expansion-site counter`) via `subst_
+  macro_stmt`'s own rename map before splicing -- the ONLY case that actually needs it, since a
+  NESTED block's own `let` is already scoped by its own `{ }` and can never collide with anything
+  outside it. Verified directly: a macro-local named the same as an unrelated caller-scope
+  variable survives the macro call untouched, and calling the same statement macro twice in one
+  block doesn't collide.
+
+Both shapes flow through `Checker.hotc`/`Codegen.hotc` completely normally after expansion -- no
+separate macro-aware code in either file. An earlier-declared, DIFFERENT macro can be called from
+inside a later macro's own body, and composes correctly, because expansion is eager and happens
+once, at the outer macro's own declaration (verified: `double_it!(double_it!(y))` inside `quad_
+it`'s body becomes `quad_it`'s literal stored body `(y * 2) * 2`). Self-recursion is rejected for
+free by the same declared-before-use rule. See `examples/macros.hotc`.
 
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 

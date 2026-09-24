@@ -149,10 +149,33 @@ pub struct Parser {
     macro_param_counts: Vec<Int>,
     macro_param_names: Vec<String>,
     macro_bodies: Vec<Expr>,
+    // `macro name(...) { stmt1; stmt2; ... }` -- a STATEMENT macro (see `macro_decl`'s own
+    // header for how the two shapes are told apart), invoked ONLY at statement position
+    // (`name!(args);`, spliced directly into the caller's own enclosing block -- see `block`'s
+    // own new pre-check). `macro_is_stmt` is index-aligned with `macro_names` (true for a
+    // statement macro, false for an expression one -- `macro_bodies.get(i)` is a meaningless
+    // placeholder `Expr` whenever this is true, never read). `macro_stmt_counts` is index-aligned
+    // with `macro_names` too (0 for an expression macro); `macro_stmt_bodies` is FLATTENED across
+    // every statement macro's own body (same real "avoid a `Vec<Vec<Stmt>>` struct field"
+    // monomorphization-gap workaround `event_field_names`/`macro_param_names` already establish)
+    // -- `expand_stmt_macro` computes each one's own slice offset the same way `expand_macro`
+    // already does for `macro_param_names`. `macro_expansion_counter` is a single, whole-file
+    // counter (never reset, never per-macro) handing out a fresh gensym suffix to every
+    // STATEMENT-macro expansion SITE -- see `expand_stmt_macro`'s own header on why only a
+    // statement macro's own TOP-LEVEL `let`/`var` bindings need this at all.
+    macro_is_stmt: Vec<Bool>,
+    macro_stmt_counts: Vec<Int>,
+    macro_stmt_bodies: Vec<Stmt>,
+    macro_expansion_counter: Int,
 }
 
 pub fn parser_new(tokens: Vec<Token>) -> Parser {
-    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false, event_names: empty_str_vec2(), event_field_counts: empty_int_vec_ev(), event_field_names: empty_str_vec2(), event_field_types: empty_str_vec2(), event_handler_counter: 0, handler_event_names: empty_str_vec2(), handler_fn_names: empty_str_vec2(), pending_event_fns: empty_fn_decl_vec(), macro_names: empty_str_vec2(), macro_param_counts: empty_int_vec_ev(), macro_param_names: empty_str_vec2(), macro_bodies: empty_expr_vec() };
+    return Parser { tokens: tokens, pos: 0, no_struct_lit: false, current_module: "", parallel_for_counter: 0, needs_phoenix: false, needs_collections: false, sequence_counter: 0, needs_sequence: false, pending_seq_fns: empty_fn_decl_vec(), tunable_names: empty_str_vec2(), needs_contracts: false, event_names: empty_str_vec2(), event_field_counts: empty_int_vec_ev(), event_field_names: empty_str_vec2(), event_field_types: empty_str_vec2(), event_handler_counter: 0, handler_event_names: empty_str_vec2(), handler_fn_names: empty_str_vec2(), pending_event_fns: empty_fn_decl_vec(), macro_names: empty_str_vec2(), macro_param_counts: empty_int_vec_ev(), macro_param_names: empty_str_vec2(), macro_bodies: empty_expr_vec(), macro_is_stmt: empty_bool_vec_macro(), macro_stmt_counts: empty_int_vec_ev(), macro_stmt_bodies: empty_stmt_vec(), macro_expansion_counter: 0 };
+}
+
+pub fn empty_bool_vec_macro() -> Vec<Bool> {
+    var v = vec_of(false);
+    return Vec { data: v.data, len: 0 };
 }
 
 impl Parser {
@@ -1542,42 +1565,50 @@ impl Parser {
         return StateMachineResult { state_enum: state_enum, event_enum: event_enum, transition_fn: transition_fn };
     }
 
-    // `macro name(p1, p2, ...) { expr }`, invoked `name!(arg1, arg2)` -- see `IDEAS.md`'s own
+    // `macro name(p1, p2, ...) { ... }`, invoked `name!(arg1, arg2)` -- see `IDEAS.md`'s own
     // "Macros" entry for the full design discussion. Real, disclosed scope, tight on purpose
     // (that entry's own header explicitly warns this is "real design work needed... not a small
-    // addition"):
+    // addition"). Two body shapes, told apart by `macro_body_is_stmt_list` (see its own header):
     //
-    // - **Expression-only.** A macro's body is exactly ONE expression (parsed via `self.
-    //   expression()`, same as any other expr), not a statement list -- no macro-introduced
-    //   `let` bindings are possible, which sidesteps the classic macro-hygiene "does a macro-
-    //   introduced name accidentally capture/collide with a call-site name" problem entirely,
-    //   rather than solving it: a macro with an expression-only body introduces NO new bindings
-    //   at all, so there's nothing that could capture anything. `IDEAS.md`'s own header calls
-    //   hygiene "probably harder than anything the move/borrow checker already does" -- this is
-    //   the scope cut that makes it a non-issue for v1, at the real cost of not covering a
-    //   statement-list-shaped macro (no `macro_rules!`-style repetition, no multi-statement
-    //   bodies).
-    // - **AST-level substitution, not textual.** `expand_macro` splices each CALLER-supplied,
-    //   already-PARSED argument `Expr` in for every bare `Ident` in the macro's own pre-parsed
-    //   body that names one of its declared params (see `subst_macro_expr`'s own header) --
-    //   never re-tokenizes/re-parses text. The resulting `Expr` tree is spliced directly into
-    //   the call site and flows through `Checker.hotc`/`Codegen.hotc` completely normally, same
-    //   as if the caller had hand-written the expanded form -- satisfies `IDEAS.md`'s own "must
-    //   generate real AST nodes the checker still runs over normally" requirement, not a
-    //   preprocessor bypassing it.
-    // - **Untyped params.** A macro's own params have no declared types (just bare names) --
-    //   they're placeholders in an AST tree, not real typed function parameters; whatever type
-    //   each argument expression actually has is discovered when the EXPANDED call site is
-    //   checked, same as it would be for hand-written code.
-    // - **Declared-before-use, single file.** Expansion happens at PARSE time (`expand_macro` is
-    //   called the moment `primary()` sees `name!(`), so a macro must be declared textually
-    //   earlier in the SAME file than any call site -- no forward references, no cross-file
-    //   visibility of any kind yet (real, disclosed narrower scope than `pub`/`priv`'s own
-    //   real cross-file visibility rules). A macro invoking ANOTHER macro (or itself) inside its
-    //   own body is naturally rejected by this same rule: the callee wouldn't be in `self.
-    //   macro_names` yet while THIS macro's own body is being parsed (or, for self-recursion,
-    //   ever) -- `expand_macro`'s own "no macro named ..." error covers it for free, no separate
-    //   check needed.
+    // - **Expression macros** (`macro name(...) { expr }`, body is exactly ONE expression) --
+    //   invoked ANYWHERE an expression is legal (`primary()`'s own `IDENT BANG LPAREN` check).
+    //   No macro-introduced `let` bindings are possible, which sidesteps the classic macro-
+    //   hygiene "does a macro-introduced name accidentally capture/collide with a call-site name"
+    //   problem entirely, rather than solving it: an expression-only body introduces NO new
+    //   bindings at all, so there's nothing that could capture anything.
+    // - **Statement macros** (`macro name(...) { stmt1; stmt2; ... }`, body is one or more
+    //   statements) -- invoked ONLY at statement position (`name!(args);`, spliced directly into
+    //   the caller's own enclosing block by `block`'s own pre-check, mirroring how `parallel
+    //   for`/`sequence` already splice their own desugared statements there). A statement body
+    //   CAN introduce `let`/`var` bindings, so THIS shape does need real hygiene -- see
+    //   `expand_stmt_macro`'s own header for exactly how much (and how little) it does.
+    //
+    // Both shapes share the same underlying mechanism: **AST-level substitution, not textual.**
+    // `expand_macro`/`expand_stmt_macro` splice each CALLER-supplied, already-PARSED argument
+    // `Expr` in for every bare `Ident` in the macro's own pre-parsed body that names one of its
+    // declared params (`subst_macro_expr`/`subst_macro_stmt`) -- never re-tokenizes/re-parses
+    // text. The result flows through `Checker.hotc`/`Codegen.hotc` completely normally, same as
+    // if the caller had hand-written the expanded form -- satisfies `IDEAS.md`'s own "must
+    // generate real AST nodes the checker still runs over normally" requirement, not a
+    // preprocessor bypassing it. Params are untyped (bare names, no declared type -- placeholders
+    // in an AST tree, not real typed fn params); whatever type each argument expression actually
+    // has is discovered when the EXPANDED call site is checked, same as hand-written code.
+    // Declared-before-use, single file: expansion happens at PARSE time, so a macro must be
+    // declared textually earlier in the SAME file than any call site (real, disclosed narrower
+    // scope than `pub`/`priv`'s own real cross-file visibility rules). This same rule rejects
+    // SELF-recursion for free (a macro's own name is never in `self.macro_names` yet while its
+    // OWN body is being parsed, and never becomes so) -- but calling an EARLIER-declared,
+    // DIFFERENT macro from inside a later one's body works, and composes correctly, precisely
+    // BECAUSE expansion is eager: `macro double_it(x) { x * 2 } macro quad_it(y) { double_it!
+    // (double_it!(y)) }` expands the inner `double_it!(y)` the moment `quad_it`'s own body is
+    // parsed (substituting `x` -> the literal `Ident { name: "y" }`, `quad_it`'s own still-
+    // unsubstituted param), then the outer one the same way, leaving `quad_it`'s STORED body as
+    // `(y * 2) * 2` -- so `quad_it!(5)` only has to substitute its own `y` -> `5` at its own call
+    // site, same as any other expression macro, and gets `20`. Real, disclosed limitation this
+    // still leaves: since expansion is eager and per-DECLARATION (not per-call-site), the inner
+    // macro's OWN argument count/shape is checked once, when the outer macro is declared, using
+    // whatever the outer macro's body happens to write there -- there's no way to defer that to
+    // each of the outer macro's own call sites.
     fn macro_decl(&mut self) {
         self.expect(MACRO);
         let name = self.expect(IDENT).text;
@@ -1594,8 +1625,6 @@ impl Parser {
         }
         self.expect(RPAREN);
         self.expect(LBRACE);
-        let body = self.expression();
-        self.expect(RBRACE);
         self.macro_names.push(name);
         self.macro_param_counts.push(params.length());
         var pi = 0;
@@ -1603,24 +1632,117 @@ impl Parser {
             self.macro_param_names.push(params.get(pi));
             pi = pi + 1;
         }
-        self.macro_bodies.push(body);
+        if self.check(RBRACE) {
+            // An empty `macro name(...) {}` body has no expression to parse -- treated as a
+            // (trivial, zero-statement) statement macro rather than a real parse error, since
+            // there's no meaningful single `Expr` an empty body could mean.
+            self.advance();
+            self.macro_is_stmt.push(true);
+            self.macro_bodies.push(IntLit { value: 0 });
+            self.macro_stmt_counts.push(0);
+            return;
+        }
+        if self.macro_body_is_stmt_list() {
+            var body_stmts = empty_stmt_vec();
+            while !self.check(RBRACE) {
+                body_stmts.push(self.statement());
+            }
+            self.expect(RBRACE);
+            self.macro_is_stmt.push(true);
+            self.macro_bodies.push(IntLit { value: 0 });
+            self.macro_stmt_counts.push(body_stmts.length());
+            var si = 0;
+            while si < body_stmts.length() {
+                self.macro_stmt_bodies.push(body_stmts.get(si));
+                si = si + 1;
+            }
+        } else {
+            let body = self.expression();
+            self.expect(RBRACE);
+            self.macro_is_stmt.push(false);
+            self.macro_bodies.push(body);
+            self.macro_stmt_counts.push(0);
+        }
     }
 
-    // Expands `name!(args)` -- looks `name` up in `self.macro_names` (declared-before-use, see
-    // `macro_decl`'s own header), validates the argument count, and returns the macro's own body
-    // `Expr` with every bare-`Ident` reference to one of its params replaced by the matching
-    // caller-supplied argument expression (`subst_macro_expr`). Called the instant `primary()`
-    // sees `IDENT BANG LPAREN` -- there is no separate "macro invocation" AST node at all; by the
-    // time this returns, the call site already looks exactly like the expanded code.
-    fn expand_macro(&mut self, name: String, args: Vec<Expr>) -> Expr {
+    // Non-consuming, bracket-depth-aware scan from the CURRENT position (right after a macro's
+    // own opening `{`, at least one real token known to remain before the matching `}`) --
+    // decides which of the two body shapes `macro_decl` is looking at. True the moment a `;` is
+    // found at DEPTH 0 (i.e. not inside a nested `{...}`/`(...)`/`[...]`) before the matching
+    // closing `}`; false if the matching `}` is reached first. This is exhaustive, not a
+    // heuristic: a single EXPRESSION can never contain a bare top-level `;` (statement separators
+    // only exist inside a statement list), so finding one is conclusive proof this must be a
+    // statement-list body, and NOT finding one before the closing brace is equally conclusive
+    // proof it's a single expression -- same "decide the shape via pure token lookahead" idiom
+    // `looks_like_index_field_access` already established elsewhere in this file.
+    fn macro_body_is_stmt_list(&self) -> Bool {
+        var depth = 0;
+        var i = self.pos;
+        while i < self.tokens.length() {
+            let k = self.tokens.get(i).kind;
+            if k == LBRACE || k == LPAREN || k == LBRACKET {
+                depth = depth + 1;
+            } else if k == RPAREN || k == RBRACKET {
+                depth = depth - 1;
+            } else if k == RBRACE {
+                if depth == 0 { return false; }
+                depth = depth - 1;
+            } else if k == SEMI && depth == 0 {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Linear scan over `self.macro_names` -- shared by every macro-lookup call site (`is_stmt_
+    // macro_ahead`, `expand_macro`, `expand_stmt_macro`). Returns -1 when `name` names no
+    // declared macro (declared-before-use, see `macro_decl`'s own header).
+    fn find_macro_index(&self, name: String) -> Int {
         var idx = -1;
         var i = 0;
         while i < self.macro_names.length() {
             if self.macro_names.get(i) == name { idx = i; }
             i = i + 1;
         }
+        return idx;
+    }
+
+    // Non-consuming lookahead used by `block`'s own per-statement dispatch: true iff the current
+    // position is `IDENT BANG LPAREN` AND `IDENT` names an already-declared STATEMENT macro
+    // (never an expression macro -- those keep going through the ordinary `statement()` ->
+    // `expression()` -> `primary()` fallback path unchanged, exactly as before this feature
+    // existed, since wrapping a lone expression-macro call in an `ExprStmt` already works and
+    // needs no special handling). A macro NOT yet declared at this point is simply not a
+    // statement-macro call as far as this check is concerned -- `expression()`'s own ordinary
+    // `Ident` fallback will handle (or fail on) it exactly as it always has.
+    fn is_stmt_macro_ahead(&self) -> Bool {
+        if !self.check(IDENT) { return false; }
+        if self.pos + 2 >= self.tokens.length() { return false; }
+        if self.tokens.get(self.pos + 1).kind != BANG { return false; }
+        if self.tokens.get(self.pos + 2).kind != LPAREN { return false; }
+        let idx = self.find_macro_index(self.peek().text);
+        if idx == -1 { return false; }
+        return self.macro_is_stmt.get(idx);
+    }
+
+    // Expands `name!(args)` for an EXPRESSION macro -- looks `name` up (declared-before-use),
+    // validates the argument count, and returns the macro's own body `Expr` with every bare-
+    // `Ident` reference to one of its params replaced by the matching caller-supplied argument
+    // expression (`subst_macro_expr`). Called the instant `primary()` sees `IDENT BANG LPAREN` --
+    // there is no separate "macro invocation" AST node at all; by the time this returns, the call
+    // site already looks exactly like the expanded code. `name` naming a STATEMENT macro instead
+    // is a real, named error here (an empty rename-map, since expression-macro expansion never
+    // needs the hygiene machinery `expand_stmt_macro` uses) -- `block`'s own `is_stmt_macro_ahead`
+    // check means this only happens for a statement-macro call used somewhere OTHER than direct
+    // statement position (`let x = stmt_macro!();`), which this subset simply doesn't support.
+    fn expand_macro(&mut self, name: String, args: Vec<Expr>) -> Expr {
+        let idx = self.find_macro_index(name);
         if idx == -1 {
             throw ParseError::new("no macro named '" + name + "' (macros must be declared earlier in the same file)");
+        }
+        if self.macro_is_stmt.get(idx) {
+            throw ParseError::new("macro '" + name + "' is a statement macro (its body is a statement list, not one expression) -- it can only be called at statement position, 'name!(args);', not used as a value");
         }
         var offset = 0;
         var oi = 0;
@@ -1639,7 +1761,87 @@ impl Parser {
             pj = pj + 1;
         }
         let body = self.macro_bodies.get(idx);
-        return subst_macro_expr(body, &pnames, &args);
+        return subst_macro_expr(body, &pnames, &args, &empty_str_vec(), &empty_str_vec());
+    }
+
+    // Expands `name!(args);` for a STATEMENT macro, called from `block`'s own pre-check the
+    // instant it sees `IDENT BANG LPAREN` where `IDENT` is a known statement macro. Returns the
+    // fully-substituted `Vec<Stmt>` for `block` to splice directly into its own growing statement
+    // list (same "desugar to N statements, splice them in" shape `parallel_for_stmts`/
+    // `sequence_stmts` already established there).
+    //
+    // Hygiene, real but deliberately narrow: every name this macro's body declares via a
+    // TOP-LEVEL `let`/`var` (directly in the body's own statement list, NOT inside a nested
+    // `if`/`while`/`for`/`try` block one level down) gets renamed to a fresh, gensym'd name
+    // (`name + "__mexp" + a whole-file expansion counter`, bumped once per EXPANSION SITE, not
+    // per macro) before splicing -- consistently, everywhere that name is read OR reassigned
+    // anywhere in the body, however deeply nested (`subst_macro_stmt`'s own rename map covers the
+    // whole tree, only the DISCOVERY of which names need it is top-level-only). This is the exact
+    // and ONLY case that actually needs it: a nested block's own `let` is already scoped by its
+    // own `{ }` and can never collide with anything outside it, in a hand-written body OR an
+    // expanded one, so it needs no renaming at all. A macro's TOP-LEVEL `let`, by contrast, gets
+    // spliced directly into the CALLER's own enclosing block, at the SAME scope as everything
+    // around it -- calling the same statement macro twice in one block would otherwise produce
+    // two real `let`s of the identical name in the identical scope, a genuine "variable already
+    // declared"-shaped bug. Real, disclosed limitation this narrow, name-based approach accepts:
+    // if the body's OWN nested `if`/`while`/`for`/`try` happens to declare (or bind, as a loop
+    // var/catch var/lambda param) something with the exact same name as one of the macro's own
+    // top-level lets, this rename would affect that inner shadowing binding's own uses too, since
+    // matching is by NAME across the whole tree, not by real lexical scope. Matches this feature's
+    // own "reduce boilerplate, not good for everything" stance: avoid that by not reusing a
+    // top-level macro-local's name for an unrelated nested binding in the same macro body.
+    fn expand_stmt_macro(&mut self, name: String, args: Vec<Expr>) -> Vec<Stmt> {
+        let idx = self.find_macro_index(name);
+        if idx == -1 {
+            throw ParseError::new("no macro named '" + name + "' (macros must be declared earlier in the same file)");
+        }
+        var poffset = 0;
+        var oi = 0;
+        while oi < idx {
+            poffset = poffset + self.macro_param_counts.get(oi);
+            oi = oi + 1;
+        }
+        let pcount = self.macro_param_counts.get(idx);
+        if args.length() != pcount {
+            throw ParseError::new("macro '" + name + "' expects " + JString3::valueOf(pcount) + " argument(s), got " + JString3::valueOf(args.length()));
+        }
+        var pnames = empty_str_vec();
+        var pj = 0;
+        while pj < pcount {
+            pnames.push(self.macro_param_names.get(poffset + pj));
+            pj = pj + 1;
+        }
+        var soffset = 0;
+        var si2 = 0;
+        while si2 < idx {
+            soffset = soffset + self.macro_stmt_counts.get(si2);
+            si2 = si2 + 1;
+        }
+        let scount = self.macro_stmt_counts.get(idx);
+        var body_stmts = empty_stmt_vec();
+        var sj = 0;
+        while sj < scount {
+            body_stmts.push(self.macro_stmt_bodies.get(soffset + sj));
+            sj = sj + 1;
+        }
+        // Discover every TOP-LEVEL `let`/`var` name (see this fn's own header on why only the
+        // top level needs it) and mint a fresh gensym for each one.
+        self.macro_expansion_counter = self.macro_expansion_counter + 1;
+        let suffix = "__mexp" + JString3::valueOf(self.macro_expansion_counter);
+        var rnames = empty_str_vec();
+        var rvals = empty_str_vec();
+        var ti = 0;
+        while ti < body_stmts.length() {
+            match body_stmts.get(ti) {
+                Let { name: lname, mutable, init, declared_type, line } => {
+                    rnames.push(lname);
+                    rvals.push(lname + suffix);
+                }
+                _ => {}
+            }
+            ti = ti + 1;
+        }
+        return subst_macro_stmt_list(body_stmts, &pnames, &args, &rnames, &rvals);
     }
 
     // `event PlayerDied(player: Entity, cause: String);` -- events/signals, compile-time-wired
@@ -1816,6 +2018,25 @@ impl Parser {
                 while di2 < desugared2.length() {
                     stmts.push(desugared2.get(di2));
                     di2 = di2 + 1;
+                }
+            } else if self.is_stmt_macro_ahead() {
+                // `name!(args);` where `name` is a STATEMENT macro -- see `expand_stmt_macro`'s
+                // own header. An expression-macro call left at statement position (`is_stmt_
+                // macro_ahead` returns false for it) falls straight through to the ordinary
+                // `statement()` branch below, unaffected -- that path already handles it via
+                // `expression()` -> `primary()`'s own `IDENT BANG LPAREN` check, exactly as
+                // before this feature existed.
+                let mname = self.peek().text;
+                self.advance(); // IDENT
+                self.advance(); // BANG
+                self.advance(); // LPAREN
+                let margs2 = self.arg_list();
+                self.expect(SEMI);
+                let expanded = self.expand_stmt_macro(mname, margs2);
+                var mi = 0;
+                while mi < expanded.length() {
+                    stmts.push(expanded.get(mi));
+                    mi = mi + 1;
                 }
             } else {
                 stmts.push(self.statement());
@@ -4264,8 +4485,14 @@ pub fn empty_expr_vec() -> Vec<Expr> {
 // with a full caller-supplied Expr spliced in each time -- so every struct/enum/static-call NAME
 // string here (`StructLit.name`, `StaticCall.type_name`, `Cast`/`IsCheck.target_type`, ...) is
 // left completely untouched (macro substitution is about VALUES, never types), unlike that fn's
-// own matching branches.
-pub fn subst_macro_expr(e: Expr, pnames: &Vec<String>, pargs: &Vec<Expr>) -> Expr {
+// own matching branches. `rnames`/`rvals` is a SECOND, independent name -> name rename map (empty
+// for every expression-macro call, see `expand_macro`'s own header) -- `expand_stmt_macro`'s own
+// hygiene mechanism for a statement macro's top-level `let`/`var` bindings, checked in the exact
+// same `Ident` arm right after the param check, and ALSO applied to `Assign`'s own bare target
+// `name` field (an assignment target is never a param -- reassigning a macro PARAM doesn't mean
+// anything, since params are substituted as whole caller expressions, not real mutable locals --
+// so only the rename map, never `pargs`, ever touches that one field).
+pub fn subst_macro_expr(e: Expr, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames: &Vec<String>, rvals: &Vec<String>) -> Expr {
     match e {
         IntLit { value } => { return IntLit { value: value }; }
         FloatLit { text } => { return FloatLit { text: text }; }
@@ -4273,7 +4500,7 @@ pub fn subst_macro_expr(e: Expr, pnames: &Vec<String>, pargs: &Vec<Expr>) -> Exp
         LongLit { text } => { return LongLit { text: text }; }
         CharLit { value } => { return CharLit { value: value }; }
         StringLit { value } => { return StringLit { value: value }; }
-        StringInterp { literals, exprs } => { return StringInterp { literals: literals, exprs: subst_macro_expr_list(exprs, pnames, pargs) }; }
+        StringInterp { literals, exprs } => { return StringInterp { literals: literals, exprs: subst_macro_expr_list(exprs, pnames, pargs, rnames, rvals) }; }
         BoolLit { value } => { return BoolLit { value: value }; }
         Ident { name } => {
             var vi = 0;
@@ -4281,49 +4508,62 @@ pub fn subst_macro_expr(e: Expr, pnames: &Vec<String>, pargs: &Vec<Expr>) -> Exp
                 if pnames.get(vi) == name { return pargs.get(vi); }
                 vi = vi + 1;
             }
+            var ri = 0;
+            while ri < rnames.length() {
+                if rnames.get(ri) == name { return Ident { name: rvals.get(ri) }; }
+                ri = ri + 1;
+            }
             return Ident { name: name };
         }
-        Binary { op, left, right } => { return Binary { op: op, left: subst_macro_expr(left, pnames, pargs), right: subst_macro_expr(right, pnames, pargs) }; }
-        Unary { op, expr } => { return Unary { op: op, expr: subst_macro_expr(expr, pnames, pargs) }; }
-        Call { callee, args } => { return Call { callee: callee, args: subst_macro_expr_list(args, pnames, pargs) }; }
-        FieldAccess { obj, field } => { return FieldAccess { obj: subst_macro_expr(obj, pnames, pargs), field: field }; }
-        MethodCall { recv, method, args } => { return MethodCall { recv: subst_macro_expr(recv, pnames, pargs), method: method, args: subst_macro_expr_list(args, pnames, pargs) }; }
-        Assign { name, value } => { return Assign { name: name, value: subst_macro_expr(value, pnames, pargs) }; }
-        FieldAssign { obj, field, value } => { return FieldAssign { obj: subst_macro_expr(obj, pnames, pargs), field: field, value: subst_macro_expr(value, pnames, pargs) }; }
-        StructLit { name, field_names, field_values, generic_base } => { return StructLit { name: name, field_names: field_names, field_values: subst_macro_expr_list(field_values, pnames, pargs), generic_base: generic_base }; }
-        ArrayLit { elements } => { return ArrayLit { elements: subst_macro_expr_list(elements, pnames, pargs) }; }
-        ArrayRepeat { value, count } => { return ArrayRepeat { value: subst_macro_expr(value, pnames, pargs), count: subst_macro_expr(count, pnames, pargs) }; }
-        ArenaNew { struct_name, count } => { return ArenaNew { struct_name: struct_name, count: subst_macro_expr(count, pnames, pargs) }; }
-        Index { arr, index } => { return Index { arr: subst_macro_expr(arr, pnames, pargs), index: subst_macro_expr(index, pnames, pargs) }; }
-        IndexAssign { arr, index, value } => { return IndexAssign { arr: subst_macro_expr(arr, pnames, pargs), index: subst_macro_expr(index, pnames, pargs), value: subst_macro_expr(value, pnames, pargs) }; }
-        Slice { arr, start, end, inclusive } => { return Slice { arr: subst_macro_expr(arr, pnames, pargs), start: subst_macro_expr(start, pnames, pargs), end: subst_macro_expr(end, pnames, pargs), inclusive: inclusive }; }
-        IndexFieldGet { arr_name, index, field } => { return IndexFieldGet { arr_name: arr_name, index: subst_macro_expr(index, pnames, pargs), field: field }; }
-        IndexFieldSet { arr_name, index, field, value } => { return IndexFieldSet { arr_name: arr_name, index: subst_macro_expr(index, pnames, pargs), field: field, value: subst_macro_expr(value, pnames, pargs) }; }
-        StaticCall { type_name, method, args } => { return StaticCall { type_name: type_name, method: method, args: subst_macro_expr_list(args, pnames, pargs) }; }
+        Binary { op, left, right } => { return Binary { op: op, left: subst_macro_expr(left, pnames, pargs, rnames, rvals), right: subst_macro_expr(right, pnames, pargs, rnames, rvals) }; }
+        Unary { op, expr } => { return Unary { op: op, expr: subst_macro_expr(expr, pnames, pargs, rnames, rvals) }; }
+        Call { callee, args } => { return Call { callee: callee, args: subst_macro_expr_list(args, pnames, pargs, rnames, rvals) }; }
+        FieldAccess { obj, field } => { return FieldAccess { obj: subst_macro_expr(obj, pnames, pargs, rnames, rvals), field: field }; }
+        MethodCall { recv, method, args } => { return MethodCall { recv: subst_macro_expr(recv, pnames, pargs, rnames, rvals), method: method, args: subst_macro_expr_list(args, pnames, pargs, rnames, rvals) }; }
+        Assign { name, value } => {
+            var an = name;
+            var ari = 0;
+            while ari < rnames.length() {
+                if rnames.get(ari) == name { an = rvals.get(ari); }
+                ari = ari + 1;
+            }
+            return Assign { name: an, value: subst_macro_expr(value, pnames, pargs, rnames, rvals) };
+        }
+        FieldAssign { obj, field, value } => { return FieldAssign { obj: subst_macro_expr(obj, pnames, pargs, rnames, rvals), field: field, value: subst_macro_expr(value, pnames, pargs, rnames, rvals) }; }
+        StructLit { name, field_names, field_values, generic_base } => { return StructLit { name: name, field_names: field_names, field_values: subst_macro_expr_list(field_values, pnames, pargs, rnames, rvals), generic_base: generic_base }; }
+        ArrayLit { elements } => { return ArrayLit { elements: subst_macro_expr_list(elements, pnames, pargs, rnames, rvals) }; }
+        ArrayRepeat { value, count } => { return ArrayRepeat { value: subst_macro_expr(value, pnames, pargs, rnames, rvals), count: subst_macro_expr(count, pnames, pargs, rnames, rvals) }; }
+        ArenaNew { struct_name, count } => { return ArenaNew { struct_name: struct_name, count: subst_macro_expr(count, pnames, pargs, rnames, rvals) }; }
+        Index { arr, index } => { return Index { arr: subst_macro_expr(arr, pnames, pargs, rnames, rvals), index: subst_macro_expr(index, pnames, pargs, rnames, rvals) }; }
+        IndexAssign { arr, index, value } => { return IndexAssign { arr: subst_macro_expr(arr, pnames, pargs, rnames, rvals), index: subst_macro_expr(index, pnames, pargs, rnames, rvals), value: subst_macro_expr(value, pnames, pargs, rnames, rvals) }; }
+        Slice { arr, start, end, inclusive } => { return Slice { arr: subst_macro_expr(arr, pnames, pargs, rnames, rvals), start: subst_macro_expr(start, pnames, pargs, rnames, rvals), end: subst_macro_expr(end, pnames, pargs, rnames, rvals), inclusive: inclusive }; }
+        IndexFieldGet { arr_name, index, field } => { return IndexFieldGet { arr_name: arr_name, index: subst_macro_expr(index, pnames, pargs, rnames, rvals), field: field }; }
+        IndexFieldSet { arr_name, index, field, value } => { return IndexFieldSet { arr_name: arr_name, index: subst_macro_expr(index, pnames, pargs, rnames, rvals), field: field, value: subst_macro_expr(value, pnames, pargs, rnames, rvals) }; }
+        StaticCall { type_name, method, args } => { return StaticCall { type_name: type_name, method: method, args: subst_macro_expr_list(args, pnames, pargs, rnames, rvals) }; }
         ExternStaticFieldGet { type_name, field } => { return ExternStaticFieldGet { type_name: type_name, field: field }; }
-        ExternStaticFieldSet { type_name, field, value } => { return ExternStaticFieldSet { type_name: type_name, field: field, value: subst_macro_expr(value, pnames, pargs) }; }
-        Cast { expr, target_type } => { return Cast { expr: subst_macro_expr(expr, pnames, pargs), target_type: target_type }; }
-        IsCheck { expr, target_type } => { return IsCheck { expr: subst_macro_expr(expr, pnames, pargs), target_type: target_type }; }
-        Lambda { params, body } => { return Lambda { params: params, body: subst_macro_expr(body, pnames, pargs) }; }
-        TryOp { expr } => { return TryOp { expr: subst_macro_expr(expr, pnames, pargs) }; }
-        NamedArg { name, value } => { return NamedArg { name: name, value: subst_macro_expr(value, pnames, pargs) }; }
+        ExternStaticFieldSet { type_name, field, value } => { return ExternStaticFieldSet { type_name: type_name, field: field, value: subst_macro_expr(value, pnames, pargs, rnames, rvals) }; }
+        Cast { expr, target_type } => { return Cast { expr: subst_macro_expr(expr, pnames, pargs, rnames, rvals), target_type: target_type }; }
+        IsCheck { expr, target_type } => { return IsCheck { expr: subst_macro_expr(expr, pnames, pargs, rnames, rvals), target_type: target_type }; }
+        Lambda { params, body } => { return Lambda { params: params, body: subst_macro_expr(body, pnames, pargs, rnames, rvals) }; }
+        TryOp { expr } => { return TryOp { expr: subst_macro_expr(expr, pnames, pargs, rnames, rvals) }; }
+        NamedArg { name, value } => { return NamedArg { name: name, value: subst_macro_expr(value, pnames, pargs, rnames, rvals) }; }
         NullLit => { return NullLit; }
-        SafeCall { recv, method, args } => { return SafeCall { recv: subst_macro_expr(recv, pnames, pargs), method: method, args: subst_macro_expr_list(args, pnames, pargs) }; }
-        SafeFieldAccess { recv, field } => { return SafeFieldAccess { recv: subst_macro_expr(recv, pnames, pargs), field: field }; }
-        Elvis { left, right } => { return Elvis { left: subst_macro_expr(left, pnames, pargs), right: subst_macro_expr(right, pnames, pargs) }; }
+        SafeCall { recv, method, args } => { return SafeCall { recv: subst_macro_expr(recv, pnames, pargs, rnames, rvals), method: method, args: subst_macro_expr_list(args, pnames, pargs, rnames, rvals) }; }
+        SafeFieldAccess { recv, field } => { return SafeFieldAccess { recv: subst_macro_expr(recv, pnames, pargs, rnames, rvals), field: field }; }
+        Elvis { left, right } => { return Elvis { left: subst_macro_expr(left, pnames, pargs, rnames, rvals), right: subst_macro_expr(right, pnames, pargs, rnames, rvals) }; }
         Comprehension { result_expr, var_name, iter_expr, cond } => {
             var new_cond = none_expr();
-            if let Some { value: c } = cond { new_cond = some_expr(subst_macro_expr(c, pnames, pargs)); }
-            return Comprehension { result_expr: subst_macro_expr(result_expr, pnames, pargs), var_name: var_name, iter_expr: subst_macro_expr(iter_expr, pnames, pargs), cond: new_cond };
+            if let Some { value: c } = cond { new_cond = some_expr(subst_macro_expr(c, pnames, pargs, rnames, rvals)); }
+            return Comprehension { result_expr: subst_macro_expr(result_expr, pnames, pargs, rnames, rvals), var_name: var_name, iter_expr: subst_macro_expr(iter_expr, pnames, pargs, rnames, rvals), cond: new_cond };
         }
     }
 }
 
-pub fn subst_macro_expr_list(es: Vec<Expr>, pnames: &Vec<String>, pargs: &Vec<Expr>) -> Vec<Expr> {
+pub fn subst_macro_expr_list(es: Vec<Expr>, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames: &Vec<String>, rvals: &Vec<String>) -> Vec<Expr> {
     var out = empty_expr_vec();
     var i = 0;
     while i < es.length() {
-        out.push(subst_macro_expr(es.get(i), pnames, pargs));
+        out.push(subst_macro_expr(es.get(i), pnames, pargs, rnames, rvals));
         i = i + 1;
     }
     return out;
@@ -4331,6 +4571,83 @@ pub fn subst_macro_expr_list(es: Vec<Expr>, pnames: &Vec<String>, pargs: &Vec<Ex
 pub fn empty_stmt_vec() -> Vec<Stmt> {
     var v = vec_of(ExprStmt { expr: IntLit { value: 0 }, line: 0 });
     return Vec { data: v.data, len: 0 };
+}
+
+// Statement-level counterpart to `subst_macro_expr`, used only by `expand_stmt_macro` (a
+// STATEMENT macro's body -- an expression macro's body is a single `Expr`, never a `Stmt`, so
+// this is never reached from that path). Structurally mirrors `Checker.hotc`'s own `subst_stmt`/
+// `subst_stmt_list`/`subst_arm_list`/`subst_catches` (the generic-substitution walkers) almost
+// exactly, threading `subst_macro_expr`'s same 4 params through every `Expr` field, PLUS applying
+// the `rnames`/`rvals` rename (see `subst_macro_expr`'s own header) to `Let`'s own binding `name`
+// -- the ONE place a NEW name is actually introduced by a statement macro's body (every other
+// binder -- `For.var_name`, `Try`'s own `catch_var`, a `MatchArm`'s own `bind_names` -- is left
+// completely alone; see `expand_stmt_macro`'s own header on why only `Let`/`var` ever needs this).
+pub fn subst_macro_stmt(s: Stmt, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames: &Vec<String>, rvals: &Vec<String>) -> Stmt {
+    match s {
+        Let { name, mutable, init, declared_type, line } => {
+            var ln = name;
+            var lri = 0;
+            while lri < rnames.length() {
+                if rnames.get(lri) == name { ln = rvals.get(lri); }
+                lri = lri + 1;
+            }
+            return Let { name: ln, mutable: mutable, init: subst_macro_expr(init, pnames, pargs, rnames, rvals), declared_type: declared_type, line: line };
+        }
+        ExprStmt { expr, line } => { return ExprStmt { expr: subst_macro_expr(expr, pnames, pargs, rnames, rvals), line: line }; }
+        Return { value, line } => {
+            var new_val = none_expr();
+            if let Some { value: v } = value { new_val = some_expr(subst_macro_expr(v, pnames, pargs, rnames, rvals)); }
+            return Return { value: new_val, line: line };
+        }
+        If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+            var new_else = none_stmt_vec();
+            if let Some { value: eb } = else_body { new_else = some_stmt_vec(subst_macro_stmt_list(eb, pnames, pargs, rnames, rvals)); }
+            return If { cond: subst_macro_expr(cond, pnames, pargs, rnames, rvals), then_body: subst_macro_stmt_list(then_body, pnames, pargs, rnames, rvals), else_body: new_else, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq };
+        }
+        While { cond, body, line } => { return While { cond: subst_macro_expr(cond, pnames, pargs, rnames, rvals), body: subst_macro_stmt_list(body, pnames, pargs, rnames, rvals), line: line }; }
+        For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+            return For { var_name: var_name, is_range: is_range, range_start: subst_macro_expr(range_start, pnames, pargs, rnames, rvals), range_end: subst_macro_expr(range_end, pnames, pargs, rnames, rvals), inclusive: inclusive, arr_expr: subst_macro_expr(arr_expr, pnames, pargs, rnames, rvals), body: subst_macro_stmt_list(body, pnames, pargs, rnames, rvals), line: line };
+        }
+        Match { subject, arms, line } => { return Match { subject: subst_macro_expr(subject, pnames, pargs, rnames, rvals), arms: subst_macro_arm_list(arms, pnames, pargs, rnames, rvals), line: line }; }
+        Throw { value, line } => { return Throw { value: subst_macro_expr(value, pnames, pargs, rnames, rvals), line: line }; }
+        Break { line } => { return Break { line: line }; }
+        Continue { line } => { return Continue { line: line }; }
+        Try { try_block, catches, line } => {
+            return Try { try_block: subst_macro_stmt_list(try_block, pnames, pargs, rnames, rvals), catches: subst_macro_catches(catches, pnames, pargs, rnames, rvals), line: line };
+        }
+    }
+}
+
+pub fn subst_macro_stmt_list(ss: Vec<Stmt>, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames: &Vec<String>, rvals: &Vec<String>) -> Vec<Stmt> {
+    var out = empty_stmt_vec();
+    var i = 0;
+    while i < ss.length() {
+        out.push(subst_macro_stmt(ss.get(i), pnames, pargs, rnames, rvals));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn subst_macro_catches(cs: Vec<CatchClause>, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames: &Vec<String>, rvals: &Vec<String>) -> Vec<CatchClause> {
+    var out = empty_catchclause_vec();
+    var i = 0;
+    while i < cs.length() {
+        let c = cs.get(i);
+        out.push(CatchClause { catch_var: c.catch_var, catch_type: c.catch_type, catch_block: subst_macro_stmt_list(c.catch_block, pnames, pargs, rnames, rvals) });
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn subst_macro_arm_list(arms: Vec<MatchArm>, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames: &Vec<String>, rvals: &Vec<String>) -> Vec<MatchArm> {
+    var out = empty_matcharm_vec();
+    var i = 0;
+    while i < arms.length() {
+        let a = arms.get(i);
+        out.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: subst_macro_stmt_list(a.body, pnames, pargs, rnames, rvals), is_literal: a.is_literal, literal: subst_macro_expr(a.literal, pnames, pargs, rnames, rvals), is_positional: a.is_positional });
+        i = i + 1;
+    }
+    return out;
 }
 pub fn empty_param_vec() -> Vec<Param> {
     var v = vec_of(Param { name: "_", type_name: "_", is_ref: false, is_mut_ref: false });

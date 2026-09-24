@@ -1,8 +1,9 @@
-// Basic macros -- see IDEAS.md's own "Macros" entry. `macro name(p1, p2, ...) { expr }`,
-// invoked `name!(arg1, arg2)`. Real, disclosed scope cuts: expression-only body (no macro-
-// introduced bindings, so no hygiene problem to solve), AST-level substitution (not textual --
-// the expanded expression flows through the checker completely normally), untyped params,
-// declared-before-use in the same file only. See ARCHITECTURE.md for the full design writeup.
+// Basic macros -- see IDEAS.md's own "Macros" entry. Two shapes: `macro name(p1, ...) { expr }`
+// (an EXPRESSION macro, invoked `name!(args)` anywhere a value is expected) and `macro name(p1,
+// ...) { stmt1; stmt2; ... }` (a STATEMENT macro, invoked `name!(args);` only at statement
+// position, spliced directly into the enclosing block). AST-level substitution, not textual --
+// the expanded code flows through the checker completely normally. See ARCHITECTURE.md for the
+// full design writeup, including the real hygiene story for statement macros.
 
 extern class JMath = "java.lang.Math" {
     static fn min(a: Int, b: Int) -> Int;
@@ -25,6 +26,31 @@ macro square(x) {
     x * x
 }
 
+// An earlier-declared macro can be called from a LATER macro's own body -- expansion is eager
+// (happens once, when the outer macro is declared), so this composes correctly: `quad_it`'s own
+// stored body ends up as `(y * 2) * 2`, and `quad_it!(5)` only substitutes its own `y` at its
+// call site, same as any other expression macro.
+macro double_it(x) {
+    x * 2
+}
+macro quad_it(y) {
+    double_it!(double_it!(y))
+}
+
+// A STATEMENT macro -- its body is a statement list, not one expression, so it's invoked
+// `name!(args);` only at statement position, never nested inside a larger expression. Real
+// boilerplate this actually earns its keep on: a "clamp, then report" sequence that would
+// otherwise be hand-duplicated at every call site.
+macro clamp(x, lo, hi) {
+    JMath::max(JMath::min(x, hi), lo)
+}
+
+macro report_clamped(label, x, lo, hi) {
+    let clamped = clamp!(x, lo, hi);
+    print(label);
+    print(clamped);
+}
+
 struct Point { x: Int, y: Int, z: Int }
 
 fn main() {
@@ -37,6 +63,14 @@ fn main() {
     // `square(2 + 3)` expands to `(2 + 3) * (2 + 3)`, not `2 + 3 * 2 + 3` -- confirms the
     // substituted argument expression is spliced in as one unit, not re-tokenized.
     print(square!(2 + 3));
+
+    print(quad_it!(5));
+
+    // `report_clamped!` declares its own local `clamped` -- calling it TWICE in the same scope
+    // would collide on that name without hygiene. Each expansion site gensyms its own top-level
+    // `let` (`clamped__mexpN`), so this compiles and runs cleanly.
+    report_clamped!("first", 999, 0, 10);
+    report_clamped!("second", -5, 0, 10);
 
     print("done");
 }
