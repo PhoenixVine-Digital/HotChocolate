@@ -1,0 +1,54 @@
+// `world.get(id)` -- the real ECS query API `ECS_IDEAS.md` had flagged as its own still-open gap
+// ("no query API on `World` exists"): reading a component's value back out by entity id, outside
+// of any system's own `run` iteration. No real generic-method syntax (`world.get::<Transform>
+// (id)`) -- the queried component type is read back from the declared `Option<T>` result type on
+// the `let` that receives it.
+use ecs;
+
+component Transform { x: Int, y: Int }
+component Health { hp: Int }
+
+system Regen {
+    fn run(h: &mut Health) {
+        h.hp = h.hp + 5;
+    }
+}
+
+fn main() {
+    var world = World::new();
+    let e1 = world.spawn(Transform { x: 1, y: 2 }, Health { hp: 100 });
+    let e2 = world.spawn(Transform { x: 9, y: 9 });
+
+    // Found: e1 has a Transform.
+    let t1: Option<Transform> = world.get(e1);
+    match t1 {
+        Some { value } => { print("e1 transform: {value.x} {value.y}"); }
+        None => { print("e1 transform: missing"); }
+    }
+
+    // Found, in a DIFFERENT archetype (e2 has no Health) -- confirms the search spans every
+    // archetype that could hold the queried type, not just the first one.
+    let t2: Option<Transform> = world.get(e2);
+    match t2 {
+        Some { value } => { print("e2 transform: {value.x} {value.y}"); }
+        None => { print("e2 transform: missing"); }
+    }
+
+    // Not found: e2 was never spawned with a Health component.
+    let h2: Option<Health> = world.get(e2);
+    match h2 {
+        Some { value } => { print("e2 health: {value.hp}"); }
+        None => { print("e2 health: missing"); }
+    }
+
+    // Reads back a value a SYSTEM wrote, after run_all() -- the actual motivating case (checking
+    // simulation state from ordinary code, not just from inside another system).
+    world.run_all();
+    let h1: Option<Health> = world.get(e1);
+    match h1 {
+        Some { value } => { print("e1 health after regen: {value.hp}"); }
+        None => { print("e1 health after regen: missing"); }
+    }
+
+    print("done");
+}

@@ -753,6 +753,24 @@ without a big back-and-forth, but real picks nonetheless:
    practice it hasn't needed solving: every real use so far (Marshmallow's `Camera`) is `main()`
    pushing state IN, never reading component state back OUT, so resources answered the actual
    need without requiring the harder half.
+
+   **Built, 2026-09-24**: `world.get(id)`, the real query API this "Still open" item's own answer
+   above explicitly left unsolved. No real generic-method syntax (`world.get::<Transform>(id)`) --
+   the queried component type is read back from the caller's own declared `Option<T>` result type
+   (`let t: Option<Transform> = world.get(id);`), the same "hint via declared type" convention
+   comprehensions already established. One `__world_get_<T>` helper fn synthesized per distinct
+   queried type (`Codegen.hotc`'s own `build_world_get_fn_ecs`), searching every archetype that
+   could hold `T` (including ones only reachable via `world.add`/`world.remove`, not just the
+   originally-spawned set) linearly for a matching entity id. Two real, previously-hit gaps found
+   building it: (1) `Option<T>`'s own generic enum template is never even PARSED unless something
+   pulls in the `option` stdlib topic, and `use ecs;` alone didn't -- `world.get` returning a real
+   `Option<T>` meant `ecs` now needs to transitively depend on `option` too, the same "independent
+   of whether the user's own source ever writes it" reasoning `vec`/`phoenix` already established
+   for the identical reason; (2) even with `Option<T>` loaded, a caller's own `match result { Some
+   {...} => ..., None => ... }` still needs `Checker.hotc`'s own `ensure_instantiated` called on
+   the exact concrete `"Option$T"` mono name at least once somewhere in the same compile for its
+   variant-ownership table to exist at all -- `check_world_get` calls it explicitly rather than
+   relying on some OTHER call site happening to construct a real `Some`/`None` literal first.
 7. **A "never runs off the main thread" scheduling constraint** — the real gap found adding a
    second OpenGL-calling system (see the "Status" note at the top, 2026-09-15). The ownership-
    conflict analysis this whole scheduler is built on only ever reasons about HC-visible `&`/

@@ -1194,6 +1194,24 @@ impl CodeGen {
             self.mv.visitMethodInsn(184, self.owner, remove_target, remove_desc, false); // INVOKESTATIC
             return "Unit";
         }
+        // `world.get(id)` -- see `Checker.hotc`'s own `check_world_get` header for the full
+        // design. `T` (the queried component type) comes from `self.ret_ty` -- the ENCLOSING
+        // `let`'s own declared `Option<T>` result type, set by `gen_stmt`'s own `Let` arm before
+        // this whole `gen_expr(init)` call ever started (same mechanism the bare-`None`-variant
+        // fallback already relies on) -- there's no other way to know which `__world_get_<T>`
+        // helper fn (`build_world_get_fn_ecs`, synthesized once per queried type by `compile_
+        // program`'s own ECS section, before this fn's own body ever runs) to call.
+        if rt == "World" && method == "get" {
+            self.mv.visitInsn(87); // POP the unused receiver
+            let get_t = option_inner_type_cg(self.ret_ty);
+            self.gen_expr(args.get(0)); // entity id
+            let get_target = world_get_fn_name_ecs(get_t);
+            let get_desc_found = self.fn_descs.get(get_target);
+            var get_desc = "";
+            if let Some { value: gd } = get_desc_found { get_desc = gd; }
+            self.mv.visitMethodInsn(184, self.owner, get_target, get_desc, false); // INVOKESTATIC
+            return "Option$" + get_t;
+        }
         let mkey = rt + "#" + method;
         let mdesc_found = self.struct_methods.get(mkey);
         if let Some { value: mdesc } = mdesc_found {
@@ -7318,6 +7336,18 @@ pub fn mono_arg_cg(name: String) -> String {
     return name.substring(idx + 1, name.length());
 }
 
+// `"Option$Transform"` -> `"Transform"` -- see `Checker.hotc`'s own `option_inner_type_chk`
+// header for why a declared `Option<Transform>` type is ALREADY stored this way (`Parser.hotc`'s
+// own `type_name_ref` builds every generic type annotation as this internal `$`-joined mono name
+// directly, never as an angle-bracket string) -- this is just `mono_arg_cg` under a name that
+// matches its caller's own intent. Trusted unconditionally (no re-validating the "Option$..."
+// shape or that the inner name is a real component): `Checker.hotc`'s own `check_world_get`
+// already rejected anything else, and a real error there means this codegen path never runs at
+// all.
+pub fn option_inner_type_cg(s: String) -> String {
+    return mono_arg_cg(s);
+}
+
 // Finds `mono_name`'s (`"Box$Int"`) generic template (`structs`' own `"Box"` declaration) and
 // substitutes its type parameter with the real argument, producing the concrete field list
 // `gen_struct` needs to emit a real class for it -- same substitution `Checker.hotc`'s own
@@ -8478,6 +8508,51 @@ pub fn build_reset_changed_stmts_ecs(archetype_signatures: &Vec<Vec<String>>) ->
     return stmts;
 }
 
+pub fn world_get_fn_name_ecs(component_type: String) -> String {
+    return "__world_get_" + component_type;
+}
+
+// `world.get::<Transform>(entity_id)` -- see `ECS_IDEAS.md`'s own "still open" note ("no query API
+// on `World` exists") and `Checker.hotc`'s own `check_world_get` header for the full design. No
+// real generic-method syntax needed: the component type is read back from the surrounding `let`'s
+// own declared type (`let t: Option<Transform> = world.get(id);`), the same "hint via declared
+// type" convention comprehensions/bare-variant `let`s already establish elsewhere in this file.
+// One real, plain, ONE-param top-level fn synthesized per DISTINCT component type ever queried
+// this way (`Checker.hotc`'s own `queried_component_types`, one entry per type, deduplicated) --
+// same "materialize a real fn, reuse the ordinary compile pipeline" strategy `synthesize_system_
+// dispatch_fn_ecs` already uses, rather than hand-writing bytecode for a multi-archetype linear
+// search directly. Body: one `For` loop per archetype that actually HAS `component_type` in its
+// own signature (skipped entirely for every archetype that doesn't -- an entity can only ever be
+// in exactly one archetype at a time, so checking archetypes without the component at all would
+// just be wasted work, never a correctness issue), returning `Some { value: <the component> }`
+// the moment a row's own entity id matches; `None` once every matching archetype comes up empty.
+pub fn build_world_get_fn_ecs(component_type: String, archetype_signatures: &Vec<Vec<String>>) -> FnDecl {
+    var body = empty_stmt_vec2();
+    var ai = 0;
+    while ai < archetype_signatures.length() {
+        let sig = archetype_signatures.get(ai);
+        let ci = str_vec_index_of_ecs(&sig, component_type);
+        if ci >= 0 {
+            let static_name = archetype_static_name_ecs(&sig);
+            let loop_var = "__wg_row" + JString::valueOf(ai);
+            let n_expr = MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: "entities" }, method: "length", args: empty_expr_vec_cg() };
+            let id_get = MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: "entities" }, method: "get", args: vec_of(Ident { name: loop_var }) };
+            let matches_cond = Binary { op: "==", left: id_get, right: Ident { name: "__wg_id" } };
+            let comp_field = archetype_field_name_ecs(ci);
+            let comp_get = MethodCall { recv: FieldAccess { obj: Ident { name: static_name }, field: comp_field }, method: "get", args: vec_of(Ident { name: loop_var }) };
+            let some_lit = StructLit { name: "Some", field_names: vec_of("value"), field_values: vec_of(comp_get), generic_base: none_string2() };
+            let found_stmt = If { cond: matches_cond, then_body: vec_of(Return { value: some_expr_cg(some_lit), line: 0 }), else_body: none_stmt_list_cg(), line: 0, narrow_name: "", narrow_is_eq: false };
+            body.push(For { var_name: loop_var, is_range: true, range_start: IntLit { value: 0 }, range_end: n_expr, inclusive: false, arr_expr: IntLit { value: 0 }, body: vec_of(found_stmt), line: 0 });
+        }
+        ai = ai + 1;
+    }
+    let none_lit = Ident { name: "None" };
+    body.push(Return { value: some_expr_cg(none_lit), line: 0 });
+    var params = empty_param_vec2();
+    params.push(Param { name: "__wg_id", type_name: "Int", is_ref: false, is_mut_ref: false });
+    return FnDecl { name: world_get_fn_name_ecs(component_type), params: params, ret_type: some_string2("Option$" + component_type), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
+}
+
 pub fn build_run_all_body_ecs(groups: &Vec<Vec<String>>) -> Vec<Stmt> {
     var body = empty_stmt_vec2();
     var gi = 0;
@@ -9454,6 +9529,25 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         checker.check_fn(queue_remove_decl2);
         fns.push(queue_remove_decl);
         rti = rti + 1;
+    }
+    // `__world_get_<T>` -- see `build_world_get_fn_ecs`'s own header / `Checker.hotc`'s own
+    // `check_world_get`. One per DISTINCT component type ever queried via `world.get(id)`
+    // anywhere in the program (`checker.queried_component_types`) -- never referenced by checked
+    // USER code directly (same as `__world_apply_add_<T>`/`__world_apply_remove_<T>` right above,
+    // which need no separate `fn_sigs` pre-registration either, unlike the QUEUEING fns) --
+    // `Codegen.hotc`'s own `finish_method_call` INVOKESTATICs it by this exact deterministic name.
+    // Uses `closed_sigs` (the FULL add/remove-reachable closure), not just `checker.archetype_
+    // signatures` (spawn's own starting set) -- an entity `world.get` queries could have been
+    // moved into an archetype only reachable via `world.add`, and a query that only searched the
+    // originally-spawned set would silently miss it.
+    var qti = 0;
+    while qti < checker.queried_component_types.length() {
+        let qt = checker.queried_component_types.get(qti);
+        let world_get_decl = build_world_get_fn_ecs(qt, &closed_sigs);
+        let world_get_decl2 = build_world_get_fn_ecs(qt, &closed_sigs);
+        checker.check_fn(world_get_decl2);
+        fns.push(world_get_decl);
+        qti = qti + 1;
     }
     // `__world_run_all` -- its own body now starts with `build_flush_transitions_stmts_ecs`
     // (applying every queued `world.add`/`world.remove` from the previous tick, or from ordinary

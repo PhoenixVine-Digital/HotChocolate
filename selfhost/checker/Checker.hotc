@@ -333,6 +333,13 @@ pub struct TyChecker {
     // closure-computation reader, `ThisType` named as a bare identifier (there's no value to
     // construct for a removal) rather than a struct literal.
     remove_component_types: Vec<String>,
+    // `world.get(id)` -- see ECS_IDEAS.md's own "Still open" #6 answer. Every DISTINCT component type
+    // ever queried this way, anywhere in the program (deduplicated, declaration-order-ish but not
+    // load-bearing) -- `Codegen.hotc`'s own `compile_program` is the only reader, synthesizing
+    // exactly one `__world_get_<T>` helper fn per entry (see `build_world_get_fn_ecs`'s own
+    // header) before the main fn-compilation loop runs, mirroring `synthesize_system_dispatch_fn_
+    // ecs`'s own "materialize a real fn, reuse the ordinary compile pipeline" strategy.
+    queried_component_types: Vec<String>,
 }
 
 pub fn checker_new() -> TyChecker {
@@ -393,7 +400,8 @@ pub fn checker_new() -> TyChecker {
     var archetype_signatures = empty_str_vec_vec_ecs();
     var add_component_types = empty_str_vec2();
     var remove_component_types = empty_str_vec2();
-    return TyChecker { fn_sigs: sigs, vars: vars, var_scopes: var_scopes, structs: structs, methods: methods, variant_owner: variant_owner, variant_owner_q: variant_owner_q, generic_templates: generic_templates, generic_enum_templates: generic_enum_templates, mono_needed: mono_needed, externs: externs, extern_methods: extern_methods, extern_fields: extern_fields, struct_extends: struct_extends, must_use_fns: must_use_fns, fn_param_names: fn_param_names, enum_variants: enum_variants, static_methods: static_methods, generic_fn_templates: generic_fn_templates, fn_mono_needed: fn_mono_needed, generic_method_templates: generic_method_templates, method_mono_needed: method_mono_needed, statics: statics, errors: errs, loop_depth: 0, cur_ret_ty: "Unit", variant_field_info: variant_field_info, generic_variant_owner: generic_variant_owner, interfaces: interfaces, struct_interfaces: struct_interfaces, arena_structs: arena_structs, sealed_interfaces: sealed_interfaces, interface_supertraits: interface_supertraits, fn_param_is_ref: fn_param_is_ref, method_param_is_ref: method_param_is_ref, static_method_param_is_ref: static_method_param_is_ref, moved: moved, moved_scopes: moved_scopes, fn_param_is_mut_ref: fn_param_is_mut_ref, method_param_is_mut_ref: method_param_is_mut_ref, static_method_param_is_mut_ref: static_method_param_is_mut_ref, mut_capable: mut_capable, mut_capable_scopes: mut_capable_scopes, components: components, resources: resources, warnings: warns, system_order: system_order, system_groups: system_groups, archetype_signatures: archetype_signatures, add_component_types: add_component_types, remove_component_types: remove_component_types };
+    var queried_component_types = empty_str_vec2();
+    return TyChecker { fn_sigs: sigs, vars: vars, var_scopes: var_scopes, structs: structs, methods: methods, variant_owner: variant_owner, variant_owner_q: variant_owner_q, generic_templates: generic_templates, generic_enum_templates: generic_enum_templates, mono_needed: mono_needed, externs: externs, extern_methods: extern_methods, extern_fields: extern_fields, struct_extends: struct_extends, must_use_fns: must_use_fns, fn_param_names: fn_param_names, enum_variants: enum_variants, static_methods: static_methods, generic_fn_templates: generic_fn_templates, fn_mono_needed: fn_mono_needed, generic_method_templates: generic_method_templates, method_mono_needed: method_mono_needed, statics: statics, errors: errs, loop_depth: 0, cur_ret_ty: "Unit", variant_field_info: variant_field_info, generic_variant_owner: generic_variant_owner, interfaces: interfaces, struct_interfaces: struct_interfaces, arena_structs: arena_structs, sealed_interfaces: sealed_interfaces, interface_supertraits: interface_supertraits, fn_param_is_ref: fn_param_is_ref, method_param_is_ref: method_param_is_ref, static_method_param_is_ref: static_method_param_is_ref, moved: moved, moved_scopes: moved_scopes, fn_param_is_mut_ref: fn_param_is_mut_ref, method_param_is_mut_ref: method_param_is_mut_ref, static_method_param_is_mut_ref: static_method_param_is_mut_ref, mut_capable: mut_capable, mut_capable_scopes: mut_capable_scopes, components: components, resources: resources, warnings: warns, system_order: system_order, system_groups: system_groups, archetype_signatures: archetype_signatures, add_component_types: add_component_types, remove_component_types: remove_component_types, queried_component_types: queried_component_types };
 }
 
 pub fn empty_bool_vec_chk() -> Vec<Bool> {
@@ -638,6 +646,23 @@ pub fn str_vec_contains_ecs(v: &Vec<String>, s: String) -> Bool {
         i = i + 1;
     }
     return false;
+}
+
+// A declared `Option<Transform>` type annotation is stored as `"Option$Transform"` -- see
+// `Parser.hotc`'s own `type_name_ref` header: EVERY generic type annotation this compiler parses
+// already gets built as the internal `"Base$Arg"` mono-name string directly (no separate angle-
+// bracket-syntax `Ty` shape ever exists), the exact same convention `mono_base`/`mono_arg` (right
+// above) already read/write for a MONOMORPHIZED struct/enum instantiation's own name -- this is
+// genuinely the SAME shape, just reused here for the one thing this compiler doesn't already
+// monomorphize at parse time (there's no `Option<Transform>` struct/enum declaration anywhere to
+// instantiate -- `world.get`'s own RESULT type is assembled from a runtime query, not a real
+// generic construction). `"Option$Transform"` -> `Some("Transform")`; anything not shaped like a
+// single-type-argument `Option$...` (no declared type at all, a different generic, `Option` with
+// zero/two+ type args) -> `None`.
+pub fn option_inner_type_chk(s: String) -> Option<String> {
+    if !is_mono_name(s) { return none_string3(); }
+    if mono_base(s) != "Option" { return none_string3(); }
+    return some_string3(mono_arg(s));
 }
 
 // `true` iff `name` was declared via `resource Name { ... }` (registered into `resources`, a
@@ -4055,6 +4080,16 @@ impl TyChecker {
         if rn == "World" && (method == "add" || method == "remove") {
             return self.check_world_add_or_remove(method, args);
         }
+        // `world.get(id)` -- see ECS_IDEAS.md's own "Still open" #6 answer: reading a component's
+        // value back out by entity
+        // id, the one real gap `resources` never actually solved. No real generic-method syntax
+        // (`world.get::<Transform>(id)`) -- the queried component type `T` is read back from the
+        // enclosing `let`'s own declared `Option<T>` result type instead (`let t: Option<Transform>
+        // = world.get(id);`), threaded here via `self.cur_ret_ty` -- see `check_stmt`'s own `Let`
+        // arm header for why that's the ambient hint mechanism, not a new parameter.
+        if rn == "World" && method == "get" {
+            return self.check_world_get(args);
+        }
         var arg_tys = self.check_args_lambda_aware(args);
         if rn == "?" {
             return TyUnknown;
@@ -4131,6 +4166,51 @@ impl TyChecker {
             }
         }
         return ty_from_name("Unit");
+    }
+
+    // `world.get(id)` -- see ECS_IDEAS.md's own "Still open" #6 answer / `check_method_call`'s own
+    // header for the full design. Needs the queried component type `T` from the enclosing `let`'s
+    // own declared `Option<T>` result type (`self.cur_ret_ty`, threaded by `check_stmt`'s own
+    // `Let` arm) -- there is no real generic-method syntax carrying it any other way.
+    fn check_world_get(&mut self, args: Vec<Expr>) -> Ty {
+        if args.length() != 1 {
+            self.error("'world.get(...)' takes exactly 1 argument: an entity id");
+            return TyUnknown;
+        }
+        let entity_arg = args.get(0);
+        let entity_ty = self.check_expr(&entity_arg);
+        let entity_tn = ty_name(entity_ty);
+        if entity_tn != "Int" && entity_tn != "?" {
+            self.error("'world.get(...)' argument 1 must be an Int entity id, got " + entity_tn);
+        }
+        let inner_found = option_inner_type_chk(self.cur_ret_ty);
+        match inner_found {
+            Some { value: t } => {
+                let comp_found3 = self.components.get(t);
+                var comp_known3 = false;
+                if let Some { value: _ck3 } = comp_found3 { comp_known3 = true; }
+                if !comp_known3 {
+                    self.error("'world.get(...)' is being assigned to a declared 'Option<" + t + ">', but '" + t + "' isn't a known 'component'");
+                    return TyUnknown;
+                }
+                if !str_vec_contains_ecs(&self.queried_component_types, t) {
+                    self.queried_component_types.push(t);
+                }
+                // Registers the real `Option$<T>` monomorphized enum instantiation (variant
+                // ownership tables included) -- without this, the CALLER's own `match t1 { Some
+                // {...} => ..., None => ... }` on the result fails with "'Some' is not a variant
+                // of 'Option$Transform'", since nothing else in this whole call path ever
+                // constructs a REAL `Some`/`None` literal that would trigger this registration
+                // the normal way (`check_struct_lit`'s own path, unreached here -- this result
+                // comes back from a query, not a literal).
+                self.ensure_instantiated("Option$" + t);
+                return ty_from_name("Option$" + t);
+            }
+            None => {
+                self.error("'world.get(...)' needs a declared 'Option<T>' result type on its 'let', e.g. 'let t: Option<Transform> = world.get(id);'");
+                return TyUnknown;
+            }
+        }
     }
 
     // The real method-lookup/arg-validation body of `check_method_call`, factored out so
@@ -4647,7 +4727,23 @@ impl TyChecker {
                         self.mark_mut_capable(name, mutable);
                     }
                     _ => {
+                        // `world.get(id)` (see `check_method_call`'s own `World`/`"get"` header)
+                        // needs `dt_str` (this `let`'s own declared `Option<T>` type) to know
+                        // which component `T` is being queried -- there's no real generic-method
+                        // syntax to carry it any other way. Threaded through the SAME ambient
+                        // `self.cur_ret_ty` fallback `check_struct_lit`'s/bare-variant-`Ident`'s
+                        // own dispatch already consults (see this fn's own header on why it's
+                        // otherwise "the enclosing FUNCTION's own return type") -- save/restored
+                        // around this ONE call, same idiom `check_generic_method_instantiation`'s
+                        // own monomorphization pass already uses elsewhere in this file.
+                        // Unconditional whenever `has_dt` (not gated on `init`'s own shape) is
+                        // harmless when unused, for the identical reason `Codegen.hotc`'s own
+                        // matching `self.ret_ty` override already is: nothing here consults it
+                        // unless nothing else resolves the type first.
+                        var saved_ret_ty_let = self.cur_ret_ty;
+                        if has_dt { self.cur_ret_ty = dt_str; }
                         let t = self.check_expr(&init);
+                        self.cur_ret_ty = saved_ret_ty_let;
                         // `t` is consumed exactly once, right here (`ty_name` takes it by value) --
                         // the rest of this arm rebuilds whichever `Ty` it ultimately registers
                         // FRESH from the resulting `gn` string (`ty_name`/`ty_from_name` already

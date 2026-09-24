@@ -1805,6 +1805,15 @@ pub fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int
         // static and `pool.spawn(...)` calls whenever any two systems can run concurrently --
         // again, independent of whether the user's own source ever writes `use phoenix;` itself.
         out = add_stdlib_topic_and_deps("phoenix", out, target);
+        // `world.get(id)` (see ECS_IDEAS.md's own "Still open" #6 answer) returns a real `Option<T>` --
+        // same "independent of whether the user's own source ever writes it" transitive-dependency
+        // reasoning as `vec`/`phoenix` right above. A real, previously-hit gap found building this:
+        // without it, `Option`'s own generic enum template was never even PARSED, so `Checker.hotc`'s
+        // own `ensure_instantiated("Option$" + T)` silently found no template and registered
+        // nothing, and the CALLER's own `match result { Some {...} => ..., None => ... }` failed
+        // every arm with "'Some' is not a variant of 'Option$Transform'" even though `world.get`
+        // itself type-checked fine.
+        out = add_stdlib_topic_and_deps("option", out, target);
     } else if topic == "phoenix" {
         // `PhoenixPool::join_all_and_shutdown` (see `stdlib/phoenix.hotc`'s own header) takes a
         // real `&Vec<PhoenixTask>` -- `Vec<T>`'s own generic template has to be merged in for
