@@ -5736,7 +5736,7 @@ pub fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDe
         // unconditional behavior (a real, disclosed scope cut -- see `Checker.hotc`'s own
         // `generic_method_templates` header).
         var impl_is_generic = false;
-        let impl_tp = struct_type_param_cg(&structs, impl_decl.struct_name);
+        let impl_tp = struct_type_param_cg(&structs, &enums, impl_decl.struct_name);
         if impl_tp != "" { impl_is_generic = true; }
         var mi = 0;
         while mi < impl_decl.methods.length() {
@@ -5818,8 +5818,8 @@ pub fn build_program_info(target: Int, fns: &Vec<FnDecl>, structs: &Vec<StructDe
         let midx = mkey.indexOf("#");
         let mowner = mkey.substring(0, midx);
         let mmethod = mkey.substring(midx + 1, mkey.length());
-        let mono_mparams = monomorphized_method_params_cg(&impls, &structs, mowner, mmethod);
-        let mono_mret = monomorphized_method_retty_cg(&impls, &structs, mowner, mmethod);
+        let mono_mparams = monomorphized_method_params_cg(&impls, &structs, &enums, mowner, mmethod);
+        let mono_mret = monomorphized_method_retty_cg(&impls, &structs, &enums, mowner, mmethod);
         method_keys.push(mkey);
         method_descs_list.push(fn_descriptor(param_type_names_of(mono_mparams), mono_mret, &alias_names, &alias_binaries, &module_names, &module_values));
         method_rettys_list.push(mono_mret);
@@ -6460,7 +6460,14 @@ pub fn gen_struct(target: Int, name: String, fields: Vec<Param>, methods: Vec<Fn
 // one "shape"), this is a trivial no-arg constructor -- different variant literals populate
 // different subsets of fields, so `StructLit`-for-a-variant codegen (see `gen_expr`) sets `tag`
 // and each field via individual `PUTFIELD`s after construction instead.
-pub fn gen_enum(target: Int, name: String, variants: Vec<EnumVariant>, module_name: Option<String>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, pub_enum_names: &Vec<String>) {
+// `methods` -- see `gen_struct`'s own identical param, added the same day for the exact same real
+// gap: `impl EnumName { fn describe(&self) -> String { match self { ... } } }` previously CHECKED
+// fine (`Checker.hotc`'s own enum impl-method registration was never enum-specific) but silently
+// produced a class with NO such method at all -- a real `NoSuchMethodError` at RUNTIME, not a
+// compile error, found running (not just compiling) a plain, non-generic enum with an impl block
+// for the first time. `gen_struct`'s own method-emission loop is mirrored here directly, just
+// onto an enum's own `cw` instead of a struct's.
+pub fn gen_enum(target: Int, name: String, variants: Vec<EnumVariant>, module_name: Option<String>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, pub_enum_names: &Vec<String>, methods: Vec<FnDecl>, fns: &Vec<FnDecl>, impls: &Vec<ImplDecl>, mono_names: &Vec<String>, fn_mono_names: &Vec<String>, method_mono_names: &Vec<String>, statics: &Vec<StaticDecl>, externs: &Vec<ExternClassDecl>, interfaces: &Vec<InterfaceDecl>, sendable_struct_names: &Vec<String>) {
     var cw = ClassWriter2::new(2); // COMPUTE_FRAMES (implies COMPUTE_MAXS; real ASM value is 2, not 4)
     let qname = qualify_with_opt_module_cg(name, module_name);
     // `pub enum Foo { ... }` -- see `Ast.hc`'s own `Program.pub_enum_names` header for the real
@@ -6655,6 +6662,17 @@ pub fn gen_enum(target: Int, name: String, variants: Vec<EnumVariant>, module_na
         nof.visitInsn(176); // ARETURN
         nof.visitMaxs(0, 0);
         nof.visitEnd();
+    }
+
+    // See this fn's own header on `methods` -- mirrors `gen_struct`'s own identical loop exactly,
+    // `qname`/`name` standing in for that fn's own `binary_name`/`name` params.
+    var emi3 = 0;
+    while emi3 < methods.length() {
+        let em3 = methods.get(emi3);
+        let em3b = methods.get(emi3); // fresh copy -- `.params` is only safe to read once
+        let einfo = build_program_info(target, &fns, &structs, &impls, &enums, &mono_names, &fn_mono_names, &method_mono_names, &statics, &externs, &interfaces, sendable_struct_names); // fresh every iteration, see build_program_info's own header
+        gen_method(&mut cw, qname, name, em3.name, param_names_of(em3.params), param_type_names_of(em3b.params), opt_string_or(em3.ret_type, "Unit"), em3.body, einfo);
+        emi3 = emi3 + 1;
     }
 
     cw.visitEnd();
@@ -7251,11 +7269,22 @@ pub fn find_template_method_cg(impls: &Vec<ImplDecl>, base: String, method: Stri
     return FnDecl { name: "_", params: empty_param_vec2(), ret_type: none_string2(), body: empty_stmt_vec2(), type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: false, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
-// A generic struct declaration's own `type_param` string (`"T"` for `struct Box<T> { ... }`), `""`
-// if `base` isn't found or isn't generic -- `Codegen.hotc` doesn't share `Checker.hotc`'s own
-// `generic_templates` registry, so this is derived fresh from the plain `structs: Vec<StructDecl>`
-// every caller already has, same pattern the rest of this file's mono helpers use.
-pub fn struct_type_param_cg(structs: &Vec<StructDecl>, base: String) -> String {
+// A generic struct OR ENUM declaration's own `type_param` string (`"T"` for `struct Box<T> {
+// ... }` OR `enum Option<T> { ... }`), `""` if `base` isn't found in either or isn't generic --
+// `Codegen.hotc` doesn't share `Checker.hotc`'s own `generic_templates`/`generic_enum_templates`
+// registries, so this is derived fresh from the plain `structs: Vec<StructDecl>`/`enums: Vec
+// <EnumDecl>` every caller already has, same pattern the rest of this file's mono helpers use.
+// Real, previously-unknown gap this widening fixes: `impl Option<T> { fn is_some(&self) -> Bool
+// { ... } }` -- checking `structs` ALONE (this fn's own original scope, before enum impl-block
+// methods existed at all) can never find "Option" (an enum, not a struct), so every caller
+// downstream (this fn's own two -- `monomorphized_method_params_cg`'s own substitution AND
+// `build_program_info`'s own `impl_is_generic` check) silently treated a generic ENUM's own impl
+// methods as ordinary, non-generic, un-substituted ones -- `T` stayed literally `"T"` in the
+// generated method (a bogus `"LT;"` descriptor), and `build_program_info` registered a real,
+// wrongly-shared descriptor under the bare `"Option#is_some"` key instead of skipping it the way
+// a generic STRUCT's own impl methods already correctly do. Checks `structs` first (unchanged
+// behavior for every existing struct caller), falls back to `enums` only when not found there.
+pub fn struct_type_param_cg(structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, base: String) -> String {
     var i = 0;
     while i < structs.length() {
         let sd = structs.get(i);
@@ -7266,12 +7295,23 @@ pub fn struct_type_param_cg(structs: &Vec<StructDecl>, base: String) -> String {
         }
         i = i + 1;
     }
+    var j = 0;
+    while j < enums.length() {
+        let ed = enums.get(j);
+        if ed.name == base {
+            var etp = "";
+            if let Some { value: et } = ed.type_param { etp = et; }
+            return etp;
+        }
+        j = j + 1;
+    }
     return "";
 }
 
 // The `type_param2`-shaped sibling of `struct_type_param_cg` above -- `""` when `base` isn't
-// found or has only one type param, see `Ast.hc`'s own `StructDecl.type_param2` header.
-pub fn struct_type_param2_cg(structs: &Vec<StructDecl>, base: String) -> String {
+// found in either `structs`/`enums`, or has only one type param, see `Ast.hc`'s own `StructDecl.
+// type_param2`/`EnumDecl.type_param2` headers.
+pub fn struct_type_param2_cg(structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, base: String) -> String {
     var i = 0;
     while i < structs.length() {
         let sd = structs.get(i);
@@ -7282,6 +7322,16 @@ pub fn struct_type_param2_cg(structs: &Vec<StructDecl>, base: String) -> String 
         }
         i = i + 1;
     }
+    var j = 0;
+    while j < enums.length() {
+        let ed = enums.get(j);
+        if ed.name == base {
+            var etp2 = "";
+            if let Some { value: et2 } = ed.type_param2 { etp2 = et2; }
+            return etp2;
+        }
+        j = j + 1;
+    }
     return "";
 }
 
@@ -7291,14 +7341,14 @@ pub fn struct_type_param2_cg(structs: &Vec<StructDecl>, base: String) -> String 
 // declared `T` (the OWNING STRUCT's own type parameter, found via `struct_type_param_cg` -- NOT
 // the method's own `type_param`, which is always `None`; a method isn't independently generic, it
 // just uses its struct's `T`) for `mono_arg_cg(owner)`.
-pub fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Param> {
+pub fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, owner: String, method: String) -> Vec<Param> {
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
-    let found_tp = struct_type_param_cg(&structs, base);
+    let found_tp = struct_type_param_cg(&structs, &enums, base);
     // `impl Pair<K, V> { fn describe(&self) { self.key.hash_key(); } }` -- a SECOND type param on
     // the RECEIVER's own struct, mirroring `monomorphized_fields`'s own two-param handling (see
     // `Ast.hc`'s own `StructDecl.type_param2` header).
-    let tp2meth = struct_type_param2_cg(&structs, base);
+    let tp2meth = struct_type_param2_cg(&structs, &enums, base);
     let has_tp2meth = tp2meth != "";
     var real_argmeth = arg;
     var arg2meth = "";
@@ -7321,11 +7371,11 @@ pub fn monomorphized_method_params_cg(impls: &Vec<ImplDecl>, structs: &Vec<Struc
     return out;
 }
 
-pub fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> String {
+pub fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, owner: String, method: String) -> String {
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
-    let found_tp = struct_type_param_cg(&structs, base);
-    let tp2meth2 = struct_type_param2_cg(&structs, base);
+    let found_tp = struct_type_param_cg(&structs, &enums, base);
+    let tp2meth2 = struct_type_param2_cg(&structs, &enums, base);
     let has_tp2meth2 = tp2meth2 != "";
     var real_argmeth2 = arg;
     var arg2meth2 = "";
@@ -7342,11 +7392,11 @@ pub fn monomorphized_method_retty_cg(impls: &Vec<ImplDecl>, structs: &Vec<Struct
     return subbed_ret;
 }
 
-pub fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> Vec<Stmt> {
+pub fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, owner: String, method: String) -> Vec<Stmt> {
     let base = mono_base_cg(owner);
     let arg = mono_arg_cg(owner);
-    let found_tp = struct_type_param_cg(&structs, base);
-    let tp2meth3 = struct_type_param2_cg(&structs, base);
+    let found_tp = struct_type_param_cg(&structs, &enums, base);
+    let tp2meth3 = struct_type_param2_cg(&structs, &enums, base);
     let has_tp2meth3 = tp2meth3 != "";
     var real_argmeth3 = arg;
     var arg2meth3 = "";
@@ -7365,20 +7415,21 @@ pub fn monomorphized_method_body_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructD
 // The full substituted `FnDecl` for one mono method instantiation, ready to hand to `gen_method`
 // exactly like a real, non-generic method's own declaration -- `gen_struct`'s own method-emission
 // loop needs no changes at all once it's handed one of these (see this file's own header).
-pub fn monomorphized_method_decl_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, owner: String, method: String) -> FnDecl {
-    let params = monomorphized_method_params_cg(&impls, &structs, owner, method);
-    let ret = monomorphized_method_retty_cg(&impls, &structs, owner, method);
-    let body = monomorphized_method_body_cg(&impls, &structs, owner, method);
+pub fn monomorphized_method_decl_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, owner: String, method: String) -> FnDecl {
+    let params = monomorphized_method_params_cg(&impls, &structs, &enums, owner, method);
+    let ret = monomorphized_method_retty_cg(&impls, &structs, &enums, owner, method);
+    let body = monomorphized_method_body_cg(&impls, &structs, &enums, owner, method);
     let base2 = mono_base_cg(owner);
     let tmpl2 = find_template_method_cg(&impls, base2, method);
     return FnDecl { name: method, params: params, ret_type: some_string2(ret), body: body, type_param: none_string2(), type_bounds: empty_str_vec4(), self_is_mut: tmpl2.self_is_mut, type_param2: none_string2(), type_bounds2: empty_str_vec4() };
 }
 
 // Every substituted method `checker.method_mono_needed` recorded for THIS particular mono struct
-// (`mono_name`, e.g. `"Box$Int"`) -- `gen_struct`'s own mono-instantiation call site passes this
-// as its `methods` argument instead of the empty `Vec` it used before this phase (see `Codegen.hc`'s
-// own header for why generic struct instance methods needed this whole new pathway).
-pub fn monomorphized_methods_for_struct_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, method_mono_names: &Vec<String>, mono_name: String) -> Vec<FnDecl> {
+// OR ENUM (`mono_name`, e.g. `"Box$Int"` or `"Option$Int"`) -- `gen_struct`'s/`gen_enum`'s own
+// mono-instantiation call sites pass this as their `methods` argument instead of the empty `Vec`
+// they used before this phase (see `Codegen.hc`'s own header for why generic struct/enum instance
+// methods needed this whole new pathway).
+pub fn monomorphized_methods_for_struct_cg(impls: &Vec<ImplDecl>, structs: &Vec<StructDecl>, enums: &Vec<EnumDecl>, method_mono_names: &Vec<String>, mono_name: String) -> Vec<FnDecl> {
     var out = empty_fn_decl_vec2();
     var i = 0;
     while i < method_mono_names.length() {
@@ -7387,7 +7438,7 @@ pub fn monomorphized_methods_for_struct_cg(impls: &Vec<ImplDecl>, structs: &Vec<
         let owner = key.substring(0, idx);
         let method = key.substring(idx + 1, key.length());
         if owner == mono_name {
-            out.push(monomorphized_method_decl_cg(&impls, &structs, owner, method));
+            out.push(monomorphized_method_decl_cg(&impls, &structs, &enums, owner, method));
         }
         i = i + 1;
     }
@@ -9451,6 +9502,15 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         var im0_is_generic = false;
         let gtmpl0_found = checker.generic_templates.get(im0.struct_name);
         if let Some { value: gt0 } = gtmpl0_found { im0_is_generic = true; }
+        // A generic ENUM's own impl block (`impl Option<T> { ... }`) is generic too -- the
+        // check above only ever looked at `generic_templates` (structs), so an impl on a generic
+        // enum fell through to the `else` branch below and got registered as a real, concrete
+        // (but still bare-`T`) method under "Option#is_some" -- never entering
+        // `generic_method_templates` at all, so `ensure_method_instantiated` (Checker.hotc) could
+        // never find a template to monomorphize `Option$Int#is_some` from. Same shape as the
+        // `struct_type_param_cg` fix right above this fn's own header comment.
+        let getmpl0_found = checker.generic_enum_templates.get(im0.struct_name);
+        if let Some { value: get0 } = getmpl0_found { im0_is_generic = true; }
         var mi0 = 0;
         while mi0 < im0.methods.length() {
             let m0 = im0.methods.get(mi0);
@@ -9492,6 +9552,8 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         var im1_is_generic = false;
         let gtmpl1_found = checker.generic_templates.get(im1.struct_name);
         if let Some { value: gt1 } = gtmpl1_found { im1_is_generic = true; }
+        let getmpl1_found = checker.generic_enum_templates.get(im1.struct_name);
+        if let Some { value: get1 } = getmpl1_found { im1_is_generic = true; }
         var mi1 = 0;
         while mi1 < im1.methods.length() {
             if !im1_is_generic {
@@ -9864,10 +9926,10 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         let mono_name = checker.mono_needed.get(mi2);
         if is_generic_enum_mono(&enums, mono_name) {
             let mono_variants = monomorphized_enum_variants(&enums, mono_name);
-            gen_enum(target, mono_name, mono_variants, find_enum_module_cg(mono_name, &enums), &structs, &enums, &pub_enum_names);
+            gen_enum(target, mono_name, mono_variants, find_enum_module_cg(mono_name, &enums), &structs, &enums, &pub_enum_names, monomorphized_methods_for_struct_cg(&impls, &structs, &enums, &checker.method_mono_needed, mono_name), &fns, &impls, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, &sendable_struct_names);
         } else {
             let mono_fields = monomorphized_fields(&structs, mono_name);
-            gen_struct(target, mono_name, mono_fields, monomorphized_methods_for_struct_cg(&impls, &structs, &checker.method_mono_needed, mono_name), empty_fn_decl_vec2(), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, none_string2(), none_annotation2(), &sendable_struct_names, &pub_struct_names);
+            gen_struct(target, mono_name, mono_fields, monomorphized_methods_for_struct_cg(&impls, &structs, &enums, &checker.method_mono_needed, mono_name), empty_fn_decl_vec2(), binary_name, &fns, &structs, &impls, &enums, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, none_string2(), none_annotation2(), &sendable_struct_names, &pub_struct_names);
         }
         mi2 = mi2 + 1;
     }
@@ -9877,7 +9939,7 @@ pub fn compile_program(fns: Vec<FnDecl>, structs: Vec<StructDecl>, impls: Vec<Im
         var ed1_is_generic = false;
         if let Some { value: etp1 } = ed1.type_param { ed1_is_generic = true; }
         if !ed1_is_generic {
-            gen_enum(target, ed1.name, ed1.variants, ed1.module_name, &structs, &enums, &pub_enum_names);
+            gen_enum(target, ed1.name, ed1.variants, ed1.module_name, &structs, &enums, &pub_enum_names, methods_for_struct(&impls, ed1.name), &fns, &impls, &checker.mono_needed, &checker.fn_mono_needed, &checker.method_mono_needed, &statics, &externs, &interfaces, &sendable_struct_names);
         }
         ei1 = ei1 + 1;
     }

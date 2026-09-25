@@ -1,0 +1,40 @@
+// Real, previously-missing ergonomic methods on `Option<T>`/`Result<T, E>` -- see
+// ARCHITECTURE.md's own "Option<T>/Result<T, E> ergonomic methods" entry. Blocked until now on a
+// real compiler gap: a generic ENUM's own `impl Option<T> { ... }` block was silently never
+// monomorphized at all (registered as a bogus, un-substituted concrete method instead), so
+// `is_some()`/`unwrap()`/etc. never worked for any generic enum, not just these two.
+
+use option;
+use result;
+
+fn main() {
+    let a: Option<Int> = Some { value: 5 };
+    let b: Option<Int> = None {};
+    print(a.is_some());     // true
+    print(a.is_none());     // false
+    print(b.is_some());     // false
+    print(b.is_none());     // true
+    print(a.unwrap());      // 5
+    print(a.unwrap_or(99)); // 5
+    print(b.unwrap_or(99)); // 99
+    try {
+        print(b.unwrap());
+    } catch (e: OptionUnwrapPanic) {
+        print("caught: {e.getMessage()}");
+    }
+
+    let ok: Result<Int, String> = Result<Int, String>::Ok { value: 7 };
+    let err: Result<Int, String> = Result<Int, String>::Err { error: "boom" };
+    print(ok.is_ok());       // true
+    print(ok.is_err());      // false
+    print(err.is_ok());      // false
+    print(err.is_err());     // true
+    print(ok.unwrap());      // 7
+    print(ok.unwrap_or(99)); // 7
+    print(err.unwrap_or(99)); // 99
+    try {
+        print(err.unwrap());
+    } catch (e: ResultUnwrapPanic) {
+        print("caught: {e.getMessage()}");
+    }
+}

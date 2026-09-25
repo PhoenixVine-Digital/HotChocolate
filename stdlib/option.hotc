@@ -5,3 +5,40 @@ pub enum Option<T> {
     Some { value: T },
     None {},
 }
+
+extern class OptionUnwrapPanic = "java.lang.RuntimeException" {
+    fn new(msg: String) -> Self;
+    fn getMessage(&self) -> String;
+}
+
+// Ergonomic methods on the generic enum template itself (`impl Option<T> { ... }`) -- each
+// monomorphization (`Option$Int`, `Option$String`, ...) gets its own real, substituted copy of
+// these bodies (see `Checker.hotc`'s own `ensure_method_instantiated`/`generic_enum_templates`
+// header for how a generic ENUM's impl block is monomorphized, same mechanism a generic STRUCT's
+// own impl block already used).
+impl Option<T> {
+    fn is_some(&self) -> Bool {
+        match self {
+            Some { value } => { return true; }
+            None {} => { return false; }
+        }
+    }
+
+    fn is_none(&self) -> Bool {
+        return !self.is_some();
+    }
+
+    fn unwrap(&self) -> T {
+        match self {
+            Some { value } => { return value; }
+            None {} => { throw OptionUnwrapPanic::new("called 'unwrap()' on a 'None' value"); }
+        }
+    }
+
+    fn unwrap_or(&self, default_val: T) -> T {
+        match self {
+            Some { value } => { return value; }
+            None {} => { return default_val; }
+        }
+    }
+}

@@ -8,3 +8,39 @@ pub enum Result<T, E> {
     Ok { value: T },
     Err { error: E },
 }
+
+extern class ResultUnwrapPanic = "java.lang.RuntimeException" {
+    fn new(msg: String) -> Self;
+    fn getMessage(&self) -> String;
+}
+
+// Same ergonomic-method shape `option.hotc`'s own `impl Option<T>` already established, extended
+// to a SECOND type param (`E`) -- see `Checker.hotc`'s own `ensure_method_instantiated` two-
+// type-param branch (`type_param2`/`mono_arg1_of2`/`mono_arg2_of2`) for how `Result$Int$String`
+// gets both `T` and `E` substituted.
+impl Result<T, E> {
+    fn is_ok(&self) -> Bool {
+        match self {
+            Ok { value } => { return true; }
+            Err { error } => { return false; }
+        }
+    }
+
+    fn is_err(&self) -> Bool {
+        return !self.is_ok();
+    }
+
+    fn unwrap(&self) -> T {
+        match self {
+            Ok { value } => { return value; }
+            Err { error } => { throw ResultUnwrapPanic::new("called 'unwrap()' on an 'Err' value"); }
+        }
+    }
+
+    fn unwrap_or(&self, default_val: T) -> T {
+        match self {
+            Ok { value } => { return value; }
+            Err { error } => { return default_val; }
+        }
+    }
+}

@@ -4860,6 +4860,58 @@ own `prelude_source` header) -- read fresh off disk at every compile, so no self
 sync/re-verify cycle was needed for this change, unlike every `selfhost/*.hotc` change earlier
 this session. See `examples/stdlib_additions.hotc`.
 
+## `Option<T>`/`Result<T, E>` ergonomic methods (`is_some`/`unwrap`/`unwrap_or`/...)
+
+**Shipped, 2026-09-25.** `stdlib/option.hotc`/`stdlib/result.hotc` were bare enum declarations
+with zero methods -- every real program needing `is_some()`/`unwrap()`-style ergonomics had to
+hand-write a `match` every time. Blocked on a real, previously-unknown compiler gap, found while
+building this: `impl Option<T> { fn is_some(&self) -> Bool { match self { ... } } }` failed with
+`'Some' is not a variant of 'Option'` at the checker, and (once that was fixed) `codegen for
+'MethodCall' to 'is_some' not implemented this phase` at codegen -- a genuine SILENT MISCOMPILE
+class of bug, not caught anywhere before this.
+
+Three separate, real gaps, all with the same root shape -- a struct-only check that never
+considered a generic ENUM could be the thing on the other end:
+
+1. **`Checker.hotc`'s own `check_match`**: `self`'s static type inside a generic enum's own
+   impl-block method body is the BARE template name (`"Option"`), and `ensure_instantiated` is a
+   deliberate no-op for non-mono names -- so `variant_owner_q`/`self.enum_variants` never had an
+   entry for it at all. Fixed with a fallback: when the match subject's type name isn't a mono
+   name but IS a registered `generic_enum_templates` entry, resolve variant existence/field
+   types/exhaustiveness directly against the template's own raw `Vec<EnumVariant>` instead.
+2. **`Codegen.hotc`'s own `build_program_info`** (the impl-registration loop that decides whether
+   an impl block's methods go into `generic_method_templates`, deferred until a real mono
+   receiver asks for them, or get registered directly as a concrete method): checked ONLY
+   `checker.generic_templates` (structs) to decide "is this impl's owner generic?", never
+   `checker.generic_enum_templates` (enums). A generic enum's impl fell through to the `else`
+   branch and got registered as a real, concrete-but-still-abstract-`T` method under the bare
+   name (`"Option#is_some"`) -- never entering `generic_method_templates` at all, so
+   `ensure_method_instantiated` could never find a template to monomorphize `Option$Int#is_some`
+   from. Two call sites had this exact check (registration and per-instantiation body-checking);
+   both fixed the same way, checking `generic_enum_templates` as a second lookup.
+3. **`Checker.hotc`'s own `ensure_method_instantiated`**: once (1) and (2) let it find a real
+   generic method template, it still looked up the receiver's own type PARAMETER NAME (`T`) via
+   `self.generic_templates.get(base)` only (structs) to know what to substitute -- missing for a
+   generic enum, this would leave `found_tp` as `""` and silently substitute nothing at all.
+   Fixed with the same `generic_enum_templates` fallback, including the two-type-param
+   (`type_param2`) case `Result<T, E>` needs.
+4. **`Codegen.hotc`'s own `gen_enum`**: had NO `methods` parameter at all -- a BROADER,
+   pre-existing gap than just generics, affecting every plain (non-generic) enum's own impl
+   methods too. Confirmed as a genuine silent miscompile with a standalone plain-enum test: the
+   checker accepted it and the class compiled and loaded, but calling the method threw
+   `java.lang.NoSuchMethodError` at RUNTIME. Fixed by widening `gen_enum`'s signature to accept
+   `methods: Vec<FnDecl>` (mirroring `gen_struct`'s own identical parameter) and adding a
+   method-emission loop right before `cw.visitEnd()`, reusing the existing `gen_method`/
+   `build_program_info` helpers exactly like `gen_struct` already does.
+
+`stdlib/option.hotc` gained `is_some`/`is_none`/`unwrap`/`unwrap_or` on `impl Option<T>`;
+`stdlib/result.hotc` gained the same four (`is_ok`/`is_err` instead of `is_some`/`is_none`) on
+`impl Result<T, E>`. `unwrap()` on `None`/`Err` throws a real, dedicated extern exception
+(`OptionUnwrapPanic`/`ResultUnwrapPanic`, both bound to `java.lang.RuntimeException`) rather than
+reusing a shared/generic exception type, so a caller's own `catch` clause can distinguish "I
+called unwrap wrong" from any other runtime exception. See `examples/option_result_ergonomics.hotc`
+for both types' full method set, including the `unwrap()`-throws-and-is-caught path for each.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/

@@ -493,6 +493,44 @@ pub fn find_field_type_raw(info: StructInfo, field: String) -> String {
     return "?";
 }
 
+// `check_match`'s own generic-enum-template fallback (see that fn's own header on the real
+// "'Some' is not a variant of 'Option'" gap this closes) -- both readers need the DECLARED field
+// list for `variant_name` directly inside a generic enum's raw, un-substituted `Vec<EnumVariant>`;
+// "?"/`""` on a missing variant/field (a real error, reported by each caller, not silently
+// swallowed here).
+pub fn find_variant_field_type_in_template_chk(variants: &Vec<EnumVariant>, variant_name: String, field_name: String) -> String {
+    var i = 0;
+    while i < variants.length() {
+        let v = variants.get(i);
+        if v.name == variant_name {
+            var j = 0;
+            while j < v.fields.length() {
+                let p = v.fields.get(j);
+                if p.name == field_name { return p.type_name; }
+                j = j + 1;
+            }
+            return "?";
+        }
+        i = i + 1;
+    }
+    return "?";
+}
+
+// The positional-pattern (`Goblin(hp)`) sibling: the field NAME sitting at declaration position
+// `pos` within `variant_name`'s own field list, `""` if `variant_name`/`pos` doesn't resolve.
+pub fn find_variant_field_name_at_pos_chk(variants: &Vec<EnumVariant>, variant_name: String, pos: Int) -> String {
+    var i = 0;
+    while i < variants.length() {
+        let v = variants.get(i);
+        if v.name == variant_name {
+            if pos < v.fields.length() { return v.fields.get(pos).name; }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
 extern class JStringChk = "java.lang.String" {
     fn length(&self) -> Int;
     fn codePointAt(&self, index: Int) -> Int;
@@ -4052,6 +4090,17 @@ impl TyChecker {
             if let Some { value: tmpl } = tmpl_found {
                 found_tp = tmpl.type_param;
                 if let Some { value: tp2mv } = tmpl.type_param2 { has_tp2m = true; tp2m = tp2mv; }
+            } else {
+                // `base` names a generic ENUM ("Option"), not a struct -- `generic_templates`
+                // only ever holds structs, so the lookup above misses and `found_tp` would stay
+                // "" (substituting nothing, silently leaving every `T` in the method's own
+                // params/return/body unsubstituted). Same struct-only gap already fixed in
+                // `Codegen.hotc`'s own impl-registration loops.
+                let etmpl_found = self.generic_enum_templates.get(base);
+                if let Some { value: etmpl } = etmpl_found {
+                    found_tp = etmpl.type_param;
+                    if let Some { value: etp2mv } = etmpl.type_param2 { has_tp2m = true; tp2m = etp2mv; }
+                }
             }
             // `impl Pair<K, V> { fn describe(&self) { self.key.hash_key(); } }` -- a SECOND type
             // param on the RECEIVER's own struct, mirroring `ensure_fn_instantiated`'s own two-
@@ -5210,6 +5259,33 @@ impl TyChecker {
             // site checked earlier in the same run failed every arm with a spurious "'Some' is not a
             // variant of 'Opt$Int'".
             self.ensure_instantiated(sn);
+            // `impl Option<T> { fn is_some(&self) -> Bool { match self { Some {...} => ...,
+            // None {} => ... } } }` -- a real, previously-unknown gap found trying to write
+            // exactly this: `self`'s own type inside a GENERIC struct/enum's own impl-block
+            // method body is registered as the BARE template name ("Option"), never a concrete
+            // mono instantiation ("Option$Int") -- `ensure_instantiated` is a deliberate no-op for
+            // a non-mono name (see its own header), so `variant_owner_q`/`self.structs`/`self.
+            // enum_variants` never have an entry for the bare name at all, and every arm failed
+            // with "'Some' is not a variant of 'Option'" even though `Option`'s own declared
+            // template obviously HAS a `Some` variant. Fixed by resolving variant existence AND
+            // each bound field's own type directly against `self.generic_enum_templates.get(sn)`
+            // (the raw, un-substituted template) whenever `sn` isn't a mono name but IS a known
+            // generic enum's own bare name -- structurally valid regardless of which concrete
+            // type this method eventually monomorphizes to, since variant/field NAMES are fixed
+            // by the declaration, only field TYPES vary per instantiation. A field typed exactly
+            // the enum's own bare type parameter (`Some { value: T }`) registers its bound name
+            // as `ty_from_name("T")` -- the same abstract-placeholder convention an ordinary
+            // generic fn param typed bare `T` already uses elsewhere in this file (e.g. `Vec<T>
+            // ::push`'s own `value: T`), not a new mechanism.
+            var is_generic_template_match = false;
+            var gtmpl_variants = empty_variant_vec3();
+            if !is_mono_name(sn) {
+                let gtmpl_found2 = self.generic_enum_templates.get(sn);
+                if let Some { value: gtmpl2 } = gtmpl_found2 {
+                    is_generic_template_match = true;
+                    gtmpl_variants = gtmpl2.variants;
+                }
+            }
             var has_wildcard = false;
             var covered = empty_str_vec2();
             var i = 0;
@@ -5234,11 +5310,23 @@ impl TyChecker {
                     // every enum -- plain and generic mono instantiations alike) rather than the bare
                     // `variant_owner` lookup, since the latter would collide across multiple concrete
                     // instantiations of the same generic enum (see `Ast.hc`'s own `EnumDecl` header).
-                    let owner_q_found = self.variant_owner_q.get(sn + "#" + arm.variant_name);
-                    var owner_ok = false;
-                    if let Some { value: ok } = owner_q_found { owner_ok = true; }
-                    if !owner_ok && sn != "?" {
-                        self.error("'" + arm.variant_name + "' is not a variant of '" + sn + "'");
+                    if is_generic_template_match {
+                        var gv_ok = false;
+                        var gvi2 = 0;
+                        while gvi2 < gtmpl_variants.length() {
+                            if gtmpl_variants.get(gvi2).name == arm.variant_name { gv_ok = true; }
+                            gvi2 = gvi2 + 1;
+                        }
+                        if !gv_ok {
+                            self.error("'" + arm.variant_name + "' is not a variant of '" + sn + "'");
+                        }
+                    } else {
+                        let owner_q_found = self.variant_owner_q.get(sn + "#" + arm.variant_name);
+                        var owner_ok = false;
+                        if let Some { value: ok } = owner_q_found { owner_ok = true; }
+                        if !owner_ok && sn != "?" {
+                            self.error("'" + arm.variant_name + "' is not a variant of '" + sn + "'");
+                        }
                     }
                 }
                 // Real scope, pushed for this arm alone: a binding leaking into a LATER arm or past
@@ -5261,12 +5349,19 @@ impl TyChecker {
                     // directly, so only the positional shape needs this extra lookup.
                     var fname = "";
                     if arm.is_positional {
-                        let vinfo_for_pos = self.variant_field_info.get(sn + "#" + arm.variant_name);
-                        if let Some { value: vfp } = vinfo_for_pos {
-                            if fj < vfp.field_names.length() {
-                                fname = vfp.field_names.get(fj);
-                            } else {
+                        if is_generic_template_match {
+                            fname = find_variant_field_name_at_pos_chk(&gtmpl_variants, arm.variant_name, fj);
+                            if fname == "" {
                                 self.error("'" + arm.variant_name + "' has fewer than " + JString::valueOf(fj + 1) + " field(s), but the pattern binds " + JString::valueOf(arm.bind_names.length()));
+                            }
+                        } else {
+                            let vinfo_for_pos = self.variant_field_info.get(sn + "#" + arm.variant_name);
+                            if let Some { value: vfp } = vinfo_for_pos {
+                                if fj < vfp.field_names.length() {
+                                    fname = vfp.field_names.get(fj);
+                                } else {
+                                    self.error("'" + arm.variant_name + "' has fewer than " + JString::valueOf(fj + 1) + " field(s), but the pattern binds " + JString::valueOf(arm.bind_names.length()));
+                                }
                             }
                         }
                     } else {
@@ -5284,13 +5379,17 @@ impl TyChecker {
                     // Falls back to the union table when there's no per-variant entry (a plain,
                     // non-enum struct never being matched this way in practice, but harmless either
                     // way).
-                    let variant_info_found = self.variant_field_info.get(sn + "#" + arm.variant_name);
-                    if let Some { value: vinfo } = variant_info_found {
-                        fty = find_field_type(vinfo, fname);
+                    if is_generic_template_match {
+                        fty = find_variant_field_type_in_template_chk(&gtmpl_variants, arm.variant_name, fname);
                     } else {
-                        let info_found = self.structs.get(sn); // fresh every iteration -- see check_match's own header
-                        if let Some { value: info } = info_found {
-                            fty = find_field_type(info, fname);
+                        let variant_info_found = self.variant_field_info.get(sn + "#" + arm.variant_name);
+                        if let Some { value: vinfo } = variant_info_found {
+                            fty = find_field_type(vinfo, fname);
+                        } else {
+                            let info_found = self.structs.get(sn); // fresh every iteration -- see check_match's own header
+                            if let Some { value: info } = info_found {
+                                fty = find_field_type(info, fname);
+                            }
                         }
                     }
                     self.vars.register(bname, ty_from_name(fty));
@@ -5301,21 +5400,38 @@ impl TyChecker {
                 i = i + 1;
             }
             if !has_wildcard && sn != "?" {
-                let variants_found = self.enum_variants.get(sn);
-                if let Some { value: variants } = variants_found {
-                    var vi = 0;
-                    while vi < variants.length() {
-                        let vname = variants.get(vi);
-                        var found_cov = false;
-                        var ci = 0;
-                        while ci < covered.length() {
-                            if covered.get(ci) == vname { found_cov = true; }
-                            ci = ci + 1;
+                if is_generic_template_match {
+                    var gvi3 = 0;
+                    while gvi3 < gtmpl_variants.length() {
+                        let gvname = gtmpl_variants.get(gvi3).name;
+                        var gfound_cov = false;
+                        var gci = 0;
+                        while gci < covered.length() {
+                            if covered.get(gci) == gvname { gfound_cov = true; }
+                            gci = gci + 1;
                         }
-                        if !found_cov {
-                            self.error("match on '" + sn + "' is not exhaustive, missing variant '" + vname + "'");
+                        if !gfound_cov {
+                            self.error("match on '" + sn + "' is not exhaustive, missing variant '" + gvname + "'");
                         }
-                        vi = vi + 1;
+                        gvi3 = gvi3 + 1;
+                    }
+                } else {
+                    let variants_found = self.enum_variants.get(sn);
+                    if let Some { value: variants } = variants_found {
+                        var vi = 0;
+                        while vi < variants.length() {
+                            let vname = variants.get(vi);
+                            var found_cov = false;
+                            var ci = 0;
+                            while ci < covered.length() {
+                                if covered.get(ci) == vname { found_cov = true; }
+                                ci = ci + 1;
+                            }
+                            if !found_cov {
+                                self.error("match on '" + sn + "' is not exhaustive, missing variant '" + vname + "'");
+                            }
+                            vi = vi + 1;
+                        }
                     }
                 }
             }
