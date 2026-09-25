@@ -5039,6 +5039,53 @@ uses for Ctrl+Space suggestions had independently fallen behind the same way (mi
 `component`/`system`/`resource` from an EARLIER round of this same gap, on top of the seven above)
 — caught up too, plus `Char` added to `PRIMITIVE_TYPE_NAMES`.
 
+**Caught up, 2026-09-25**: `HCAnnotator.kt`'s own `checkAnnotation` -- the plugin's SEMANTIC
+validation of `@directive` placement, separate from the parser-level gap the entry right above
+this one closes -- had fallen behind by an entire session's worth of shipped directives:
+`@deterministic`, `@gpu`, `@sendable`, `@tunable`, `@derive(...)`, `@startup`/`@update`/
+`@fixed_update`/`@render`, `@requires(...)`/`@ensures(...)`, and `@after(...)`/`@before(...)`/
+`@profile`/`@main_thread`/`@run_if(...)` all real-error-squiggled as "expected a quoted annotation
+name ... or a known compiler directive" even on perfectly valid code, since `checkAnnotation`'s own
+`kind` dispatch only ever recognized `must_use`/`serializable`/`entry`/`dev`. Fixed by grouping
+every OTHER bare/parenthesized-args directive by the ONE declaration kind it's valid before
+(`FN_ONLY`/`STRUCT_ONLY`/`STATIC_ONLY`/`SYSTEM_ONLY` sets, mirroring `Parser.hotc`'s own
+`directive()`-dispatch chain), checked against a widened `isFn`/`isStruct`/`isStatic`/`isSystem`.
+
+Two REAL, previously-latent gaps in `nextSignificantSibling` itself found finishing this (neither
+specific to any one directive, both pre-existing): (1) a leading `pub`/`open`/`priv` modifier
+keyword sits as a bare token BETWEEN the annotation node and the actual declaration's own node
+(`HCPsiParser.topLevelItem` consumes `pub`/`open` as their own step, outside any node), so
+`@sendable pub struct Foo { ... }` saw the "pub" token as its next sibling instead of
+`STRUCT_DECL` -- false-positiving on every annotated `pub` declaration, silently, since no
+existing test combined the two. (2) `leadingAnnotations` creates ONE SEPARATE sibling `ANNOTATION`
+node per stacked `@...` (never nesting them), so `@profile @after(Other) system S { ... }`'s
+FIRST annotation saw the SECOND annotation node as its own next sibling, not `SYSTEM_DECL` --
+breaking every legitimately-stacked-directive combination the real compiler's own header comment
+for this exact shape explicitly calls out as supported. Both fixed by widening
+`nextSignificantSibling`'s own skip-loop to also skip past `pub`/`open`/`priv` and any further
+`ANNOTATION` sibling.
+
+`gpu_thread_id` (the `@gpu`-fn-body-only pseudo-builtin, never a real `FnDecl` the plugin's own
+undefined-reference checker could discover by walking the file) added to
+`ALWAYS_KNOWN_VALUE_NAMES`, same shape `vec_of`/`Some`/`None` already use there.
+
+Real, disclosed scope cut, found but NOT fixed by this pass: `HCAnnotatorTest`'s own real-example
+regression sweep (`test real example programs produce no unexpected annotator errors`) was
+ALREADY failing before this change, on 23 files entirely unrelated to annotation handling --
+`macros.hotc`/`state_machine.hotc`/`const_fn.hotc`/`numeric_range_bounds.hotc`/
+`tunable_constants.hotc`/`units_as_types.hotc`/`tuple_and_comprehension.hotc`/
+`priv_visibility_*`/`collections_*`/`mixin_annotations.hotc`/`lifecycle_annotations.hotc`/
+`deterministic_replay.hotc`/`events_signals.hotc`/`random_seeded.hotc`/
+`sequence_coroutines.hotc`/`derive_eq_hash.hotc`/`parallel_for.hotc`/`stdlib_additions.hotc`/
+`asset_existence_check.hotc`/`bitwise_shift_xor.hotc`/`hashmap2_itemstack.hotc` -- this plugin's
+own PARSER (not just the annotator) never learned the grammar for macros/state machines/`const
+fn`/numeric-range types/contracts/tunable/units/tuples+comprehensions/`priv` visibility across
+several past sessions' worth of real compiler features. A much larger job than this pass's own
+scope (porting an entire grammar subset per feature, not widening one dispatch table) -- this
+pass only confirmed it fixed exactly the two files it targeted (`gpu_particles.hotc`,
+`contracts_requires_ensures.hotc`, both now clean) and added no NEW failures to that pre-existing
+list, verified by diffing the sweep's own failure output before/after.
+
 **Also fixed the same day: go-to-definition on stdlib/external-library names never resolved at
 all.** `HCReferences.filesInScope` (the function every reference-resolution path in the plugin
 funnels through) only ever searched the clicked file's own directory plus same-directory siblings

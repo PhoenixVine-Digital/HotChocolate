@@ -35,6 +35,21 @@ import com.intellij.psi.util.PsiTreeUtil
 // need whole-file context (every top-level name; every `FN_DECL`'s own local names) rather than
 // being meaningfully checkable one node at a time.
 class HCAnnotator : Annotator {
+    companion object {
+        // Bare or parenthesized-args directives, grouped by the ONE declaration kind each is
+        // valid before -- see `checkAnnotation`'s own header. Whether a directive takes `(...)`
+        // args isn't checked here at all (the generic `leadingAnnotations` parser already
+        // consumes an optional `(...)` for ANY directive uniformly, see that fn's own header) --
+        // only WHICH declaration kind follows it.
+        private val FN_ONLY = setOf(
+            "deterministic", "gpu", "startup", "update", "fixed_update", "render",
+            "requires", "ensures",
+        )
+        private val STRUCT_ONLY = setOf("sendable", "derive")
+        private val STATIC_ONLY = setOf("tunable")
+        private val SYSTEM_ONLY = setOf("after", "before", "profile", "main_thread", "run_if")
+    }
+
     override fun annotate(element: PsiElement, holder: AnnotationHolder) {
         when (element.node?.elementType) {
             HCElementTypes.ANNOTATION -> checkAnnotation(element, holder)
@@ -68,9 +83,25 @@ class HCAnnotator : Annotator {
         return out
     }
 
+    // Skips whitespace, a leading `pub`/`open`/`priv` modifier keyword, and any OTHER stacked
+    // `@...` annotation -- `leadingAnnotations` (see its own header) creates one SEPARATE sibling
+    // `ANNOTATION` node per `@...` (never nesting them), and `pub`/`open` are bare tokens
+    // consumed directly under the file/block root, both BEFORE the actual declaration's own node
+    // ever opens. So `@profile @after(Other) system S { ... }`'s FIRST annotation's own next
+    // sibling is the SECOND annotation node, not `SYSTEM_DECL` -- and `@sendable pub struct Foo {
+    // ... }`'s sits before a bare "pub" leaf, not directly before `STRUCT_DECL` either. Real,
+    // previously-latent gap in BOTH shapes, pre-existing (not specific to any one directive),
+    // just never exercised by a test before stacked-annotation/`pub`-plus-directive coverage was
+    // added alongside the new directives below.
     private fun nextSignificantSibling(element: PsiElement): PsiElement? {
         var next = element.nextSibling
-        while (next is PsiWhiteSpace) next = next.nextSibling
+        while (
+            next is PsiWhiteSpace ||
+            next?.node?.elementType == HCElementTypes.ANNOTATION ||
+            (next?.node?.elementType == HCTokenTypes.KEYWORD && (next.text == "pub" || next.text == "open" || next.text == "priv"))
+        ) {
+            next = next.nextSibling
+        }
         return next
     }
 
@@ -79,23 +110,36 @@ class HCAnnotator : Annotator {
     }
 
     // `@name` / `@"binary.Name"` -- children are `[AT, nameToken, (LPAREN ... RPAREN)?]`, see
-    // `HCPsiParser.leadingAnnotations`.
+    // `HCPsiParser.leadingAnnotations`. `FN_ONLY`/`STRUCT_ONLY`/`STATIC_ONLY`/`SYSTEM_ONLY` --
+    // every bare compiler directive `Parser.hotc`'s own top-level `while self.check(AT) { ... }`
+    // dispatch recognizes as of this writing, grouped by the ONE declaration kind each is valid
+    // before (see that fn's own `directive()`-dispatch chain and each directive's own `Ast.hc`
+    // header for why). `must_use`/`dev`/`serializable`/`entry` (pre-existing) aren't in these sets
+    // -- they keep their own explicit branches below, unchanged.
     private fun checkAnnotation(element: PsiElement, holder: AnnotationHolder) {
         val nameToken = directChildren(element).getOrNull(1) ?: return
         val isString = nameToken.node?.elementType == HCTokenTypes.STRING
+        val text = nameToken.text
         val kind = when {
             isString -> "string"
-            nameToken.text == "must_use" -> "must_use"
-            nameToken.text == "serializable" -> "serializable"
-            nameToken.text == "entry" -> "entry"
-            nameToken.text == "dev" -> "dev"
+            text == "must_use" -> "must_use"
+            text == "serializable" -> "serializable"
+            text == "entry" -> "entry"
+            text == "dev" -> "dev"
+            text in FN_ONLY -> "fn_only:$text"
+            text in STRUCT_ONLY -> "struct_only:$text"
+            text in STATIC_ONLY -> "static_only:$text"
+            text in SYSTEM_ONLY -> "system_only:$text"
             else -> null
         }
         if (kind == null) {
             error(
                 holder, element,
                 "expected a quoted annotation name (@\"binary.Name\") or a known compiler directive " +
-                    "(@serializable, @must_use, @dev, @entry(\"target\", ...)) after '@'",
+                    "after '@' (@must_use, @dev, @serializable, @entry(\"target\", ...), " +
+                    "@deterministic, @gpu, @sendable, @tunable, @derive(...), @startup/@update/" +
+                    "@fixed_update/@render, @requires(...)/@ensures(...), @after(...)/@before(...)/" +
+                    "@profile/@main_thread/@run_if(...))",
             )
             return
         }
@@ -109,12 +153,18 @@ class HCAnnotator : Annotator {
         val nextType = next?.node?.elementType
         val isFn = nextType == HCElementTypes.FN_DECL
         val isStruct = nextType == HCElementTypes.STRUCT_DECL
-        when (kind) {
-            "serializable" -> if (!isStruct) error(holder, element, "'@serializable' can only precede a top-level 'struct'")
-            "must_use" -> if (!isFn) error(holder, element, "'@must_use' can only precede a top-level 'fn'")
-            "dev" -> if (!isFn) error(holder, element, "'@dev' can only precede a top-level 'fn'")
-            "entry" -> if (!isFn) error(holder, element, "'@entry(...)' can only precede a top-level 'fn'")
-            "string" -> if (!isFn && !isStruct) error(holder, element, "annotations can only precede a top-level 'struct' or 'fn'")
+        val isStatic = nextType == HCElementTypes.STATIC_DECL
+        val isSystem = nextType == HCElementTypes.SYSTEM_DECL
+        when {
+            kind == "serializable" -> if (!isStruct) error(holder, element, "'@serializable' can only precede a top-level 'struct'")
+            kind == "must_use" -> if (!isFn) error(holder, element, "'@must_use' can only precede a top-level 'fn'")
+            kind == "dev" -> if (!isFn) error(holder, element, "'@dev' can only precede a top-level 'fn'")
+            kind == "entry" -> if (!isFn) error(holder, element, "'@entry(...)' can only precede a top-level 'fn'")
+            kind == "string" -> if (!isFn && !isStruct) error(holder, element, "annotations can only precede a top-level 'struct' or 'fn'")
+            kind.startsWith("fn_only:") -> if (!isFn) error(holder, element, "'@$text' can only precede a top-level 'fn'")
+            kind.startsWith("struct_only:") -> if (!isStruct) error(holder, element, "'@$text' can only precede a top-level 'struct'")
+            kind.startsWith("static_only:") -> if (!isStatic) error(holder, element, "'@$text' can only precede a top-level 'static'")
+            kind.startsWith("system_only:") -> if (!isSystem) error(holder, element, "'@$text' can only precede a 'system'")
         }
     }
 
@@ -207,6 +257,11 @@ class HCAnnotator : Annotator {
     //   `Result<T, E>` enum variants, included here too since a bare bit like `return None;` is a
     //   real, common shape and this check has no way to special-case "these enums came from the
     //   prelude" from ordinary enum-variant collection.
+    // - `gpu_thread_id` is a `@gpu`-fn-body-only pseudo-builtin (see ARCHITECTURE.md's own
+    //   "`@gpu`" entry / `Driver.hotc`'s own `check_gpu_expr` header) -- never a real `FnDecl`
+    //   anywhere (a `@gpu` fn's body is entirely rewritten away before the ordinary checker/
+    //   codegen pipeline ever runs), so it can't be discovered by walking the file's own tree
+    //   either.
     // Missing an entry here is a REAL false-positive risk, not a cosmetic gap -- see
     // `HCAnnotatorTest`'s own real-example sweep, which is exactly what this list was built and
     // verified against.
@@ -214,6 +269,7 @@ class HCAnnotator : Annotator {
         "print", "read_line", "drop",
         "vec_of", "registry_new", "read_int", "read_string", "read_ints", "read_strings",
         "Some", "None", "Ok", "Err",
+        "gpu_thread_id",
     )
 
     // Every name a value expression could legitimately refer to at the TOP level: a callable

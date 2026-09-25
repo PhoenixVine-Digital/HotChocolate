@@ -64,6 +64,66 @@ class HCAnnotatorTest : BasePlatformTestCase() {
         assertTrue("expected an impl-method-annotation error, got: $errs", errs.any { it.contains("only '@must_use'") })
     }
 
+    // **Added 2026-09-25** -- `@deterministic`/`@gpu`/`@sendable`/`@tunable`/`@derive`/
+    // `@after`/`@before`/`@profile`/`@main_thread`/`@run_if`/`@requires`/`@ensures` used to all be
+    // unrecognized (falling into the generic "unknown compiler directive" error) even though the
+    // real compiler accepts every one of them -- see `HCAnnotator.checkAnnotation`'s own header.
+    fun `test at-gpu before fn is not flagged`() {
+        val errs = errors("@gpu\nfn f(pos: &mut Vec<Float>) {\n}\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    fun `test at-gpu before struct is flagged`() {
+        val errs = errors("@gpu\nstruct S { x: Int, }\n")
+        assertTrue("expected an @gpu-placement error, got: $errs", errs.any { it.contains("@gpu") })
+    }
+
+    fun `test at-deterministic before fn is not flagged`() {
+        val errs = errors("@deterministic\nfn f() {}\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    fun `test at-sendable before struct is not flagged`() {
+        val errs = errors("@sendable\nstruct S { x: Int, }\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    fun `test at-derive before struct is not flagged`() {
+        val errs = errors("@derive(Eq, Hash)\nstruct S { x: Int, }\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    fun `test at-tunable before static is not flagged`() {
+        val errs = errors("@tunable\npub static x: Float = 1.0f;\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    fun `test at-tunable before fn is flagged`() {
+        val errs = errors("@tunable\nfn f() {}\n")
+        assertTrue("expected an @tunable-placement error, got: $errs", errs.any { it.contains("@tunable") })
+    }
+
+    fun `test at-profile and at-after before system are not flagged`() {
+        val errs = errors("component A { x: Int, }\n@profile\n@after(Other)\nsystem S {\nfn run(a: &mut A) {\n}\n}\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    fun `test at-requires before fn is not flagged`() {
+        val errs = errors("@requires(x > 0)\nfn f(x: Int) {\n}\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    // **Added 2026-09-25** -- a real, previously-latent gap in `nextSignificantSibling` itself
+    // (not specific to any one directive): a leading `pub`/`open`/`priv` modifier keyword sits as
+    // a bare token BETWEEN the annotation node and the actual declaration's own node (see
+    // `HCPsiParser.topLevelItem`'s own header), so `@sendable pub struct S { ... }` used to see
+    // the "pub" TOKEN as its next sibling instead of `STRUCT_DECL`, false-positiving on every
+    // annotated `pub` declaration.
+    fun `test at-sendable before pub struct is not flagged`() {
+        val errs = errors("@sendable\npub struct S { x: Int, }\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
     fun `test break outside a loop is flagged`() {
         val errs = errors("fn f() {\n    break;\n}\n")
         assertTrue("expected a break-outside-loop error, got: $errs", errs.any { it.contains("'break'") })
