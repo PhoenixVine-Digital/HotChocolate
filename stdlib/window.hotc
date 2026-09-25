@@ -147,8 +147,15 @@ extern class GL11 = "org.lwjgl.opengl.GL11" {
 // `open` -- `open` is a real reserved keyword in this language (`pub open module ...`
 // visibility), found the hard way: `Window::open(...)` failed with a real parse error
 // ("unexpected token 'open'") since `open` never lexes as an `IDENT` after `::` at all.
+// Field named `glfw_handle`, not the shorter `handle` this used to be -- `handle` is a real
+// reserved keyword in this language (the `handle Name { ... }` resource-handle construct), found
+// the hard way via a real downstream consumer (Marshmallow): `handle: Long` parsed fine when this
+// field was first written, then broke with a real parse error ("unexpected token 'handle'")
+// once that keyword was added later, with nothing in this repo's own example suite ever
+// exercising `window.hotc` to catch the regression. Same class of bug `Window::new` (not `::open`)
+// right below already has its own header note about, for `open`.
 pub struct Window {
-    handle: Long,
+    glfw_handle: Long,
 }
 
 impl Window {
@@ -171,8 +178,8 @@ impl Window {
         GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MINOR, 3);
         GLFW::glfwWindowHint(GLFW::GLFW_OPENGL_PROFILE, GLFW::GLFW_OPENGL_CORE_PROFILE);
         GLFW::glfwWindowHint(GLFW::GLFW_RESIZABLE, GLFW::GLFW_TRUE);
-        let handle = GLFW::glfwCreateWindow(width, height, title as JCharSequenceWin, 0 as Long, 0 as Long);
-        GLFW::glfwMakeContextCurrent(handle);
+        let glfw_handle = GLFW::glfwCreateWindow(width, height, title as JCharSequenceWin, 0 as Long, 0 as Long);
+        GLFW::glfwMakeContextCurrent(glfw_handle);
         GL::createCapabilities();
         GLFW::glfwSwapInterval(1);
         // Real, disclosed scope decision (added 2026-09-11, alongside `graphics.hotc`'s own
@@ -182,16 +189,16 @@ impl Window {
         // `GL11::glDisable(GL11::GL_DEPTH_TEST)` directly for now -- no wrapper for that yet,
         // same "convenience wrapper, not the only way in" precedent this whole struct sets.
         GL11::glEnable(GL11::GL_DEPTH_TEST);
-        GLFW::glfwShowWindow(handle);
-        return Window { handle: handle };
+        GLFW::glfwShowWindow(glfw_handle);
+        return Window { glfw_handle: glfw_handle };
     }
 
     fn should_close(&self) -> Bool {
-        return GLFW::glfwWindowShouldClose(self.handle);
+        return GLFW::glfwWindowShouldClose(self.glfw_handle);
     }
 
     fn request_close(&self) {
-        GLFW::glfwSetWindowShouldClose(self.handle, true);
+        GLFW::glfwSetWindowShouldClose(self.glfw_handle, true);
     }
 
     // Clears the frame to `(r, g, b)` (opaque, `a` fixed at `1.0`) -- the common case; call
@@ -209,16 +216,16 @@ impl Window {
     // real per-tick calls every GLFW render loop needs, bundled since neither ever makes sense
     // without the other.
     fn present(&self) {
-        GLFW::glfwSwapBuffers(self.handle);
+        GLFW::glfwSwapBuffers(self.glfw_handle);
         GLFW::glfwPollEvents();
     }
 
     fn is_key_down(&self, key: Int) -> Bool {
-        return GLFW::glfwGetKey(self.handle, key) == GLFW::GLFW_PRESS;
+        return GLFW::glfwGetKey(self.glfw_handle, key) == GLFW::GLFW_PRESS;
     }
 
     fn close(&self) {
-        GLFW::glfwDestroyWindow(self.handle);
+        GLFW::glfwDestroyWindow(self.glfw_handle);
         GLFW::glfwTerminate();
     }
 }

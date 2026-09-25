@@ -112,7 +112,7 @@ impl Input {
     fn update_mouse(&mut self, window: &Window) {
         var xpos_arr = [0.0];
         var ypos_arr = [0.0];
-        GLFWMouse::glfwGetCursorPos(window.handle, xpos_arr, ypos_arr);
+        GLFWMouse::glfwGetCursorPos(window.glfw_handle, xpos_arr, ypos_arr);
         let cx = xpos_arr[0] as Float;
         let cy = ypos_arr[0] as Float;
         // First-ever call has no real previous position to diff against -- without this, the
@@ -131,6 +131,6 @@ impl Input {
     }
 
     fn mouse_button_down(&self, window: &Window, button: Int) -> Bool {
-        return GLFWMouse::glfwGetMouseButton(window.handle, button) == 1;
+        return GLFWMouse::glfwGetMouseButton(window.glfw_handle, button) == 1;
     }
 }
