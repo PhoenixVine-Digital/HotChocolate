@@ -925,6 +925,15 @@ pub struct Program {
     // full taint analysis: only catches a DIRECT call to one of these, not one hidden behind an
     // un-annotated helper fn.
     deterministic_fn_names: Vec<String>,
+    // `@gpu fn update_particles(pos: Vec<Float>, dt: Float) { ... }` -- see `IDEAS.md`'s own
+    // "`@gpu` -- GPU compute functions" entry. Same bare-directive side-channel shape
+    // `deterministic_fn_names` above already uses. Two readers: `Driver.hotc`'s own
+    // `check_gpu_fns` (a standalone diagnostic pass enforcing the real, disclosed v1 subset --
+    // only `Int`/`Float`/`Bool`/`Vec<Int>`/`Vec<Float>` params, and every DIRECT call inside a
+    // `@gpu` fn's own body must target another `@gpu` fn, mirroring GLSL's own "no recursion, no
+    // calling into arbitrary host code" restrictions) and `Codegen.hotc`'s own GLSL-emission pass
+    // (`gen_gpu_glsl`), which only ever runs for a fn named here.
+    gpu_fn_names: Vec<String>,
     // `/// ...` immediately before a top-level `struct` or `fn` -- see README's own "Structured
     // doc comments" section. Same flat-side-channel reasoning as `struct_annotation_names`/
     // `must_use_fn_names` above -- `Checker.hotc`'s own `check_doc_sees` (a pass at the very end

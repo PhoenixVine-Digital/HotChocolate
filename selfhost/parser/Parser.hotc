@@ -3289,6 +3289,9 @@ impl Parser {
         var must_use_fn_names = empty_str_vec();
         var dev_fn_names = empty_str_vec();
         var deterministic_fn_names = empty_str_vec();
+        // `@gpu fn ... { ... }` -- see `Ast.hc`'s own `Program.gpu_fn_names` header. Same
+        // "collect names, consumed only by `parse_program`'s own tail" side-channel shape.
+        var gpu_fn_names = empty_str_vec();
         // `@startup`/`@update`/`@fixed_update`/`@render` -- see `build_lifecycle_dispatcher_fn`'s
         // own header. Each is its own flat name list (same accumulator shape `dev_fn_names`/
         // `deterministic_fn_names` already use), consumed ONLY by `parse_program`'s own tail --
@@ -3376,6 +3379,9 @@ impl Parser {
             // `@deterministic` -- see `Ast.hc`'s own `Program.deterministic_fn_names` header.
             // Same bare-directive shape/gate as `@dev` right above.
             var pending_deterministic = false;
+            // `@gpu` -- see `Ast.hc`'s own `Program.gpu_fn_names` header. Same bare-directive
+            // shape/gate as `@deterministic` right above.
+            var pending_gpu = false;
             // `@startup`/`@update`/`@fixed_update`/`@render` -- see `build_lifecycle_dispatcher_
             // fn`'s own header. Same bare-directive shape/gate as `@dev`/`@deterministic` above;
             // real param-signature validation happens once the `fn` itself is actually parsed
@@ -3445,6 +3451,8 @@ impl Parser {
                         pending_must_use = true;
                     } else if directive == "deterministic" {
                         pending_deterministic = true;
+                    } else if directive == "gpu" {
+                        pending_gpu = true;
                     } else if directive == "sendable" {
                         pending_sendable = true;
                     } else if directive == "after" {
@@ -3552,6 +3560,9 @@ impl Parser {
             }
             if pending_deterministic && next_is_other_decl_kind {
                 throw ParseError::new("'@deterministic' is only supported on top-level 'fn' declarations");
+            }
+            if pending_gpu && next_is_other_decl_kind {
+                throw ParseError::new("'@gpu' is only supported on top-level 'fn' declarations");
             }
             var has_pending_lifecycle = pending_startup || pending_update || pending_fixed_update || pending_render;
             if has_pending_lifecycle && next_is_other_decl_kind {
@@ -3905,6 +3916,9 @@ impl Parser {
                 if pending_deterministic {
                     deterministic_fn_names.push(fd.name);
                 }
+                if pending_gpu {
+                    gpu_fn_names.push(fd.name);
+                }
                 if pending_startup {
                     if fd.params.length() != 0 {
                         throw ParseError::new("'@startup' fn '" + fd.name + "' must take zero parameters, got " + JString3::valueOf(fd.params.length()));
@@ -4015,7 +4029,7 @@ impl Parser {
             fns.push(build_event_emit_fn(ev_name, &ev_fields, &ev_handlers));
             evi = evi + 1;
         }
-        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources, private_type_names: private_type_names, pub_struct_names: pub_struct_names, pub_enum_names: pub_enum_names, pub_interface_names: pub_interface_names, pub_fn_names: pub_fn_names, pub_static_names: pub_static_names, const_fns: const_fns, const_names: const_names, const_types: const_types, const_inits: const_inits };
+        return Program { fns: fns, structs: structs, impls: impls, enums: enums, externs: externs, statics: statics, interfaces: interfaces, struct_annotation_names: struct_annotation_names, struct_annotation_data: struct_annotation_data, fn_annotation_names: fn_annotation_names, fn_annotation_data: fn_annotation_data, extend_decls: extend_decls, must_use_fn_names: must_use_fn_names, dev_fn_names: dev_fn_names, deterministic_fn_names: deterministic_fn_names, gpu_fn_names: gpu_fn_names, struct_doc_names: struct_doc_names, struct_doc_data: struct_doc_data, fn_doc_names: fn_doc_names, fn_doc_data: fn_doc_data, uses: uses, sendable_struct_names: sendable_struct_names, components: components, systems: systems, resources: resources, private_type_names: private_type_names, pub_struct_names: pub_struct_names, pub_enum_names: pub_enum_names, pub_interface_names: pub_interface_names, pub_fn_names: pub_fn_names, pub_static_names: pub_static_names, const_fns: const_fns, const_names: const_names, const_types: const_types, const_inits: const_inits };
     }
 
     // `component Name { field: Type, ... }` -- see `Ast.hc`'s own `ComponentDecl` header. Field

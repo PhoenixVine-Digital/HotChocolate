@@ -1,0 +1,39 @@
+// `@gpu` -- GPU compute functions. See ARCHITECTURE.md's own "`@gpu` GPU compute functions"
+// entry and IDEAS.md's own "`@gpu` -- GPU compute functions" entry (its "Scoping pass" note has
+// the full design this implements).
+//
+// **Real, disclosed limitation**: this COMPILES cleanly (checked, validated against the v1
+// subset, and translated to real GLSL -- all verified) but has never been RUN end-to-end in this
+// repo's own dev environment, which has no LWJGL jar on its classpath and no display/GPU at all.
+// A real consumer project (with LWJGL on its classpath, a real `Window::new` call establishing
+// the GL 4.3+ context first, and an actual GPU) is needed to exercise the real dispatch.
+
+use gpu;
+
+@gpu
+fn update_particles(pos: &mut Vec<Float>, vel: &mut Vec<Float>, dt: Float) {
+    let i: Int = gpu_thread_id();
+    let p: Float = pos.get(i);
+    let v: Float = vel.get(i);
+    pos.set(i, p + v * dt);
+}
+
+fn main() {
+    var pos = vec_of(0.0f);
+    pos.push(10.0f);
+    pos.push(20.0f);
+
+    var vel = vec_of(1.0f);
+    vel.push(2.0f);
+    vel.push(-1.0f);
+
+    // Real, disclosed precondition (not enforced at compile time -- see `stdlib/gpu.hotc`'s own
+    // header): a real GL 4.3+ context must already be current on this thread before this call
+    // (`Window::new(...)` from `stdlib/window.hotc`) -- omitted here since this file only proves
+    // the compile-time half (parsing/validation/GLSL emission), not a real windowed run.
+    update_particles(pos, vel, 0.5f);
+
+    print(pos.get(0));
+    print(pos.get(1));
+    print(pos.get(2));
+}

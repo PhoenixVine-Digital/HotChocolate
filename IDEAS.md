@@ -1092,82 +1092,13 @@ true fixed point.
 
 ### `@gpu` — GPU compute functions
 
-```
-@gpu
-fn update_particles(particles: GPU<Particle>, dt: Float) {
-    particles.position += particles.velocity * dt;
-}
-```
-
-Flagging this honestly as the single largest lift of anything in this
-entire backlog, by a wide margin — larger than the ECS scheduler, larger
-than macros, larger than everything else combined. The JVM has no
-native GPU compute pathway at all; this would mean writing an actual
-shader/kernel compiler backend from scratch (translating a subset of HC
-straight to SPIR-V or GLSL/HLSL, not just calling out to an existing one
-the way `extern class` calls out to existing JVM classes), plus a real
-host-device memory transfer story for the `GPU<T>` wrapper type, plus
-whatever validation catches "this HC code uses a GPU-incompatible
-operation" before it ever reaches the backend. This is worth recording
-as a real ambition for "general JVM language for games," not worth
-touching until there's an established base of real HC games and a
-concrete, specific performance need driving it — not speculatively, the
-way most of this backlog can reasonably be picked up "whenever."
-
-**Scoping pass, 2026-09-23 (still NOT started -- this is the concrete plan for when it is, not an
-implementation)**: the paragraph above is still the right honest headline (the largest lift in
-the backlog, correctly not attempted speculatively), but "translate a subset of HC straight to
-SPIR-V or GLSL/HLSL" turns out to have a real, dramatically cheaper on-ramp than a from-scratch
-backend implies, once `stdlib/graphics.hotc`'s own EXISTING machinery is accounted for:
-
-- **Target GLSL compute shaders specifically, not SPIR-V, and not a new runtime.**
-  `stdlib/graphics.hotc`'s own `Shader` struct ALREADY compiles GLSL source text at RUNTIME
-  (`GL20::glCreateShader`/`glShaderSource`/`glCompileShader`/`glLinkProgram`) -- the exact
-  mechanism a compute kernel needs, just for a vertex/fragment pair today. `@gpu fn` doesn't need
-  a new BACKEND EXECUTABLE FORMAT at all, only a new `Codegen.hotc`-SIBLING pass that walks a
-  `@gpu` fn's own `Vec<Stmt>` body and emits a GLSL STRING instead of ASM bytecode for that one
-  function -- structurally the SAME "compile this AST to a different target text" shape
-  `Codegen.hotc` already is, aimed at a text emitter instead of `ClassWriter2`. The runtime half
-  (compile the emitted GLSL, `glDispatchCompute`, read results back) is ORDINARY new stdlib code
-  (`stdlib/gpu.hotc`, a sibling to `graphics.hotc`), not a new execution model.
-- **Real, concrete new requirement found checking this**: `stdlib/window.hotc`'s own
-  `Window::new` currently requests OpenGL 3.3 core (`GLFW_CONTEXT_VERSION_MAJOR/MINOR` hints,
-  hardcoded `3`/`3`) -- compute shaders need GL 4.3+ (`GL_ARB_compute_shader`, standardized in
-  4.3). A real open question this raises, not yet answered: bump the ONE existing context-version
-  hint globally (simpler, but a real compatibility risk for whatever hardware/driver combination
-  the 3.3 floor was originally chosen for), or add a SEPARATE opt-in higher-version context path
-  used only by programs that actually `use gpu;`? Needs a real answer before any code, not
-  guessed at here.
-- **A real, narrow v1 language subset, matching this whole backlog's own "ship an honest subset"
-  discipline**: only `Int`/`Float`/`Bool` scalars and flat `Vec<Int>`/`Vec<Float>` PARAMETERS
-  (each becomes one `layout(std430, binding=N) buffer` SSBO declaration) -- no structs, no
-  `String`, no `Vec<T>` METHOD calls (`.push()`/`.get()` don't exist as GLSL concepts; a buffer
-  parameter maps to GLSL's own `[]` indexing directly, `buf[gl_GlobalInvocationID.x]`, not
-  `buf.get(i)`), no recursion (GLSL forbids it), no calling any OTHER HC fn unless it's ALSO
-  `@gpu` (mirrors `@deterministic`'s own already-shipped "must only call other same-attribute
-  fns" discipline, reusable almost verbatim as a checker/diagnostic pass), no `String`/exception/
-  struct-literal expressions at all. This is dramatically narrower than the brainstormed `GPU
-  <Particle>`/struct-of-arrays example at the top of this entry -- that needs a real host-device
-  struct-layout marshaling story (SoA transform, alignment/padding rules matching GLSL's own
-  `std430` layout) that's its own, separate, later phase, not v1.
-- **Dispatch surface**: a plain top-level `fn` call to a `@gpu`-marked fn (`update_particles(pos,
-  vel, dt)`) desugars, same parser-level-AST-synthesis strategy this whole backlog already uses
-  everywhere else, into: compile-and-cache the emitted GLSL program (once, not per-call), upload
-  each `Vec` parameter into an SSBO, `glDispatchCompute(ceil(n / workgroup_size), 1, 1)`, a
-  `glMemoryBarrier`, then read the (possibly-mutated) buffers back into ordinary `Vec<T>` values.
-  Workgroup size: a fixed, hardcoded constant (`local_size_x = 256`) for v1 -- real tuning is a
-  later, hardware-specific concern, not needed to prove the mechanism works at all.
-- **Honest relative sizing against everything else THIS backlog sweep actually shipped**: every
-  other item (`@derive`, `unit`, `sequence`, `@tunable`, `@requires`/`@ensures`, real `Long`/
-  `Char` literals, `typestate`, `@deterministic`/`@derive(Snapshot)`) reused EXISTING Checker.hotc/
-  Codegen.hotc machinery, mostly through pure parser-level AST desugaring, and each was verified
-  end-to-end within one sitting using nothing but `java -cp ... SelfhostCLI` on this same
-  development machine. `@gpu` needs a genuinely NEW code-emission target (GLSL text, not JVM
-  bytecode) AND a real windowed OpenGL 4.3+ context to test end-to-end at all (not just compile --
-  actually RUNNING a compute dispatch needs a live GPU context, which this remote/headless
-  development environment may not even have access to) -- a fundamentally different, much larger
-  category of work than anything else in this sweep, confirming the very first paragraph's own
-  "single largest lift" framing was correct, not just cautious.
+**Shipped, 2026-09-25 (real, disclosed v1 subset)** — moved to ARCHITECTURE.md's own "`@gpu` --
+GPU compute functions" entry, which has the full implementation writeup (parsing/validation/GLSL
+emission/dispatcher synthesis, the real lexer-escaping trap found along the way, and the honest
+"never run-tested here, no LWJGL/display in this dev environment" disclosure) — this entry's own
+prior "Scoping pass" plan (GLSL-not-SPIR-V, GL 4.3 bump, a narrow v1 param/statement subset, the
+"compile-and-cache/upload/dispatch/barrier/readback" call-site desugaring) is exactly what got
+built, so it isn't repeated here.
 
 Real repetition already visible in `kubejs-aisle-tool`'s own `.hotc` files —
 every `extern class` bridging one of HC's *own* already-compiled files

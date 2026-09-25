@@ -4912,6 +4912,85 @@ reusing a shared/generic exception type, so a caller's own `catch` clause can di
 called unwrap wrong" from any other runtime exception. See `examples/option_result_ergonomics.hotc`
 for both types' full method set, including the `unwrap()`-throws-and-is-caught path for each.
 
+## `@gpu` -- GPU compute functions
+
+**Shipped, 2026-09-25 (real, disclosed v1 subset -- see IDEAS.md's own "Scoping pass" note for the
+plan this implements).** `@gpu fn update_particles(pos: &mut Vec<Float>, vel: &mut Vec<Float>, dt:
+Float) { ... }` compiles the fn's own body straight to a real GLSL compute shader, and an ordinary
+call to it (`update_particles(pos, vel, 0.5f)`) desugars into: compile-and-cache the GLSL program,
+upload each `&mut Vec<Int>`/`&mut Vec<Float>` param into an SSBO, set each scalar param as a
+uniform, `glDispatchCompute`, a memory barrier, then read the (mutated) buffers back into the
+caller's own `Vec`s -- exactly the dispatch surface that entry's own note describes.
+
+**Real, disclosed limitation, up front**: this repo has no LWJGL jar on its own classpath and no
+display/GPU in this development environment, so the actual buffer-upload/dispatch/readback
+sequence has never been RUN end-to-end here. What IS verified: parsing, the v1-subset checker
+pass (both accepting valid programs and rejecting real violations), and GLSL text emission
+(inspected directly -- a `@gpu fn` translating cleanly to well-formed GLSL matching the source).
+`examples/gpu_particles.hotc` compiles cleanly and is part of the example regression sweep's own
+disclosed KNOWN-FAILING set (fails with `NoClassDefFoundError: org/lwjgl/opengl/GL43` when
+actually RUN here, for exactly the reason above -- not a compiler bug).
+
+Three separate implementation pieces, entirely in `Ast.hc`/`Parser.hotc`/`Driver.hotc` -- **zero
+changes to `Checker.hotc`/`Codegen.hotc`**, because `Driver.hotc`'s own `rewrite_gpu_fns` REPLACES
+every `@gpu` fn's body with a synthesized dispatcher (real, ordinary AST calling into `stdlib/
+gpu.hotc`) before either of those two passes ever sees the program -- same "materialize real AST,
+let the normal pipeline compile it" strategy `ECS_IDEAS.md`'s own systems/lifecycle dispatchers
+already established:
+
+1. **Parsing**: `@gpu` is a bare directive, same shape `@deterministic` already has (`Program.
+   gpu_fn_names: Vec<String>`, a flat name-list side-channel -- see `Ast.hc`'s own header).
+2. **Validation** (`Driver.hotc`'s own `check_gpu_fns`): a real, narrow v1 subset, mirroring `check_
+   deterministic_fns`'s own exhaustive-AST-walk shape. Params: only `Int`/`Float`/`Bool` scalars
+   and `&mut Vec<Int>`/`&mut Vec<Float>` buffers (at least one buffer param required -- its
+   `.length()` picks the dispatch's own thread count; `&mut`, not by-value, since the kernel
+   writes into it and the synthesized dispatcher passes it straight into `gpu_readback_*_buffer`'s
+   own `&mut Vec<T>` param afterward). Every local `let` needs an explicit `Int`/`Float`/`Bool`
+   type annotation (inference isn't attempted -- seeding a real type from an untyped `let` would
+   need each PARAM's own real type threaded through every nested expression just to resolve one
+   local). Body: `let`/plain expression statements/`if`/`while`/range-only `for`/a valueless
+   `return`; expressions: literals, `Ident`, `Binary`/`Unary`, `Assign`, `.get(i)`/`.set(i, v)` on
+   a buffer param (the only two permitted `Vec` operations -- translated directly to GLSL's own
+   `buf[i]`/`buf[i] = v`), and the one built-in `gpu_thread_id()` (maps to `gl_GlobalInvocationID.
+   x`). Calling any OTHER fn is rejected outright (a real, narrower cut than "must only call other
+   `@gpu` fns" -- v1 doesn't support composing `@gpu` fns together at all, each one becomes its own
+   standalone kernel).
+3. **GLSL emission** (`gen_gpu_glsl`/`gpu_stmts_to_glsl`/`gpu_expr_to_glsl`): a straight AST-to-text
+   walk. Each buffer param becomes a `layout(std430, binding=N) buffer` SSBO (binding indices
+   assigned in declaration order, skipping scalar params); each scalar becomes a plain `uniform`.
+   Real, previously-hit lexer trap found writing this: a GLSL literal `{`/`}` inside an ordinary HC
+   string constant (`"void main() {\n"`) is NOT plain text to this language's own lexer -- an
+   unescaped `{` starts real `${...}`-style STRING INTERPOLATION scanning, and the backslash
+   inside `\n` right after it then reads as a bare, invalid expression token ("Unexpected
+   character (codepoint 92)") once the lexer tries to lex the interpolated region AS CODE. Fixed by
+   escaping every literal GLSL brace as `\{`/`\}` (the same escape `Lexer.hotc`'s own `string_
+   tokens` already resolves back to a literal brace, per its own `CP_LBRACE`/`CP_RBRACE` handling).
+4. **Dispatcher synthesis** (`build_gpu_dispatcher_fn`): replaces the fn's body, keeping its
+   original name/params/(lack of) return type -- every call site is completely unchanged. A real,
+   previously-hit trap: the runtime buffer-upload/readback helpers in `stdlib/gpu.hotc` originally
+   took `Vec<Int>`/`Vec<Float>` BY VALUE, which MOVED the caller's own buffer on the first call
+   (upload), then failed "use of moved value" on the second (readback) -- fixed by declaring them
+   `&`/`&mut` instead (upload only reads, readback mutates in place).
+
+`stdlib/gpu.hotc` (new, no dependency on any other topic -- `use gpu;` is REQUIRED alongside any
+`@gpu` fn, a real, named compile error otherwise) declares its own small LWJGL/JDK extern surface
+(`GL15Gpu`/`GL20Gpu`/`GL30Gpu`/`GL42Gpu`/`GL43Gpu`/`BufferUtilsGpu`/`JFloatBufferGpu`/
+`JIntBufferGpu`) and the real runtime fns (`gpu_compile_program`/`gpu_upload_*_buffer`/`gpu_set_
+uniform_*`/`gpu_dispatch`/`gpu_barrier`/`gpu_readback_*_buffer`/`gpu_delete_*`) `rewrite_gpu_fns`'s
+own synthesized bodies call into -- no caching this v1 (every dispatch recompiles the GLSL program
+from scratch; a real, disclosed performance concern deferred, not a correctness one). Real,
+previously-hit trap mirroring `graphics.hotc`'s own documented one: an extern method with no
+`&self` is implicitly STATIC (`JFloatBufferGpu::put`/`flip`/`get` are genuine instance methods) --
+missing it compiled clean with no classpath, then failed real signature verification the moment
+`java.nio.FloatBuffer`/`IntBuffer` (always resolvable, no external jar needed) made the check
+actually run.
+
+`stdlib/window.hotc`'s own `Window::new` context-version hint is bumped from GL 3.3 to 4.3 (compute
+shaders need `GL_ARB_compute_shader`, standardized in 4.3) -- a global bump, not a second opt-in
+context path, a real, disclosed compatibility-risk tradeoff (see that file's own header) taken
+because there is only ONE context-creation point in the whole stdlib and no existing HC program
+anywhere in this repo opens a real window yet to be affected by it either way.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/

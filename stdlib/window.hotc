@@ -19,7 +19,7 @@
 //         print("GLFW init failed");
 //         return;
 //     }
-//     GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MAJOR, 3);
+//     GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MAJOR, 4);
 //     GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MINOR, 3);
 //     GLFW::glfwWindowHint(GLFW::GLFW_OPENGL_PROFILE, GLFW::GLFW_OPENGL_CORE_PROFILE);
 //     let window = GLFW::glfwCreateWindow(800, 600, "Marshmallow" as JCharSequenceWin, 0 as Long, 0 as Long);
@@ -152,12 +152,22 @@ pub struct Window {
 }
 
 impl Window {
-    // Real, disclosed scope cut: always requests an OpenGL 3.3 core-profile context. A real
+    // Real, disclosed scope cut: always requests an OpenGL 4.3 core-profile context. A real
     // Minecraft-mod-style consumer targeting a different GL version needs the raw `GLFW::` calls
     // directly for now, same "convenience wrapper, not the only way in" precedent `PhoenixPool`
     // itself sets over raw `java.util.concurrent`.
+    //
+    // **Bumped from 3.3 to 4.3, 2026-09-25** -- see `IDEAS.md`'s own "`@gpu` -- GPU compute
+    // functions" entry. Compute shaders (`GL_ARB_compute_shader`) need GL 4.3+; there is only ONE
+    // context-creation point in the whole stdlib (this one), so a `@gpu`-using program needs it
+    // bumped here rather than through a second, opt-in context path. Real, disclosed compatibility
+    // risk taken deliberately: any consumer on hardware/drivers that only support up to 3.3 (a
+    // real possibility -- 4.3 shipped in 2012, but embedded/older-integrated-GPU drivers can still
+    // lag) now fails `glfwCreateWindow` where it previously succeeded. Not yet hit by any real HC
+    // program (no example anywhere in this repo opens a real window yet, see this same entry's own
+    // "no LWJGL jar/display in this dev environment" disclosure) -- revisit if it ever is.
     static fn new(width: Int, height: Int, title: String) -> Window {
-        GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MAJOR, 3);
+        GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MAJOR, 4);
         GLFW::glfwWindowHint(GLFW::GLFW_CONTEXT_VERSION_MINOR, 3);
         GLFW::glfwWindowHint(GLFW::GLFW_OPENGL_PROFILE, GLFW::GLFW_OPENGL_CORE_PROFILE);
         GLFW::glfwWindowHint(GLFW::GLFW_RESIZABLE, GLFW::GLFW_TRUE);

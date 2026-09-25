@@ -696,6 +696,20 @@ pub fn run_cli(args: [String]) {
     // Runs AFTER `strip_dev_code` too, same reasoning: a `@deterministic` fn that got dropped
     // entirely in a release build (it was ALSO `@dev`) should never be checked either.
     check_deterministic_fns(&prog);
+    // `@gpu` -- see `IDEAS.md`'s own "`@gpu` -- GPU compute functions" entry for the full design
+    // and `Ast.hc`'s own `Program.gpu_fn_names` header. Runs AFTER `check_deterministic_fns`, same
+    // "checked after `strip_dev_code`, on the final program" reasoning that entry's own comment
+    // gives, and BEFORE `compile_program` ever sees `prog.fns` -- `rewrite_gpu_fns` REPLACES every
+    // `@gpu` fn's own body with a synthesized runtime-dispatch body (real, ordinary `Ast.hc`
+    // nodes calling into `stdlib/gpu.hotc`'s own helpers -- the SAME "materialize real AST, let
+    // the ordinary checker/codegen pipeline compile it" strategy `ECS_IDEAS.md`'s own systems/
+    // lifecycle dispatchers already use) BEFORE checking/codegen run, so neither of those two
+    // passes needs to know `@gpu` exists at all.
+    if prog.gpu_fn_names.length() > 0 && !str_vec_contains(&prog.uses, "gpu") {
+        throw ParseError::new("this program declares at least one '@gpu' fn but never writes 'use gpu;' -- add it to bring in the GPU compute runtime helpers ('@gpu' fns are compiled to GLSL and dispatched through 'stdlib/gpu.hotc', not ordinary bytecode)");
+    }
+    check_gpu_fns(&prog);
+    prog = rewrite_gpu_fns(prog);
 
     // See `name_collides_with_decl`'s own header, right above `parse_directory`: the entry class
     // name is mangled -- ONLY when it would otherwise collide -- never a struct's own name (which
@@ -1087,7 +1101,7 @@ pub fn merge_program(a: Program, b: Program) -> Program {
         extend_decls: merge_extend_decl_vec(a.extend_decls, b.extend_decls),
         must_use_fn_names: merge_str_vec(a.must_use_fn_names, b.must_use_fn_names),
         dev_fn_names: merge_str_vec(a.dev_fn_names, b.dev_fn_names),
-        deterministic_fn_names: merge_str_vec(a.deterministic_fn_names, b.deterministic_fn_names),
+        deterministic_fn_names: merge_str_vec(a.deterministic_fn_names, b.deterministic_fn_names), gpu_fn_names: merge_str_vec(a.gpu_fn_names, b.gpu_fn_names),
         struct_doc_names: merge_str_vec(a.struct_doc_names, b.struct_doc_names),
         struct_doc_data: merge_doc_comment_vec(a.struct_doc_data, b.struct_doc_data),
         fn_doc_names: merge_str_vec(a.fn_doc_names, b.fn_doc_names),
@@ -1218,7 +1232,7 @@ pub fn strip_dev_code(prog: Program, dev_mode: Bool) -> Program {
         new_systems.push(SystemDecl { name: sysd.name, run_params: sysd.run_params, run_body: strip_dev_blocks_list(sysd.run_body, dev_mode), after: sysd.after, before: sysd.before, has_profile: sysd.has_profile, has_main_thread: sysd.has_main_thread, run_if: sysd.run_if });
         si = si + 1;
     }
-    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names, const_fns: prog.const_fns, const_names: prog.const_names, const_types: prog.const_types, const_inits: prog.const_inits };
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, gpu_fn_names: prog.gpu_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: new_systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names, const_fns: prog.const_fns, const_names: prog.const_names, const_types: prog.const_types, const_inits: prog.const_inits };
 }
 
 // `asset("textures/player.png")` -- see `IDEAS.md`'s own "Compile-time asset existence checks"
@@ -1470,6 +1484,385 @@ pub fn check_deterministic_expr(e: &Expr, fn_name: String) {
         Ident { name } => {}
         NullLit => {}
     }
+}
+
+// `@gpu fn update_particles(pos: Vec<Float>, dt: Float) { ... }` -- see `IDEAS.md`'s own "`@gpu`
+// -- GPU compute functions" entry (its own "Scoping pass" note has the full plan this
+// implements) and `Ast.hc`'s own `Program.gpu_fn_names` header. A genuinely narrow, real,
+// disclosed v1 language subset -- deliberately much smaller than the brainstormed `GPU<Particle>`
+// example at that entry's own top: only `Int`/`Float`/`Bool` scalar params and `Vec<Int>`/
+// `Vec<Float>` buffer params, no structs/String/exceptions, no calling any other fn (the one
+// built-in is `gpu_thread_id()`, mapping to GLSL's own `gl_GlobalInvocationID.x`), a range-only
+// `for`, and every local `let` needs an explicit `Int`/`Float`/`Bool` type annotation (no
+// inference attempted -- see `gpu_one_stmt_to_glsl`'s own header for why). `.get(i)`/`.set(i, v)`
+// on a `Vec<Int>`/`Vec<Float>` param are the only two permitted Vec operations (translated
+// directly to GLSL's own `buf[i]`/`buf[i] = v` -- this entry's own doc text frames this as "no
+// Vec<T> method calls, [use] GLSL's own [] indexing directly," but reaching that through ordinary
+// `.get`/`.set` calls rather than teaching the general checker a brand-new `[]`-on-`Vec<T>`
+// indexing feature is a deliberate, disclosed cheaper substitute producing the exact same GLSL
+// text either way).
+pub fn is_gpu_allowed_param_type(name: String) -> Bool {
+    if name == "Int" { return true; }
+    if name == "Float" { return true; }
+    if name == "Bool" { return true; }
+    if name == "Vec$Int" { return true; }
+    if name == "Vec$Float" { return true; }
+    return false;
+}
+
+pub fn is_gpu_buffer_param_type(name: String) -> Bool {
+    return name == "Vec$Int" || name == "Vec$Float";
+}
+
+pub fn check_gpu_fns(prog: &Program) {
+    var i = 0;
+    while i < prog.fns.length() {
+        let f = prog.fns.get(i);
+        if str_vec_contains(&prog.gpu_fn_names, f.name) {
+            check_gpu_fn_signature(&f);
+            check_gpu_stmts(&f.body, f.name);
+        }
+        i = i + 1;
+    }
+}
+
+pub fn check_gpu_fn_signature(f: &FnDecl) {
+    var has_buffer_param = false;
+    var pi = 0;
+    while pi < f.params.length() {
+        let p = f.params.get(pi);
+        if !is_gpu_allowed_param_type(p.type_name) {
+            throw ParseError::new("'@gpu' fn '" + f.name + "' param '" + p.name + "' has type '" + p.type_name + "' -- only Int/Float/Bool/&mut Vec<Int>/&mut Vec<Float> are supported in the v1 GPU compute subset");
+        }
+        if is_gpu_buffer_param_type(p.type_name) {
+            has_buffer_param = true;
+            // A buffer param must be `&mut` -- the kernel writes into it (`.set(i, v)`), and the
+            // synthesized dispatcher body (`build_gpu_dispatcher_fn`) passes the SAME param
+            // straight into `gpu_readback_*_buffer`'s own `&mut Vec<T>` param afterward, which the
+            // borrow checker only allows for a `var` local, an `&mut`-borrowed param, or `&mut
+            // self` -- a plain by-value buffer param would fail that check at the dispatcher
+            // level, confusingly far from this real, disclosed root cause.
+            if !p.is_mut_ref {
+                throw ParseError::new("'@gpu' fn '" + f.name + "' param '" + p.name + "' has buffer type '" + p.type_name + "' but isn't declared '&mut' -- write it as '&mut Vec<Int>'/'&mut Vec<Float>', not a plain by-value 'Vec<...>' (the kernel writes results back into it)");
+            }
+        }
+        pi = pi + 1;
+    }
+    if !has_buffer_param {
+        throw ParseError::new("'@gpu' fn '" + f.name + "' has no '&mut Vec<Int>'/'&mut Vec<Float>' param -- at least one buffer param is required in the v1 GPU compute subset (its length picks the dispatch's own thread count)");
+    }
+    match f.ret_type {
+        Some { value: rt } => {
+            if rt != "Unit" {
+                throw ParseError::new("'@gpu' fn '" + f.name + "' declares a return type ('" + rt + "') -- a v1 GPU compute fn must return nothing, write results into its own Vec<Int>/Vec<Float> params instead");
+            }
+        }
+        None => {}
+    }
+}
+
+pub fn check_gpu_stmts(ss: &Vec<Stmt>, fn_name: String) {
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Let { name, mutable, init, declared_type, line } => {
+                match declared_type {
+                    Some { value: dt } => {
+                        if dt != "Int" && dt != "Float" && dt != "Bool" {
+                            throw ParseError::new("'@gpu' fn '" + fn_name + "' declares local '" + name + "' with type '" + dt + "' -- only Int/Float/Bool locals are supported in the v1 GPU compute subset");
+                        }
+                    }
+                    None => {
+                        throw ParseError::new("'@gpu' fn '" + fn_name + "' declares local '" + name + "' with no explicit type -- every local in a v1 GPU compute fn body needs an explicit ': Int'/': Float'/': Bool' annotation (type inference isn't attempted in this subset)");
+                    }
+                }
+                check_gpu_expr(&init, fn_name);
+            }
+            ExprStmt { expr, line } => { check_gpu_expr(&expr, fn_name); }
+            Return { value, line } => {
+                match value {
+                    Some { value: v } => { throw ParseError::new("'@gpu' fn '" + fn_name + "' has a 'return' with a value -- a v1 GPU compute fn must return nothing"); }
+                    None => {}
+                }
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                check_gpu_expr(&cond, fn_name);
+                check_gpu_stmts(&then_body, fn_name);
+                match else_body {
+                    Some { value: eb } => { check_gpu_stmts(&eb, fn_name); }
+                    None => {}
+                }
+            }
+            While { cond, body, line } => {
+                check_gpu_expr(&cond, fn_name);
+                check_gpu_stmts(&body, fn_name);
+            }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                if !is_range {
+                    throw ParseError::new("'@gpu' fn '" + fn_name + "' has a for-each loop over an array/Vec -- only a range 'for i in a..b' is supported in the v1 GPU compute subset");
+                }
+                check_gpu_expr(&range_start, fn_name);
+                check_gpu_expr(&range_end, fn_name);
+                check_gpu_stmts(&body, fn_name);
+            }
+            _ => {
+                throw ParseError::new("'@gpu' fn '" + fn_name + "' uses a statement kind not supported in the v1 GPU compute subset (only 'let'/plain expression statements/'if'/'while'/range-'for'/a valueless 'return')");
+            }
+        }
+        i = i + 1;
+    }
+}
+
+pub fn is_gpu_allowed_method(method: String, argc: Int) -> Bool {
+    if method == "get" && argc == 1 { return true; }
+    if method == "set" && argc == 2 { return true; }
+    return false;
+}
+
+pub fn check_gpu_expr_list(es: &Vec<Expr>, fn_name: String) {
+    var i = 0;
+    while i < es.length() {
+        check_gpu_expr(&es.get(i), fn_name);
+        i = i + 1;
+    }
+}
+
+pub fn check_gpu_expr(e: &Expr, fn_name: String) {
+    match e {
+        IntLit { value } => {}
+        FloatLit { text } => {}
+        BoolLit { value } => {}
+        Ident { name } => {}
+        Binary { op, left, right } => { check_gpu_expr(&left, fn_name); check_gpu_expr(&right, fn_name); }
+        Unary { op, expr } => { check_gpu_expr(&expr, fn_name); }
+        Assign { name, value } => { check_gpu_expr(&value, fn_name); }
+        MethodCall { recv, method, args } => {
+            if !is_gpu_allowed_method(method, args.length()) {
+                throw ParseError::new("'@gpu' fn '" + fn_name + "' calls '." + method + "(...)' -- only '.get(i)'/'.set(i, v)' on a 'Vec<Int>'/'Vec<Float>' param are supported in the v1 GPU compute subset");
+            }
+            check_gpu_expr(&recv, fn_name);
+            check_gpu_expr_list(&args, fn_name);
+        }
+        Call { callee, args } => {
+            if callee == "gpu_thread_id" {
+                if args.length() != 0 {
+                    throw ParseError::new("'@gpu' fn '" + fn_name + "' calls 'gpu_thread_id(...)' with arguments -- it takes none");
+                }
+                return;
+            }
+            throw ParseError::new("'@gpu' fn '" + fn_name + "' calls '" + callee + "(...)' -- calling another fn isn't supported in the v1 GPU compute subset (the only built-in is 'gpu_thread_id()')");
+        }
+        _ => {
+            throw ParseError::new("'@gpu' fn '" + fn_name + "' uses an expression kind not supported in the v1 GPU compute subset");
+        }
+    }
+}
+
+// Translates a `@gpu` fn's own AST straight to GLSL source TEXT -- see `IDEAS.md`'s own "Scoping
+// pass" note: "`@gpu fn` doesn't need a new backend executable format at all, only a ... pass
+// that walks a `@gpu` fn's own `Vec<Stmt>` body and emits a GLSL STRING instead of ASM bytecode."
+// Every param becomes either a `layout(std430, binding=N) buffer` SSBO (`Vec<Int>`/`Vec<Float>`,
+// binding indices assigned in declaration order, skipping scalar params) or a plain `uniform`
+// (`Int`/`Float`/`Bool`) -- `rewrite_gpu_fns`'s own synthesized dispatcher body uploads/sets each
+// one under the EXACT same name/binding this fn assigns, so the two halves stay in lock-step by
+// construction (one shared traversal order), not by coincidence.
+pub fn gpu_glsl_type(hc_type: String) -> String {
+    if hc_type == "Int" { return "int"; }
+    if hc_type == "Float" { return "float"; }
+    if hc_type == "Bool" { return "bool"; }
+    if hc_type == "Vec$Int" { return "int"; }
+    if hc_type == "Vec$Float" { return "float"; }
+    return "float";
+}
+
+pub fn gen_gpu_glsl(f: &FnDecl) -> String {
+    var src = "#version 430\n";
+    src = src + "layout(local_size_x = 256) in;\n\n";
+    var binding = 0;
+    var pi = 0;
+    while pi < f.params.length() {
+        let p = f.params.get(pi);
+        if is_gpu_buffer_param_type(p.type_name) {
+            src = src + "layout(std430, binding = " + JString4::valueOf(binding) + ") buffer " + p.name + "Block \{ " + gpu_glsl_type(p.type_name) + " " + p.name + "[]; \};\n";
+            binding = binding + 1;
+        } else {
+            src = src + "uniform " + gpu_glsl_type(p.type_name) + " " + p.name + ";\n";
+        }
+        pi = pi + 1;
+    }
+    src = src + "\nvoid main() \{\n";
+    src = src + gpu_stmts_to_glsl(&f.body);
+    src = src + "\}\n";
+    return src;
+}
+
+pub fn gpu_stmts_to_glsl(ss: &Vec<Stmt>) -> String {
+    var out = "";
+    var i = 0;
+    while i < ss.length() {
+        out = out + gpu_one_stmt_to_glsl(ss.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// A `let`'s own GLSL type comes straight from its (checker-mandated, see `check_gpu_stmts`'s own
+// `Let` arm) explicit annotation -- deliberately NOT inferred from `init`, unlike everywhere else
+// in this compiler's own `let` handling. Real type inference here would need to know each
+// PARAM's own real type (Int vs. Float buffer/uniform) threaded all the way down through every
+// nested expression just to resolve one local's type -- a real, disclosed narrower scope, not an
+// oversight -- requiring the annotation instead is a few extra keystrokes per local in exchange
+// for a much simpler, more obviously-correct translation pass.
+pub fn gpu_one_stmt_to_glsl(s: Stmt) -> String {
+    match s {
+        Let { name, mutable, init, declared_type, line } => {
+            var dt = "Float";
+            match declared_type {
+                Some { value: d } => { dt = d; }
+                None => {}
+            }
+            return "    " + gpu_glsl_type(dt) + " " + name + " = " + gpu_expr_to_glsl(&init) + ";\n";
+        }
+        ExprStmt { expr, line } => {
+            match expr {
+                MethodCall { recv, method, args } => {
+                    if method == "set" {
+                        return "    " + gpu_expr_to_glsl(&recv) + "[" + gpu_expr_to_glsl(&args.get(0)) + "] = " + gpu_expr_to_glsl(&args.get(1)) + ";\n";
+                    }
+                    return "    " + gpu_expr_to_glsl(&expr) + ";\n";
+                }
+                Assign { name, value } => {
+                    return "    " + name + " = " + gpu_expr_to_glsl(&value) + ";\n";
+                }
+                _ => { return "    " + gpu_expr_to_glsl(&expr) + ";\n"; }
+            }
+        }
+        If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+            var out = "    if (" + gpu_expr_to_glsl(&cond) + ") \{\n" + gpu_stmts_to_glsl(&then_body) + "    \}";
+            match else_body {
+                Some { value: eb } => { out = out + " else \{\n" + gpu_stmts_to_glsl(&eb) + "    \}\n"; }
+                None => { out = out + "\n"; }
+            }
+            return out;
+        }
+        While { cond, body, line } => {
+            return "    while (" + gpu_expr_to_glsl(&cond) + ") \{\n" + gpu_stmts_to_glsl(&body) + "    \}\n";
+        }
+        For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+            var cmp = "<";
+            if inclusive { cmp = "<="; }
+            return "    for (int " + var_name + " = " + gpu_expr_to_glsl(&range_start) + "; " + var_name + " " + cmp + " " + gpu_expr_to_glsl(&range_end) + "; " + var_name + "++) \{\n" + gpu_stmts_to_glsl(&body) + "    \}\n";
+        }
+        Return { value, line } => { return "    return;\n"; }
+        _ => { return ""; }
+    }
+}
+
+pub fn gpu_expr_to_glsl(e: &Expr) -> String {
+    match e {
+        IntLit { value } => { return JString4::valueOf(value); }
+        FloatLit { text } => { return text; }
+        BoolLit { value } => {
+            if value { return "true"; }
+            return "false";
+        }
+        Ident { name } => { return name; }
+        Binary { op, left, right } => { return "(" + gpu_expr_to_glsl(&left) + " " + op + " " + gpu_expr_to_glsl(&right) + ")"; }
+        Unary { op, expr } => { return "(" + op + gpu_expr_to_glsl(&expr) + ")"; }
+        MethodCall { recv, method, args } => {
+            if method == "get" {
+                return gpu_expr_to_glsl(&recv) + "[" + gpu_expr_to_glsl(&args.get(0)) + "]";
+            }
+            // `.set(i, v)` is only ever reached as a whole `ExprStmt` (see `gpu_one_stmt_to_glsl`'s
+            // own dedicated case) -- this arm exists only so the match stays exhaustive against
+            // `check_gpu_expr`'s own allowlist, never actually emitted from here in practice.
+            return gpu_expr_to_glsl(&recv) + "[" + gpu_expr_to_glsl(&args.get(0)) + "] = " + gpu_expr_to_glsl(&args.get(1));
+        }
+        Call { callee, args } => { return "int(gl_GlobalInvocationID.x)"; }
+        _ => { return "0"; }
+    }
+}
+
+// Replaces every `@gpu` fn's own body with a synthesized runtime-dispatch body -- real, ordinary
+// `Ast.hc` nodes (`Let`/`ExprStmt`/`Call`/...) calling straight into `stdlib/gpu.hotc`'s own
+// helpers, compiled by the perfectly ordinary checker/codegen pipeline afterward, same
+// "materialize real AST, let the normal pipeline compile it" strategy `ECS_IDEAS.md`'s own
+// systems/lifecycle dispatchers already established. The fn keeps its ORIGINAL name/params/
+// (lack of) return type, so every existing call site (`update_particles(pos, vel, dt)`) is
+// completely unchanged -- this IS the "desugars into: compile-and-cache ... upload ... dispatch
+// ... barrier ... read back" dispatch surface `IDEAS.md`'s own "Scoping pass" note describes, in
+// full. Dispatch size (thread count) comes from the FIRST `Vec<Int>`/`Vec<Float>` param's own
+// `.length()`, evaluated fresh at each call -- a real, disclosed v1 assumption that every buffer
+// param shares that same length; not enforced at compile time (matching this whole project's
+// established "trust the caller" stance on other runtime-only preconditions, e.g. resource
+// injection's own `__resource_<Name>` header in `Codegen.hotc`).
+pub fn rewrite_gpu_fns(prog: Program) -> Program {
+    var new_fns = empty_fn_decl_vec2();
+    var i = 0;
+    while i < prog.fns.length() {
+        let f = prog.fns.get(i);
+        if str_vec_contains(&prog.gpu_fn_names, f.name) {
+            new_fns.push(build_gpu_dispatcher_fn(f));
+        } else {
+            new_fns.push(f);
+        }
+        i = i + 1;
+    }
+    return Program { fns: new_fns, structs: prog.structs, impls: prog.impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, gpu_fn_names: empty_str_vec2(), struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: prog.systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names, const_fns: prog.const_fns, const_names: prog.const_names, const_types: prog.const_types, const_inits: prog.const_inits };
+}
+
+pub fn build_gpu_dispatcher_fn(f: FnDecl) -> FnDecl {
+    let glsl_src = gen_gpu_glsl(&f);
+    var body = empty_stmt_vec2();
+    body.push(Let { name: "__gpu_prog", mutable: false, init: Call { callee: "gpu_compile_program", args: vec_of(StringLit { value: glsl_src }) }, declared_type: none_string2(), line: 0 });
+    var buf_names = empty_str_vec2();
+    var dispatch_n_param = "";
+    var binding = 0;
+    var pi = 0;
+    while pi < f.params.length() {
+        let p = f.params.get(pi);
+        if is_gpu_buffer_param_type(p.type_name) {
+            if dispatch_n_param == "" { dispatch_n_param = p.name; }
+            let buf_name = "__gpu_buf_" + p.name;
+            var upload_fn = "gpu_upload_int_buffer";
+            if p.type_name == "Vec$Float" { upload_fn = "gpu_upload_float_buffer"; }
+            var upload_args = vec_of(IntLit { value: binding });
+            upload_args.push(Ident { name: p.name });
+            body.push(Let { name: buf_name, mutable: false, init: Call { callee: upload_fn, args: upload_args }, declared_type: none_string2(), line: 0 });
+            buf_names.push(buf_name);
+            binding = binding + 1;
+        } else {
+            var set_fn = "gpu_set_uniform_int";
+            if p.type_name == "Float" { set_fn = "gpu_set_uniform_float"; }
+            if p.type_name == "Bool" { set_fn = "gpu_set_uniform_bool"; }
+            var set_args = vec_of(Ident { name: "__gpu_prog" });
+            set_args.push(StringLit { value: p.name });
+            set_args.push(Ident { name: p.name });
+            body.push(ExprStmt { expr: Call { callee: set_fn, args: set_args }, line: 0 });
+        }
+        pi = pi + 1;
+    }
+    var dispatch_args = vec_of(Ident { name: "__gpu_prog" });
+    dispatch_args.push(MethodCall { recv: Ident { name: dispatch_n_param }, method: "length", args: empty_expr_vec_cg() });
+    body.push(ExprStmt { expr: Call { callee: "gpu_dispatch", args: dispatch_args }, line: 0 });
+    body.push(ExprStmt { expr: Call { callee: "gpu_barrier", args: empty_expr_vec_cg() }, line: 0 });
+    var bi = 0;
+    var pi2 = 0;
+    while pi2 < f.params.length() {
+        let p2 = f.params.get(pi2);
+        if is_gpu_buffer_param_type(p2.type_name) {
+            var readback_fn = "gpu_readback_int_buffer";
+            if p2.type_name == "Vec$Float" { readback_fn = "gpu_readback_float_buffer"; }
+            var readback_args = vec_of(Ident { name: buf_names.get(bi) });
+            readback_args.push(Ident { name: p2.name });
+            body.push(ExprStmt { expr: Call { callee: readback_fn, args: readback_args }, line: 0 });
+            body.push(ExprStmt { expr: Call { callee: "gpu_delete_buffer", args: vec_of(Ident { name: buf_names.get(bi) }) }, line: 0 });
+            bi = bi + 1;
+        }
+        pi2 = pi2 + 1;
+    }
+    body.push(ExprStmt { expr: Call { callee: "gpu_delete_program", args: vec_of(Ident { name: "__gpu_prog" }) }, line: 0 });
+    return FnDecl { name: f.name, params: f.params, ret_type: f.ret_type, body: body, type_param: f.type_param, type_bounds: f.type_bounds, self_is_mut: f.self_is_mut, type_param2: f.type_param2, type_bounds2: f.type_bounds2 };
 }
 
 // Splits a decorated type-name string (`"&mut Vec<Foo>"`, `"[Foo]"`, `"Foo?"`, `"Result<Foo,
@@ -2361,7 +2754,7 @@ pub fn fold_consts(prog: Program) -> Program {
         extend_decls: fold_const_extend_decls(prog.extend_decls, &names, &values),
         must_use_fn_names: prog.must_use_fn_names,
         dev_fn_names: prog.dev_fn_names,
-        deterministic_fn_names: prog.deterministic_fn_names,
+        deterministic_fn_names: prog.deterministic_fn_names, gpu_fn_names: prog.gpu_fn_names,
         struct_doc_names: prog.struct_doc_names,
         struct_doc_data: prog.struct_doc_data,
         fn_doc_names: prog.fn_doc_names,
@@ -2518,6 +2911,12 @@ pub fn add_stdlib_topic_and_deps(topic: String, wanted: Vec<String>, target: Int
         // that topic's own program merged in" reasoning every other cross-topic dependency here
         // already follows.
         out = add_stdlib_topic_and_deps("window", out, target);
+        out = add_stdlib_topic_and_deps("vec", out, target);
+    } else if topic == "gpu" {
+        // `stdlib/gpu.hotc`'s own `gpu_upload_float_buffer`/`gpu_readback_int_buffer`/... take a
+        // real `Vec<Float>`/`Vec<Int>` directly -- same "declares a real type from another topic,
+        // needs that topic's own program merged in" reasoning every other cross-topic dependency
+        // here already follows.
         out = add_stdlib_topic_and_deps("vec", out, target);
     } else if topic == "collections" {
         // `collections.hotc`'s own `HashMap<V>`/`IntHashMap<V>` build on real `Vec<Entry<V>>`

@@ -1,0 +1,214 @@
+// GPU compute runtime -- backs `@gpu fn ...` (see `IDEAS.md`'s own "`@gpu` -- GPU compute
+// functions" entry and `Driver.hotc`'s own `rewrite_gpu_fns` header for the full design). `use
+// gpu;` alongside at least one `@gpu` fn is REQUIRED -- `Driver.hotc` throws a real, named error
+// otherwise. No dependency on any other stdlib topic (declares its own small extern surface
+// rather than reusing `graphics.hotc`'s/`window.hotc`'s aliases over the same real LWJGL/JDK
+// classes, matching `option.hotc`/`result.hotc`'s own "no dependencies" convention) -- needs a
+// real OpenGL 4.3+ context already current on this thread (`Window::new` -- see `window.hotc`'s
+// own header, bumped to request 4.3 for exactly this) before any of these are called.
+//
+// **Real, disclosed limitation: NOT run-tested.** This repo has no LWJGL jar on its own classpath
+// and no display/GPU in this development environment (see `IDEAS.md`'s own "Scoping pass" note) --
+// every extern signature here was written to match LWJGL's real, documented method shapes, and the
+// compile-time half (parsing/`@gpu` subset validation/GLSL text emission) IS verified, but the
+// actual buffer-upload/dispatch/readback sequence below has never been run against a real GPU.
+
+extern class JCharSequenceGpu = "java.lang.CharSequence" {}
+
+// Real, previously-hit trap (see `graphics.hotc`'s own `JFloatBufferGfx` header): an extern
+// method with no `&self` receiver is implicitly STATIC -- `put`/`flip`/`get` here are genuine
+// INSTANCE methods (`buf.put(...)`), so `&self` isn't optional decoration.
+extern class JFloatBufferGpu = "java.nio.FloatBuffer" {
+    fn put(&self, v: Float) -> JFloatBufferGpu;
+    fn flip(&self) -> JFloatBufferGpu;
+    fn get(&self, i: Int) -> Float;
+}
+
+extern class JIntBufferGpu = "java.nio.IntBuffer" {
+    fn put(&self, v: Int) -> JIntBufferGpu;
+    fn flip(&self) -> JIntBufferGpu;
+    fn get(&self, i: Int) -> Int;
+}
+
+extern class BufferUtilsGpu = "org.lwjgl.BufferUtils" {
+    static fn createFloatBuffer(capacity: Int) -> JFloatBufferGpu;
+    static fn createIntBuffer(capacity: Int) -> JIntBufferGpu;
+}
+
+extern class GL15Gpu = "org.lwjgl.opengl.GL15" {
+    static GL_DYNAMIC_DRAW: Int;
+    static fn glGenBuffers() -> Int;
+    static fn glBindBuffer(target: Int, buffer: Int) -> Unit;
+    static fn glBufferData(target: Int, data: JFloatBufferGpu, usage: Int) -> Unit;
+    static fn glBufferData(target: Int, data: JIntBufferGpu, usage: Int) -> Unit;
+    static fn glGetBufferSubData(target: Int, offset: Long, data: JFloatBufferGpu) -> Unit;
+    static fn glGetBufferSubData(target: Int, offset: Long, data: JIntBufferGpu) -> Unit;
+    static fn glDeleteBuffers(buffer: Int) -> Unit;
+}
+
+extern class GL20Gpu = "org.lwjgl.opengl.GL20" {
+    static GL_COMPILE_STATUS: Int;
+    static GL_LINK_STATUS: Int;
+    static fn glCreateShader(shader_type: Int) -> Int;
+    static fn glShaderSource(shader: Int, source: JCharSequenceGpu) -> Unit;
+    static fn glCompileShader(shader: Int) -> Unit;
+    static fn glGetShaderi(shader: Int, pname: Int) -> Int;
+    static fn glGetShaderInfoLog(shader: Int) -> String;
+    static fn glDeleteShader(shader: Int) -> Unit;
+    static fn glCreateProgram() -> Int;
+    static fn glAttachShader(program: Int, shader: Int) -> Unit;
+    static fn glLinkProgram(program: Int) -> Unit;
+    static fn glGetProgrami(program: Int, pname: Int) -> Int;
+    static fn glGetProgramInfoLog(program: Int) -> String;
+    static fn glUseProgram(program: Int) -> Unit;
+    static fn glDeleteProgram(program: Int) -> Unit;
+    static fn glGetUniformLocation(program: Int, name: JCharSequenceGpu) -> Int;
+    static fn glUniform1i(location: Int, v: Int) -> Unit;
+    static fn glUniform1f(location: Int, v: Float) -> Unit;
+}
+
+extern class GL30Gpu = "org.lwjgl.opengl.GL30" {
+    static fn glBindBufferBase(target: Int, index: Int, buffer: Int) -> Unit;
+}
+
+extern class GL42Gpu = "org.lwjgl.opengl.GL42" {
+    static GL_SHADER_STORAGE_BARRIER_BIT: Int;
+    static fn glMemoryBarrier(barriers: Int) -> Unit;
+}
+
+extern class GL43Gpu = "org.lwjgl.opengl.GL43" {
+    static GL_COMPUTE_SHADER: Int;
+    static GL_SHADER_STORAGE_BUFFER: Int;
+    static fn glDispatchCompute(num_groups_x: Int, num_groups_y: Int, num_groups_z: Int) -> Unit;
+}
+
+extern class GpuCompileError = "java.lang.RuntimeException" {
+    fn new(msg: String) -> Self;
+}
+
+// Compiles+links a real GLSL compute-shader program from source text -- same real compile/link
+// error-checking shape `graphics.hotc`'s own `Shader::compile` already established for vertex/
+// fragment pairs, just one shader stage instead of two. No caching this v1 (a real, disclosed
+// performance concern deferred, not a correctness one -- see `ECS_IDEAS.md`'s own "fast isn't a
+// goal for the first cut" precedent): every dispatched `@gpu` call recompiles from scratch.
+pub fn gpu_compile_program(source: String) -> Int {
+    let shader = GL20Gpu::glCreateShader(GL43Gpu::GL_COMPUTE_SHADER);
+    GL20Gpu::glShaderSource(shader, source as JCharSequenceGpu);
+    GL20Gpu::glCompileShader(shader);
+    if GL20Gpu::glGetShaderi(shader, GL20Gpu::GL_COMPILE_STATUS) == 0 {
+        throw GpuCompileError::new("GPU compute shader failed to compile: " + GL20Gpu::glGetShaderInfoLog(shader));
+    }
+    let program = GL20Gpu::glCreateProgram();
+    GL20Gpu::glAttachShader(program, shader);
+    GL20Gpu::glLinkProgram(program);
+    if GL20Gpu::glGetProgrami(program, GL20Gpu::GL_LINK_STATUS) == 0 {
+        throw GpuCompileError::new("GPU compute program failed to link: " + GL20Gpu::glGetProgramInfoLog(program));
+    }
+    GL20Gpu::glDeleteShader(shader);
+    return program;
+}
+
+// Uploads `data` into a new SSBO bound at `binding` (matching `Driver.hotc`'s own `gen_gpu_glsl`
+// -- the two assign binding indices in the exact same declaration order, by construction, not by
+// coincidence). Returns the real GL buffer object id, needed later for readback/deletion.
+pub fn gpu_upload_float_buffer(binding: Int, data: &Vec<Float>) -> Int {
+    let n = data.length();
+    let nio = BufferUtilsGpu::createFloatBuffer(n);
+    var i = 0;
+    while i < n {
+        nio.put(data.get(i));
+        i = i + 1;
+    }
+    nio.flip();
+    let buf = GL15Gpu::glGenBuffers();
+    GL15Gpu::glBindBuffer(GL43Gpu::GL_SHADER_STORAGE_BUFFER, buf);
+    GL15Gpu::glBufferData(GL43Gpu::GL_SHADER_STORAGE_BUFFER, nio, GL15Gpu::GL_DYNAMIC_DRAW);
+    GL30Gpu::glBindBufferBase(GL43Gpu::GL_SHADER_STORAGE_BUFFER, binding, buf);
+    return buf;
+}
+
+pub fn gpu_upload_int_buffer(binding: Int, data: &Vec<Int>) -> Int {
+    let n = data.length();
+    let nio = BufferUtilsGpu::createIntBuffer(n);
+    var i = 0;
+    while i < n {
+        nio.put(data.get(i));
+        i = i + 1;
+    }
+    nio.flip();
+    let buf = GL15Gpu::glGenBuffers();
+    GL15Gpu::glBindBuffer(GL43Gpu::GL_SHADER_STORAGE_BUFFER, buf);
+    GL15Gpu::glBufferData(GL43Gpu::GL_SHADER_STORAGE_BUFFER, nio, GL15Gpu::GL_DYNAMIC_DRAW);
+    GL30Gpu::glBindBufferBase(GL43Gpu::GL_SHADER_STORAGE_BUFFER, binding, buf);
+    return buf;
+}
+
+pub fn gpu_set_uniform_float(program: Int, name: String, value: Float) {
+    GL20Gpu::glUseProgram(program);
+    let loc = GL20Gpu::glGetUniformLocation(program, name as JCharSequenceGpu);
+    GL20Gpu::glUniform1f(loc, value);
+}
+
+pub fn gpu_set_uniform_int(program: Int, name: String, value: Int) {
+    GL20Gpu::glUseProgram(program);
+    let loc = GL20Gpu::glGetUniformLocation(program, name as JCharSequenceGpu);
+    GL20Gpu::glUniform1i(loc, value);
+}
+
+// GLSL's own `bool` uniforms are set through the same integer entry point real OpenGL exposes
+// (there is no separate `glUniform1b`) -- `0`/`1`, same as C's own historical bool-as-int
+// convention.
+pub fn gpu_set_uniform_bool(program: Int, name: String, value: Bool) {
+    var v = 0;
+    if value { v = 1; }
+    gpu_set_uniform_int(program, name, v);
+}
+
+// `count` is the dispatch's own thread count (`Driver.hotc`'s own `build_gpu_dispatcher_fn` passes
+// the first buffer param's `.length()`) -- `local_size_x = 256` is hardcoded on the GLSL side
+// (`gen_gpu_glsl`), so the group count here just has to cover every thread, real tuning deferred
+// (see `IDEAS.md`'s own "Workgroup size" note).
+pub fn gpu_dispatch(program: Int, count: Int) {
+    GL20Gpu::glUseProgram(program);
+    let groups = (count + 255) / 256;
+    GL43Gpu::glDispatchCompute(groups, 1, 1);
+}
+
+pub fn gpu_barrier() {
+    GL42Gpu::glMemoryBarrier(GL42Gpu::GL_SHADER_STORAGE_BARRIER_BIT);
+}
+
+// Overwrites every element of `data` IN PLACE from the GPU buffer's own current contents --
+// `data`'s own length is trusted to still match what was uploaded (same buffer, no resize
+// between upload and readback within one dispatch).
+pub fn gpu_readback_float_buffer(buffer: Int, data: &mut Vec<Float>) {
+    let n = data.length();
+    GL15Gpu::glBindBuffer(GL43Gpu::GL_SHADER_STORAGE_BUFFER, buffer);
+    let nio = BufferUtilsGpu::createFloatBuffer(n);
+    GL15Gpu::glGetBufferSubData(GL43Gpu::GL_SHADER_STORAGE_BUFFER, 0 as Long, nio);
+    var i = 0;
+    while i < n {
+        data.set(i, nio.get(i));
+        i = i + 1;
+    }
+}
+
+pub fn gpu_readback_int_buffer(buffer: Int, data: &mut Vec<Int>) {
+    let n = data.length();
+    GL15Gpu::glBindBuffer(GL43Gpu::GL_SHADER_STORAGE_BUFFER, buffer);
+    let nio = BufferUtilsGpu::createIntBuffer(n);
+    GL15Gpu::glGetBufferSubData(GL43Gpu::GL_SHADER_STORAGE_BUFFER, 0 as Long, nio);
+    var i = 0;
+    while i < n {
+        data.set(i, nio.get(i));
+        i = i + 1;
+    }
+}
+
+pub fn gpu_delete_buffer(buffer: Int) {
+    GL15Gpu::glDeleteBuffers(buffer);
+}
+
+pub fn gpu_delete_program(program: Int) {
+    GL20Gpu::glDeleteProgram(program);
+}
