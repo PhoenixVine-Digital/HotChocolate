@@ -4830,6 +4830,36 @@ never from impl-method codegen) -- only top-level `fn`s and `struct`s can carry 
 top-level fn instead, a real, narrower shape than a full mixin usually wants. `@shadow` fields
 (needing FIELD-level annotations, which also don't exist) aren't attempted either.
 
+## Standard library additions (`Vec<T>` basics, `math` clamp)
+
+**Shipped, 2026-09-24.** Real, previously-missing gaps found by actually needing them, not by
+speculative completeness sweeps: `clamp` was hand-written from scratch, identically, in several
+real examples this session (`numeric_range_bounds.hotc` among them) -- exactly the "game-value
+bounds" case `Int<0..=100>`-style ranged types are also aimed at -- and `Vec<T>` had only `push`/
+`get`/`set`/`length`/`pop`/`clear`, missing even the most basic `is_empty`/`contains`/`remove`/
+`insert`.
+
+`stdlib/math.hotc` gained `clamp_int`/`clamp_float`/`clamp_long` (ordinary HC composition over the
+file's own already-declared `min_*`/`max_*` siblings) and a `Double`-typed `clamp` bound directly
+through `Math::min`/`::max`, matching that file's own established `Int`/`Float`/`Long`/`Double`
+split for `abs`/`min`/`max` exactly.
+
+`stdlib/vec.hotc` gained `is_empty`, a linear-scan `contains` (no hashing/ordering assumption on
+`T` -- the same honest tradeoff `HashSet`/`HashMap` exist specifically to avoid for repeated
+membership checks), `remove` (shift every later element down), and `insert` (shift every later
+element up). `insert` mirrors `push`'s own exact growth-check block rather than calling `push`
+directly and placing the value afterward -- calling `push` would MOVE `value` before `insert`
+ever gets to place it at the real target position, a real "use of moved value" for a non-`Copy`
+`T`; mirroring the block instead reuses the SAME already-proven-safe "seed `[value; newCap]`,
+then place `value` for real" pattern `push` already uses, just with an extra shift loop. Verified
+directly against a non-`Copy` struct element (not just `Int`, which this compiler's own move-
+checker already treats leniently) to confirm the growth-block path holds up. Neither of these
+files is consumed by `selfhost/`'s own self-hosting build at all (`stdlib/` lives outside
+`selfhost/` specifically so directory-mode self-compile doesn't sweep it up, see `Driver.hotc`'s
+own `prelude_source` header) -- read fresh off disk at every compile, so no self-hosting rebuild/
+sync/re-verify cycle was needed for this change, unlike every `selfhost/*.hotc` change earlier
+this session. See `examples/stdlib_additions.hotc`.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/

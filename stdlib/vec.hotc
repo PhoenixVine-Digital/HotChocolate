@@ -55,6 +55,67 @@ impl Vec<T> {
     fn clear(&mut self) {
         self.len = 0;
     }
+
+    fn is_empty(&self) -> Bool {
+        return self.len == 0;
+    }
+
+    // Linear scan -- `Vec<T>` has no hashing/ordering assumption on `T` at all, so this is the
+    // only real option (same honest tradeoff `HashSet`/`HashMap` exist specifically to avoid for
+    // a caller who needs repeated membership checks on a large collection).
+    fn contains(&self, value: T) -> Bool {
+        var i = 0;
+        while i < self.len {
+            if self.data[i] == value {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Removes and returns the element at `i`, shifting every LATER element down by one. No bounds
+    // check -- same trust-the-caller convention `get`/`set`/`pop` already have.
+    fn remove(&mut self, i: Int) -> T {
+        let removed = self.data[i];
+        var j = i;
+        while j < self.len - 1 {
+            self.data[j] = self.data[j + 1];
+            j = j + 1;
+        }
+        self.len = self.len - 1;
+        return removed;
+    }
+
+    // Inserts `value` at position `i`, shifting `i` and every LATER element up by one (so a
+    // `push` is exactly `insert(length(), value)`, though `push` stays its own simpler method
+    // rather than becoming a thin wrapper around this, to keep it independent of the shift loop
+    // below). Mirrors `push`'s own exact growth-check block (`value` seeds `[value; newCap]`
+    // first, then gets placed for real afterward, same as `push` already does) rather than
+    // calling `push` directly -- calling it would MOVE `value` before this fn ever gets to place
+    // it at the real target position, a real "use of moved value" for a non-`Copy` `T`.
+    fn insert(&mut self, i: Int, value: T) {
+        if self.len == self.data.length {
+            var newCap = self.data.length * 2;
+            if newCap == 0 {
+                newCap = 4;
+            }
+            var newData = [value; newCap];
+            var k = 0;
+            while k < self.len {
+                newData[k] = self.data[k];
+                k = k + 1;
+            }
+            self.data = newData;
+        }
+        var j = self.len;
+        while j > i {
+            self.data[j] = self.data[j - 1];
+            j = j - 1;
+        }
+        self.data[i] = value;
+        self.len = self.len + 1;
+    }
 }
 
 pub fn vec_of<T>(first: T) -> Vec<T> {

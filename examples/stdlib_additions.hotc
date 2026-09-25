@@ -1,0 +1,45 @@
+// Real, previously-missing stdlib basics -- see ARCHITECTURE.md's own "Standard library
+// additions" entry. `Vec<T>` gained `is_empty`/`contains`/`remove`/`insert` (only `push`/`get`/
+// `set`/`length`/`pop`/`clear` existed before); `math` gained `clamp`/`clamp_int`/`clamp_float`/
+// `clamp_long` (hand-written from scratch in several real examples this session, never actually
+// in the stdlib itself).
+
+use vec;
+use math;
+
+struct Point { x: Int, y: Int }
+
+fn main() {
+    var v = vec_of(10);
+    v.push(20);
+    v.push(30);
+    v.push(40);
+    print(v.contains(30));
+    print(v.contains(99));
+
+    let removed = v.remove(1);
+    print(removed);       // 20
+    print(v.get(1));       // 30 (shifted down)
+
+    v.insert(1, 25);
+    print(v.get(1));       // 25
+    print(v.get(2));       // 30 (shifted back up)
+    print(v.length());     // 4
+
+    var empty_v = vec_of(1);
+    empty_v.pop();
+    print(empty_v.is_empty());
+
+    // Works for a non-Copy struct element too, including the growth-block path.
+    var points = vec_of(Point { x: 1, y: 1 });
+    points.push(Point { x: 2, y: 2 });
+    points.insert(1, Point { x: 99, y: 99 });
+    print(points.get(1).x);
+
+    print(clamp_int(150, 0, 100));
+    print(clamp_int(-10, 0, 100));
+    print(clamp_float(150.0f, 0.0f, 100.0f));
+    print(clamp(150.0, 0.0, 100.0));
+
+    print("done");
+}

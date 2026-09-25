@@ -75,6 +75,17 @@ pub fn abs_long(x: Long) -> Long { if x < (0 as Long) { return -x; } return x; }
 pub fn min_long(a: Long, b: Long) -> Long { if a < b { return a; } return b; }
 pub fn max_long(a: Long, b: Long) -> Long { if a > b { return a; } return b; }
 
+// `clamp(x, lo, hi)` -- restricts `x` to `[lo, hi]`. Real, previously-missing gap: hand-written
+// from scratch, identically, in several real examples this session (game-value bounds checks are
+// exactly the kind of thing `Int<0..=100>`-style ranged types, `@must_use`, and typestate are all
+// aimed at). Same `Int`/`Float`/`Long`/`Double` split every other fn in this file already has --
+// `Double` bound directly to `Math::min`/`::max` (already `Double`-typed above), the rest ordinary
+// HC composition over their own already-declared `min_*`/`max_*` siblings.
+pub fn clamp_int(x: Int, lo: Int, hi: Int) -> Int { return max_int(lo, min_int(x, hi)); }
+pub fn clamp_float(x: Float, lo: Float, hi: Float) -> Float { return max_float(lo, min_float(x, hi)); }
+pub fn clamp_long(x: Long, lo: Long, hi: Long) -> Long { return max_long(lo, min_long(x, hi)); }
+pub fn clamp(x: Double, lo: Double, hi: Double) -> Double { return Math::max(lo, Math::min(x, hi)); }
+
 // `Float` wrappers for `Math::sqrt`/`::sin`/`::cos`/`::tan`/`::acos` -- unlike `abs`/`min`/`max`
 // right above, there's no way to compute a square root or a trig function directly in HC (no
 // native intrinsic exists), so these still round-trip through `Double` internally -- but they do
