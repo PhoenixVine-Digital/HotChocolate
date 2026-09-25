@@ -1739,6 +1739,60 @@ this shadowed field" is a real but *narrower* guarantee than it sounds,
 not full safety against the vanilla class's own concurrent/aliased
 access to the same field.
 
+**Status (2026-09-24): the pragmatic version's own real prerequisite shipped — general
+class-literal and nested-annotation values, needed nothing mixin-specific at all.** The
+already-existing `@"binary.Name"(arg: value, ...)` annotation system (real, arbitrary Java
+annotations, shipped 2026-09-03) was missing exactly two value shapes a real `@Mixin`/`@Inject`
+needs: a `Class<?>`-typed argument (`@Mixin`'s own `value: Class<?>[]`) and a NESTED annotation
+argument (`@Inject`'s own `at: @At(...)`). Closing those two gaps in `Ast.hc`'s own `AnnValue`
+enum turned out to be the ENTIRE feature — no new `mixin`/`@inject`/`@shadow` HC-level syntax was
+needed at all, since ordinary `extern class` (for `CallbackInfo`, the target class, etc.) and the
+general annotation grammar already cover everything else:
+
+```
+extern class CallbackInfo = "org.spongepowered.asm.mixin.injection.callback.CallbackInfo" {}
+
+@"org.spongepowered.asm.mixin.Mixin"(value: [class("net.minecraft.entity.player.PlayerEntity")])
+struct PlayerMixin {}
+
+@"org.spongepowered.asm.mixin.injection.Inject"(method: "tick", at: @"org.spongepowered.asm.mixin.injection.At"(value: "HEAD"))
+fn onTick(ci: CallbackInfo) {}
+```
+
+`class("binary.Name")` (a new `AnnValue::AnnClass`) reuses the ALREADY-EXISTING `CLASS` token
+(`extern class`'s own keyword) in this one new grammar position, same "one token, more than one
+position" convention `enum(...)`'s own annotation-value shape already established; compiles to
+`AnnotationVisitor.visit(name, Type.getObjectType(internalName))`, a real Java `Type` object (a
+new `JAsmType` extern binding for `org.objectweb.asm.Type`). A nested `@"binary.Name"(...)` value
+(a new `AnnValue::AnnAnnotation`) just recurses straight into the SAME `annotation()` parse fn
+that already handles the outer form; compiles to `AnnotationVisitor.visitAnnotation(name,
+descriptor)`, recursing through the SAME `emit_annotation_args` the outer annotation already uses.
+Array-ELEMENT forms of both (an unnamed class literal/nested annotation inside `[...]`, needed for
+`@Mixin`'s own `Class<?>[]` -- a single-element array is still an array) needed two new real-Java-
+`null`-`name` `CodegenShim.java` methods (`visitArrayClass`/`visitArrayAnnotation`), same pattern
+`visitArrayString`/`visitArrayEnum` already established for the two existing scalar shapes.
+
+Verified via `javap -v` against the actual, compiled class files (this compiler's own usual
+run-it-and-check verification doesn't apply here -- there's no runtime BEHAVIOR to observe, only a
+classfile-level ANNOTATION SHAPE): both examples above produce EXACTLY the real, documented
+SpongePowered Mixin annotation structure (`@Mixin(value=[class Lnet/minecraft/entity/player/
+PlayerEntity;])`, `@Inject(method="tick", at=@At(value="HEAD"))`), confirmed against the real
+Mixin javadoc API. **Honestly disclosed, not glossed over**: this has NOT been tested inside an
+actual running Forge + Mixin-transformer environment (no such harness exists in this repo) — the
+verification claim is specifically "the emitted bytecode has the correct annotation shape the real
+framework's own documented API expects," not "a real mod using this successfully loaded and
+mixed in."
+
+Real, disclosed scope cut found along the way, not fixed this pass: **impl-block METHODS have no
+annotation support at all** — only top-level `fn`s and `struct`s do (`emit_method_annotation`
+exists but is only ever called from `gen_fn`, never from the impl-method codegen path). A real
+Mixin `@Inject` target is conventionally an INSTANCE method (mirroring the target's own instance
+method signature), so this is a real limitation on how faithfully a real mixin can be expressed
+today, not just a cosmetic gap — `examples/mixin_annotations.hotc` uses a top-level fn instead,
+which is still correctly annotated, just not the instance-method shape a real mixin usually wants.
+`@shadow` fields (needing FIELD-level annotations, which don't exist at all either) are similarly
+not attempted. See that example for the full, hand-verified output.
+
 ### Pipeline syntax: `xs |> filter(f) |> map(g)`
 
 Written when this language had no closures yet — that part's since shipped (2026-09-02, see this

@@ -161,7 +161,20 @@ extern class AnnotationVisitor2 = "org.objectweb.asm.AnnotationVisitor" {
     fn visit(&mut self, name: String, value: JObject4);
     fn visitEnum(&mut self, name: String, descriptor: String, value: String);
     fn visitArray(&mut self, name: String) -> AnnotationVisitor2;
+    // A NESTED, NAMED annotation value (`@Inject(at = @At("HEAD"))`) -- see `Ast.hc`'s own
+    // `AnnValue.AnnAnnotation` header. `name` isn't `null` here (this is the same named-argument
+    // shape `visit`/`visitEnum` already use), so this needs no `CodegenShim` real-`null` detour
+    // the way the UNNAMED array-element form does.
+    fn visitAnnotation(&mut self, name: String, descriptor: String) -> AnnotationVisitor2;
     fn visitEnd(&mut self);
+}
+// `Type.getObjectType(internalName)` -- the real Java object an `AnnotationVisitor.visit` call
+// needs for a `Class<?>`-typed argument (`SomeClass.class`, see `Ast.hc`'s own `AnnValue.AnnClass`
+// header). `internalName` is JVM-internal slash form (`"net/minecraft/entity/Entity"`, not
+// dot-form) -- same convention `extern class`'s own `binary_name` already uses everywhere else in
+// this file, via `dot_to_slash_cg`.
+extern class JAsmType = "org.objectweb.asm.Type" {
+    static fn getObjectType(internalName: String) -> JAsmType;
 }
 extern class MethodVisitor2 = "org.objectweb.asm.MethodVisitor" {
     fn visitCode(&mut self);
@@ -216,6 +229,12 @@ extern class CodegenShim = "hc.selfhost.codegen.CodegenShim" {
     // annotation ARRAY element.
     fn visitArrayString(av: &mut AnnotationVisitor2, value: String);
     fn visitArrayEnum(av: &mut AnnotationVisitor2, descriptor: String, value: String);
+    // Same real "needs a genuine Java null" gap, two more instances -- an unnamed array element
+    // that's a class literal or a nested annotation (`@Mixin(value = [Target.class])`, an array
+    // of ONE class literal, is the actual real-world shape `@Mixin`'s own `Class<?>[]` value
+    // param needs). See `Ast.hc`'s own `AnnValue.AnnClass`/`AnnAnnotation` headers.
+    fn visitArrayClass(av: &mut AnnotationVisitor2, internalName: String);
+    fn visitArrayAnnotation(av: &mut AnnotationVisitor2, descriptor: String) -> AnnotationVisitor2;
 }
 
 // Whole-program metadata `gen_fn` needs beyond the one `FnDecl` it's currently emitting --
@@ -6720,6 +6739,16 @@ pub fn emit_ann_value(av: &mut AnnotationVisitor2, name: String, value: AnnValue
         AnnEnumConst { binary_name, const_name } => {
             av.visitEnum(name, "L" + dot_to_slash_cg(binary_name) + ";", const_name);
         }
+        AnnClass { binary_name } => {
+            let tobj = JAsmType::getObjectType(dot_to_slash_cg(binary_name));
+            av.visit(name, tobj as JObject4);
+        }
+        AnnAnnotation { ann } => {
+            let ndesc = "L" + dot_to_slash_cg(ann.binary_name) + ";";
+            var nav = av.visitAnnotation(name, ndesc);
+            emit_annotation_args(&mut nav, ann);
+            nav.visitEnd();
+        }
         AnnArray { values } => {
             var sub = av.visitArray(name);
             var j = 0;
@@ -6733,15 +6762,24 @@ pub fn emit_ann_value(av: &mut AnnotationVisitor2, name: String, value: AnnValue
 }
 
 // The UNNAMED (array element) shape -- see `CodegenShim.java`'s own header for why this needs its
-// own real Java-`null`-`name` path (`visitArrayString`/`visitArrayEnum`) instead of just calling
-// `emit_ann_value` with an empty string. Nested arrays aren't part of the documented grammar (an
-// array of scalar/enum values only, never an array of arrays) -- `AnnArray` here is a real error,
-// not a silently-dropped case.
+// own real Java-`null`-`name` path (`visitArrayString`/`visitArrayEnum`/`visitArrayClass`/
+// `visitArrayAnnotation`) instead of just calling `emit_ann_value` with an empty string. Nested
+// arrays aren't part of the documented grammar (an array of scalar/enum/class/annotation values
+// only, never an array of arrays) -- `AnnArray` here is a real error, not a silently-dropped case.
 pub fn emit_ann_array_elem(av: &mut AnnotationVisitor2, value: AnnValue) {
     match value {
         AnnStr { value: v } => { CodegenShim::visitArrayString(av, v); }
         AnnEnumConst { binary_name, const_name } => {
             CodegenShim::visitArrayEnum(av, "L" + dot_to_slash_cg(binary_name) + ";", const_name);
+        }
+        AnnClass { binary_name } => {
+            CodegenShim::visitArrayClass(av, dot_to_slash_cg(binary_name));
+        }
+        AnnAnnotation { ann } => {
+            let ndesc2 = "L" + dot_to_slash_cg(ann.binary_name) + ";";
+            var nav2 = CodegenShim::visitArrayAnnotation(av, ndesc2);
+            emit_annotation_args(&mut nav2, ann);
+            nav2.visitEnd();
         }
         AnnArray { values } => {
             throw CodegenError::new("codegen: nested annotation arrays aren't supported");

@@ -3,6 +3,7 @@ package hc.selfhost.codegen;
 import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Type;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -83,5 +84,17 @@ public final class CodegenShim {
 
     public static void visitArrayEnum(AnnotationVisitor av, String enumDescriptor, String value) {
         av.visitEnum(null, enumDescriptor, value);
+    }
+
+    // Two more instances of the same real "needs a genuine Java null" gap -- a class-literal or
+    // nested-annotation array element is unnamed by definition too, same as the String/enum cases
+    // right above. Added for Mixins support (see IDEAS.md's own "Mixins" entry): `@Mixin`'s own
+    // `value` param is `Class<?>[]`, so `@Mixin(value = [Target.class])` needs this exact shape.
+    public static void visitArrayClass(AnnotationVisitor av, String internalName) {
+        av.visit(null, Type.getObjectType(internalName));
+    }
+
+    public static AnnotationVisitor visitArrayAnnotation(AnnotationVisitor av, String descriptor) {
+        return av.visitAnnotation(null, descriptor);
     }
 }

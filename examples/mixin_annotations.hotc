@@ -1,0 +1,42 @@
+// Mixins (the pragmatic version) -- see IDEAS.md's own "Mixins" entry. Rather than HC's compiler
+// becoming its own ASM-based bytecode patcher (reimplementing SpongePowered Mixin's own runtime),
+// HC syntax compiles down to real, standard @Mixin/@Inject/@Shadow-annotated Java-shaped class
+// output that the existing, already-battle-tested Mixin framework processes at Forge's own
+// launch time -- same ergonomic win, zero new bytecode-patching engine.
+//
+// This needed two real extensions to the general `@"binary.Name"(...)` annotation system (both
+// genuinely useful beyond mixins, not mixin-specific machinery): a real Java CLASS LITERAL value
+// (`class("binary.Name")`, for `@Mixin`'s own `Class<?>[] value` param) and a NESTED annotation
+// value (`@"..."(...)`  as another annotation's own argument, for `@Inject`'s own `@At(...) at`
+// param). No new mixin-specific syntax was needed at all once those two gaps closed -- ordinary
+// `extern class`/`@"binary.Name"(...)` already cover the rest.
+//
+// Real, disclosed scope cut: only STRUCT- and top-level-FN-level annotations work (impl-block
+// METHODS have no annotation support at all yet -- a separate, real gap, not fixed this pass).
+// A real Mixin @Inject target is usually an impl method (matching the target's own instance
+// method), so this example uses a top-level fn instead -- still a real, correctly-shaped
+// annotation, just not yet attachable to the instance-method shape a real mixin typically wants.
+//
+// IMPORTANT, disclosed honestly: this has been verified via `javap -v` to produce the CORRECT
+// annotation bytecode SHAPE the real SpongePowered Mixin framework's own documented API expects
+// -- it has NOT been tested inside an actual running Forge + Mixin-transformer environment (no
+// such harness exists in this repo). Getting a real mod loaded and mixed in successfully still
+// depends on things this compiler can't verify in isolation (the real target class/method
+// actually existing on the real runtime classpath, the Mixin config JSON referencing this class,
+// etc).
+
+extern class CallbackInfo = "org.spongepowered.asm.mixin.injection.callback.CallbackInfo" {}
+
+// `@Mixin(value = PlayerEntity.class)` -- a real Class<?>[] array of ONE class literal.
+@"org.spongepowered.asm.mixin.Mixin"(value: [class("net.minecraft.entity.player.PlayerEntity")])
+struct PlayerMixin {}
+
+// `@Inject(method = "tick", at = @At("HEAD"))` -- the nested @At annotation is itself a real,
+// separate `AnnValue::AnnAnnotation`, not a special case.
+@"org.spongepowered.asm.mixin.injection.Inject"(method: "tick", at: @"org.spongepowered.asm.mixin.injection.At"(value: "HEAD"))
+fn onTick(ci: CallbackInfo) {
+}
+
+fn main() {
+    print("done");
+}

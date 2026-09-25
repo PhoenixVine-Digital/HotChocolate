@@ -4780,6 +4780,56 @@ by re-reading the earlier fix's own reasoning. See `examples/numeric_range_bound
 
 This closes every gap this feature's own entry originally disclosed.
 
+## Mixins, the pragmatic version (real `@Mixin`/`@Inject` annotation output)
+
+**Shipped, 2026-09-24.** See `IDEAS.md`'s own "Mixins" entry for the full design and why this
+targets the real, already-existing SpongePowered Mixin framework's own annotation-driven bytecode
+weaving rather than HC becoming its own ASM-based patcher. The short version:
+
+```
+extern class CallbackInfo = "org.spongepowered.asm.mixin.injection.callback.CallbackInfo" {}
+
+@"org.spongepowered.asm.mixin.Mixin"(value: [class("net.minecraft.entity.player.PlayerEntity")])
+struct PlayerMixin {}
+
+@"org.spongepowered.asm.mixin.injection.Inject"(method: "tick", at: @"org.spongepowered.asm.mixin.injection.At"(value: "HEAD"))
+fn onTick(ci: CallbackInfo) {}
+```
+
+Entirely an extension to the ALREADY-EXISTING `@"binary.Name"(...)` general annotation system
+(shipped 2026-09-03) -- no new mixin-specific syntax at all. Two new `AnnValue` variants closed
+the only real gaps:
+- **`AnnClass { binary_name: String }`** -- a real Java class literal (`class("binary.Name")`,
+  reusing the ALREADY-existing `CLASS` token in this one new grammar position, same "one token,
+  more than one position" convention `enum(...)`'s own annotation-value shape already
+  established). Compiles to `AnnotationVisitor.visit(name, Type.getObjectType(internalName))` --
+  a new `JAsmType` extern binding for `org.objectweb.asm.Type`.
+- **`AnnAnnotation { ann: Annotation }`** -- a NESTED annotation value (`at: @At(...)`), parsed by
+  recursing straight into the same `annotation()` fn that parses the outer form; compiles to
+  `AnnotationVisitor.visitAnnotation(name, descriptor)`, recursing through the same
+  `emit_annotation_args` the outer annotation already uses.
+
+Array-ELEMENT forms of both (needed for `@Mixin`'s own `value: Class<?>[]`) needed two new
+real-Java-`null`-`name` `CodegenShim.java` methods (`visitArrayClass`/`visitArrayAnnotation`), the
+same pattern `visitArrayString`/`visitArrayEnum` already established there for the two existing
+scalar array-element shapes.
+
+**Verification looked different from every other feature this session** -- there's no runtime
+BEHAVIOR to run and observe, only a classfile-level annotation SHAPE to check. Verified via
+`javap -v` against the real compiled output: both examples above produce exactly the documented
+real Mixin annotation structure (`@Mixin(value=[class Lnet/minecraft/entity/player/
+PlayerEntity;])`, `@Inject(method="tick", at=@At(value="HEAD"))`). Explicitly, honestly disclosed:
+this confirms the emitted bytecode has the correct shape the real framework's own documented API
+expects -- it does NOT confirm a real mod using this actually loads and mixes in inside a running
+Forge environment, which this repo has no harness to test.
+
+Real, disclosed gap found along the way, not fixed this pass: impl-block METHODS have no
+annotation support at all (`emit_method_annotation` exists but is only ever called from `gen_fn`,
+never from impl-method codegen) -- only top-level `fn`s and `struct`s can carry one. A real Mixin
+`@Inject` target is conventionally an instance method, so `examples/mixin_annotations.hotc` uses a
+top-level fn instead, a real, narrower shape than a full mixin usually wants. `@shadow` fields
+(needing FIELD-level annotations, which also don't exist) aren't attempted either.
+
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 
 A real, hand-written IntelliJ Platform plugin (own lexer/PSI parser/annotator/type-checker/

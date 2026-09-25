@@ -4096,11 +4096,13 @@ impl Parser {
         return AnnotationArg { name: name, value: value };
     }
 
-    // Three shapes only -- see `Ast.hc`'s own `AnnValue` header for why this is its own small
+    // Five shapes now -- see `Ast.hc`'s own `AnnValue` header for why this is its own small
     // grammar, not the general expression language. `enum(...)` reuses the ordinary `ENUM`
     // keyword token in this one new context (same "one token, more than one grammar position"
     // convention `static` already has between a top-level `static NAME: Type = ...;` and an
-    // impl-block `static fn ...`).
+    // impl-block `static fn ...`); `class(...)` (see `Ast.hc`'s own `AnnValue.AnnClass` header)
+    // does the exact same thing with the ALREADY-existing `CLASS` token (`extern class`'s own
+    // keyword), and a nested `@"binary.Name"(...)` recurses straight into `self.annotation()`.
     fn annotation_value(&mut self) -> AnnValue {
         if self.check(STRING) {
             return AnnStr { value: self.advance().text };
@@ -4113,6 +4115,16 @@ impl Parser {
             let econst = self.expect(STRING).text;
             self.expect(RPAREN);
             return AnnEnumConst { binary_name: ebin, const_name: econst };
+        }
+        if self.check(CLASS) {
+            self.advance();
+            self.expect(LPAREN);
+            let cbin = self.expect(STRING).text;
+            self.expect(RPAREN);
+            return AnnClass { binary_name: cbin };
+        }
+        if self.check(AT) {
+            return AnnAnnotation { ann: self.annotation() };
         }
         if self.check(LBRACKET) {
             self.advance();
@@ -4128,7 +4140,7 @@ impl Parser {
             return AnnArray { values: values };
         }
         let t = self.peek();
-        throw ParseError::new("Parse error at line " + JString3::valueOf(t.line) + ": expected an annotation value (string, enum(...), or [...]), got '" + t.text + "'");
+        throw ParseError::new("Parse error at line " + JString3::valueOf(t.line) + ": expected an annotation value (string, enum(...), class(...), @\"...\"(...), or [...]), got '" + t.text + "'");
     }
 
     // `pub static NAME: Type = expr;` -- see `Ast.hc`'s own `StaticDecl` header. Unambiguous with

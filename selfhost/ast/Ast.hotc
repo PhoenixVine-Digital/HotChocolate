@@ -1059,6 +1059,24 @@ pub enum AnnValue {
     // metadata is inert data read back by reflection, never executed.
     AnnEnumConst { binary_name: String, const_name: String },
     AnnArray { values: Vec<AnnValue> },
+    // A real Java CLASS LITERAL (`SomeClass.class`), spelled `class("binary.Name")` here since
+    // this subset has no general `.class` expression syntax to reuse -- compiles to
+    // `AnnotationVisitor.visit(name, Type.getObjectType(internalName))`, exactly what a
+    // `Class<?>`-typed annotation argument is stored as at the classfile level (see `IDEAS.md`'s
+    // own "Mixins" entry, whose pragmatic version -- targeting the real, already-existing
+    // SpongePowered Mixin framework's own `@Mixin(value = Target.class)` -- is the actual
+    // motivating need: `@Mixin`'s own `value` param is `Class<?>[]`).
+    AnnClass { binary_name: String },
+    // A NESTED annotation value (`@Inject(at = @At("HEAD"))` -- `at`'s own value is itself a real
+    // annotation, not a scalar/enum/array) -- compiles to `AnnotationVisitor.visitAnnotation(name,
+    // descriptor)`, which returns a FRESH `AnnotationVisitor` for the nested annotation's own args
+    // (same real classfile shape `emit_class_annotation`/`emit_method_annotation` already use for
+    // the OUTER annotation, recursed one level). Real, disclosed narrower scope than a fully
+    // general annotation language: only ONE level of nesting is exercised by anything this
+    // compiler emits so far (a nested annotation containing ANOTHER nested annotation would still
+    // work mechanically -- `emit_ann_value`'s own recursion doesn't stop at one level -- just
+    // untested).
+    AnnAnnotation { ann: Annotation },
 }
 
 pub struct AnnotationArg {
