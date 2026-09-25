@@ -4922,14 +4922,31 @@ upload each `&mut Vec<Int>`/`&mut Vec<Float>` param into an SSBO, set each scala
 uniform, `glDispatchCompute`, a memory barrier, then read the (mutated) buffers back into the
 caller's own `Vec`s -- exactly the dispatch surface that entry's own note describes.
 
-**Real, disclosed limitation, up front**: this repo has no LWJGL jar on its own classpath and no
-display/GPU in this development environment, so the actual buffer-upload/dispatch/readback
-sequence has never been RUN end-to-end here. What IS verified: parsing, the v1-subset checker
-pass (both accepting valid programs and rejecting real violations), and GLSL text emission
-(inspected directly -- a `@gpu fn` translating cleanly to well-formed GLSL matching the source).
-`examples/gpu_particles.hotc` compiles cleanly and is part of the example regression sweep's own
-disclosed KNOWN-FAILING set (fails with `NoClassDefFoundError: org/lwjgl/opengl/GL43` when
-actually RUN here, for exactly the reason above -- not a compiler bug).
+**Real end-to-end run confirmed, 2026-09-25, against Marshmallow (a real downstream consumer with
+a real LWJGL classpath, a real window, and real GPU hardware)** -- this repo's OWN dev environment
+still has no LWJGL jar/display, so `examples/gpu_particles.hotc` here still only compiles (part of
+the example regression sweep's own disclosed KNOWN-FAILING set, `NoClassDefFoundError: org/lwjgl/
+opengl/GL43` when run here -- not a compiler bug), but bumping Marshmallow to this version and
+adding a real `@gpu fn gpu_add_scaled(pos: &mut Vec<Float>, vel: &mut Vec<Float>, dt: Float)` smoke
+test (called once right after `Window::new`, before the render loop) produced EXACT, correct
+results on real hardware -- `pos = [0, 10, 20]`, `vel = [1, 2, -1]`, `dt = 2.0` dispatched through
+a real compiled-and-linked GLSL compute shader came back `[2.0, 14.0, 18.0]`, matching the
+by-hand-computed expected values exactly, then the app continued into its own normal render loop
+at a steady ~60 FPS. Two real bugs found and fixed by this one real run, neither catchable without
+it (this repo's own dev environment has no GPU to have caught them):
+- **`stdlib/window.hotc`'s own `Window` struct field named `handle`** -- broke with a real parse
+  error ("unexpected token 'handle'") the instant this was tested, because `handle` had become a
+  real reserved keyword (the `handle Name { ... }` resource-handle construct) at some point AFTER
+  this field was written, with no example anywhere in this repo ever exercising `window.hotc` to
+  catch the regression. Renamed to `glfw_handle` throughout `window.hotc`/`input.hotc` (shipped as
+  v0.1.81).
+- **`stdlib/gpu.hotc`'s own `GL_SHADER_STORAGE_BARRIER_BIT` constant, declared on the wrong extern
+  class** -- `glMemoryBarrier` itself is a real GL42 method, but shader-storage-buffer constants
+  (`GL_SHADER_STORAGE_BARRIER_BIT` among them) are GL43, introduced alongside SSBOs themselves, not
+  GL42. Compiled clean (a bare constant reference isn't classpath-verified the way a method
+  signature is) but threw a real `NoSuchFieldError` the instant `gpu_barrier()` actually ran --
+  everything BEFORE it (shader compile+link, SSBO upload, uniform set, `glDispatchCompute` itself)
+  had already succeeded on real hardware by that point. Moved to `GL43Gpu` (shipped as v0.1.82).
 
 Three separate implementation pieces, entirely in `Ast.hc`/`Parser.hotc`/`Driver.hotc` -- **zero
 changes to `Checker.hotc`/`Codegen.hotc`**, because `Driver.hotc`'s own `rewrite_gpu_fns` REPLACES
