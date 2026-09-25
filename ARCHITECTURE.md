@@ -4752,7 +4752,33 @@ Real, disclosed nuance found testing this: a directly-negated literal init (`let
 runtime check still catches it regardless (it runs unconditionally, independent of literal-ness),
 just without the compile-time optimization a plain positive literal gets.
 
-Still open: assignment to an existing struct field, enum variant fields.
+**Extended once more the same day to field assignment and enum variant fields**, closing this
+feature's own last two disclosed gaps:
+- **Field assignment** (`obj.health = 150;`) -- `Checker.hotc`'s own `check_field_assign_on_type`
+  had the identical bug `check_struct_lit` needed fixing for earlier: it read the field's type
+  through the normalizing `find_field_type`, so the ranged annotation was already stripped before
+  a detection branch could see it. Fixed the same way (`find_field_type_raw`). `Codegen.hotc`'s
+  own `finish_field_assign` needed a new `field_type_of_raw` (the raw twin of `field_type_of`) for
+  the same reason, with `emit_ranged_int_check` inserted right after the new value is pushed.
+- **Enum variant fields** (`Alive { hp: Int<0..=100> }`) -- the CHECKER side needed no changes at
+  all: `check_struct_lit`'s own `field_info` resolves to either the struct table or the
+  per-variant one, and the fix already in place from earlier covers both uniformly. Only
+  `Codegen.hotc`'s own `gen_variant_construct` (the enum-specific `PUTFIELD` sequence) needed
+  `emit_ranged_int_check` wired in, via the same new `field_type_of_raw`.
+
+A real, SEPARATE bug surfaced testing the variant case (not the fix being made, a different one
+found along the way): a genuine `VerifyError` ("Type integer ... not assignable to
+'java/lang/String'") from `print(hp)` right after matching `Alive { hp }` back out. `gen_stmt`'s
+own `Match` arm has TWO field-type lookups for a bound variable -- `field_type_of` (already
+normalized), immediately overwritten by the per-variant `variant_ftypes` table (RAW, unlike the
+first lookup) whenever the variant has its own dedicated field entry. The second lookup winning
+meant `hp`'s own `var_types` entry kept the ranged annotation, so `print(hp)`'s descriptor-picking
+logic (`if arg_ty == "Int" {...}`) never matched and fell through to the wrong `println`
+overload. Same "two lookups, only one normalized" shape as the `check_struct_lit` bug fixed
+earlier the same day, but in a genuinely different function -- found by running the example, not
+by re-reading the earlier fix's own reasoning. See `examples/numeric_range_bounds.hotc`.
+
+This closes every gap this feature's own entry originally disclosed.
 
 ## IntelliJ plugin (`hc-intellij-plugin/`)
 

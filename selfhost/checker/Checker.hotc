@@ -1877,7 +1877,12 @@ impl TyChecker {
         self.ensure_instantiated(on);
         let found = self.structs.get(on);
         if let Some { value: info } = found {
-            let ft = find_field_type(info, field);
+            // Fetched RAW once via `find_field_type_raw` -- same "don't move `info` twice" reason
+            // `check_struct_lit`'s own identical fix documents -- `ft` (normalized) is derived
+            // from it locally rather than a second lookup call.
+            let ft_raw = find_field_type_raw(info, field);
+            var ft = ft_raw;
+            if is_ranged_int_type_chk(ft_raw) { ft = "Int"; }
             // Same real gap `check_struct_lit`'s own per-field loop just got fixed for (see that
             // fn's own header, added wiring `TextureCache` over to `Option<HashMap<Texture>>`):
             // `recv.field = None;`/`recv.field = Some { value: ... };` needs the field's own
@@ -1913,6 +1918,28 @@ impl TyChecker {
             let vn = ty_name(vt);
             if ft == "?" {
                 self.error("struct '" + on + "' has no field '" + field + "'");
+            } else if is_ranged_int_type_chk(ft_raw) && vn == "Int" {
+                // `obj.health = 150;` -- same literal-vs-runtime split as `check_struct_lit`'s
+                // own construction-time check (see that fn's own header). The literal case is
+                // proven here; anything else gets a real runtime check from `Codegen.hotc`'s own
+                // mirrored `FieldAssign` codegen.
+                match value {
+                    IntLit { value: fav } => {
+                        let falo = ranged_int_lo_chk(ft_raw);
+                        let fahi = ranged_int_hi_chk(ft_raw);
+                        let faincl = ranged_int_inclusive_chk(ft_raw);
+                        var faout = fav < falo;
+                        if faincl {
+                            if fav > fahi { faout = true; }
+                        } else {
+                            if fav >= fahi { faout = true; }
+                        }
+                        if faout {
+                            self.error("field '" + field + "' of '" + on + "' = " + JString::valueOf(fav) + " is out of the declared range " + ft_raw);
+                        }
+                    }
+                    _ => {}
+                }
             } else if vn != "?" && ft != vn {
                 self.error("cannot assign " + vn + " to field '" + field + "' of type " + ft);
             }

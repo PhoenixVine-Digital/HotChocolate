@@ -908,7 +908,36 @@ enforced (the runtime check runs unconditionally regardless of literal-ness, una
 not proven statically the way `Checker.hotc`'s existing `IntLit`-only pattern match would need to
 recognize a negated-literal shape too (not attempted this pass).
 
-Still open: assignment to an existing struct field, enum variant fields.
+**Extended once more the same day to field assignment and enum variant fields**, closing this
+entry's own last two disclosed gaps:
+- **`obj.health = 150;`** (assignment to an EXISTING field, not just construction) —
+  `Checker.hotc`'s own `check_field_assign_on_type` had the identical "read the field's type
+  through the normalizing lookup, so the ranged annotation is already stripped before the new
+  check can see it" bug `check_struct_lit` was fixed for earlier the same day — fixed the same
+  way, with a `find_field_type_raw` fetch. `Codegen.hotc`'s own `finish_field_assign` similarly
+  needed `field_type_of_raw` (a new raw twin of `field_type_of`) in place of the normalizing
+  lookup, with `emit_ranged_int_check` inserted right after the new value is pushed (stack:
+  `[objref, value]` at that point — safe, since the check only ever touches the single value on
+  top).
+- **Enum variant fields** (`Alive { hp: Int<0..=100> }`) — the CHECKER side turned out to already
+  work correctly with no changes at all: `check_struct_lit`'s own `field_info` is either the
+  struct's table or the per-variant one depending on which resolves, and the fix already added
+  for struct construction covers both uniformly. Only `Codegen.hotc`'s own `gen_variant_construct`
+  (the enum-specific `PUTFIELD` sequence, structurally separate from the plain-struct constructor
+  path) needed the same `emit_ranged_int_check` wiring, via a new `field_type_of_raw`.
+
+A real, SEPARATE bug surfaced testing the variant case, not the one being fixed: a genuine
+`VerifyError` ("Type integer ... not assignable to 'java/lang/String'") from `print(hp)` after
+matching `Alive { hp }` back out — `gen_stmt`'s own `Match` arm has TWO field-type lookups for a
+bound variable (`field_type_of`, already normalized, immediately overwritten by the per-variant
+`variant_ftypes` table, which is RAW) — the second one winning meant `hp`'s own `var_types` entry
+kept the ranged annotation, so `print(hp)`'s own descriptor-picking logic (`if arg_ty == "Int"
+{...}`) never matched it and fell through to the wrong (`String`) `println` overload. A real,
+previously-hit-SHAPED bug (the same "two lookups, only one fixed" pattern as `check_struct_lit`'s
+own earlier bug) but in a genuinely different fn this pass hadn't touched yet — found by actually
+running the enum-variant example, not by code review.
+
+This closes every gap this entry's own header originally called out.
 
 ### `@deterministic` + built-in state replay/rewind
 

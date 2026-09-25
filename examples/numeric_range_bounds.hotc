@@ -14,7 +14,14 @@
 // not a bare `IntLit`, so it skips the compile-time literal check specifically -- still fully
 // enforced (the runtime check always runs regardless), just not proven statically the way a
 // literal `20` or `-20` written as a single token (impossible in this language either way) would
-// be.
+// be. Also checked on FIELD ASSIGNMENT after construction (`obj.health = 150;`, not just the
+// original `StructName { field: value }` literal), and on ENUM VARIANT fields (`Variant { field:
+// value }`), both with the same literal-vs-runtime split.
+
+enum Status {
+    Alive { hp: Int<0..=100> },
+    Dead {},
+}
 
 fn clamp(x: Int, lo: Int, hi: Int) -> Int {
     if x < lo {
@@ -88,6 +95,21 @@ fn main() {
     print(temp);
     let delta: Int<-10..10> = clamp(-999, -10, 9);
     print(delta);
+
+    // Field ASSIGNMENT after construction -- a literal (compile-time), then a computed value
+    // (runtime-checked), both against the same declared range.
+    var p2 = Player { name: "Grace", health: 40 };
+    p2.health = 60;
+    print(p2.health);
+    p2.health = clamp(999, 0, 100);
+    print(p2.health);
+
+    // An ENUM VARIANT field -- checked the same way as a plain struct field.
+    let alive = Alive { hp: clamp(999, 0, 100) };
+    match alive {
+        Alive { hp } => { print(hp); }
+        Dead {} => {}
+    }
 
     print("done");
 }

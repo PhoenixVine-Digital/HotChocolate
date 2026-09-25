@@ -629,6 +629,28 @@ impl CodeGen {
         throw CodegenError::new("codegen: unknown field '" + field + "' on struct '" + struct_name + "'");
     }
 
+    // The RAW (un-normalized) twin of `field_type_of`, right above -- `gen_variant_construct`'s
+    // own field-type resolution is the one caller that needs the ranged-Int annotation still
+    // intact (to know whether to insert a runtime bounds check at all); `resolve_descriptor`
+    // already treats the raw string identically to the normalized one (both map to `"I"`), so
+    // using this instead of `field_type_of` there costs nothing.
+    fn field_type_of_raw(&mut self, struct_name: String, field: String) -> String {
+        let names_found = self.struct_fields.get(struct_name);
+        let types_found = self.struct_ftypes.get(struct_name);
+        if let Some { value: names } = names_found {
+            if let Some { value: types } = types_found {
+                var i = 0;
+                while i < names.length() {
+                    if names.get(i) == field {
+                        return types.get(i);
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        throw CodegenError::new("codegen: unknown field '" + field + "' on struct '" + struct_name + "'");
+    }
+
     // Sequential packing, no alignment padding -- narrow fields (`Int`/`Bool`) 4 bytes, `Long` 8 --
     // exactly mirroring the real compiler's own `ArenaLayout` (see that class's own header, ported
     // as-is: it makes the identical simplification, not a new scope cut this port invented).
@@ -960,7 +982,10 @@ impl CodeGen {
             }
             throw CodegenError::new("codegen: unknown field '" + field + "' on extern class '" + ot + "'");
         }
-        let fty = self.field_type_of(ot, field);
+        // See `field_type_of_raw`'s own header -- this fn's own detection of "is this field
+        // ranged-Int" needs the annotation still intact; `resolve_descriptor`/the `Long`/`Double`
+        // checks right below treat the raw string identically to the normalized one either way.
+        let fty = self.field_type_of_raw(ot, field);
         // Same `self.ret_ty`-as-hint reasoning as the plain-struct-literal field loop's own fix
         // right above in this file (see that one's own header) -- `recv.field = None;`/`recv.field
         // = Some { value: ... }` needs `fty` (this field's own already-resolved declared type),
@@ -970,6 +995,12 @@ impl CodeGen {
         self.ret_ty = fty;
         self.gen_expr(value); // stack: [objref, value]
         self.ret_ty = saved_ret_ty_for_assign;
+        // `obj.health = 150;` -- see `Checker.hotc`'s own matching `check_field_assign_on_type`
+        // header. Safe here too: only the single TOP value (just pushed) is touched, the `objref`
+        // sitting beneath it is untouched.
+        if is_ranged_int_type_name_cg(fty) {
+            self.emit_ranged_int_check(fty, field);
+        }
         // A `Long`/`Double`-typed field is a real, previously-undetected gap here: `value` is
         // category-2 (64-bit), so a bare `DUP_X1` (90) -- which only ever correctly preserves a
         // category-1 value across the 1-deep `objref` underneath it -- produces a real,
@@ -2178,7 +2209,7 @@ impl CodeGen {
         var pk = 0;
         while pk < field_names.length() {
             let fname0 = field_names.get(pk);
-            var fty0 = self.field_type_of(vowner, fname0);
+            var fty0 = self.field_type_of_raw(vowner, fname0);
             if has_v2_fields {
                 var v2i = 0;
                 while v2i < v2_fnames.length() {
@@ -2217,6 +2248,15 @@ impl CodeGen {
             let fty = resolved_ftypes.get(k);
             self.mv.visitInsn(89); // DUP
             self.gen_expr(field_values.get(k));
+            // `health: Int<0..=100>` on an ENUM VARIANT field -- see `Checker.hotc`'s own
+            // `check_struct_lit` header (that check already covers variants too, since it reads
+            // whichever field table -- struct or per-variant -- actually applies; only THIS
+            // runtime half was missing). Safe here for the same reason it's safe in the plain-
+            // struct constructor loop: only the single value just pushed is touched, the DUP'd
+            // `instance` reference sitting beneath it on the stack is untouched.
+            if is_ranged_int_type_name_cg(fty) {
+                self.emit_ranged_int_check(fty, fname);
+            }
             self.mv.visitFieldInsn(181, qvowner, name + "$" + fname, self.resolve_descriptor(fty)); // PUTFIELD -- mangled, see gen_enum's own header
             k = k + 1;
         }
@@ -4641,6 +4681,17 @@ impl CodeGen {
                                 while vfi2 < variant_fnames.length() {
                                     if variant_fnames.get(vfi2) == fname {
                                         fty = variant_ftypes.get(vfi2);
+                                        // `variant_ftypes` (the per-variant table, unlike `field_
+                                        // type_of` right above) is RAW -- a real `VerifyError`
+                                        // ("Type integer ... not assignable to 'java/lang/
+                                        // String'") found running a real example: `Alive { hp:
+                                        // Int<0..=100> }`'s own bound `hp` kept the ranged
+                                        // annotation as its own `var_types` entry, so `print(hp)`
+                                        // picked the wrong `println` overload (the raw string
+                                        // never exactly equals `"Int"`, so that dispatch fell
+                                        // through to the default `String` descriptor). Normalized
+                                        // here, same as every other ranged-Int read-back point.
+                                        if is_ranged_int_type_name_cg(fty) { fty = "Int"; }
                                     }
                                     vfi2 = vfi2 + 1;
                                 }
