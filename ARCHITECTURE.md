@@ -5096,12 +5096,33 @@ Name(Base);`'s lowercased constructor, an `event Name(...)`'s `emit_Name`, a sta
 dispatchers, `@tunable`'s `tunable_get`/`tunable_set`/`tunable_names`, and `@derive(Eq, Hash,
 Snapshot)`'s `equals`/`hash_key`/`snapshot`/`restore` methods (added to `collectStructMethodSigs`,
 not just the value-name list, since these are METHODS, not top-level fns). `HCAnnotatorTest`'s own
-real-example sweep (every `.hc`/`.hotc` file under `examples/`) now passes cleanly -- the ONLY remaining known
-gap anywhere in the plugin's own test suite is `HCParserTest`'s separate `stdlib/` sweep, confirmed
-PRE-EXISTING (still fails identically on the pre-2026-09-25 code, via `git stash`) and unrelated to
-directives at all: a nested-generic struct literal (`Vec<Entry<V>> { data: [], len: 0 }`, in
-`stdlib/collections.hotc`/`stdlib/tuple.hotc`) isn't recognized by the plugin's own one-level-only
-`looks_like_generic_lit`-equivalent lookahead -- a real, separate follow-up, not attempted here.
+real-example sweep (every `.hc`/`.hotc` file under `examples/`) now passes cleanly.
+
+**Caught up, 2026-09-26: the last remaining gap, closed too.** `HCParserTest`'s own separate
+`stdlib/` sweep (confirmed pre-existing via `git stash` the day before) failed on a nested-generic
+struct literal (`Vec<Entry<V>> { data: [], len: 0 }`, in `stdlib/collections.hotc`) and a plain
+two-type-argument literal with no `::Variant` qualifier (`Tuple2<A, B> { item0: a, item1: b }`, in
+`stdlib/tuple.hotc`) -- `identLed`'s own generic-literal branches only ever handled a bare,
+single/two-argument shape, and only when qualified with `::Variant`. Both turned out to already be
+real, WORKING compiler features (`Parser.hotc`'s own `looks_like_generic_lit2`/`looks_like_nested_
+generic_lit`) the plugin had simply never learned -- ported directly:
+- **Plain two-argument literal** (`looks_like_generic_lit2`): `LT IDENT COMMA IDENT GT LBRACE`,
+  same bounded token-shape lookahead the existing one-argument/qualified branches already use.
+- **Nested-generic literal** (`looks_like_nested_generic_lit`): a cheap 2-token pre-check (is the
+  type argument itself `IDENT <`?) rules out every non-nested case for free, then a REAL
+  speculative parse via `typeRef` (already recurses through arbitrary nesting depth for type
+  ANNOTATIONS, so no second, parallel lookahead-only type parser is needed) confirms the whole
+  shape really ends in `> {` before committing -- `mark()`/`rollbackTo()`, mirroring the real
+  compiler's own identical design exactly.
+
+Both `HCParserTest` and `HCAnnotatorTest` (all 353+ tests) now pass with zero failures -- there is
+no longer any known gap in the plugin's own test suite. One genuinely separate, narrower gap
+surfaced writing the new tests for this (not fixed, not previously exercised by anything in
+`examples/`/`stdlib/`, and confirmed absent from the REAL compiler too via `Parser.hotc`'s own
+`looks_like_generic_variant`/`_variant2`): a QUALIFIED variant construction whose type argument is
+itself nested-generic (`Option<Vec<Int>>::Some { ... }`, `Result<Vec<Int>, String>::Ok { ... }`)
+isn't supported by either implementation -- a real, disclosed, narrower follow-up if it's ever
+needed, not attempted here since nothing requires it.
 
 Three genuinely new, real bugs found and fixed along the way, none specific to any one feature:
 - **`>>`/`>>>` silently misread as a bare `>` comparison by every type-inference call site.**

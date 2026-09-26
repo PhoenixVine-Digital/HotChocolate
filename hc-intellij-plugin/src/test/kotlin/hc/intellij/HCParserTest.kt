@@ -77,6 +77,43 @@ class HCParserTest : BasePlatformTestCase() {
         }
     }
 
+    // **Added 2026-09-26** -- two real, previously-latent generic-struct-literal gaps found via
+    // `HCParserTest`'s own `stdlib/` sweep (`stdlib/tuple.hotc`/`stdlib/collections.hotc`),
+    // confirmed pre-existing via `git stash` before being fixed: a PLAIN two-type-argument literal
+    // with no `::Variant` qualifier (`Tuple2<A, B> { ... }`, mirroring the real compiler's own
+    // `Parser.hotc` `looks_like_generic_lit2`), and a NESTED generic literal, where the type
+    // argument is itself generic (`Vec<Entry<V>> { ... }`, mirroring `looks_like_nested_generic_
+    // lit`'s own real speculative-parse-via-`typeRef` design).
+    fun `test generic struct literals with no colon-colon parse as STRUCT_LIT_EXPR`() {
+        for (src in listOf(
+            "struct Tuple2<A, B> { item0: A, item1: B }\nfn f(a: Int, b: String) -> Tuple2<Int, String> {\n    return Tuple2<Int, String> { item0: a, item1: b };\n}\n",
+            "struct Entry<V> { key: String, value: V }\nstruct Vec<T> { data: [T], len: Int }\nfn f() -> Vec<Entry<Int>> {\n    return Vec<Entry<Int>> { data: [], len: 0 };\n}\n",
+        )) {
+            val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hc", HCLanguage, src)
+            val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+            assertTrue("unexpected parse error(s) in `$src`: ${errors.map { it.errorDescription }}", errors.isEmpty())
+            val allElements = PsiTreeUtil.findChildrenOfType(psiFile, com.intellij.psi.PsiElement::class.java)
+            val hasStructLit = allElements.any { it.node?.elementType == HCElementTypes.STRUCT_LIT_EXPR }
+            assertTrue("expected a STRUCT_LIT_EXPR node in `$src`", hasStructLit)
+        }
+    }
+
+    // The new nested-generic-literal branch (`Vec<Entry<V>> { ... }`, right above) must NOT swallow
+    // an ORDINARY qualified enum-variant construction whose base also starts `IDENT <` --
+    // `Option<Vec<Int>>::Some { ... }` matches the new branch's own cheap pre-check (`Vec` then
+    // `<`), but its real speculative parse correctly finds `::` (not `{`) after the outer `>` and
+    // reports no match, so this still falls through to the ordinary bare-arg qualified-variant
+    // branch (which itself does NOT yet support a NESTED single argument there either -- a real,
+    // separate, narrower pre-existing gap, matching the real compiler's own `Parser.hotc` `looks_
+    // like_generic_variant`/`_variant2`, neither of which handles a nested argument -- not
+    // attempted here since nothing in `examples/`/`stdlib/` needs it).
+    fun `test qualified generic variant literals with a bare type argument still parse correctly`() {
+        val src = "use option;\nfn f() -> Option<Int> {\n    return Option<Int>::Some { value: 5 };\n}\n"
+        val psiFile = PsiFileFactory.getInstance(project).createFileFromText("t.hc", HCLanguage, src)
+        val errors = PsiTreeUtil.findChildrenOfType(psiFile, PsiErrorElement::class.java)
+        assertTrue("unexpected parse error(s) in `$src`: ${errors.map { it.errorDescription }}", errors.isEmpty())
+    }
+
     // `resource Name { ... }` + `world.set_resource(...)` -- the ECS resource-injection feature
     // (see `Ast.hc`'s own `Program.resources` header). Same shape as `component`, just its own
     // keyword and element type (`RESOURCE_DECL`) -- pins that down directly, same reasoning the

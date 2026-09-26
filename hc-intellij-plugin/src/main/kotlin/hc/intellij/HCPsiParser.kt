@@ -1540,6 +1540,42 @@ object HCPsiParser : PsiParser {
                 structLitFields(b)
                 m.done(HCElementTypes.STRUCT_LIT_EXPR)
             }
+            // `Name<Arg1, Arg2> { ... }` -- a PLAIN two-type-argument generic struct literal, no
+            // `::Variant` qualifier (`Tuple2<A, B> { item0: a, item1: b }`) -- distinct from the
+            // `Base<Arg1, Arg2>::Variant { ... }` branch below (that one always has the `::`).
+            // Matches the real compiler's own `Parser.hotc` `looks_like_generic_lit2` (`LT IDENT
+            // COMMA IDENT GT LBRACE`, 5 tokens from the current `<`).
+            b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<" &&
+                b.lookAhead(1) == HCTokenTypes.IDENT && b.lookAhead(2) == HCTokenTypes.COMMA && b.lookAhead(3) == HCTokenTypes.IDENT &&
+                b.lookAheadIsOp(4, ">") && b.lookAhead(5) == HCTokenTypes.LBRACE -> {
+                b.advanceLexer() // <
+                expect(b, HCTokenTypes.IDENT, "a type argument")
+                expect(b, HCTokenTypes.COMMA, "','")
+                expect(b, HCTokenTypes.IDENT, "a type argument")
+                expectOp(b, ">")
+                structLitFields(b)
+                m.done(HCElementTypes.STRUCT_LIT_EXPR)
+            }
+            // `Name<NestedGeneric<...>> { ... }` -- a NESTED generic struct literal, where the
+            // type argument is itself generic (`Vec<Entry<V>> { data: [], len: 0 }`, found in
+            // `stdlib/collections.hotc`'s own `entries()` methods) -- matches the real compiler's
+            // own `Parser.hotc` `looks_like_nested_generic_lit`: a cheap 2-token pre-check (is the
+            // argument itself `IDENT <`?) rules out every non-nested case for free without ever
+            // running the heavier check below, then a REAL speculative parse via `typeRef`
+            // (already recurses through arbitrary nesting depth for type ANNOTATIONS -- no need
+            // for a second, parallel lookahead-only type parser) confirms the whole shape really
+            // ends in `> {` before committing -- mark/rollback, so a false match (e.g. `Result<
+            // Vec<Int>, String>::Ok { ... }`, which also starts `IDENT <`, but has a `,` where
+            // this checks for `>`) costs nothing and correctly falls through to the qualified-
+            // variant branches below instead.
+            b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<" &&
+                b.lookAhead(1) == HCTokenTypes.IDENT && b.lookAheadIsOp(2, "<") && looksLikeNestedGenericLit(b) -> {
+                b.advanceLexer() // <
+                typeRef(b)
+                expectOp(b, ">")
+                structLitFields(b)
+                m.done(HCElementTypes.STRUCT_LIT_EXPR)
+            }
             // `Base<Arg>::Variant { ... }` -- explicitly-qualified generic-enum-variant
             // construction (`Option<Int>::Some { ... }`). Checked before the plain `<Arg>` shape
             // above's own STRUCT_LIT reading would ever get a chance to misfire, matching
@@ -1649,5 +1685,23 @@ object HCPsiParser : PsiParser {
         if (ok && !(tokenType == HCTokenTypes.OPERATOR && tokenText == ">")) ok = false
         m.rollbackTo()
         return ok
+    }
+
+    // Non-consuming: mirrors the real compiler's own `Parser.hotc` `looks_like_nested_generic_
+    // lit` exactly -- a REAL (consuming) speculative parse via `typeRef` (not a second, parallel
+    // lookahead-only type-expression parser), unconditionally rolled back afterward. Called with
+    // `b` sitting AT the outer `<` (not yet consumed) -- see `identLed`'s own header for the full
+    // shape this confirms (`< <a full nested typeRef> > {`).
+    private fun looksLikeNestedGenericLit(b: PsiBuilder): Boolean {
+        val m = b.mark()
+        b.advanceLexer() // outer '<'
+        typeRef(b)
+        var matched = false
+        if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == ">") {
+            b.advanceLexer()
+            matched = b.tokenType == HCTokenTypes.LBRACE
+        }
+        m.rollbackTo()
+        return matched
     }
 }
