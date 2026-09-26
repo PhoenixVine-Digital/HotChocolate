@@ -1,0 +1,126 @@
+// Real, non-sugar `try`/`finally` -- see ARCHITECTURE.md's own "`try`/`finally`" entry for the
+// full design. Unlike `defer`/`using` (which deliberately stayed top-level-only sugar to avoid
+// needing this), `finally_block` is real: an AST-level pre-pass (`Driver.hotc`'s own
+// `inline_finally_stmts`/`inline_finally_before_exits`) inlines a copy of each `try`'s own
+// `finally` block before every `return`/`break`/`continue` reachable inside its `try`/`catch`
+// bodies, and `Codegen.hotc`'s own `gen_stmt` handles the two paths that can't reach (normal
+// completion, and an exception escaping every `catch`) with real JVM exception-table entries.
+
+extern class IllegalStateException = "java.lang.IllegalStateException" {
+    fn new(msg: String) -> Self;
+    fn getMessage(&self) -> String;
+}
+
+extern class ArithmeticException = "java.lang.ArithmeticException" {
+    fn getMessage(&self) -> String;
+}
+
+// `finally` always runs, whether `try_block` completes normally or throws-and-is-caught.
+fn normal_completion() -> Int {
+    var x = 0;
+    try {
+        x = 1;
+    } finally {
+        print("finally: normal completion");
+    }
+    return x;
+}
+
+// `finally` runs BEFORE a `return` inside `try_block` actually returns -- the AST-level pre-pass
+// splices a copy of `finally_block` in right before the `return`.
+fn returns_from_try() -> Int {
+    try {
+        print("in try, about to return");
+        return 42;
+    } finally {
+        print("finally: return path");
+    }
+}
+
+// Same, but the `return` is inside a `catch_block` instead.
+fn returns_from_catch() -> Int {
+    try {
+        throw IllegalStateException::new("boom");
+    } catch (e: IllegalStateException) {
+        print("caught: {e.getMessage()}");
+        return 7;
+    } finally {
+        print("finally: catch-return path");
+    }
+}
+
+// `break` only exits the ENCLOSING LOOP (never the function -- same rule `defer` follows), but it
+// still has to run the `try`'s own `finally` first, since it's leaving the `try` statement itself.
+fn break_through_try() {
+    var i = 0;
+    while i < 3 {
+        try {
+            if i == 1 {
+                print("breaking at i=1");
+                break;
+            }
+            print("loop body i={i}");
+        } finally {
+            print("finally: loop iteration {i}");
+        }
+        i = i + 1;
+    }
+    print("after loop");
+}
+
+// An exception that matches NO `catch` clause still runs `finally` -- a real, additional
+// exception-table entry (registered AFTER the user's own `catch` entries, and, in nested `try`s,
+// AFTER every nested `try`'s own entries too, so the JVM's table-order search always finds the
+// innermost matching handler first) -- before re-throwing it unchanged. Nesting two `try`/`finally`
+// blocks in the same function is exactly the case that exposed a real ordering bug during
+// development (see this feature's own ARCHITECTURE.md entry) -- the inner `finally` must run
+// before the outer one sees the rethrown exception.
+fn escapes_every_catch() -> Int {
+    try {
+        try {
+            throw IllegalStateException::new("unhandled");
+        } catch (e: ArithmeticException) {
+            print("wrong catch, should not happen");
+        } finally {
+            print("finally: inner, exception escapes");
+        }
+        return 0;
+    } catch (e: IllegalStateException) {
+        print("outer caught: {e.getMessage()}");
+        return 99;
+    } finally {
+        print("finally: outer");
+    }
+}
+
+// `try { ... } finally { ... }` with ZERO `catch` clauses is legal -- a real grammar relaxation
+// over the old "at least one `catch`" rule, matching Java/Kotlin's own `try`/`finally`-with-no-
+// `catch` shape.
+fn zero_catch_finally() -> Int {
+    try {
+        print("zero-catch try body");
+    } finally {
+        print("finally: zero-catch");
+    }
+    return 5;
+}
+
+fn main() {
+    print("--- normal_completion ---");
+    print(normal_completion());
+
+    print("--- returns_from_try ---");
+    print(returns_from_try());
+
+    print("--- returns_from_catch ---");
+    print(returns_from_catch());
+
+    print("--- break_through_try ---");
+    break_through_try();
+
+    print("--- escapes_every_catch ---");
+    print(escapes_every_catch());
+
+    print("--- zero_catch_finally ---");
+    print(zero_catch_finally());
+}

@@ -1759,6 +1759,13 @@ function, which turned out to be confirmed BROKEN in the self-hosted compiler to
 own desugaring target would have shipped something that looks right until the moment it's
 actually run. See `examples/defer_using.hotc`.
 
+**Update, 2026-09-26**: real `try`/`finally` shipped right after this (see ARCHITECTURE.md's own
+"`try`/`finally`" entry, and `examples/finally.hotc`) — the exact machinery this entry's own
+reasoning above explains `defer` deliberately avoided needing. `defer` itself still doesn't route
+through it, on purpose: staying top-level-only is what keeps `defer`'s own desugaring a simple,
+static, single-pass rewrite, and that tradeoff didn't stop being worth it just because `finally`
+now exists for the cases that genuinely need it.
+
 ### ~~Pattern matching sugar: positional enum patterns~~ — shipped 2026-09-17
 
 ```

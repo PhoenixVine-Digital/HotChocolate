@@ -5262,8 +5262,12 @@ specifically to pin this down (the deferred cleanup fires once, right after the 
 `break` point).
 
 Real, disclosed limitations, stated plainly:
-- No real `finally`-equivalent exists in this language -- an exception thrown before a scheduled
-  defer's own flush point is reached skips it entirely. Not silently pretended otherwise.
+- **Update, 2026-09-26**: real `try`/`finally` now exists (see the entry right below) -- but
+  `defer` still doesn't desugar through it, on purpose: `defer`'s whole value is being a pure,
+  single-pass, static rewrite with no runtime stack, and that's still true precisely because it
+  stays top-level-only; routing it through `finally` would need lifting every top-level `defer`
+  into a synthetic enclosing `try`, buying nothing this simpler design doesn't already have. An
+  exception thrown before a scheduled defer's own flush point is reached still skips it entirely.
 - `using` requires the resource's own type to declare a real `close(&mut self)`/`close(&self)`
   method (matching this feature's own original motivating example, `file.close()`) -- not the
   built-in `drop(x)` function, which is confirmed BROKEN in this self-hosted compiler today (see
@@ -5286,4 +5290,64 @@ top-level defer, a loop `break` correctly NOT triggering it, and `using`'s own o
 every value matched hand-computed expectations exactly. Full example regression sweep: zero new
 failures (the same disclosed pre-existing baseline as every other pass this session). Self-hosting
 verified to a true fixed point.
+
+## `try`/`finally`
+
+**Shipped, 2026-09-26 (real, non-sugar semantics).** Extended `try`/`catch` with a real `finally`
+clause: `try { ... } catch (e: T) { ... } finally { ... }`. Unlike `defer` (above), this is genuine
+bytecode-level `try`/`finally`, not a static rewrite -- `finally_block` runs on normal completion of
+`try_block`/any `catch_block`, on a `return`/`break`/`continue` passing through either, and on an
+exception that escapes every `catch` clause (which is then re-thrown unchanged, never swallowed).
+Also relaxed the grammar: `try { ... } finally { ... }` with ZERO `catch` clauses is now legal
+(previously `try` required at least one `catch` unconditionally), matching Java/Kotlin's own shape.
+
+`Ast.hotc`'s `Stmt::Try` gained a fourth field, `finally_block: Vec<Stmt>` (empty = no `finally`),
+which rippled through **16 exhaustive `Stmt`/`Try`-matching sites** across `Parser.hotc`,
+`Checker.hotc`, `Codegen.hotc`, `Driver.hotc`, and `TestDriver.hotc` -- the same "every exhaustive
+match over `Stmt` must be touched" cost `defer`'s own `Stmt::Defer` variant paid, just larger (a
+field addition touches every SITE that destructures `Try`, not just the sites needing new variant
+handling).
+
+Implementation is a hybrid, matching the reasoning laid out before writing any code: an AST-level
+pre-pass for the two exit paths bytecode-level handling genuinely can't reach on its own, plus real
+JVM exception-table entries for the two it can:
+- **`Driver.hotc`'s own `inline_finally_stmts`/`inline_finally_before_exits`** (run before
+  `Codegen.hotc` ever sees the program, and before the `defer` passes -- so a `finally` lexically
+  inside a function runs before that function's own top-level `defer` flush at a shared exit)
+  inlines a fresh COPY of each `Try`'s own `finally_block` directly before every `return`/`break`/
+  `continue` reachable inside its `try_block`/any `catch_block`, at any nesting depth -- mirrors
+  `flush_defers_before_exits`'s own recursive shape exactly, but propagates a FIXED statement list
+  instead of a dynamic "pending" one, and runs unconditionally over the WHOLE program (unlike
+  `defer`, `finally` has no top-level-only restriction). Recurses bottom-up so a NESTED `try`'s own
+  `finally` is fully spliced in before the OUTER `try` splices its own copy -- giving the correct
+  inner-before-outer order on a shared exit.
+- **`Codegen.hotc`'s `gen_stmt`** handles the two paths that AST rewriting can't reach: normal
+  completion (one more inline copy right before the existing `GOTO end_label`, after `try_block`
+  and after each `catch_block`), and an exception escaping every `catch` (a real, additional
+  `visitTryCatchBlock` entry with a `null` exception type -- real ASM/JVM "catches anything, no
+  type check" convention -- covering `try_start` through the end of the LAST catch handler's own
+  body, since an exception thrown INSIDE a `catch_block` needs `finally` too).
+
+**A real, previously-undiscovered JVM bytecode-ordering bug found and fixed during verification**:
+the JVM resolves OVERLAPPING exception-table entries strictly by TABLE ORDER (JVMS 2.10 -- the
+first entry whose PC range contains the fault AND whose type matches, searched in table order),
+*not* by nesting depth. An early draft registered each `Try`'s own exception-table entries (both
+its typed `catch`es and its `null`-typed universal `finally` entry) BEFORE generating `try_block`'s
+own bytecode -- so a NESTED `try`/`finally` inside that `try_block` would register ITS entries
+*after* the outer one's, landing later in the table. Two `try`/`finally`s nested in the SAME
+function, where the outer `catch` happened to match the exception type, silently stole the fault
+away from the inner `finally` entirely -- the inner cleanup code never ran, no error, no crash,
+just a missing side effect. Found via `examples/finally.hotc`'s own `escapes_every_catch` test
+(nesting two `try`/`finally`s and checking BOTH cleanup messages print, in the right order) -- fixed
+by registering each `Try`'s own exception-table entries only AFTER generating everything nested
+inside its own `try_block`/`catch_block`s, guaranteeing inner entries always precede outer ones in
+the table regardless of nesting depth.
+
+Verified end to end with `examples/finally.hotc`: normal completion, `return` from inside `try_block`
+and from inside a `catch_block`, `break` correctly running the `try`'s own `finally` before exiting
+the loop (not at the `break` point itself, but still before the loop-exit -- unlike `defer`, which
+`break` skips entirely, `finally` DOES run here since the `try` statement itself is being exited),
+the nested-`try` exception-escape ordering bug above, and the new zero-`catch` grammar shape --
+every value matched hand-computed expectations exactly, including after the ordering-bug fix. Full
+example regression sweep: zero new failures. Self-hosting verified to a true fixed point.
 

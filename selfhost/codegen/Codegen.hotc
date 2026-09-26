@@ -4782,7 +4782,24 @@ impl CodeGen {
             // catching a common supertype, same as real Java source order already implies).
             // `Checker.hotc`'s own `Try` check already guarantees every `catch_type` names a known
             // extern class, so `self.extern_binary.get(...)` is trusted to succeed here.
-            Try { try_block, catches, line } => {
+            // `finally_block` (real, non-sugar semantics -- see `Ast.hc`'s own `Stmt::Try.
+            // finally_block` header): `Driver.hotc`'s own `inline_finally_before_exits` (run
+            // BEFORE this ever sees the program, see that fn's own header) has already inserted
+            // an inline COPY of `finally_block` directly before every `Return`/`Break`/`Continue`
+            // reachable inside `try_block`/any `catch_block`, at any depth -- so codegen only
+            // ever has to handle the two paths that AST-level rewriting genuinely can't reach:
+            // (1) NORMAL completion of `try_block` or a `catch_block` (falling off its own end,
+            // not via an early exit) -- one more inline copy, right before the existing `GOTO
+            // end_label`; (2) an exception that ESCAPES every `catch` clause entirely -- a real,
+            // ADDITIONAL `visitTryCatchBlock` entry covering the WHOLE region (`try_start` through
+            // the end of the LAST catch handler's own body -- an exception thrown INSIDE a
+            // `catch_block` needs `finally` to run too), registered with a `null` exception type
+            // (real ASM/JVM "catches `Throwable`, no type check" convention) AFTER every user
+            // catch entry above so the JVM's own "first matching handler in table order" always
+            // tries the user's own (real, typed) catches first, falling through to this universal
+            // one only if none matched -- runs `finally_block` once, in a fresh local slot holding
+            // the live exception, then re-`ATHROW`s it unchanged.
+            Try { try_block, catches, finally_block, line } => {
                 self.mark_line(line);
                 var try_start = Label::new();
                 var try_end = Label::new();
@@ -4790,19 +4807,37 @@ impl CodeGen {
                 var handlers = empty_label_vec_cg();
                 var ci = 0;
                 while ci < catches.length() {
-                    let c = catches.get(ci);
-                    var binary_name = c.catch_type;
-                    let bin_found = self.extern_binary.get(c.catch_type);
-                    if let Some { value: b } = bin_found { binary_name = b; }
-                    var handler = Label::new();
-                    self.mv.visitTryCatchBlock(&try_start, &try_end, &handler, binary_name);
-                    handlers.push(handler);
+                    handlers.push(Label::new());
                     ci = ci + 1;
                 }
+                let has_finally = finally_block.length() > 0;
+                var finally_handler = Label::new();
+                var handler_region_end = Label::new();
+                // Generate `try_block` FIRST, and register THIS `Try`'s own exception-table
+                // entries only AFTER (below) -- a real bug found and fixed here: the JVM resolves
+                // OVERLAPPING exception-table entries strictly by TABLE ORDER (2.10, "the first
+                // one whose range contains the PC and whose type matches"), not by nesting depth.
+                // A nested `try` inside `try_block` registers its OWN entries while `gen_block`
+                // below is running -- if THIS `Try`'s own entries were registered before that (as
+                // an earlier draft did), they'd cover the exact same PC range as the nested one's,
+                // sit EARLIER in the table, and silently steal every exception a nested `try`
+                // should have handled/`finally`-ed first, skipping the inner `finally` entirely.
+                // Registering after guarantees inner entries always precede outer ones in the
+                // table, so the JVM's own table-order search naturally finds the innermost match.
                 self.mv.visitLabel(&try_start);
                 self.gen_block(try_block);
                 self.mv.visitLabel(&try_end);
+                if has_finally { self.gen_block_ref(&finally_block); }
                 self.mv.visitJumpInsn(167, &end_label); // GOTO
+                var ri = 0;
+                while ri < catches.length() {
+                    let cr = catches.get(ri);
+                    var binary_name = cr.catch_type;
+                    let bin_found = self.extern_binary.get(cr.catch_type);
+                    if let Some { value: b } = bin_found { binary_name = b; }
+                    self.mv.visitTryCatchBlock(&try_start, &try_end, &handlers.get(ri), binary_name);
+                    ri = ri + 1;
+                }
                 var hi = 0;
                 while hi < catches.length() {
                     let c2 = catches.get(hi);
@@ -4815,8 +4850,26 @@ impl CodeGen {
                     self.mv.visitVarInsn(58, catch_slot); // ASTORE
                     self.gen_block(c2.catch_block);
                     self.pop_var_scope();
+                    if has_finally { self.gen_block_ref(&finally_block); }
                     self.mv.visitJumpInsn(167, &end_label); // GOTO
                     hi = hi + 1;
+                }
+                if has_finally {
+                    self.mv.visitLabel(&handler_region_end);
+                    // Registered here -- AFTER `try_block` AND every `catch_block` above have
+                    // both been fully generated -- for the same table-order reason as the typed
+                    // catches above, except this range covers catch bodies too (an exception
+                    // thrown INSIDE a `catch_block` needs `finally` to run as well), so it must
+                    // wait for every nested `try` in EITHER region to register its own entries
+                    // first.
+                    self.mv.visitTryCatchBlock(&try_start, &handler_region_end, &finally_handler, null);
+                    self.mv.visitLabel(&finally_handler);
+                    let exc_slot = self.next_slot;
+                    self.next_slot = self.next_slot + 1;
+                    self.mv.visitVarInsn(58, exc_slot); // ASTORE the live exception
+                    self.gen_block_ref(&finally_block);
+                    self.mv.visitVarInsn(25, exc_slot); // ALOAD it back
+                    self.mv.visitInsn(191); // ATHROW -- rethrow unchanged, finally never swallows
                 }
                 self.mv.visitLabel(&end_label);
             }
@@ -4839,6 +4892,21 @@ impl CodeGen {
     }
 
     fn gen_block(&mut self, stmts: Vec<Stmt>) {
+        self.push_var_scope();
+        var i = 0;
+        while i < stmts.length() {
+            self.gen_stmt(stmts.get(i));
+            i = i + 1;
+        }
+        self.pop_var_scope();
+    }
+
+    // Same as `gen_block` above, but borrows instead of taking ownership -- needed for a `finally`
+    // block's own bytecode (`gen_stmt`'s own `Try` arm), which gets emitted as an inline copy in up
+    // to three separate places (after `try_block`, after each `catch_block`, and in the universal
+    // exception handler) from the SAME `finally_block` value, so it can never be handed over by
+    // value more than once.
+    fn gen_block_ref(&mut self, stmts: &Vec<Stmt>) {
         self.push_var_scope();
         var i = 0;
         while i < stmts.length() {
@@ -7202,8 +7270,8 @@ pub fn subst_stmt_cg(s: Stmt, type_param: String, arg: String) -> Stmt {
         Throw { value, line } => { return Throw { value: subst_expr_cg(value, type_param, arg), line: line }; }
         Break { line } => { return Break { line: line }; }
         Continue { line } => { return Continue { line: line }; }
-        Try { try_block, catches, line } => {
-            return Try { try_block: subst_stmt_list_cg(try_block, type_param, arg), catches: subst_catches_cg(catches, type_param, arg), line: line };
+        Try { try_block, catches, finally_block, line } => {
+            return Try { try_block: subst_stmt_list_cg(try_block, type_param, arg), catches: subst_catches_cg(catches, type_param, arg), finally_block: subst_stmt_list_cg(finally_block, type_param, arg), line: line };
         }
         Defer { expr, line } => { return Defer { expr: subst_expr_cg(expr, type_param, arg), line: line }; }
     }

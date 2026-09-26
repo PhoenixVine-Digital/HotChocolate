@@ -1129,8 +1129,8 @@ pub fn subst_stmt(s: Stmt, type_param: String, arg: String) -> Stmt {
         Throw { value, line } => { return Throw { value: subst_expr(value, type_param, arg), line: line }; }
         Break { line } => { return Break { line: line }; }
         Continue { line } => { return Continue { line: line }; }
-        Try { try_block, catches, line } => {
-            return Try { try_block: subst_stmt_list(try_block, type_param, arg), catches: subst_catches(catches, type_param, arg), line: line };
+        Try { try_block, catches, finally_block, line } => {
+            return Try { try_block: subst_stmt_list(try_block, type_param, arg), catches: subst_catches(catches, type_param, arg), finally_block: subst_stmt_list(finally_block, type_param, arg), line: line };
         }
         Defer { expr, line } => { return Defer { expr: subst_expr(expr, type_param, arg), line: line }; }
     }
@@ -5211,7 +5211,7 @@ impl TyChecker {
             // subset has to name a real JVM exception type. `catch_var` is registered into a scope
             // pushed for this catch clause alone -- it's a fresh exception value on every catch, not
             // something later code outside the clause should still see.
-            Try { try_block, catches, line } => {
+            Try { try_block, catches, finally_block, line } => {
                 self.check_block(try_block);
                 var ci = 0;
                 while ci < catches.length() {
@@ -5228,6 +5228,12 @@ impl TyChecker {
                     self.check_block(c.catch_block);
                     self.pop_scope();
                     ci = ci + 1;
+                }
+                // `finally_block` -- checked in its own fresh scope, same as `try_block`/each
+                // `catch_block` above (never sees `catch_var`'s own binding, which is scoped to
+                // its own clause alone).
+                if finally_block.length() > 0 {
+                    self.check_block(finally_block);
                 }
             }
             // `defer EXPR;` -- see `Ast.hc`'s own `Stmt::Defer` header. Checked like any other

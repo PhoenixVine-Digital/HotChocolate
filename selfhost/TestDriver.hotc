@@ -132,13 +132,16 @@ fn dump_stmt(s: Stmt, indent: String) -> String {
         Throw { value, line } => { return "throw " + dump_expr(value) + ";"; }
         Break { line } => { return "break;"; }
         Continue { line } => { return "continue;"; }
-        Try { try_block, catches, line } => {
+        Try { try_block, catches, finally_block, line } => {
             var out = "try \{ ... \}";
             var i = 0;
             while i < catches.length() {
                 let c = catches.get(i);
                 out = out + " catch (" + c.catch_var + ": " + c.catch_type + ") \{ ... \}";
                 i = i + 1;
+            }
+            if finally_block.length() > 0 {
+                out = out + " finally \{ ... \}";
             }
             return out;
         }

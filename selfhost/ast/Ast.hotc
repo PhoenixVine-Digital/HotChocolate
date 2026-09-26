@@ -277,12 +277,17 @@ pub enum Stmt {
     // codegen is a plain unconditional jump to the loop's end/start label -- nothing to clean up.
     Break { line: Int },
     Continue { line: Int },
-    // `try { try_block } catch (catch_var: catch_type) { catch_block } catch (...) { ... } ...` --
-    // now a real Vec of `CatchClause`s (one or more), not a single fixed catch -- see
-    // `CatchClause`'s own header, right below, for the shape each one carries. Each `catch_type`
-    // must name a known `extern class` (a real JVM exception type); each `catch_var` is bound to
-    // it, in scope only within that clause's own `catch_block`.
-    Try { try_block: Vec<Stmt>, catches: Vec<CatchClause>, line: Int },
+    // `try { try_block } catch (catch_var: catch_type) { catch_block } catch (...) { ... } ...
+    // [finally { finally_block }]` -- `catches` is a real Vec of `CatchClause`s (one or more),
+    // not a single fixed catch -- see `CatchClause`'s own header, right below, for the shape each
+    // one carries. Each `catch_type` must name a known `extern class` (a real JVM exception
+    // type); each `catch_var` is bound to it, in scope only within that clause's own
+    // `catch_block`. `finally_block` -- empty when no `finally` clause was written at all, real
+    // otherwise -- see `Codegen.hotc`'s own `gen_stmt` `Try` header for the full real semantics
+    // (runs on normal completion, on `return`/`break`/`continue` passing through `try_block`/any
+    // `catch_block`, AND on an exception that escapes past every `catch` clause -- a real
+    // bytecode-level `finally`, not sugar).
+    Try { try_block: Vec<Stmt>, catches: Vec<CatchClause>, finally_block: Vec<Stmt>, line: Int },
     // `defer EXPR;` -- see `IDEAS.md`'s own "`defer`/`using` for resource cleanup" entry.
     // Real, disclosed v1 scope, CHECKED not just documented (`Driver.hotc`'s own `check_defer_
     // placement`): legal ONLY as a direct top-level statement of a `fn`/method body, never
@@ -292,10 +297,12 @@ pub enum Stmt {
     // registered UNCONDITIONALLY (never behind a branch), the set of "defers already registered"
     // at any later point is exactly "every `Defer` textually before it at the top level" -- a
     // fixed, position-only fact, not something that depends on which branch actually ran. `using
-    // NAME = EXPR;` is pure sugar on top of this (`let NAME = EXPR; defer drop(NAME);`, expanded
-    // at parse time -- no separate AST shape of its own). No real `finally`-equivalent exists in
-    // this language, so an exception thrown before a scheduled defer's own flush point is
-    // reached skips it -- a real, disclosed limitation, not silently pretended away.
+    // NAME = EXPR;` is pure sugar on top of this (`let NAME = EXPR; defer NAME.close();`,
+    // expanded at parse time -- no separate AST shape of its own). Real `finally` (right above)
+    // now exists in this language, but `defer` still doesn't desugar through it -- `defer`'s own
+    // "top-level only, no nested nesting" restriction already gives it a simpler, sufficient
+    // static rewrite (see that fn's own header); an exception thrown before a scheduled defer's
+    // own flush point is still skipped, a real, disclosed limitation, not silently pretended away.
     Defer { expr: Expr, line: Int },
 }
 

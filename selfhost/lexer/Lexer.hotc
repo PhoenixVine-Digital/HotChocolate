@@ -100,6 +100,13 @@ pub enum TokType {
     FN, STRUCT, LET, VAR, IF, ELSE, WHILE, FOR, IN, RETURN, TRUE, FALSE, IMPL, MUT, ARENA,
     INTERFACE, DYN, ENUM, MATCH, BY, SEALED, EXTERN, CLASS, MODULE, PUB, PRIV, OPEN, EXTEND, STATIC, AS,
     TRY, CATCH, THROW, EXTENDS, OVERRIDE, NULL, IS, USE,
+    // `try { ... } catch (...) { ... } finally { ... }` -- a real, bytecode-level `finally`
+    // clause (runs on normal completion, on `return`/`break`/`continue` passing through, AND on
+    // an exception escaping every `catch`) -- see `Ast.hc`'s own `Stmt::Try.finally_block`
+    // header. Checked for a self-hosting collision (grepped all 6 selfhost/*.hotc files for a
+    // bare `finally` identifier) before reserving it, same discipline `on`/`macro`/`defer`/
+    // `using`'s own headers describe -- only ever appears inside comments today.
+    FINALLY,
     BREAK, CONTINUE, DEV,
     // `parallel for x in arr { expr; }` -- see `Parser.hotc`'s own header for the full design.
     PARALLEL,
@@ -205,6 +212,7 @@ pub fn build_keywords() -> Registry<TokType> {
     kw.register("as", AS);
     kw.register("try", TRY);
     kw.register("catch", CATCH);
+    kw.register("finally", FINALLY);
     kw.register("throw", THROW);
     kw.register("extends", EXTENDS);
     kw.register("override", OVERRIDE);

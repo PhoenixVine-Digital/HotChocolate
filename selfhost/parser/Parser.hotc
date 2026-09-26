@@ -2417,15 +2417,28 @@ impl Parser {
     // catch clauses (real gap closed, see `Ast.hc`'s own `Try`/`CatchClause` headers). Each is
     // parsed identically; the loop just keeps going as long as another bare `catch` follows the
     // previous clause's own closing `}`.
+    // `try { ... } catch (...) { ... } [finally { ... }]` -- at least one `catch`, OR a
+    // `finally` with zero catches (a plain `try { ... } finally { ... }`, matching real Java/
+    // Kotlin's own identical allowance) -- `try` with NEITHER is a real, named error (nothing to
+    // do). See `Ast.hc`'s own `Stmt::Try.finally_block` header for the real semantics.
     fn try_stmt(&mut self, start_line: Int) -> Stmt {
         self.expect(TRY);
         let try_block = self.block();
         var catches = empty_catchclause_vec();
-        catches.push(self.catch_clause());
         while self.check(CATCH) {
             catches.push(self.catch_clause());
         }
-        return Try { try_block: try_block, catches: catches, line: start_line };
+        var finally_block = empty_stmt_vec();
+        var has_finally = false;
+        if self.check(FINALLY) {
+            self.advance();
+            finally_block = self.block();
+            has_finally = true;
+        }
+        if catches.length() == 0 && !has_finally {
+            throw ParseError::new("'try' needs at least one 'catch' clause or a 'finally' clause at line " + JString3::valueOf(start_line));
+        }
+        return Try { try_block: try_block, catches: catches, finally_block: finally_block, line: start_line };
     }
 
     fn catch_clause(&mut self) -> CatchClause {
@@ -4277,8 +4290,8 @@ pub fn rewrite_ensures_returns(ss: Vec<Stmt>, ens_cond: &Expr, fn_name: String) 
             For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
                 out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: rewrite_ensures_returns(body, ens_cond, fn_name), line: line });
             }
-            Try { try_block, catches, line } => {
-                out.push(Try { try_block: rewrite_ensures_returns(try_block, ens_cond, fn_name), catches: catches, line: line });
+            Try { try_block, catches, finally_block, line } => {
+                out.push(Try { try_block: rewrite_ensures_returns(try_block, ens_cond, fn_name), catches: catches, finally_block: rewrite_ensures_returns(finally_block, ens_cond, fn_name), line: line });
             }
             Match { subject, arms, line } => {
                 var new_arms = empty_matcharm_vec();
@@ -4896,8 +4909,8 @@ pub fn subst_macro_stmt(s: Stmt, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames
         Throw { value, line } => { return Throw { value: subst_macro_expr(value, pnames, pargs, rnames, rvals), line: line }; }
         Break { line } => { return Break { line: line }; }
         Continue { line } => { return Continue { line: line }; }
-        Try { try_block, catches, line } => {
-            return Try { try_block: subst_macro_stmt_list(try_block, pnames, pargs, rnames, rvals), catches: subst_macro_catches(catches, pnames, pargs, rnames, rvals), line: line };
+        Try { try_block, catches, finally_block, line } => {
+            return Try { try_block: subst_macro_stmt_list(try_block, pnames, pargs, rnames, rvals), catches: subst_macro_catches(catches, pnames, pargs, rnames, rvals), finally_block: subst_macro_stmt_list(finally_block, pnames, pargs, rnames, rvals), line: line };
         }
         Defer { expr, line } => { return Defer { expr: subst_macro_expr(expr, pnames, pargs, rnames, rvals), line: line }; }
     }

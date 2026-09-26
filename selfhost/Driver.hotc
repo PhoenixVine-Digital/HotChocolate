@@ -717,6 +717,16 @@ pub fn run_cli(args: [String]) {
     // since every `Defer` in a function is now GUARANTEED unconditional (never behind a branch),
     // "which defers are already registered" at any later point is exactly "every `Defer`
     // textually before it," a fixed fact independent of which branch actually runs.
+    // Run BEFORE the `defer` passes: `inline_finally_stmts` only ever INSERTS statements (copies
+    // of a `Try`'s own `finally_block`, never a `Defer`, which `check_defer_forbidden_in`'s own
+    // `Try` arm already forbids inside `finally_block` -- so this can never hand `defer`'s own
+    // passes an unexpected `Defer`), so ordering relative to `defer` only affects where a `finally`
+    // copy lands relative to a `defer` flush that ALSO fires at the same exit. Running `finally`
+    // first gives the correct nesting order on a shared `return`/`break`/`continue`: a `finally`
+    // that's LEXICALLY INSIDE a function runs before that function's own top-level `defer`s do,
+    // exactly like the copy already spliced in here ends up sitting before the flush
+    // `desugar_defers_in_program` inserts at the very same exit point right after.
+    prog = inline_finally_in_program(prog);
     check_defer_placement(&prog);
     prog = desugar_defers_in_program(prog);
 
@@ -1183,8 +1193,8 @@ pub fn strip_dev_blocks_list(ss: Vec<Stmt>, dev_mode: Bool) -> Vec<Stmt> {
             For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
                 out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: strip_dev_blocks_list(body, dev_mode), line: line });
             }
-            Try { try_block, catches, line } => {
-                out.push(Try { try_block: strip_dev_blocks_list(try_block, dev_mode), catches: catches, line: line });
+            Try { try_block, catches, finally_block, line } => {
+                out.push(Try { try_block: strip_dev_blocks_list(try_block, dev_mode), catches: catches, finally_block: strip_dev_blocks_list(finally_block, dev_mode), line: line });
             }
             Match { subject, arms, line } => {
                 var new_arms = empty_matcharm_vec_cg();
@@ -1322,7 +1332,7 @@ pub fn check_assets_in_stmts(ss: &Vec<Stmt>, assets_dir: String) {
             }
             While { cond, body, line } => { check_assets_in_stmts(&body, assets_dir); }
             For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => { check_assets_in_stmts(&body, assets_dir); }
-            Try { try_block, catches, line } => { check_assets_in_stmts(&try_block, assets_dir); }
+            Try { try_block, catches, finally_block, line } => { check_assets_in_stmts(&try_block, assets_dir); check_assets_in_stmts(&finally_block, assets_dir); }
             Match { subject, arms, line } => {
                 var ai = 0;
                 while ai < arms.length() {
@@ -1400,7 +1410,7 @@ pub fn check_deterministic_stmts(ss: &Vec<Stmt>, fn_name: String) {
                 check_deterministic_expr(&arr_expr, fn_name);
                 check_deterministic_stmts(&body, fn_name);
             }
-            Try { try_block, catches, line } => { check_deterministic_stmts(&try_block, fn_name); }
+            Try { try_block, catches, finally_block, line } => { check_deterministic_stmts(&try_block, fn_name); check_deterministic_stmts(&finally_block, fn_name); }
             Match { subject, arms, line } => {
                 check_deterministic_expr(&subject, fn_name);
                 var ai = 0;
@@ -1926,13 +1936,14 @@ fn check_defer_forbidden_in_nested(ss: &Vec<Stmt>, fn_name: String) {
                     ai = ai + 1;
                 }
             }
-            Try { try_block, catches, line } => {
+            Try { try_block, catches, finally_block, line } => {
                 check_defer_forbidden_in(&try_block, fn_name);
                 var ci = 0;
                 while ci < catches.length() {
                     check_defer_forbidden_in(&catches.get(ci).catch_block, fn_name);
                     ci = ci + 1;
                 }
+                check_defer_forbidden_in(&finally_block, fn_name);
             }
             _ => {}
         }
@@ -1965,13 +1976,14 @@ fn check_defer_forbidden_in(ss: &Vec<Stmt>, fn_name: String) {
                     ai = ai + 1;
                 }
             }
-            Try { try_block, catches, line } => {
+            Try { try_block, catches, finally_block, line } => {
                 check_defer_forbidden_in(&try_block, fn_name);
                 var ci = 0;
                 while ci < catches.length() {
                     check_defer_forbidden_in(&catches.get(ci).catch_block, fn_name);
                     ci = ci + 1;
                 }
+                check_defer_forbidden_in(&finally_block, fn_name);
             }
             _ => {}
         }
@@ -2027,7 +2039,7 @@ fn desugar_defers_stmts(ss: Vec<Stmt>) -> Vec<Stmt> {
                 }
                 out.push(Match { subject: subject, arms: new_arms, line: line });
             }
-            Try { try_block, catches, line } => {
+            Try { try_block, catches, finally_block, line } => {
                 var new_catches = empty_catchclause_vec3();
                 var ci2 = 0;
                 while ci2 < catches.length() {
@@ -2035,7 +2047,7 @@ fn desugar_defers_stmts(ss: Vec<Stmt>) -> Vec<Stmt> {
                     new_catches.push(CatchClause { catch_var: c3.catch_var, catch_type: c3.catch_type, catch_block: flush_defers_before_exits(c3.catch_block, &pending) });
                     ci2 = ci2 + 1;
                 }
-                out.push(Try { try_block: flush_defers_before_exits(try_block, &pending), catches: new_catches, line: line });
+                out.push(Try { try_block: flush_defers_before_exits(try_block, &pending), catches: new_catches, finally_block: flush_defers_before_exits(finally_block, &pending), line: line });
             }
             _ => { out.push(ss.get(i)); }
         }
@@ -2096,7 +2108,7 @@ fn flush_defers_before_exits(ss: Vec<Stmt>, pending: &Vec<Expr>) -> Vec<Stmt> {
                 }
                 out.push(Match { subject: subject, arms: new_arms2, line: line });
             }
-            Try { try_block, catches, line } => {
+            Try { try_block, catches, finally_block, line } => {
                 var new_catches2 = empty_catchclause_vec3();
                 var ci3 = 0;
                 while ci3 < catches.length() {
@@ -2104,13 +2116,190 @@ fn flush_defers_before_exits(ss: Vec<Stmt>, pending: &Vec<Expr>) -> Vec<Stmt> {
                     new_catches2.push(CatchClause { catch_var: c4.catch_var, catch_type: c4.catch_type, catch_block: flush_defers_before_exits(c4.catch_block, pending) });
                     ci3 = ci3 + 1;
                 }
-                out.push(Try { try_block: flush_defers_before_exits(try_block, pending), catches: new_catches2, line: line });
+                out.push(Try { try_block: flush_defers_before_exits(try_block, pending), catches: new_catches2, finally_block: flush_defers_before_exits(finally_block, pending), line: line });
             }
             _ => { out.push(ss.get(i)); }
         }
         i = i + 1;
     }
     return out;
+}
+
+// Real, non-sugar `finally` support: an AST-level pre-pass run BEFORE `Codegen.hotc` ever sees the
+// program (see that file's own `gen_stmt` `Try` arm header for the two paths codegen handles on
+// its own: normal completion of `try_block`/a `catch_block`, and an exception escaping every
+// `catch`). This pass handles the one path codegen genuinely can't reach on its own: a `return`/
+// `break`/`continue` inside `try_block` or any `catch_block` jumping straight past the JVM's own
+// `GOTO end_label`/rethrow paths -- exactly the same problem `defer`'s own desugaring solves for
+// ITS statements (`flush_defers_before_exits` above), solved here the same way: splice an inline
+// COPY of the enclosing `Try`'s own `finally_block` directly before every such exit, at any
+// nesting depth. Unlike `defer`'s dynamic "pending" list (which can grow as more `Defer`s are
+// walked), a `Try`'s own `finally_block` is a single FIXED list known up front, so this never
+// needs a running accumulator -- just the block itself, passed down.
+fn inline_finally_before_exits(ss: Vec<Stmt>, finally_stmts: &Vec<Stmt>) -> Vec<Stmt> {
+    var out = empty_stmt_vec2();
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Return { value, line } => {
+                push_finally_copy(&mut out, finally_stmts);
+                out.push(Return { value: value, line: line });
+            }
+            Break { line } => {
+                push_finally_copy(&mut out, finally_stmts);
+                out.push(Break { line: line });
+            }
+            Continue { line } => {
+                push_finally_copy(&mut out, finally_stmts);
+                out.push(Continue { line: line });
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                var new_else = none_stmt_list_cg();
+                match else_body {
+                    Some { value: eb } => { new_else = some_stmt_list_cg(inline_finally_before_exits(eb, finally_stmts)); }
+                    None => {}
+                }
+                out.push(If { cond: cond, then_body: inline_finally_before_exits(then_body, finally_stmts), else_body: new_else, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq });
+            }
+            While { cond, body, line } => { out.push(While { cond: cond, body: inline_finally_before_exits(body, finally_stmts), line: line }); }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: inline_finally_before_exits(body, finally_stmts), line: line });
+            }
+            Match { subject, arms, line } => {
+                var new_arms = empty_matcharm_vec3();
+                var ai = 0;
+                while ai < arms.length() {
+                    let a = arms.get(ai);
+                    new_arms.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: inline_finally_before_exits(a.body, finally_stmts), is_literal: a.is_literal, literal: a.literal, is_positional: a.is_positional });
+                    ai = ai + 1;
+                }
+                out.push(Match { subject: subject, arms: new_arms, line: line });
+            }
+            Try { try_block, catches, finally_block, line } => {
+                var new_catches = empty_catchclause_vec3();
+                var ci = 0;
+                while ci < catches.length() {
+                    let c = catches.get(ci);
+                    new_catches.push(CatchClause { catch_var: c.catch_var, catch_type: c.catch_type, catch_block: inline_finally_before_exits(c.catch_block, finally_stmts) });
+                    ci = ci + 1;
+                }
+                out.push(Try { try_block: inline_finally_before_exits(try_block, finally_stmts), catches: new_catches, finally_block: finally_block, line: line });
+            }
+            _ => { out.push(ss.get(i)); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Appends a fresh COPY of every stmt in `finally_stmts`, in the SAME order they were written --
+// unlike `defer`'s own LIFO reversal (`push_reversed_defer_flush`), a single `finally` block always
+// runs its own statements top-to-bottom exactly once, so no reordering is needed here.
+fn push_finally_copy(out: &mut Vec<Stmt>, finally_stmts: &Vec<Stmt>) {
+    var k = 0;
+    while k < finally_stmts.length() {
+        out.push(finally_stmts.get(k));
+        k = k + 1;
+    }
+}
+
+// Top-level driver: walks EVERY `Try` node in the whole program (unlike `defer`, `finally` has no
+// "top-level only" restriction -- a `try`/`finally` can appear anywhere a statement can), inlining
+// each one's own `finally_block` before every `return`/`break`/`continue` reachable inside its own
+// `try_block`/any `catch_block`, at any depth (`inline_finally_before_exits` above). Recurses
+// bottom-up: a NESTED `Try`'s own `finally_block` gets fully processed (including its OWN nested
+// splicing) before the OUTER `Try` splices its own copy in -- so a return passing through two
+// nested `try`/`finally`s correctly runs the inner `finally` before the outer one.
+fn inline_finally_stmts(ss: Vec<Stmt>) -> Vec<Stmt> {
+    var out = empty_stmt_vec2();
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                var new_else = none_stmt_list_cg();
+                match else_body {
+                    Some { value: eb } => { new_else = some_stmt_list_cg(inline_finally_stmts(eb)); }
+                    None => {}
+                }
+                out.push(If { cond: cond, then_body: inline_finally_stmts(then_body), else_body: new_else, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq });
+            }
+            While { cond, body, line } => { out.push(While { cond: cond, body: inline_finally_stmts(body), line: line }); }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: inline_finally_stmts(body), line: line });
+            }
+            Match { subject, arms, line } => {
+                var new_arms = empty_matcharm_vec3();
+                var ai = 0;
+                while ai < arms.length() {
+                    let a = arms.get(ai);
+                    new_arms.push(MatchArm { variant_name: a.variant_name, field_names: a.field_names, bind_names: a.bind_names, body: inline_finally_stmts(a.body), is_literal: a.is_literal, literal: a.literal, is_positional: a.is_positional });
+                    ai = ai + 1;
+                }
+                out.push(Match { subject: subject, arms: new_arms, line: line });
+            }
+            Try { try_block, catches, finally_block, line } => {
+                // Bottom-up: fully resolve any nested `try`/`finally` inside `finally_block` itself
+                // FIRST, so this `Try`'s own splicing (right below) sees the finished, already-
+                // spliced form.
+                var rec_finally_block = inline_finally_stmts(finally_block);
+                var rec_try_block = inline_finally_stmts(try_block);
+                var new_catches = empty_catchclause_vec3();
+                var ci = 0;
+                while ci < catches.length() {
+                    let c = catches.get(ci);
+                    new_catches.push(CatchClause { catch_var: c.catch_var, catch_type: c.catch_type, catch_block: inline_finally_stmts(c.catch_block) });
+                    ci = ci + 1;
+                }
+                if rec_finally_block.length() > 0 {
+                    rec_try_block = inline_finally_before_exits(rec_try_block, &rec_finally_block);
+                    var new_catches2 = empty_catchclause_vec3();
+                    var fi = 0;
+                    while fi < new_catches.length() {
+                        let cc = new_catches.get(fi);
+                        new_catches2.push(CatchClause { catch_var: cc.catch_var, catch_type: cc.catch_type, catch_block: inline_finally_before_exits(cc.catch_block, &rec_finally_block) });
+                        fi = fi + 1;
+                    }
+                    new_catches = new_catches2;
+                }
+                out.push(Try { try_block: rec_try_block, catches: new_catches, finally_block: rec_finally_block, line: line });
+            }
+            _ => { out.push(ss.get(i)); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn inline_finally_in_program(prog: Program) -> Program {
+    var new_fns = empty_fn_decl_vec2();
+    var i = 0;
+    while i < prog.fns.length() {
+        let f = prog.fns.get(i);
+        new_fns.push(FnDecl { name: f.name, params: f.params, ret_type: f.ret_type, body: inline_finally_stmts(f.body), type_param: f.type_param, type_bounds: f.type_bounds, self_is_mut: f.self_is_mut, type_param2: f.type_param2, type_bounds2: f.type_bounds2 });
+        i = i + 1;
+    }
+    var new_impls = empty_impl_decl_vec();
+    var j = 0;
+    while j < prog.impls.length() {
+        let impl_decl = prog.impls.get(j);
+        var new_methods = empty_fn_decl_vec2();
+        var mi = 0;
+        while mi < impl_decl.methods.length() {
+            let m = impl_decl.methods.get(mi);
+            new_methods.push(FnDecl { name: m.name, params: m.params, ret_type: m.ret_type, body: inline_finally_stmts(m.body), type_param: m.type_param, type_bounds: m.type_bounds, self_is_mut: m.self_is_mut, type_param2: m.type_param2, type_bounds2: m.type_bounds2 });
+            mi = mi + 1;
+        }
+        var new_static_methods = empty_fn_decl_vec2();
+        var smi = 0;
+        while smi < impl_decl.static_methods.length() {
+            let sm = impl_decl.static_methods.get(smi);
+            new_static_methods.push(FnDecl { name: sm.name, params: sm.params, ret_type: sm.ret_type, body: inline_finally_stmts(sm.body), type_param: sm.type_param, type_bounds: sm.type_bounds, self_is_mut: sm.self_is_mut, type_param2: sm.type_param2, type_bounds2: sm.type_bounds2 });
+            smi = smi + 1;
+        }
+        new_impls.push(ImplDecl { struct_name: impl_decl.struct_name, methods: new_methods, static_methods: new_static_methods, interface_name: impl_decl.interface_name, delegate_field: impl_decl.delegate_field });
+        j = j + 1;
+    }
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, gpu_fn_names: prog.gpu_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: prog.systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names, const_fns: prog.const_fns, const_names: prog.const_names, const_types: prog.const_types, const_inits: prog.const_inits };
 }
 
 pub fn desugar_defers_in_program(prog: Program) -> Program {
@@ -2308,7 +2497,7 @@ pub fn collect_private_refs_stmts(ss: &Vec<Stmt>, out: &mut Vec<String>) {
                 collect_private_refs_expr(&arr_expr, out);
                 collect_private_refs_stmts(&body, out);
             }
-            Try { try_block, catches, line } => {
+            Try { try_block, catches, finally_block, line } => {
                 collect_private_refs_stmts(&try_block, out);
                 var ci = 0;
                 while ci < catches.length() {
@@ -2316,6 +2505,7 @@ pub fn collect_private_refs_stmts(ss: &Vec<Stmt>, out: &mut Vec<String>) {
                     collect_private_refs_stmts(&catches.get(ci).catch_block, out);
                     ci = ci + 1;
                 }
+                collect_private_refs_stmts(&finally_block, out);
             }
             Match { subject, arms, line } => {
                 collect_private_refs_expr(&subject, out);
@@ -2901,7 +3091,7 @@ fn fold_const_stmt(s: Stmt, names: &Vec<String>, values: &Vec<Expr>) -> Stmt {
         Throw { value, line } => { return Throw { value: fold_const_expr(value, names, values), line: line }; }
         Break { line } => { return Break { line: line }; }
         Continue { line } => { return Continue { line: line }; }
-        Try { try_block, catches, line } => { return Try { try_block: fold_const_stmt_list(try_block, names, values), catches: fold_const_catches(catches, names, values), line: line }; }
+        Try { try_block, catches, finally_block, line } => { return Try { try_block: fold_const_stmt_list(try_block, names, values), catches: fold_const_catches(catches, names, values), finally_block: fold_const_stmt_list(finally_block, names, values), line: line }; }
         Defer { expr, line } => { return Defer { expr: fold_const_expr(expr, names, values), line: line }; }
     }
 }
