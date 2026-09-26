@@ -2168,6 +2168,26 @@ impl Parser {
                     stmts.push(desugared2.get(di2));
                     di2 = di2 + 1;
                 }
+            } else if self.check(USING) {
+                // `using NAME = EXPR;` -- pure sugar (see `Ast.hc`'s own `Stmt::Defer` header):
+                // desugars to exactly `let NAME = EXPR; defer NAME.close();`, spliced in as TWO
+                // real statements, same "desugar into a real Vec<Stmt>, splice it in" strategy
+                // `parallel_for_stmts`/`sequence_stmts` right above already use. Calls `.close()`
+                // (an ordinary METHOD call), not the built-in `drop(x)` -- `drop` is confirmed
+                // BROKEN in this self-hosted compiler today (`codegen for 'Call' to 'drop' not
+                // implemented this phase`, see ARCHITECTURE.md's own "Destructors" section), and
+                // `.close()` matches this doc's own original motivating example (`file.close()`)
+                // exactly anyway -- `using` requires its resource type to declare a real
+                // `close(&mut self)`/`close(&self)` method, a real, disclosed naming convention
+                // rather than a universal destructor hook.
+                let start_line3 = self.peek().line;
+                self.advance(); // using
+                let uname = self.expect(IDENT).text;
+                self.expect(EQ);
+                let uinit = self.expression();
+                self.expect(SEMI);
+                stmts.push(Let { name: uname, mutable: false, init: uinit, declared_type: none_string(), line: start_line3 });
+                stmts.push(Defer { expr: MethodCall { recv: Ident { name: uname }, method: "close", args: empty_expr_vec() }, line: start_line3 });
             } else if self.is_stmt_macro_ahead() {
                 // `name!(args);` where `name` is a STATEMENT macro -- see `expand_stmt_macro`'s
                 // own header. An expression-macro call left at statement position (`is_stmt_
@@ -2316,6 +2336,17 @@ impl Parser {
         }
         if self.check(TRY) {
             return self.try_stmt(start_line);
+        }
+        // `defer EXPR;` -- see `Ast.hc`'s own `Stmt::Defer` header. Parsed generically here (legal
+        // anywhere an ordinary statement is), same as every other `Stmt` variant -- the real,
+        // CHECKED "top-level of a fn body only" restriction is enforced by a separate, later
+        // pass (`Driver.hotc`'s own `check_defer_placement`), not by the grammar itself, keeping
+        // this parse rule as simple as `throw`'s own right above.
+        if self.check(DEFER) {
+            self.advance();
+            let e2 = self.expression();
+            self.expect(SEMI);
+            return Defer { expr: e2, line: start_line };
         }
         let e = self.expression();
         self.expect(SEMI);
@@ -4868,6 +4899,7 @@ pub fn subst_macro_stmt(s: Stmt, pnames: &Vec<String>, pargs: &Vec<Expr>, rnames
         Try { try_block, catches, line } => {
             return Try { try_block: subst_macro_stmt_list(try_block, pnames, pargs, rnames, rvals), catches: subst_macro_catches(catches, pnames, pargs, rnames, rvals), line: line };
         }
+        Defer { expr, line } => { return Defer { expr: subst_macro_expr(expr, pnames, pargs, rnames, rvals), line: line }; }
     }
 }
 

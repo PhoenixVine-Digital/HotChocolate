@@ -4820,6 +4820,21 @@ impl CodeGen {
                 }
                 self.mv.visitLabel(&end_label);
             }
+            // `defer EXPR;` -- see `Ast.hc`'s own `Stmt::Defer` header. Never actually reached by
+            // a real compile (`Driver.hotc`'s own `desugar_defers` rewrites every `Defer` node
+            // away before `Codegen.hotc` ever runs, same "already gone by codegen time" shape
+            // `Checker.hotc`'s own matching arm's header explains) -- kept exactly as simple as
+            // `ExprStmt`'s own arm right above `gen_block`, just so this match stays exhaustive.
+            Defer { expr, line } => {
+                self.mark_line(line);
+                let dty = self.gen_expr(expr);
+                if dty == "Unit" {
+                } else if dty == "Long" || dty == "Double" {
+                    self.mv.visitInsn(88); // POP2
+                } else {
+                    self.mv.visitInsn(87); // POP
+                }
+            }
         }
     }
 
@@ -7190,6 +7205,7 @@ pub fn subst_stmt_cg(s: Stmt, type_param: String, arg: String) -> Stmt {
         Try { try_block, catches, line } => {
             return Try { try_block: subst_stmt_list_cg(try_block, type_param, arg), catches: subst_catches_cg(catches, type_param, arg), line: line };
         }
+        Defer { expr, line } => { return Defer { expr: subst_expr_cg(expr, type_param, arg), line: line }; }
     }
 }
 

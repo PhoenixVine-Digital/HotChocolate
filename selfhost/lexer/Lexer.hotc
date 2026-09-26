@@ -140,6 +140,12 @@ pub enum TokType {
     // checked for a self-hosting collision (grepped all 6 selfhost/*.hotc files for a bare
     // `macro` identifier) before reserving it, same discipline `on`'s own header describes.
     MACRO,
+    // `defer EXPR;` / `using NAME = EXPR;` -- see `IDEAS.md`'s own "`defer`/`using` for resource
+    // cleanup" entry. `Driver.hotc`'s own `check_defer_placement`/`desugar_defers` are the only
+    // readers; checked for a self-hosting collision (grepped all 6 selfhost/*.hotc files for a
+    // bare `defer`/`using` identifier) before reserving them, same discipline `on`/`macro`'s own
+    // headers describe -- both only ever appear inside comments today.
+    DEFER, USING,
     LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA, COLON, COLONCOLON, ARROW, FATARROW, SEMI, DOT, DOTDOT, DOTDOTEQ,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     EQ, EQEQ, BANGEQ, LT, LTEQ, GT, GTEQ, BANG, AMP, AMPAMP, PIPE, PIPEPIPE, QUESTION, AT,
@@ -215,6 +221,8 @@ pub fn build_keywords() -> Registry<TokType> {
     kw.register("handle", HANDLE);
     kw.register("const", CONST);
     kw.register("macro", MACRO);
+    kw.register("defer", DEFER);
+    kw.register("using", USING);
     return kw;
 }
 

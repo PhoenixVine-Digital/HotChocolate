@@ -1736,22 +1736,28 @@ specialized loop with no intermediate allocation at all — see that doc's own h
 reasoning. If `filter`/`map` ever get built anyway (a real caller wanting the point-free style),
 `|>` stays trivial sugar on top (`a |> f(b)` desugars to `f(a, b)`), unchanged from before.
 
-### `defer` / `using` for resource cleanup
+### ~~`defer` / `using` for resource cleanup~~ — shipped 2026-09-26
 
 ```
 let file = open("save.dat");
 defer file.close();
 ```
 
-Tempting, but this is a GC'd JVM target — there's no real "this value's
-lifetime just ended" moment to hook `defer` to beyond what the existing
-`drop`/move-checker machinery (see ARCHITECTURE.md's Destructors section)
-already tracks. `defer` would either (a) just be sugar for "declare a
-`drop` impl and let scope-exit call it," in which case it's not adding a
-capability, only a spelling, or (b) need real closure capture to defer an
-arbitrary block rather than a single method call, which circles back to
-the "no closures yet" blocker above. Worth revisiting once closures exist;
-until then `drop` already covers the actual use case.
+**Status: built, real, disclosed CHECKED v1 subset** — see ARCHITECTURE.md's own "`defer`/`using`
+for resource cleanup" entry for the full design. The "no closures yet" blocker this entry's own
+original reasoning cited was already gone (closures shipped 2026-09-02) by the time this got
+picked up; the REAL remaining question turned out to be different: this language has no `finally`
+clause at all, so a fully general, Go-style `defer` (registered conditionally, guaranteed across
+exceptions) would need a real runtime stack, not just parser-level rewriting. Solved by scoping
+`defer` to a direct top-level statement of a fn body ONLY — never nested inside `if`/`while`/`for`/
+`match`/`try`, a real, CHECKED compile error otherwise — which makes every registration
+unconditional, and that's exactly what lets the whole feature desugar via one pure, static,
+single-pass rewrite. `using NAME = EXPR;` is sugar on top of it (`let NAME = EXPR; defer NAME.
+close();`) — deliberately targeting an ordinary `.close()` method, NOT the built-in `drop(x)`
+function, which turned out to be confirmed BROKEN in the self-hosted compiler today (`codegen for
+'Call' to 'drop' not implemented this phase`) — reusing a known-broken builtin as a new feature's
+own desugaring target would have shipped something that looks right until the moment it's
+actually run. See `examples/defer_using.hotc`.
 
 ### ~~Pattern matching sugar: positional enum patterns~~ — shipped 2026-09-17
 

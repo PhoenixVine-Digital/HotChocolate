@@ -5227,3 +5227,63 @@ identically-scoped `looks_like_generic_lit`) plus a broader, pre-existing annota
 `@deterministic`/lifecycle annotations, and a few stdlib collection constructors like
 `hash_map_new` aren't in scope for name resolution) — neither attempted in this pass.
 
+## `defer`/`using` for resource cleanup
+
+**Shipped, 2026-09-26 (real, disclosed, CHECKED v1 subset).** `defer EXPR;` schedules `EXPR` to
+run when the enclosing FUNCTION exits -- in reverse declaration order (LIFO, same as Go/Rust's own
+scope-guard idiom) -- at every real exit: normal fall-through, or an explicit `return` anywhere in
+the function (even nested inside an `if`). `using NAME = EXPR;` is pure sugar on top of it: `let
+NAME = EXPR; defer NAME.close();`, expanded at parse time (no separate AST node of its own).
+
+**The real scope decision, made up front, not discovered the hard way**: this language has no
+`finally` clause at all (checked before writing a line of code), so a fully general, Go-style
+`defer` -- registered conditionally, behind arbitrary branches, and guaranteed to run even across
+an exception -- would need a real runtime stack, not just a parser-level rewrite. Chose a
+narrower, but still genuinely useful and, crucially, CORRECTLY-implementable-with-pure-static-
+rewriting v1 instead: **`defer` is legal ONLY as a direct top-level statement of a fn/method
+body** -- never nested inside `if`/`while`/`for`/`match`/`try` -- enforced by a real, named
+compile error (`Driver.hotc`'s own `check_defer_placement`), not silently mis-scheduled. Because
+every `defer` in a function is therefore unconditionally registered (never behind a branch), "which
+defers already ran" at any later point is exactly "every `defer` textually before it" -- a fixed,
+position-only fact that doesn't depend on which branch actually executed at runtime, which is
+exactly what makes `desugar_defers_in_program` a single, purely-static pass rather than needing
+real bytecode-level `try`/`finally` machinery this compiler doesn't have.
+
+`Driver.hotc`'s own `desugar_defers_stmts` walks each fn/method's top-level statement list once,
+collecting each `Defer`'s expr into a `pending` list as it's encountered (removing the `Defer` node
+from the output entirely); every `Return` -- found by recursing into `if`/`while`/`for`/`match`/
+`try` bodies at any depth via `flush_defers_before_exits` -- gets the CURRENT `pending` snapshot
+flushed (reversed) directly before it, and the natural end of the top-level block flushes whatever
+is still pending for the fall-through case. **A real correctness bug found and fixed by this
+pass's own first test**: `break`/`continue` only ever exit the ENCLOSING LOOP, never the function
+itself -- an early draft flushed pending defers before them too (as if they were a function exit),
+which is wrong; `examples/defer_using.hotc`'s own `defer_survives_a_loop_break` test exists
+specifically to pin this down (the deferred cleanup fires once, right after the loop, not at the
+`break` point).
+
+Real, disclosed limitations, stated plainly:
+- No real `finally`-equivalent exists in this language -- an exception thrown before a scheduled
+  defer's own flush point is reached skips it entirely. Not silently pretended otherwise.
+- `using` requires the resource's own type to declare a real `close(&mut self)`/`close(&self)`
+  method (matching this feature's own original motivating example, `file.close()`) -- not the
+  built-in `drop(x)` function, which is confirmed BROKEN in this self-hosted compiler today (see
+  this doc's own "Destructors" section: `codegen for 'Call' to 'drop' not implemented this
+  phase`). Reusing a KNOWN-BROKEN builtin for a brand-new feature's own desugaring target would
+  have shipped something that looks like it works at parse time and fails the instant it's ever
+  actually run -- checked directly before committing to the design, not discovered afterward.
+- No structural/recursive cleanup (a struct field's own `close`, if it had a `defer`-registered
+  resource of its own, isn't cascaded into) -- only ever the ONE resource named in the `using`
+  itself.
+
+Two new reserved keywords (`defer`, `using`), checked for a self-hosting source collision first
+(same discipline `on`→`handle`/`macro` already established) -- both only ever appeared inside
+comments beforehand, so neither broke self-compilation. One new `Stmt::Defer { expr: Expr, line:
+Int }` AST variant, needing a (never-actually-reached-post-desugaring, purely-for-exhaustiveness)
+arm added to all 7 real per-variant `Stmt` matches across `Checker.hotc`/`Codegen.hotc`/
+`Driver.hotc`/`Parser.hotc`/`TestDriver.hotc`. Verified end to end with `examples/defer_using.hotc`
+(declaration-order LIFO flushing, an early return from inside a nested `if` still running an outer
+top-level defer, a loop `break` correctly NOT triggering it, and `using`'s own open/close pair) --
+every value matched hand-computed expectations exactly. Full example regression sweep: zero new
+failures (the same disclosed pre-existing baseline as every other pass this session). Self-hosting
+verified to a true fixed point.
+

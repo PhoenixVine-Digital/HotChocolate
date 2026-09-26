@@ -142,6 +142,7 @@ fn dump_stmt(s: Stmt, indent: String) -> String {
             }
             return out;
         }
+        Defer { expr, line } => { return "defer " + dump_expr(expr) + ";"; }
     }
 }
 

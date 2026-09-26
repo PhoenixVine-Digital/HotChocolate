@@ -1,0 +1,87 @@
+// `defer`/`using` for resource cleanup -- see IDEAS.md's own "`defer`/`using` for resource
+// cleanup" entry and ARCHITECTURE.md's own entry for the full design. Real, disclosed v1 scope,
+// CHECKED not just documented: `defer EXPR;` is legal ONLY as a direct top-level statement of a
+// fn/method body -- never nested inside `if`/`while`/`for`/`match`/`try` -- a real, named compile
+// error otherwise, not silent mis-scheduling. This is what lets the whole feature desugar via a
+// pure, single-pass, purely-static rewrite (no runtime stack, no real `finally` needed): every
+// `defer` in a function is unconditionally registered, so "which defers already ran" at any
+// later point is exactly "every defer textually before it" -- a fixed fact, not something that
+// depends on which branch actually executed.
+
+struct Resource { name: String }
+
+impl Resource {
+    fn close(&mut self) {
+        print("closing " + self.name);
+    }
+}
+
+fn make_resource(name: String) -> Resource {
+    print("opening " + name);
+    return Resource { name: name };
+}
+
+// Runs in REVERSE declaration order (LIFO, same as Go/Rust's own scope-guard idiom) at every real
+// exit: normal fall-through, or an explicit `return` anywhere in the function (even nested inside
+// an `if`) -- but NOT `break`/`continue`, which only ever exit the ENCLOSING LOOP, never the
+// function itself.
+fn defer_order_demo() {
+    defer print("defer 1 (registered first, runs LAST)");
+    defer print("defer 2 (registered second, runs FIRST)");
+    print("body");
+}
+
+fn defer_with_early_return(early: Bool) -> Int {
+    defer print("cleanup A");
+    if early {
+        return 1; // still runs "cleanup A" -- the return is nested inside the `if`, the defer isn't
+    }
+    defer print("cleanup B");
+    return 2; // runs "cleanup B" then "cleanup A", in that order
+}
+
+// `break` exits the loop, not the function -- the deferred cleanup only fires once the function
+// itself is actually done, right after the loop, not at the break point.
+fn defer_survives_a_loop_break(stop_early: Bool) {
+    defer print("cleanup after loop");
+    var i = 0;
+    while i < 5 {
+        if stop_early && i == 2 {
+            break;
+        }
+        print(i);
+        i = i + 1;
+    }
+    print("after loop");
+}
+
+// `using NAME = EXPR;` is pure sugar on top of `defer`: `let NAME = EXPR; defer NAME.close();`,
+// expanded at parse time. Requires the resource's own type to declare a real `close(&mut self)`
+// method -- a real, disclosed naming convention (matching this doc's own original motivating
+// example, `file.close()`), not a universal destructor hook.
+fn using_demo() {
+    using r = make_resource("R");
+    print("using body");
+}
+
+fn main() {
+    print("--- defer_order_demo ---");
+    defer_order_demo();
+
+    print("--- defer_with_early_return(true) ---");
+    print(defer_with_early_return(true));
+
+    print("--- defer_with_early_return(false) ---");
+    print(defer_with_early_return(false));
+
+    print("--- defer_survives_a_loop_break(false) ---");
+    defer_survives_a_loop_break(false);
+
+    print("--- defer_survives_a_loop_break(true) ---");
+    defer_survives_a_loop_break(true);
+
+    print("--- using_demo ---");
+    using_demo();
+
+    print("done");
+}

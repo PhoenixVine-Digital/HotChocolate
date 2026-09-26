@@ -710,6 +710,15 @@ pub fn run_cli(args: [String]) {
     }
     check_gpu_fns(&prog);
     prog = rewrite_gpu_fns(prog);
+    // `defer`/`using` -- see `Ast.hc`'s own `Stmt::Defer` header. `check_defer_placement` rejects
+    // any `Defer` NOT sitting directly at the top level of a fn/method body (a real, named
+    // error) BEFORE `desugar_defers_in_program` ever runs -- that ordering is what lets the
+    // desugaring itself be a pure, single-pass, purely-static rewrite (no runtime stack needed):
+    // since every `Defer` in a function is now GUARANTEED unconditional (never behind a branch),
+    // "which defers are already registered" at any later point is exactly "every `Defer`
+    // textually before it," a fixed fact independent of which branch actually runs.
+    check_defer_placement(&prog);
+    prog = desugar_defers_in_program(prog);
 
     // See `name_collides_with_decl`'s own header, right above `parse_directory`: the entry class
     // name is mangled -- ONLY when it would otherwise collide -- never a struct's own name (which
@@ -1865,6 +1874,277 @@ pub fn build_gpu_dispatcher_fn(f: FnDecl) -> FnDecl {
     return FnDecl { name: f.name, params: f.params, ret_type: f.ret_type, body: body, type_param: f.type_param, type_bounds: f.type_bounds, self_is_mut: f.self_is_mut, type_param2: f.type_param2, type_bounds2: f.type_bounds2 };
 }
 
+// `defer EXPR;` / `using NAME = EXPR;` -- see `Ast.hc`'s own `Stmt::Defer` header for the full
+// design and real, disclosed v1 scope (checked, not just documented: legal ONLY as a direct
+// top-level statement of a fn/method body). `check_defer_placement` runs FIRST, rejecting any
+// `Defer` found nested inside `if`/`while`/`for`/`match`/`try` anywhere in the program -- a real,
+// named error, not a silent mis-scheduling -- so `desugar_defers_in_program` (right below) never
+// has to reason about a `Defer` appearing anywhere but a fn's own top-level list.
+pub fn check_defer_placement(prog: &Program) {
+    var i = 0;
+    while i < prog.fns.length() {
+        check_defer_forbidden_in_nested(&prog.fns.get(i).body, prog.fns.get(i).name);
+        i = i + 1;
+    }
+    var j = 0;
+    while j < prog.impls.length() {
+        let impl_decl = prog.impls.get(j);
+        var mi = 0;
+        while mi < impl_decl.methods.length() {
+            check_defer_forbidden_in_nested(&impl_decl.methods.get(mi).body, impl_decl.methods.get(mi).name);
+            mi = mi + 1;
+        }
+        var smi = 0;
+        while smi < impl_decl.static_methods.length() {
+            check_defer_forbidden_in_nested(&impl_decl.static_methods.get(smi).body, impl_decl.static_methods.get(smi).name);
+            smi = smi + 1;
+        }
+        j = j + 1;
+    }
+}
+
+// Walks a fn's own TOP-LEVEL statement list -- `Defer` is fine right here, only its NESTED bodies
+// (an `if`/`while`/`for`/`match` arm/`try`/`catch` body) get the stricter, unconditional check
+// (`check_defer_forbidden_in`, right below) applied to them.
+fn check_defer_forbidden_in_nested(ss: &Vec<Stmt>, fn_name: String) {
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                check_defer_forbidden_in(&then_body, fn_name);
+                match else_body {
+                    Some { value: eb } => { check_defer_forbidden_in(&eb, fn_name); }
+                    None => {}
+                }
+            }
+            While { cond, body, line } => { check_defer_forbidden_in(&body, fn_name); }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => { check_defer_forbidden_in(&body, fn_name); }
+            Match { subject, arms, line } => {
+                var ai = 0;
+                while ai < arms.length() {
+                    check_defer_forbidden_in(&arms.get(ai).body, fn_name);
+                    ai = ai + 1;
+                }
+            }
+            Try { try_block, catches, line } => {
+                check_defer_forbidden_in(&try_block, fn_name);
+                var ci = 0;
+                while ci < catches.length() {
+                    check_defer_forbidden_in(&catches.get(ci).catch_block, fn_name);
+                    ci = ci + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+// Applied to a body that's ALREADY nested (never a fn's own top-level list) -- a `Defer` anywhere
+// inside `ss`, at any depth, is a real, named compile error here.
+fn check_defer_forbidden_in(ss: &Vec<Stmt>, fn_name: String) {
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Defer { expr, line } => {
+                throw ParseError::new("'defer' at line " + JString4::valueOf(line) + " in '" + fn_name + "' must be a direct top-level statement of the fn body -- not nested inside 'if'/'while'/'for'/'match'/'try' (see IDEAS.md's own \"'defer'/'using' for resource cleanup\" entry)");
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                check_defer_forbidden_in(&then_body, fn_name);
+                match else_body {
+                    Some { value: eb } => { check_defer_forbidden_in(&eb, fn_name); }
+                    None => {}
+                }
+            }
+            While { cond, body, line } => { check_defer_forbidden_in(&body, fn_name); }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => { check_defer_forbidden_in(&body, fn_name); }
+            Match { subject, arms, line } => {
+                var ai = 0;
+                while ai < arms.length() {
+                    check_defer_forbidden_in(&arms.get(ai).body, fn_name);
+                    ai = ai + 1;
+                }
+            }
+            Try { try_block, catches, line } => {
+                check_defer_forbidden_in(&try_block, fn_name);
+                var ci = 0;
+                while ci < catches.length() {
+                    check_defer_forbidden_in(&catches.get(ci).catch_block, fn_name);
+                    ci = ci + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+// The actual rewrite: every top-level `Defer` is unconditionally registered (never behind a
+// branch, guaranteed by `check_defer_placement` above), so the set of "already-registered"
+// defers at any later point is exactly "every `Defer` textually before it" -- a fixed, static
+// fact. Recurses into NESTED bodies (`if`/`while`/`for`/`match`/`try`) looking for a `Return`/
+// `Break`/`Continue` at ANY depth, inserting a flush of the CURRENT (outer) `pending` list
+// directly before it -- using the snapshot already accumulated by the time the walk reaches that
+// nested body, which is complete precisely because nothing conditional could have added to it.
+fn desugar_defers_stmts(ss: Vec<Stmt>) -> Vec<Stmt> {
+    var out = empty_stmt_vec2();
+    var pending = empty_expr_vec_cg();
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            Defer { expr, line } => { pending.push(expr); }
+            // `Break`/`Continue` only exit the ENCLOSING LOOP, never the function itself -- a
+            // bare one can't even legally appear at this TOP level to begin with (`Checker.hotc`'s
+            // own `loop_depth` already rejects "'break' outside of a loop" before this pass ever
+            // runs), so these two arms only exist to keep the match exhaustive; they fall through
+            // completely unflushed on purpose. Only a real `Return` (or falling off the natural
+            // end of this block, right after the loop) means the FUNCTION is actually exiting.
+            Return { value, line } => {
+                push_reversed_defer_flush(&mut out, &pending);
+                out.push(Return { value: value, line: line });
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                var new_else3 = none_stmt_list_cg();
+                match else_body {
+                    Some { value: eb } => { new_else3 = some_stmt_list_cg(flush_defers_before_exits(eb, &pending)); }
+                    None => {}
+                }
+                out.push(If { cond: cond, then_body: flush_defers_before_exits(then_body, &pending), else_body: new_else3, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq });
+            }
+            While { cond, body, line } => {
+                out.push(While { cond: cond, body: flush_defers_before_exits(body, &pending), line: line });
+            }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: flush_defers_before_exits(body, &pending), line: line });
+            }
+            Match { subject, arms, line } => {
+                var new_arms = empty_matcharm_vec3();
+                var ai2 = 0;
+                while ai2 < arms.length() {
+                    let a2 = arms.get(ai2);
+                    new_arms.push(MatchArm { variant_name: a2.variant_name, field_names: a2.field_names, bind_names: a2.bind_names, body: flush_defers_before_exits(a2.body, &pending), is_literal: a2.is_literal, literal: a2.literal, is_positional: a2.is_positional });
+                    ai2 = ai2 + 1;
+                }
+                out.push(Match { subject: subject, arms: new_arms, line: line });
+            }
+            Try { try_block, catches, line } => {
+                var new_catches = empty_catchclause_vec3();
+                var ci2 = 0;
+                while ci2 < catches.length() {
+                    let c3 = catches.get(ci2);
+                    new_catches.push(CatchClause { catch_var: c3.catch_var, catch_type: c3.catch_type, catch_block: flush_defers_before_exits(c3.catch_block, &pending) });
+                    ci2 = ci2 + 1;
+                }
+                out.push(Try { try_block: flush_defers_before_exits(try_block, &pending), catches: new_catches, line: line });
+            }
+            _ => { out.push(ss.get(i)); }
+        }
+        i = i + 1;
+    }
+    // Normal fall-through off the end of this block -- run whatever's still pending.
+    push_reversed_defer_flush(&mut out, &pending);
+    return out;
+}
+
+// Appends `ExprStmt`s running every expr in `pending`, LAST-registered FIRST (LIFO, same order
+// real `defer` uses everywhere -- Go, Rust's own scope-guard idiom, etc).
+fn push_reversed_defer_flush(out: &mut Vec<Stmt>, pending: &Vec<Expr>) {
+    var k = pending.length() - 1;
+    while k >= 0 {
+        out.push(ExprStmt { expr: pending.get(k), line: 0 });
+        k = k - 1;
+    }
+}
+
+// A NESTED body (an `if`/`while`/`for`/`match` arm/`try`/`catch` body) can't register its OWN
+// `Defer`s (already rejected by `check_defer_placement`), but it CAN contain a `Return`/`Break`/
+// `Continue` that needs the OUTER, already-accumulated `pending` list flushed before it -- this
+// walks such a body looking for exactly those (recursing into any FURTHER nesting the same way),
+// leaving every other statement completely alone.
+fn flush_defers_before_exits(ss: Vec<Stmt>, pending: &Vec<Expr>) -> Vec<Stmt> {
+    var out = empty_stmt_vec2();
+    var i = 0;
+    while i < ss.length() {
+        match ss.get(i) {
+            // `Break`/`Continue` only exit whichever loop DIRECTLY encloses them, never the
+            // function -- see `desugar_defers_stmts`'s own header for the full reasoning (applies
+            // identically at every nesting depth: a `break` inside a loop nested inside THIS
+            // body still only exits THAT inner loop). Falls through completely unflushed.
+            Return { value, line } => {
+                push_reversed_defer_flush(&mut out, pending);
+                out.push(Return { value: value, line: line });
+            }
+            If { cond, then_body, else_body, line, narrow_name, narrow_is_eq } => {
+                var new_else4 = none_stmt_list_cg();
+                match else_body {
+                    Some { value: eb2 } => { new_else4 = some_stmt_list_cg(flush_defers_before_exits(eb2, pending)); }
+                    None => {}
+                }
+                out.push(If { cond: cond, then_body: flush_defers_before_exits(then_body, pending), else_body: new_else4, line: line, narrow_name: narrow_name, narrow_is_eq: narrow_is_eq });
+            }
+            While { cond, body, line } => { out.push(While { cond: cond, body: flush_defers_before_exits(body, pending), line: line }); }
+            For { var_name, is_range, range_start, range_end, inclusive, arr_expr, body, line } => {
+                out.push(For { var_name: var_name, is_range: is_range, range_start: range_start, range_end: range_end, inclusive: inclusive, arr_expr: arr_expr, body: flush_defers_before_exits(body, pending), line: line });
+            }
+            Match { subject, arms, line } => {
+                var new_arms2 = empty_matcharm_vec3();
+                var ai3 = 0;
+                while ai3 < arms.length() {
+                    let a3 = arms.get(ai3);
+                    new_arms2.push(MatchArm { variant_name: a3.variant_name, field_names: a3.field_names, bind_names: a3.bind_names, body: flush_defers_before_exits(a3.body, pending), is_literal: a3.is_literal, literal: a3.literal, is_positional: a3.is_positional });
+                    ai3 = ai3 + 1;
+                }
+                out.push(Match { subject: subject, arms: new_arms2, line: line });
+            }
+            Try { try_block, catches, line } => {
+                var new_catches2 = empty_catchclause_vec3();
+                var ci3 = 0;
+                while ci3 < catches.length() {
+                    let c4 = catches.get(ci3);
+                    new_catches2.push(CatchClause { catch_var: c4.catch_var, catch_type: c4.catch_type, catch_block: flush_defers_before_exits(c4.catch_block, pending) });
+                    ci3 = ci3 + 1;
+                }
+                out.push(Try { try_block: flush_defers_before_exits(try_block, pending), catches: new_catches2, line: line });
+            }
+            _ => { out.push(ss.get(i)); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn desugar_defers_in_program(prog: Program) -> Program {
+    var new_fns = empty_fn_decl_vec2();
+    var i = 0;
+    while i < prog.fns.length() {
+        let f = prog.fns.get(i);
+        new_fns.push(FnDecl { name: f.name, params: f.params, ret_type: f.ret_type, body: desugar_defers_stmts(f.body), type_param: f.type_param, type_bounds: f.type_bounds, self_is_mut: f.self_is_mut, type_param2: f.type_param2, type_bounds2: f.type_bounds2 });
+        i = i + 1;
+    }
+    var new_impls = empty_impl_decl_vec();
+    var j = 0;
+    while j < prog.impls.length() {
+        let impl_decl = prog.impls.get(j);
+        var new_methods = empty_fn_decl_vec2();
+        var mi = 0;
+        while mi < impl_decl.methods.length() {
+            let m = impl_decl.methods.get(mi);
+            new_methods.push(FnDecl { name: m.name, params: m.params, ret_type: m.ret_type, body: desugar_defers_stmts(m.body), type_param: m.type_param, type_bounds: m.type_bounds, self_is_mut: m.self_is_mut, type_param2: m.type_param2, type_bounds2: m.type_bounds2 });
+            mi = mi + 1;
+        }
+        var new_static_methods = empty_fn_decl_vec2();
+        var smi = 0;
+        while smi < impl_decl.static_methods.length() {
+            let sm = impl_decl.static_methods.get(smi);
+            new_static_methods.push(FnDecl { name: sm.name, params: sm.params, ret_type: sm.ret_type, body: desugar_defers_stmts(sm.body), type_param: sm.type_param, type_bounds: sm.type_bounds, self_is_mut: sm.self_is_mut, type_param2: sm.type_param2, type_bounds2: sm.type_bounds2 });
+            smi = smi + 1;
+        }
+        new_impls.push(ImplDecl { struct_name: impl_decl.struct_name, methods: new_methods, static_methods: new_static_methods, interface_name: impl_decl.interface_name, delegate_field: impl_decl.delegate_field });
+        j = j + 1;
+    }
+    return Program { fns: new_fns, structs: prog.structs, impls: new_impls, enums: prog.enums, externs: prog.externs, statics: prog.statics, interfaces: prog.interfaces, struct_annotation_names: prog.struct_annotation_names, struct_annotation_data: prog.struct_annotation_data, fn_annotation_names: prog.fn_annotation_names, fn_annotation_data: prog.fn_annotation_data, extend_decls: prog.extend_decls, must_use_fn_names: prog.must_use_fn_names, dev_fn_names: prog.dev_fn_names, deterministic_fn_names: prog.deterministic_fn_names, gpu_fn_names: prog.gpu_fn_names, struct_doc_names: prog.struct_doc_names, struct_doc_data: prog.struct_doc_data, fn_doc_names: prog.fn_doc_names, fn_doc_data: prog.fn_doc_data, uses: prog.uses, sendable_struct_names: prog.sendable_struct_names, components: prog.components, systems: prog.systems, resources: prog.resources, private_type_names: prog.private_type_names, pub_struct_names: prog.pub_struct_names, pub_enum_names: prog.pub_enum_names, pub_interface_names: prog.pub_interface_names, pub_fn_names: prog.pub_fn_names, pub_static_names: prog.pub_static_names, const_fns: prog.const_fns, const_names: prog.const_names, const_types: prog.const_types, const_inits: prog.const_inits };
+}
+
 // Splits a decorated type-name string (`"&mut Vec<Foo>"`, `"[Foo]"`, `"Foo?"`, `"Result<Foo,
 // Bar>"`, ...) into its bare identifier words, pushing each into `out` -- deliberately crude (a
 // codepoint scan collecting maximal runs of anything that ISN'T one of the handful of separator
@@ -2622,6 +2902,7 @@ fn fold_const_stmt(s: Stmt, names: &Vec<String>, values: &Vec<Expr>) -> Stmt {
         Break { line } => { return Break { line: line }; }
         Continue { line } => { return Continue { line: line }; }
         Try { try_block, catches, line } => { return Try { try_block: fold_const_stmt_list(try_block, names, values), catches: fold_const_catches(catches, names, values), line: line }; }
+        Defer { expr, line } => { return Defer { expr: fold_const_expr(expr, names, values), line: line }; }
     }
 }
 

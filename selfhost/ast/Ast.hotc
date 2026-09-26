@@ -283,6 +283,20 @@ pub enum Stmt {
     // must name a known `extern class` (a real JVM exception type); each `catch_var` is bound to
     // it, in scope only within that clause's own `catch_block`.
     Try { try_block: Vec<Stmt>, catches: Vec<CatchClause>, line: Int },
+    // `defer EXPR;` -- see `IDEAS.md`'s own "`defer`/`using` for resource cleanup" entry.
+    // Real, disclosed v1 scope, CHECKED not just documented (`Driver.hotc`'s own `check_defer_
+    // placement`): legal ONLY as a direct top-level statement of a `fn`/method body, never
+    // nested inside `if`/`while`/`for`/`match`/`try`/another block. This is what makes the
+    // desugaring (`Driver.hotc`'s own `desugar_defers`) a pure, purely-static, single-pass
+    // rewrite rather than needing a real runtime stack: since every `Defer` in a function is
+    // registered UNCONDITIONALLY (never behind a branch), the set of "defers already registered"
+    // at any later point is exactly "every `Defer` textually before it at the top level" -- a
+    // fixed, position-only fact, not something that depends on which branch actually ran. `using
+    // NAME = EXPR;` is pure sugar on top of this (`let NAME = EXPR; defer drop(NAME);`, expanded
+    // at parse time -- no separate AST shape of its own). No real `finally`-equivalent exists in
+    // this language, so an exception thrown before a scheduled defer's own flush point is
+    // reached skips it -- a real, disclosed limitation, not silently pretended away.
+    Defer { expr: Expr, line: Int },
 }
 
 // One `catch (catch_var: catch_type) { catch_block }` clause of a `Try` statement -- see that

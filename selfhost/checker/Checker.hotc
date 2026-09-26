@@ -1132,6 +1132,7 @@ pub fn subst_stmt(s: Stmt, type_param: String, arg: String) -> Stmt {
         Try { try_block, catches, line } => {
             return Try { try_block: subst_stmt_list(try_block, type_param, arg), catches: subst_catches(catches, type_param, arg), line: line };
         }
+        Defer { expr, line } => { return Defer { expr: subst_expr(expr, type_param, arg), line: line }; }
     }
 }
 
@@ -5229,6 +5230,15 @@ impl TyChecker {
                     ci = ci + 1;
                 }
             }
+            // `defer EXPR;` -- see `Ast.hc`'s own `Stmt::Defer` header. Checked like any other
+            // expression statement (`self.check_expr` alone, no special validation here) --
+            // PLACEMENT (top-level of a fn body only) is enforced by `Driver.hotc`'s own
+            // `check_defer_placement`, a separate pass that runs BEFORE this one ever sees the
+            // program (see `desugar_defers`' own header for why this ordering matters); by the
+            // time a real compile reaches `check_stmt` at all, every `Defer` node has already
+            // been fully rewritten away into ordinary `Let`/`Return`/etc. statements, so this arm
+            // exists only to keep the match exhaustive, not because it's ever actually reached.
+            Defer { expr, line } => { self.check_expr(expr); }
         }
     }
 
