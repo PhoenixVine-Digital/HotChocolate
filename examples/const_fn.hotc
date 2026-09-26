@@ -3,7 +3,7 @@
 // expr;` is replaced by its own literal value everywhere it's referenced -- by the time this
 // program actually runs, LEVEL_COUNT/CLAMPED/GREETING are indistinguishable from having
 // hand-written "5"/"10"/"hi, world" directly. No runtime cost, no static field, no <clinit>.
-const fn clamp(x: Int, lo: Int, hi: Int) -> Int {
+const fn clamp_i(x: Int, lo: Int, hi: Int) -> Int {
     if x < lo {
         return lo;
     }
@@ -24,7 +24,7 @@ const fn compute_level_count(raw: Int) -> Int {
 }
 
 const LEVEL_COUNT: Int = compute_level_count(2);   // double_it(2) + 1 = 5
-const CLAMPED: Int = clamp(999, 0, 10);              // 10
+const CLAMPED: Int = clamp_i(999, 0, 10);              // 10
 const GREETING: String = "hi, " + "world";           // const fns/inits can use string ops too
 // A LATER const referencing an EARLIER one directly in its own init -- resolved entirely at
 // compile time too (`Driver.hotc`'s own `fold_consts` folds LEVEL_COUNT's literal in before this

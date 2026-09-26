@@ -106,7 +106,7 @@ internal fun inferExprTypeWithReason(expr: PsiElement, localReasons: Map<String,
             else unknown(expr, "the cast's target type couldn't be determined precisely (an array/generic/dyn type)")
         }
         HCElementTypes.BINARY_EXPR -> {
-            val op = directChildren(expr).firstOrNull { it.node?.elementType == HCTokenTypes.OPERATOR }?.text
+            val op = binaryOpText(expr)
             val operands = realExprChildrenOf(expr)
             when {
                 op in setOf("&&", "||", "==", "!=", "<", "<=", ">", ">=") ->

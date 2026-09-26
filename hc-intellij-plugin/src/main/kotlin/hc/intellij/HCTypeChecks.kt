@@ -170,6 +170,31 @@ internal fun collectTopLevelFnSigs(file: PsiFile): Map<String, HCFnSig> {
 // UNAMBIGUOUS across every struct in scope. Entries are further deduped per `(structName,
 // methodName)` -- same cross-file ambiguity concern `collectAgreeing`'s own header covers, scoped
 // down here since the struct name itself already narrows most accidental collisions.
+// `@derive(Eq, Hash, Snapshot)` on a `struct` -- the trait names it lists (see `Parser.hotc`'s own
+// `derive_impls` header for the real synthesized signatures this mirrors). Walks BACKWARD through
+// preceding siblings the same way `HCAnnotator.nextSignificantSibling` walks FORWARD (an
+// `ANNOTATION`/`pub`/`open`/`priv`/whitespace sibling never breaks the scan; anything else does),
+// since `leadingAnnotations` (see that fn's own header) makes every `@...` its own separate
+// sibling node, never a child of the declaration it precedes.
+private fun precedingDeriveTraits(structDecl: PsiElement): List<String> {
+    var prev = structDecl.prevSibling
+    while (prev != null) {
+        val et = prev.node?.elementType
+        when {
+            prev is PsiWhiteSpace -> {}
+            et == HCTokenTypes.KEYWORD && (prev.text == "pub" || prev.text == "open" || prev.text == "priv") -> {}
+            et == HCElementTypes.ANNOTATION -> {
+                if (directChildren(prev).getOrNull(1)?.text == "derive") {
+                    return directChildren(prev).filter { it.node?.elementType == HCElementTypes.REF_EXPR }.mapNotNull { declaredName(it)?.text }
+                }
+            }
+            else -> return emptyList()
+        }
+        prev = prev.prevSibling
+    }
+    return emptyList()
+}
+
 internal fun collectStructMethodSigs(file: PsiFile): Map<String, List<Pair<String, HCFnSig>>> {
     val seen = mutableMapOf<Pair<String, String>, MutableList<HCFnSig>>()
     for (f in filesInScope(file)) {
@@ -179,6 +204,29 @@ internal fun collectStructMethodSigs(file: PsiFile): Map<String, List<Pair<Strin
             for (fnDecl in directChildren(implDecl).filter { it.node?.elementType == HCElementTypes.FN_DECL }) {
                 val sig = fnSigOf(fnDecl, implGenericParams) ?: continue
                 seen.getOrPut(structName to sig.nameAnchor.text) { mutableListOf() }.add(sig)
+            }
+        }
+        // Real signatures `Parser.hotc`'s own `derive_impls` synthesizes, field by field, into a
+        // real `impl Eq for Name`/`impl Hashable for Name`/plain `impl Name` block -- never
+        // present as source `FN_DECL`s anywhere, so the loop above can't find them. `nameAnchor`
+        // reuses the struct's own declared-name token (there's no real per-method token to point
+        // at) -- fine for this checker's own purposes (arg-count/type matching), which only ever
+        // reads `nameAnchor.text` for the "every occurrence agrees" cross-file key, never its
+        // position for anything derive-specific.
+        for (structDecl in directChildren(f).filter { it.node?.elementType == HCElementTypes.STRUCT_DECL }) {
+            val structName = declaredName(structDecl)?.text ?: continue
+            val traits = precedingDeriveTraits(structDecl)
+            if (traits.isEmpty()) continue
+            val anchor = declaredName(structDecl) ?: continue
+            if ("Eq" in traits) {
+                seen.getOrPut(structName to "equals") { mutableListOf() }.add(HCFnSig(listOf(structName), "Bool", anchor))
+            }
+            if ("Hash" in traits) {
+                seen.getOrPut(structName to "hash_key") { mutableListOf() }.add(HCFnSig(emptyList(), "Int", anchor))
+            }
+            if ("Snapshot" in traits) {
+                seen.getOrPut(structName to "snapshot") { mutableListOf() }.add(HCFnSig(emptyList(), structName, anchor))
+                seen.getOrPut(structName to "restore") { mutableListOf() }.add(HCFnSig(listOf(structName), "Unit", anchor))
             }
         }
     }
@@ -803,7 +851,16 @@ private fun checkStructLiteralFields(file: PsiFile, holder: AnnotationHolder) {
     val fieldSets = collectFieldSets(file)
     for (lit in elementsOfType(file, HCElementTypes.STRUCT_LIT_EXPR)) {
         val idents = directChildren(lit).filter { it.node?.elementType == HCTokenTypes.IDENT }
-        val typeNameToken = idents.lastOrNull() ?: continue // last IDENT before any FIELD_INITs: variant name if qualified, else the bare name
+        // Qualified (`Base<Arg>::Variant { ... }`, `Base<Arg1, Arg2>::Variant { ... }`): the LAST
+        // ident before any `FIELD_INIT` is the real variant name. Otherwise (`Name { ... }` or
+        // `Name<Arg> { ... }`): the FIRST ident is the real struct name -- a real, previously-
+        // latent bug found via `examples/parallel_for.hotc`'s own `Vec<Counter> { data: [], len:
+        // 0 }`: taking the LAST ident unconditionally read "Counter" (the type ARGUMENT) as the
+        // struct name instead of "Vec" itself, the moment a one-type-argument literal had no
+        // `::` at all. Same `isQualified` distinction `HCTypeInference.structLitType` already
+        // makes correctly, right above -- this check just never mirrored it.
+        val isQualified = directChildren(lit).any { it.node?.elementType == HCTokenTypes.COLONCOLON }
+        val typeNameToken = (if (isQualified) idents.lastOrNull() else idents.firstOrNull()) ?: continue
         val declaredFields = fieldSets[typeNameToken.text] ?: continue
 
         val fieldInits = directChildren(lit).filter { it.node?.elementType == HCElementTypes.FIELD_INIT }

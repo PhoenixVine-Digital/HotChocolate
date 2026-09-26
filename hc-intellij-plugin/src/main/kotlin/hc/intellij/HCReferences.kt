@@ -84,6 +84,34 @@ private class HCReference(host: PsiElement, private val identChild: PsiElement, 
     override fun getVariants(): Array<Any> = emptyArray()
 }
 
+// A `BINARY_EXPR`'s (or `UNARY_EXPR`'s) own real operator text -- `>>`/`>>>` are never single
+// tokens (see `HCPsiParser.shift`'s own header): two/three separate bare `>` `OPERATOR` leaves,
+// consumed together and wrapped into ONE `BINARY_EXPR` node at the parser level, but never
+// combined into one token/text (the lexer only ever emits single `>` tokens, to keep a generic
+// type annotation's own closing `Vec<Vec<Int>>` unambiguous -- see `HCTokenTypes.OPERATORS`'s own
+// header). Every call site that used to just take the FIRST `OPERATOR` child's text (naively
+// correct for every other operator, since those really are one token) silently read a real `>>`
+// as a bare `>` comparison instead -- a genuine, previously-latent bug: `bigA >> 4`'s own inferred
+// type came out `Bool` (the comparison-operator branch), not the shift's own real numeric-
+// widening result, cascading into a false "type mismatch: expected 'Long', got 'Bool'" the moment
+// a `let` declared its result explicitly. Counts consecutive `>` leaves starting at the first
+// `OPERATOR` child instead, safe because `shift()`'s own `marker.done(BINARY_EXPR)` closes each
+// level immediately after consuming exactly 1/2/3 tokens -- a `BINARY_EXPR`'s direct children
+// only ever hold ITS OWN operator sequence, never a nested level's.
+internal fun binaryOpText(expr: PsiElement): String? {
+    val kids = directChildren(expr)
+    val firstOpIdx = kids.indexOfFirst { it.node?.elementType == HCTokenTypes.OPERATOR }
+    if (firstOpIdx < 0) return null
+    if (kids[firstOpIdx].text != ">") return kids[firstOpIdx].text
+    var count = 0
+    var i = firstOpIdx
+    while (i < kids.size && kids[i].node?.elementType == HCTokenTypes.OPERATOR && kids[i].text == ">") {
+        count++
+        i++
+    }
+    return ">".repeat(count)
+}
+
 internal fun directChildren(element: PsiElement): List<PsiElement> {
     val out = mutableListOf<PsiElement>()
     var c = element.firstChild

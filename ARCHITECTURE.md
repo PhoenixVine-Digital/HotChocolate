@@ -5086,6 +5086,45 @@ pass only confirmed it fixed exactly the two files it targeted (`gpu_particles.h
 `contracts_requires_ensures.hotc`, both now clean) and added no NEW failures to that pre-existing
 list, verified by diffing the sweep's own failure output before/after.
 
+**Caught up, 2026-09-25 (later): all 23 of the above, closed for real.** Every real language
+feature the plugin's own parser was missing now parses (`const fn`/top-level `const NAME: Type =
+expr;`, `macro`/`name!(args)`, top-level `state Name { ... }` machines, `Int<lo..hi>`/`Int<lo..=hi>`
+range types, `priv`), and the annotator now knows about every SYNTHESIZED name these (and earlier-
+caught-up) features generate but never write as a literal declaration anywhere in source: a `unit
+Name(Base);`'s lowercased constructor, an `event Name(...)`'s `emit_Name`, a state machine's own
+`<Machine>_transition`, `@startup`/`@update`/`@fixed_update`/`@render`'s shared `run_*`
+dispatchers, `@tunable`'s `tunable_get`/`tunable_set`/`tunable_names`, and `@derive(Eq, Hash,
+Snapshot)`'s `equals`/`hash_key`/`snapshot`/`restore` methods (added to `collectStructMethodSigs`,
+not just the value-name list, since these are METHODS, not top-level fns). `HCAnnotatorTest`'s own
+real-example sweep (every `.hc`/`.hotc` file under `examples/`) now passes cleanly -- the ONLY remaining known
+gap anywhere in the plugin's own test suite is `HCParserTest`'s separate `stdlib/` sweep, confirmed
+PRE-EXISTING (still fails identically on the pre-2026-09-25 code, via `git stash`) and unrelated to
+directives at all: a nested-generic struct literal (`Vec<Entry<V>> { data: [], len: 0 }`, in
+`stdlib/collections.hotc`/`stdlib/tuple.hotc`) isn't recognized by the plugin's own one-level-only
+`looks_like_generic_lit`-equivalent lookahead -- a real, separate follow-up, not attempted here.
+
+Three genuinely new, real bugs found and fixed along the way, none specific to any one feature:
+- **`>>`/`>>>` silently misread as a bare `>` comparison by every type-inference call site.**
+  `HCPsiParser.shift` correctly groups `>>`/`>>>` into ONE `BINARY_EXPR` node (two/three separate
+  bare `>` `OPERATOR` leaves -- the lexer only ever emits single `>` tokens, to keep `Vec<Vec<
+  Int>>`'s own closing unambiguous), but `HCTypeInference`/`HCTypeProvenance` each took "the FIRST
+  operator child's text" as the real operator -- correct for every OTHER binary op (all real
+  single tokens), silently wrong for these two. `bigA >> 4`'s own inferred type came out `Bool`
+  (the comparison branch), cascading into a false "type mismatch: expected 'Long', got 'Bool'" on
+  `examples/bitwise_shift_xor.hotc`'s own explicitly-`Long`-typed `let`. Fixed with one shared
+  `binaryOpText` helper (counts consecutive `>` leaves) reused at all 4 call sites.
+- **A generic struct literal with no `::` resolved to its own type ARGUMENT, not its base name.**
+  `checkStructLiteralFields` always took the LAST `IDENT` in a `STRUCT_LIT_EXPR` as the type name
+  -- correct for `Base<Arg>::Variant { ... }` (the variant name really is last), silently wrong for
+  a plain `Name<Arg> { ... }` (no `::`) literal, where the last ident is the type argument instead.
+  `examples/parallel_for.hotc`'s own `Vec<Counter> { data: [], len: 0 }` read as if constructing a
+  `Counter`. Fixed by branching on the SAME `isQualified` check `HCTypeInference.structLitType`
+  (right above this fn) already made correctly.
+- **`parallel for c in items { ... }`'s own loop variable was never registered as a known local.**
+  `collectLocalNames` walked `FOR_STMT` for its loop variable but never the separately-added
+  `PARALLEL_STMT` (same "first direct-child `IDENT`" shape) -- every reference to `c` inside the
+  loop body false-positived as "unresolved reference."
+
 **Also fixed the same day: go-to-definition on stdlib/external-library names never resolved at
 all.** `HCReferences.filesInScope` (the function every reference-resolution path in the plugin
 funnels through) only ever searched the clicked file's own directory plus same-directory siblings

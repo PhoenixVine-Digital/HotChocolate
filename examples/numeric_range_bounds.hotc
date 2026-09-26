@@ -23,7 +23,7 @@ enum Status {
     Dead {},
 }
 
-fn clamp(x: Int, lo: Int, hi: Int) -> Int {
+fn clamp_i(x: Int, lo: Int, hi: Int) -> Int {
     if x < lo {
         return lo;
     }
@@ -46,13 +46,13 @@ fn take_damage(current: Int, amount: Int<0..=100>) -> Int {
 }
 
 // A ranged-Int RETURN type -- checked the same way at each `return` statement. `computed_health`'s
-// own returned value is `clamp`'s result, not provable statically, so it gets a real runtime
+// own returned value is `clamp_i`'s result, not provable statically, so it gets a real runtime
 // check; `fixed_health`'s literal `80` is proven in range at compile time.
 fn fixed_health() -> Int<0..=100> {
     return 80;
 }
 fn computed_health(raw: Int) -> Int<0..=100> {
-    return clamp(raw, 0, 100);
+    return clamp_i(raw, 0, 100);
 }
 
 fn main() {
@@ -61,12 +61,12 @@ fn main() {
     print(health);
 
     // A computed value -- the compiler can't prove this statically, so a real runtime check runs
-    // (and passes here, since clamp's own result is always within [0, 100]).
-    let clamped: Int<0..=100> = clamp(999, 0, 100);
+    // (and passes here, since clamp_i's own result is always within [0, 100]).
+    let clamped: Int<0..=100> = clamp_i(999, 0, 100);
     print(clamped);
 
     // Exclusive upper bound: 0 and 99 are valid, 100 is not.
-    let a: Int<0..100> = clamp(0, 0, 99);
+    let a: Int<0..100> = clamp_i(0, 0, 99);
     print(a);
 
     // A struct field with a ranged-Int type -- checked the same way at construction (a literal
@@ -79,10 +79,10 @@ fn main() {
     let total = p.health + health;
     print(total);
 
-    // A literal argument -- proven in range at compile time. A computed one (clamp's own
+    // A literal argument -- proven in range at compile time. A computed one (clamp_i's own
     // result) gets a real runtime check instead, same split as everywhere else in this file.
     print(take_damage(p.health, 30));
-    print(take_damage(p.health, clamp(999, 0, 100)));
+    print(take_damage(p.health, clamp_i(999, 0, 100)));
 
     // A fn returning a ranged-Int type -- the result reads back as an ordinary Int too.
     let h1 = fixed_health();
@@ -93,7 +93,7 @@ fn main() {
     // gets the runtime check rather than the compile-time one -- see this file's own header.
     let temp: Int<-10..=10> = -5;
     print(temp);
-    let delta: Int<-10..10> = clamp(-999, -10, 9);
+    let delta: Int<-10..10> = clamp_i(-999, -10, 9);
     print(delta);
 
     // Field ASSIGNMENT after construction -- a literal (compile-time), then a computed value
@@ -101,11 +101,11 @@ fn main() {
     var p2 = Player { name: "Grace", health: 40 };
     p2.health = 60;
     print(p2.health);
-    p2.health = clamp(999, 0, 100);
+    p2.health = clamp_i(999, 0, 100);
     print(p2.health);
 
     // An ENUM VARIANT field -- checked the same way as a plain struct field.
-    let alive = Alive { hp: clamp(999, 0, 100) };
+    let alive = Alive { hp: clamp_i(999, 0, 100) };
     match alive {
         Alive { hp } => { print(hp); }
         Dead {} => {}

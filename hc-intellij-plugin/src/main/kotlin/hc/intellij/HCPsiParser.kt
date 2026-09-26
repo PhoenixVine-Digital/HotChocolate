@@ -89,31 +89,46 @@ object HCPsiParser : PsiParser {
     // own header for why these aren't individually validated.
     private fun leadingAnnotations(b: PsiBuilder) {
         while (b.tokenType == HCTokenTypes.AT) {
-            node(b, HCElementTypes.ANNOTATION) {
-                b.advanceLexer() // @
-                if (b.tokenType == HCTokenTypes.STRING || b.tokenType == HCTokenTypes.IDENT || b.tokenType == HCTokenTypes.KEYWORD) {
-                    b.advanceLexer()
-                } else {
-                    b.error("expected an annotation/directive name after '@'")
-                }
-                if (b.tokenType == HCTokenTypes.LPAREN) {
-                    b.advanceLexer()
-                    while (b.tokenType != HCTokenTypes.RPAREN && !b.eof()) {
-                        expression(b)
-                        if (b.tokenType == HCTokenTypes.COLON) {
-                            b.advanceLexer()
-                            expression(b)
-                        }
-                        if (b.tokenType != HCTokenTypes.RPAREN) {
-                            if (b.tokenType != HCTokenTypes.COMMA) break
-                            b.advanceLexer()
-                        }
-                    }
-                    expect(b, HCTokenTypes.RPAREN, "')'")
-                }
-            }
+            parseOneAnnotation(b)
         }
     }
+
+    // One `@name(...)`/`@"binary.Name"(...)` -- factored out of `leadingAnnotations`'s own loop
+    // (2026-09-25) so a NESTED annotation value (`@Inject(at: @At("HEAD"))` -- see `annotationArg
+    // Value`'s own header for the real grammar this closes the gap for) can recurse straight into
+    // this same fn from `primary()`, rather than duplicating the body.
+    private fun parseOneAnnotation(b: PsiBuilder) = node(b, HCElementTypes.ANNOTATION) {
+        b.advanceLexer() // @
+        if (b.tokenType == HCTokenTypes.STRING || b.tokenType == HCTokenTypes.IDENT || b.tokenType == HCTokenTypes.KEYWORD) {
+            b.advanceLexer()
+        } else {
+            b.error("expected an annotation/directive name after '@'")
+        }
+        if (b.tokenType == HCTokenTypes.LPAREN) {
+            b.advanceLexer()
+            while (b.tokenType != HCTokenTypes.RPAREN && !b.eof()) {
+                annotationArgValue(b)
+                if (b.tokenType == HCTokenTypes.COLON) {
+                    b.advanceLexer()
+                    annotationArgValue(b)
+                }
+                if (b.tokenType != HCTokenTypes.RPAREN) {
+                    if (b.tokenType != HCTokenTypes.COMMA) break
+                    b.advanceLexer()
+                }
+            }
+            expect(b, HCTokenTypes.RPAREN, "')'")
+        }
+    }
+
+    // An annotation argument's own NAME (before an optional `:`) or VALUE -- ordinary `expression`
+    // already covers everything real: literals, arrays (`value: [class(...)]`), and now (see the
+    // real compiler's own `Parser.hotc` `annotation_value` header) `class("binary.Name")` and a
+    // NESTED `@"..."(...)` too, both added straight to `primary()`'s own dispatch (reachable from
+    // ANYWHERE an ordinary expression is expected, including as an array-literal ELEMENT -- unlike
+    // a dedicated `annotationValue` fn that only the top-level arg-loop would reach). This is just
+    // `expression(b)` under a clearer name at the one call site that matters semantically.
+    private fun annotationArgValue(b: PsiBuilder) = expression(b)
 
     // === Top level ===
 
@@ -121,6 +136,11 @@ object HCPsiParser : PsiParser {
         leadingAnnotations(b)
         b.atKw("pub").let { if (it) b.advanceLexer() }
         b.atKw("open").let { if (it) b.advanceLexer() }
+        // `priv struct`/`priv enum`/`priv interface` -- a minimal import/visibility system, only
+        // ever meaningful on a top-level TYPE declaration (`Parser.hotc`'s own `is_priv`/
+        // `private_type_names` header) -- a bare modifier keyword consumed the same way `pub`/
+        // `open` right above already are, no dedicated node (same reasoning those two get none).
+        b.atKw("priv").let { if (it) b.advanceLexer() }
         when {
             b.atKw("use") -> useDecl(b)
             b.atKw("module") -> moduleDecl(b)
@@ -131,8 +151,29 @@ object HCPsiParser : PsiParser {
             b.atKw("system") -> systemDecl(b)
             b.atKw("unit") -> unitDecl(b)
             b.atKw("typestate") -> typestateDecl(b)
+            // Top-level `state Name { State1 { Event1 -> Target1; ... } ... }` -- a state
+            // machine (`Parser.hotc`'s own `state_machine_decl`), a DIFFERENT grammar from
+            // `typestate`'s own NESTED `state S1 { fields }` blocks right above (those are only
+            // ever reached from inside `typestateDecl`'s own loop, never through this dispatch,
+            // so there's no ambiguity between the two despite sharing one keyword).
+            b.atKw("state") -> stateMachineDecl(b)
             b.atKw("event") -> eventDecl(b)
             b.atKw("handle") -> handleDecl(b)
+            // `const fn name(...) { ... }` / `const NAME: Type = expr;` -- bounded compile-time
+            // evaluation (`Parser.hotc`'s own `CONST`/`const_fns` header). One-token lookahead
+            // (`const` then `fn` vs. `const` then a bare `IDENT`) picks the branch, same shape
+            // `constDecl`'s own header covers.
+            b.atKw("const") -> constDecl(b)
+            b.atKw("macro") -> macroDecl(b)
+            // `name!(args);` -- an ITEM macro invocation (only legal position for one; see
+            // `macroInvocation`'s own header) -- the only top-level shape not already covered by
+            // one of the `atKw` branches here, so it needs its own explicit lookahead rather than
+            // falling through the caller's zero-progress guard the way an ordinary unrecognized
+            // token would.
+            b.tokenType == HCTokenTypes.IDENT && b.lookAheadIsOp(1, "!") && b.lookAhead(2) == HCTokenTypes.LPAREN -> {
+                macroInvocation(b)
+                expect(b, HCTokenTypes.SEMI, "';'")
+            }
             b.atKw("fn") -> fnDecl(b)
             b.atKw("static") -> staticDecl(b)
             b.atKw("impl") -> implDecl(b)
@@ -261,6 +302,155 @@ object HCPsiParser : PsiParser {
         block(b)
     }
 
+    // Top-level `state Name { State1 { Event1 -> Target1; ... } State2 { ... } }` -- a state
+    // MACHINE (see the real compiler's own `Parser.hotc` `state_machine_decl` header), a
+    // DIFFERENT grammar from `typestateDecl`'s own NESTED `state S1 { fields }` blocks above,
+    // despite sharing the `state` keyword -- this one is only ever reached from `topLevelItem`'s
+    // own dispatch, never from inside `typestateDecl`'s loop, so there's no real ambiguity. Each
+    // transition line has no leading keyword at all (bare `IDENT -> IDENT;`), same zero-progress
+    // guard shape `typestateDecl` right above already uses for its own block loop, nested one
+    // level deeper here for the inner transition list.
+    private fun stateMachineDecl(b: PsiBuilder) = node(b, HCElementTypes.STATE_MACHINE_DECL) {
+        expectKw(b, "state")
+        expect(b, HCTokenTypes.IDENT, "a state machine name")
+        expect(b, HCTokenTypes.LBRACE, "'{'")
+        while (b.tokenType != HCTokenTypes.RBRACE && !b.eof()) {
+            val before = b.currentOffset
+            node(b, HCElementTypes.STATE_MACHINE_STATE) {
+                expect(b, HCTokenTypes.IDENT, "a state name")
+                expect(b, HCTokenTypes.LBRACE, "'{'")
+                while (b.tokenType != HCTokenTypes.RBRACE && !b.eof()) {
+                    val innerBefore = b.currentOffset
+                    node(b, HCElementTypes.STATE_TRANSITION) {
+                        expect(b, HCTokenTypes.IDENT, "an event name")
+                        expect(b, HCTokenTypes.ARROW, "'->'")
+                        expect(b, HCTokenTypes.IDENT, "a target state name")
+                        expect(b, HCTokenTypes.SEMI, "';'")
+                    }
+                    if (b.currentOffset == innerBefore) { b.error("unexpected token"); b.advanceLexer() }
+                }
+                expect(b, HCTokenTypes.RBRACE, "'}'")
+            }
+            if (b.currentOffset == before) { b.error("unexpected token"); b.advanceLexer() }
+        }
+        expect(b, HCTokenTypes.RBRACE, "'}'")
+    }
+
+    // `const fn name(...) -> Ret { ... }` / `const NAME: Type = expr;` -- bounded compile-time
+    // evaluation (see the real compiler's own `Parser.hotc` `CONST`/`const_fns` header). One-
+    // token lookahead (`const` then `fn` vs. `const` then a bare `IDENT`) picks the branch, same
+    // shape `lookAheadIsKw` was already built for. The const-fn shape reuses ordinary `fn`
+    // grammar entirely (params/return type/block) -- bounded evaluation is a real, disclosed
+    // CHECKER-level restriction (`Driver.hotc`'s own `fold_consts`), never a different syntax;
+    // the plain-const shape mirrors `staticDecl`'s own grammar exactly, just a different keyword.
+    private fun constDecl(b: PsiBuilder) {
+        if (b.lookAheadIsKw(1, "fn")) {
+            node(b, HCElementTypes.CONST_FN_DECL) {
+                expectKw(b, "const")
+                expectKw(b, "fn")
+                expect(b, HCTokenTypes.IDENT, "a function name")
+                typeParamList(b)
+                paramList(b)
+                if (b.tokenType == HCTokenTypes.ARROW) {
+                    b.advanceLexer()
+                    typeRef(b)
+                }
+                block(b)
+            }
+        } else {
+            node(b, HCElementTypes.CONST_DECL) {
+                expectKw(b, "const")
+                expect(b, HCTokenTypes.IDENT, "a const name")
+                expect(b, HCTokenTypes.COLON, "':'")
+                typeRef(b)
+                expectOp(b, "=")
+                expression(b)
+                expect(b, HCTokenTypes.SEMI, "';'")
+            }
+        }
+    }
+
+    // `macro name(p1, p2, ...) { <body> }` -- see the real compiler's own `Parser.hotc` `macro_
+    // decl`/`macro_body_is_stmt_list` header. Params are bare `IDENT`s (no `: Type`, unlike an
+    // ordinary `paramList`). Body shape is picked by content, not a leading marker: `fn` first ->
+    // an ITEM macro (delegates straight to the existing `fnDecl` grammar); a bounded, non-
+    // consuming scan (`looksLikeStmtMacroBody`) finding a top-level `;` before the matching `}` ->
+    // a STATEMENT macro (an ordinary statement LIST); otherwise -> a single EXPRESSION macro. An
+    // empty `{}` is a trivial statement macro (zero statements), checked first so it's never
+    // mistaken for "no expression to parse."
+    //
+    // Real, disclosed scope cut shared with `macroInvocation` below: this plugin tracks no
+    // macro-kind table at all (which declared macro is an expression/statement/item macro), so it
+    // can't enforce "used at the right position" the way the real compiler's own declared-before-
+    // use lookup does -- a stmt macro invoked as an expression would silently parse here instead
+    // of erroring, a real, disclosed leniency gap, not attempted this pass.
+    private fun macroDecl(b: PsiBuilder) = node(b, HCElementTypes.MACRO_DECL) {
+        expectKw(b, "macro")
+        expect(b, HCTokenTypes.IDENT, "a macro name")
+        expect(b, HCTokenTypes.LPAREN, "'('")
+        if (b.tokenType != HCTokenTypes.RPAREN) {
+            expect(b, HCTokenTypes.IDENT, "a macro parameter name")
+            while (b.tokenType == HCTokenTypes.COMMA) {
+                b.advanceLexer()
+                expect(b, HCTokenTypes.IDENT, "a macro parameter name")
+            }
+        }
+        expect(b, HCTokenTypes.RPAREN, "')'")
+        expect(b, HCTokenTypes.LBRACE, "'{'")
+        when {
+            b.tokenType == HCTokenTypes.RBRACE -> {}
+            b.atKw("fn") -> fnDecl(b)
+            b.looksLikeStmtMacroBody() -> {
+                while (b.tokenType != HCTokenTypes.RBRACE && !b.eof()) {
+                    val before = b.currentOffset
+                    statement(b)
+                    if (b.currentOffset == before) { b.error("unexpected token"); b.advanceLexer() }
+                }
+            }
+            else -> expression(b)
+        }
+        expect(b, HCTokenTypes.RBRACE, "'}'")
+    }
+
+    // Non-consuming: scans forward from the current position (right after a macro's own opening
+    // `{`) counting `{`/`(`/`[` depth, looking for a top-level `;` before the matching `}` --
+    // mirrors the real compiler's own `macro_body_is_stmt_list` exactly. Called with `b` sitting
+    // at the FIRST token of the body (never the `{` itself).
+    private fun PsiBuilder.looksLikeStmtMacroBody(): Boolean {
+        val m = mark()
+        var depth = 0
+        var result = false
+        while (!eof()) {
+            when {
+                tokenType == HCTokenTypes.LBRACE || tokenType == HCTokenTypes.LPAREN || tokenType == HCTokenTypes.LBRACKET -> depth++
+                tokenType == HCTokenTypes.RBRACE || tokenType == HCTokenTypes.RPAREN || tokenType == HCTokenTypes.RBRACKET -> {
+                    if (depth == 0) { m.rollbackTo(); return false } // the macro's own closing '}'
+                    depth--
+                }
+                tokenType == HCTokenTypes.SEMI && depth == 0 -> { result = true }
+            }
+            advanceLexer()
+            if (result) break
+        }
+        m.rollbackTo()
+        return result
+    }
+
+    // `name!(args)` -- a macro invocation, uniform across all three real positions (expression --
+    // `callOrPrimary`'s own header; statement -- falls through the ordinary `EXPR_STMT` path,
+    // since a macro invocation IS a real expression as far as this grammar is concerned; top-level
+    // -- `topLevelItem`'s own explicit branch) that this plugin doesn't try to tell apart (see
+    // `macroDecl`'s own header). The macro NAME is kept as a bare leaf token, never wrapped in its
+    // own `REF_EXPR` -- same "plain leaf under a different node" shape `STATIC_CALL_EXPR`'s own
+    // type/method idents already use (see `HCAnnotator.checkUndefinedReferences`'s own header) --
+    // so the undefined-reference walker (which only ever checks bare `REF_EXPR`s) never needs to
+    // know macro names exist at all.
+    private fun macroInvocation(b: PsiBuilder) = node(b, HCElementTypes.MACRO_INVOCATION) {
+        b.advanceLexer() // name
+        expectOp(b, "!")
+        argList(b)
+    }
+
     private fun moduleDecl(b: PsiBuilder) = node(b, HCElementTypes.MODULE_DECL) {
         expectKw(b, "module")
         expect(b, HCTokenTypes.IDENT, "a module path")
@@ -375,8 +565,24 @@ object HCPsiParser : PsiParser {
             typeRef(b)
             expect(b, HCTokenTypes.RBRACKET, "']'")
         } else {
+            val baseName = b.tokenText
             expect(b, HCTokenTypes.IDENT, "a type name")
-            if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<") {
+            // `Int<lo..hi>`/`Int<lo..=hi>` (optionally negative bounds, `Int<-10..10>`) -- see
+            // `Parser.hotc`'s own `type_name_ref` header. Checked via a bounded, NON-CONSUMING
+            // lookahead (`looksLikeIntRange`) BEFORE the ordinary generic-type-argument branch
+            // right below, same "don't commit until it's confirmed" reasoning that fn's own real
+            // compiler counterpart uses -- otherwise `0`/`100` (real `INT` tokens, never a valid
+            // type name) would hit the generic-argument loop's own `expect(IDENT, "a type name")`
+            // and fail immediately with a real, previously-latent "unexpected token" cascade.
+            if (baseName == "Int" && b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<" && b.looksLikeIntRange()) {
+                b.advanceLexer() // '<'
+                if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "-") b.advanceLexer()
+                expect(b, HCTokenTypes.INT, "a range bound")
+                if (b.tokenType == HCTokenTypes.DOTDOT || b.tokenType == HCTokenTypes.DOTDOTEQ) b.advanceLexer() else b.error("expected '..' or '..='")
+                if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "-") b.advanceLexer()
+                expect(b, HCTokenTypes.INT, "a range bound")
+                if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == ">") b.advanceLexer() else b.error("expected '>'")
+            } else if (b.tokenType == HCTokenTypes.OPERATOR && b.tokenText == "<") {
                 b.advanceLexer()
                 while (b.tokenText != ">" && !b.eof()) {
                     typeRef(b)
@@ -1003,6 +1209,16 @@ object HCPsiParser : PsiParser {
     // (`foo().class` is nonsensical), same restriction the real compiler's own `Expr.ClassLit`
     // enforces (`expr !is Expr.Ident` there is a hard parse error, not just a checker warning).
     private fun callOrPrimary(b: PsiBuilder) {
+        // `name!(args)` -- a macro invocation, checked BEFORE the ordinary call/primary dispatch
+        // below (same "confirm via non-consuming lookahead before committing" shape `typeRef`'s
+        // own `Int<lo..hi>` check uses) so a real less-than/logical-not sequence is never at
+        // risk of misfiring into this. No postfix chaining after it (a real, disclosed narrower
+        // scope than an ordinary `CALL_EXPR` gets) -- chaining off a macro's own expansion result
+        // is a rare shape not exercised anywhere in this repo's own examples.
+        if (b.tokenType == HCTokenTypes.IDENT && b.lookAheadIsOp(1, "!") && b.lookAhead(2) == HCTokenTypes.LPAREN) {
+            macroInvocation(b)
+            return
+        }
         var marker = b.mark()
         val startedAsIdent = b.tokenType == HCTokenTypes.IDENT
         var isBareIdent = startedAsIdent
@@ -1148,6 +1364,32 @@ object HCPsiParser : PsiParser {
                 expression(b)
             }
             b.tokenType == HCTokenTypes.IDENT -> identLed(b)
+            // `class("binary.Name")` -- an annotation-VALUE-only class literal (real compiler's
+            // own `Parser.hotc` `annotation_value`'s `AnnClass` branch), reachable from wherever
+            // an ordinary expression is expected (not just the top-level annotation-arg loop --
+            // see `annotationArgValue`'s own header for why that matters: `value: [class(...)]`'s
+            // own array ELEMENT is parsed by ordinary `expression()`, never anything annotation-
+            // specific).
+            b.atKw("class") -> node(b, HCElementTypes.ANN_CLASS_VALUE) {
+                b.advanceLexer()
+                expect(b, HCTokenTypes.LPAREN, "'('")
+                expect(b, HCTokenTypes.STRING, "a class binary name")
+                expect(b, HCTokenTypes.RPAREN, "')'")
+            }
+            // `enum("binary.Name", "CONST")` -- same shape, the real compiler's own `AnnEnumConst`
+            // branch (a real Java enum constant reference as an annotation value).
+            b.atKw("enum") -> node(b, HCElementTypes.ANN_ENUM_VALUE) {
+                b.advanceLexer()
+                expect(b, HCTokenTypes.LPAREN, "'('")
+                expect(b, HCTokenTypes.STRING, "an enum binary name")
+                expect(b, HCTokenTypes.COMMA, "','")
+                expect(b, HCTokenTypes.STRING, "an enum constant name")
+                expect(b, HCTokenTypes.RPAREN, "')'")
+            }
+            // A NESTED annotation value (`at: @"...At"(value: "HEAD")`) -- the real compiler's own
+            // `AnnAnnotation` branch, a real recursive case: parsed by recursing straight into
+            // `parseOneAnnotation`, same node (`ANNOTATION`) a top-level `@...` gets.
+            b.tokenType == HCTokenTypes.AT -> parseOneAnnotation(b)
             else -> {
                 b.error("expected an expression")
             }
@@ -1386,5 +1628,26 @@ object HCPsiParser : PsiParser {
         val matches = tokenType == HCTokenTypes.OPERATOR && tokenText == text
         m.rollbackTo()
         return matches
+    }
+
+    // Non-consuming: `mark()`/`rollbackTo()` instead of the index-based `lookAhead` helpers above,
+    // since the pattern has an internal branch (the optional leading `-` on either bound) that a
+    // fixed step-count can't express cleanly. Called with `b` sitting AT the `<` (not yet
+    // consumed) -- see `typeRef`'s own header for why this must be confirmed before committing to
+    // either branch. Pattern: `< [-] INT (..|..=) [-] INT >`.
+    private fun PsiBuilder.looksLikeIntRange(): Boolean {
+        val m = mark()
+        var ok = true
+        advanceLexer() // '<'
+        if (tokenType == HCTokenTypes.OPERATOR && tokenText == "-") advanceLexer()
+        if (tokenType == HCTokenTypes.INT) advanceLexer() else ok = false
+        if (ok && (tokenType == HCTokenTypes.DOTDOT || tokenType == HCTokenTypes.DOTDOTEQ)) advanceLexer() else ok = false
+        if (ok) {
+            if (tokenType == HCTokenTypes.OPERATOR && tokenText == "-") advanceLexer()
+            if (tokenType == HCTokenTypes.INT) advanceLexer() else ok = false
+        }
+        if (ok && !(tokenType == HCTokenTypes.OPERATOR && tokenText == ">")) ok = false
+        m.rollbackTo()
+        return ok
     }
 }

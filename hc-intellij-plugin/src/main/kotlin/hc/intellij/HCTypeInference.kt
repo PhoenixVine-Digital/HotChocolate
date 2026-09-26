@@ -120,7 +120,7 @@ internal fun inferExprType(expr: PsiElement, localTypes: Map<String, String>, ct
     HCElementTypes.CAST_EXPR ->
         realExprChildrenOf(expr).firstOrNull { it.node?.elementType == HCElementTypes.TYPE_REF }?.let { simpleTypeName(it) }
     HCElementTypes.BINARY_EXPR -> {
-        val op = directChildren(expr).firstOrNull { it.node?.elementType == HCTokenTypes.OPERATOR }?.text
+        val op = binaryOpText(expr)
         val operands = realExprChildrenOf(expr)
         when (op) {
             "&&", "||", "==", "!=", "<", "<=", ">", ">=" -> "Bool"

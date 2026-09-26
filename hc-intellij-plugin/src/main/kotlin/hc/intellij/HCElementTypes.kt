@@ -31,6 +31,22 @@ object HCElementTypes {
     val STATE_DECL = HCElementType("STATE_DECL")
     val EVENT_DECL = HCElementType("EVENT_DECL")
     val HANDLE_DECL = HCElementType("HANDLE_DECL")
+    // **Added 2026-09-25** -- top-level `state Name { State1 { Event1 -> Target1; ... } ... }`
+    // (a state MACHINE -- see `HCPsiParser.stateMachineDecl`'s own header for why this is a
+    // different grammar from `STATE_DECL` above, despite sharing the `state` keyword).
+    val STATE_MACHINE_DECL = HCElementType("STATE_MACHINE_DECL")
+    val STATE_MACHINE_STATE = HCElementType("STATE_MACHINE_STATE")
+    val STATE_TRANSITION = HCElementType("STATE_TRANSITION")
+    // **Added 2026-09-25** -- `const fn name(...) { ... }` / top-level `const NAME: Type = expr;`
+    // (bounded compile-time evaluation -- see `HCPsiParser.constDecl`'s own header).
+    val CONST_FN_DECL = HCElementType("CONST_FN_DECL")
+    val CONST_DECL = HCElementType("CONST_DECL")
+    // **Added 2026-09-25** -- `macro name(p1, ...) { ... }` (see `HCPsiParser.macroDecl`'s own
+    // header). One node for the declaration; `MACRO_INVOCATION` covers `name!(args)` uniformly at
+    // all three real positions (expression/statement/top-level) this plugin doesn't try to tell
+    // apart (no macro-kind table -- see that fn's own header for why).
+    val MACRO_DECL = HCElementType("MACRO_DECL")
+    val MACRO_INVOCATION = HCElementType("MACRO_INVOCATION")
 
     val TYPE_PARAM_LIST = HCElementType("TYPE_PARAM_LIST")
     val PARAM_LIST = HCElementType("PARAM_LIST")
@@ -85,6 +101,13 @@ object HCElementTypes {
     val LITERAL_EXPR = HCElementType("LITERAL_EXPR")
     val STRING_INTERP_EXPR = HCElementType("STRING_INTERP_EXPR")
     val CLASS_LIT_EXPR = HCElementType("CLASS_LIT_EXPR")
+    // **Added 2026-09-25** -- an annotation-value-only `class("binary.Name")`/`enum("Binary",
+    // "CONST")` (see `HCPsiParser.primary`'s own header) -- a genuinely different concrete syntax
+    // from `TypeName.class` above (a call-shaped form taking a `STRING`, not a dot-suffix on a
+    // bare type name), kept as its own node type rather than reusing `CLASS_LIT_EXPR` so nothing
+    // that inspects that node's own children shape gets confused by the other one's.
+    val ANN_CLASS_VALUE = HCElementType("ANN_CLASS_VALUE")
+    val ANN_ENUM_VALUE = HCElementType("ANN_ENUM_VALUE")
 
     val ARG_LIST = HCElementType("ARG_LIST")
     val LAMBDA_EXPR = HCElementType("LAMBDA_EXPR")

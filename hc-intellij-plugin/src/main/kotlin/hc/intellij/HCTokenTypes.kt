@@ -84,6 +84,16 @@ object HCTokenTypes {
         // `IDENT`, producing the same false "unexpected token" flagging `use`/`component`/
         // `system` had before the earlier fix right above.
         "unit", "parallel", "sequence", "typestate", "state", "event", "handle",
+        // **Fixed 2026-09-25** -- `priv` (`priv struct`/`priv enum`/`priv interface`, a minimal
+        // import/visibility system -- `Parser.hotc`'s own `is_priv`/`private_type_names` header)
+        // and `const` (`const fn`/top-level `const NAME: Type = expr;`, bounded compile-time
+        // evaluation -- `Parser.hotc`'s own `CONST`/`const_fns` header). `macro` is deliberately
+        // NOT added here yet -- see `HCPsiParser.kt`'s own header for why that one's a much
+        // bigger, separate follow-up.
+        "priv", "const",
+        // **Fixed 2026-09-25** -- `macro` (`macro name(p1, ...) { ... }`, invoked `name!(args)` --
+        // see `HCPsiParser.macroDecl`'s own header for the real grammar/scope this closes).
+        "macro",
     )
 
     val SYMBOLS: Map<String, HCTokenType> = mapOf(

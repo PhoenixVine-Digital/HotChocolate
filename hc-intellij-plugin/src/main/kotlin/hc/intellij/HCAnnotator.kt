@@ -117,6 +117,13 @@ class HCAnnotator : Annotator {
     // header for why). `must_use`/`dev`/`serializable`/`entry` (pre-existing) aren't in these sets
     // -- they keep their own explicit branches below, unchanged.
     private fun checkAnnotation(element: PsiElement, holder: AnnotationHolder) {
+        // A NESTED annotation VALUE (`at: @"...At"(value: "HEAD")` -- see `HCPsiParser.primary`'s
+        // own header on why this is a real, recursive `ANNOTATION` node just like a top-level
+        // one) isn't subject to the top-level PLACEMENT rule at all -- its own parent is another
+        // `ANNOTATION`, never a real declaration, so `nextSignificantSibling` below would find
+        // whatever token follows it INSIDE the outer annotation's own arg list (a `,`/`)`, never
+        // an `FN_DECL`/`STRUCT_DECL`) and false-positive "annotations can only precede ...".
+        if (element.parent?.node?.elementType == HCElementTypes.ANNOTATION) return
         val nameToken = directChildren(element).getOrNull(1) ?: return
         val isString = nameToken.node?.elementType == HCTokenTypes.STRING
         val text = nameToken.text
@@ -270,6 +277,25 @@ class HCAnnotator : Annotator {
         "vec_of", "registry_new", "read_int", "read_string", "read_ints", "read_strings",
         "Some", "None", "Ok", "Err",
         "gpu_thread_id",
+        // `asset("path")` -- a real compiler INTRINSIC (`Driver.hotc`'s own `check_assets`/
+        // `Codegen.hotc`'s own `gen_expr`, both special-casing `callee == "asset"` directly),
+        // same shape as `print`/`read_line` above -- never a real `FnDecl` anywhere.
+        "asset",
+        // `stdlib/collections.hotc`'s own constructors (`use collections;`), `stdlib/random.hotc`'s
+        // `random_new` (`use random;`), `stdlib/tuple.hotc`'s `tuple2` (`use tuple;`), `stdlib/
+        // math.hotc`'s `clamp_int`/`clamp_float`/`clamp_long` (`use math;`) -- real prelude-shaped
+        // stdlib functions, same "not discoverable by walking the current file's own tree" reason
+        // `vec_of`/`registry_new` above already are, just from a topic that needs its own explicit
+        // `use` rather than the 5-topic legacy default. Added unconditionally (not gated on the
+        // file actually writing that `use` line) -- same deliberately-imprecise "avoid a false
+        // positive over catching a missing `use`" leniency this whole list already takes for
+        // `vec_of` etc.
+        "hash_map_new", "int_hash_map_new", "hash_map2_new", "hash_set_new", "int_hash_set_new",
+        "random_new", "tuple2", "clamp", "clamp_int", "clamp_float", "clamp_long",
+        // `stdlib/sequence.hotc`'s own `wait`/`wait_until` (`use sequence;`, or implicitly via a
+        // `sequence { ... }` block) -- real coroutine-suspend helpers, callable from a virtual
+        // thread, not scoped to lexically inside the block itself.
+        "wait", "wait_until",
     )
 
     // Every name a value expression could legitimately refer to at the TOP level: a callable
@@ -293,17 +319,70 @@ class HCAnnotator : Annotator {
     // itself), so "immediate containing directory" is a deliberate, disclosed heuristic -- it
     // matches every real multi-file example in this repo, but a project layout that spreads one
     // logical multi-file program across NESTED subdirectories wouldn't be picked up by this.
+    // **Widened 2026-09-25** -- several real declarations SYNTHESIZE a callable name that never
+    // appears as its own `FN_DECL`/`STATIC_DECL` anywhere in source at all (the real compiler's
+    // own parser-level AST synthesis does it invisibly): `unit Name(Base);` generates a
+    // lowercased constructor fn (`ticks(...)` for `unit Ticks(Int);`, see `Parser.hotc`'s own
+    // `unit_decl` header); `state Machine { ... }` generates `<Machine>_transition` (see
+    // `Parser.hotc`'s own `state_machine_decl` header); `@startup`/`@update`/`@fixed_update`/
+    // `@render` each generate ONE shared dispatcher (`run_startup`/`run_update`/
+    // `run_fixed_update`/`run_render`) once ANY fn in the file carries that directive (see
+    // `build_lifecycle_dispatcher_fn`'s own header); `@tunable` on a `static` generates
+    // `tunable_get`/`tunable_set`/`tunable_names` (see `build_tunable_get_fn`'s own header).
+    // Tracked via a single forward pass accumulating "pending" annotation names exactly the way
+    // the real compiler's own parser does (`pending_startup`/`pending_tunable`/... in `Parser.
+    // hotc`'s own top-level loop) -- an `ANNOTATION`/`pub`/`open`/`priv` sibling never resets the
+    // accumulator, any OTHER node does, same shape `HCAnnotator.nextSignificantSibling` already
+    // established for the directive-PLACEMENT check (see that fn's own header).
     private fun collectTopLevelValueNames(file: PsiFile): Set<String> {
         val names = mutableSetOf<String>()
         fun collectFrom(f: PsiFile) {
+            var pending = mutableListOf<String>()
             for (decl in directChildren(f)) {
-                when (decl.node?.elementType) {
-                    HCElementTypes.FN_DECL, HCElementTypes.STATIC_DECL -> declaredName(decl)?.let { names += it.text }
+                val et = decl.node?.elementType
+                if (decl is PsiWhiteSpace) continue
+                if (et == HCElementTypes.ANNOTATION) {
+                    directChildren(decl).getOrNull(1)?.text?.let { pending += it }
+                    continue
+                }
+                if (et == HCTokenTypes.KEYWORD && (decl.text == "pub" || decl.text == "open" || decl.text == "priv")) continue
+                when (et) {
+                    HCElementTypes.FN_DECL, HCElementTypes.STATIC_DECL, HCElementTypes.CONST_FN_DECL, HCElementTypes.CONST_DECL ->
+                        declaredName(decl)?.let { names += it.text }
                     HCElementTypes.ENUM_DECL -> for (variant in directChildren(decl).filter { it.node?.elementType == HCElementTypes.ENUM_VARIANT }) {
                         declaredName(variant)?.let { names += it.text }
                     }
+                    HCElementTypes.UNIT_DECL -> declaredName(decl)?.let { names += it.text.lowercase() }
+                    HCElementTypes.STATE_MACHINE_DECL -> declaredName(decl)?.let { names += "${it.text}_transition" }
+                    HCElementTypes.EVENT_DECL -> declaredName(decl)?.let { names += "emit_${it.text}" }
+                    // A top-level ITEM-macro invocation (`make_adder!(add5, 5);`) generates a
+                    // real top-level fn this plugin's parser can never discover directly (no
+                    // macro expansion at all -- see `HCPsiParser.macroDecl`'s own header). Real,
+                    // disclosed HEURISTIC, not a precise fix: registers the invocation's own
+                    // FIRST bare-identifier argument as a known value, on the assumption it names
+                    // the generated fn (the real compiler's own convention every item-macro
+                    // example in this repo follows -- `name` is the first declared param) --
+                    // wrong for an expression/statement macro whose first arg happens to be a
+                    // bare identifier too (a real, accepted false-negative-avoidance tradeoff,
+                    // matching this whole file's own "avoid a false positive over precision"
+                    // stance elsewhere).
+                    HCElementTypes.MACRO_INVOCATION -> {
+                        val argList = directChildren(decl).firstOrNull { it.node?.elementType == HCElementTypes.ARG_LIST }
+                        val firstArg = argList?.let { directChildren(it).firstOrNull { c -> c.node?.elementType == HCElementTypes.REF_EXPR } }
+                        firstArg?.let { declaredName(it) }?.let { names += it.text }
+                    }
                     else -> {}
                 }
+                if (et == HCElementTypes.FN_DECL) {
+                    if ("startup" in pending) names += "run_startup"
+                    if ("update" in pending) names += "run_update"
+                    if ("fixed_update" in pending) names += "run_fixed_update"
+                    if ("render" in pending) names += "run_render"
+                }
+                if (et == HCElementTypes.STATIC_DECL && "tunable" in pending) {
+                    names += "tunable_get"; names += "tunable_set"; names += "tunable_names"
+                }
+                pending = mutableListOf()
             }
         }
         collectFrom(file)
@@ -337,6 +416,12 @@ class HCAnnotator : Annotator {
         }
         for (forStmt in elementsOfType(fnDecl, HCElementTypes.FOR_STMT)) {
             declaredName(forStmt)?.let { names += it.text }
+        }
+        // `parallel for c in items { ... }` -- same "first direct-child IDENT is the loop
+        // variable" shape `FOR_STMT` right above already uses (`HCPsiParser.kt`'s own
+        // `PARALLEL_STMT` parse fn confirms the identical child order).
+        for (parallelStmt in elementsOfType(fnDecl, HCElementTypes.PARALLEL_STMT)) {
+            declaredName(parallelStmt)?.let { names += it.text }
         }
         // `[result_expr for var_name in iter_expr if cond]` -- `var_name`'s own binding, same
         // "first direct-child IDENT" extraction `declaredName` already uses for `FOR_STMT`'s loop
@@ -372,10 +457,31 @@ class HCAnnotator : Annotator {
         return names
     }
 
+    // A macro's own declared params (`macro make_adder(name, amount) { fn name(x: Int) -> Int {
+    // return x + amount; } }`'s `name`/`amount`) are template variables, real-compiler-substituted
+    // away entirely at expansion time -- this plugin never expands macros at all (see
+    // `HCPsiParser.macroDecl`'s own header), so an ITEM macro's own literal, unexpanded `fn` body
+    // genuinely references a name (`amount`) that isn't a param of THAT inner fn, nor any real
+    // top-level/local name -- a guaranteed false "unresolved reference" without this. Walks UP
+    // from a `FN_DECL` looking for an enclosing `MACRO_DECL` (only true for the item-macro shape;
+    // an expression/statement macro's own body has no nested `FN_DECL` at all, so this never
+    // fires for those, and their own bare macro-param references are never checked in the first
+    // place either -- `checkUndefinedReferences`'s own loop only ever walks `FN_DECL`s).
+    private fun enclosingMacroParamNames(fnDecl: PsiElement): Set<String> {
+        var p: PsiElement? = fnDecl.parent
+        while (p != null) {
+            if (p.node?.elementType == HCElementTypes.MACRO_DECL) {
+                return directChildren(p).filter { it.node?.elementType == HCTokenTypes.IDENT }.map { it.text }.toSet()
+            }
+            p = p.parent
+        }
+        return emptySet()
+    }
+
     private fun checkUndefinedReferences(file: PsiFile, holder: AnnotationHolder) {
         val topLevel = collectTopLevelValueNames(file) + ALWAYS_KNOWN_VALUE_NAMES
         for (fnDecl in elementsOfType(file, HCElementTypes.FN_DECL)) {
-            val known = topLevel + collectLocalNames(fnDecl)
+            val known = topLevel + collectLocalNames(fnDecl) + enclosingMacroParamNames(fnDecl)
             for (ref in elementsOfType(fnDecl, HCElementTypes.REF_EXPR)) {
                 val nameToken = directChildren(ref).firstOrNull { it.node?.elementType == HCTokenTypes.IDENT } ?: continue
                 if (nameToken.text !in known) {

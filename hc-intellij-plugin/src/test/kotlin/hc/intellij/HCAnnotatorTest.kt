@@ -124,6 +124,27 @@ class HCAnnotatorTest : BasePlatformTestCase() {
         assertTrue("unexpected error(s): $errs", errs.isEmpty())
     }
 
+    // **Added 2026-09-25** -- a real, previously-latent bug found fixing `examples/
+    // bitwise_shift_xor.hotc`: `>>`/`>>>` are never single tokens (two/three separate bare `>`
+    // `OPERATOR` leaves, see `HCPsiParser.shift`'s own header), and every type-inference call
+    // site used to just take the FIRST operator child's text -- silently reading a real `>>` as a
+    // bare `>` comparison, whose own inferred type (`Bool`) then mismatched an explicit `Long`
+    // `let` annotation.
+    fun `test shift result type matches its declared let type`() {
+        val errs = errors("fn f() {\n    let a: Long = 1L << 40;\n    let b: Long = a >> 4;\n    let c: Long = a >>> 4;\n}\n")
+        assertTrue("unexpected error(s): $errs", errs.isEmpty())
+    }
+
+    // **Added 2026-09-25** -- a real, previously-latent bug found fixing `examples/
+    // parallel_for.hotc`: `checkStructLiteralFields` always took the LAST ident in a struct
+    // literal as its type name (correct for `Base<Arg>::Variant { ... }`), but for a plain
+    // `Name<Arg> { ... }` literal (no `::`) that's the type ARGUMENT, not the struct name --
+    // `Vec<Counter> { data: [], len: 0 }` read as if constructing a `Counter`.
+    fun `test generic struct literal resolves to the base name, not its type argument`() {
+        val errs = errors("struct Counter { value: Int }\nfn f() {\n    var items: Vec<Counter> = Vec<Counter> { data: [], len: 0 };\n}\n")
+        assertTrue("unexpected error(s) misreading the struct name as its own type argument: $errs", errs.none { it.contains("Counter") })
+    }
+
     fun `test break outside a loop is flagged`() {
         val errs = errors("fn f() {\n    break;\n}\n")
         assertTrue("expected a break-outside-loop error, got: $errs", errs.any { it.contains("'break'") })
